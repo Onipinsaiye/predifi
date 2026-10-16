@@ -9,6 +9,15 @@
 //! - **INV-4**: Winnings never exceed `pool_total_stake`
 //! - Protocol fee uses `RoundingMode::ProtocolFavor`
 //! - Winner share is proportional: `(user_stake * payout_pool) / winning_stake`
+//! - **INV-5 (deterministic remainder)**: For any set of winners on the
+//!   winning side, `sum(winnings_i) + retained_remainder == payout_pool`,
+//!   where `retained_remainder = payout_pool - sum(winnings_i) >= 0` is
+//!   left unclaimed in the contract's token balance. The remainder is a
+//!   deterministic function of the stake vector and `payout_pool` alone —
+//!   it does not depend on the order in which winners claim, nor on which
+//!   subset of winners has claimed so far. Every token unit of
+//!   `pool_total_stake` is accounted for as either `protocol_fee`,
+//!   a winner's `winnings`, or the retained remainder.
 //!
 //! ## Rounding Directions
 //!
@@ -79,6 +88,46 @@ pub fn calculate_payout_pool(total_stake: i128, fee_bps: i128) -> Result<i128, P
         .ok_or(PrediFiError::ArithmeticError)
 }
 
+/// Deterministic remainder retained by the contract after all winners on the
+/// winning side have been paid their floored proportional share.
+///
+/// # Invariant (INV-5)
+/// For a winning side with aggregate stake `winning_stake` and payout pool
+/// `payout_pool`, the retained remainder is defined as
+/// `payout_pool - sum_i floor(user_stake_i * payout_pool / winning_stake)`.
+/// Because each `floor(...)` term is `<=` its exact fractional value, this
+/// remainder is always `>= 0` and `< number_of_winners` (each winner can
+/// contribute at most `1` unit of dust). It is a pure function of the stake
+/// vector and `payout_pool`; it does not depend on claim order, and it is
+/// never paid out to any participant — it simply stays in the contract's
+/// token balance so that `escrow == payouts + retained_remainder` holds
+/// exactly, with every token unit accounted for.
+pub fn calculate_retained_remainder(
+    winning_stake: i128,
+    payout_pool: i128,
+    winner_stakes: &[i128],
+) -> Result<i128, PrediFiError> {
+    if winning_stake < 0 || payout_pool < 0 {
+        return Err(PrediFiError::ArithmeticError);
+    }
+    if winning_stake == 0 || payout_pool == 0 {
+        return Ok(payout_pool);
+    }
+    let mut distributed: i128 = 0;
+    for &user_stake in winner_stakes {
+        if user_stake < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        let w = calculate_winnings(user_stake, winning_stake, payout_pool)?;
+        distributed = distributed
+            .checked_add(w)
+            .ok_or(PrediFiError::ArithmeticError)?;
+    }
+    payout_pool
+        .checked_sub(distributed)
+        .ok_or(PrediFiError::ArithmeticError)
+}
+
 /// Proportional winnings for one winner.
 ///
 /// Returns `0` when there is no winning stake or the user staked nothing.
@@ -93,6 +142,10 @@ pub fn calculate_payout_pool(total_stake: i128, fee_bps: i128) -> Result<i128, P
 /// balance. Because every winner is floored independently, the sum of any
 /// number of winners' payouts can never exceed `payout_pool`, regardless of
 /// how the winning side is split between them (see `payout_proptests.rs`).
+/// The unclaimed gap is exactly [`calculate_retained_remainder`], and it is
+/// independent of claim order: each winner's payout is computed from their
+/// own stake and the pool-level `winning_stake`/`payout_pool` only, never
+/// from the contract's current balance or from who has already claimed.
 pub fn calculate_winnings(
     user_stake: i128,
     winning_stake: i128,
@@ -291,5 +344,41 @@ mod tests {
     #[test]
     fn payout_pool_subtracts_fee() {
         assert_eq!(calculate_payout_pool(10_000, 250).unwrap(), 9_750);
+    }
+
+    #[test]
+    fn retained_remainder_accounts_for_every_unit() {
+        // 3 winners with stakes 1,1,1 on a winning side of 3; pool = 100.
+        // Each floor(1*100/3) = 33, sum = 99, remainder = 1.
+        let remainder = calculate_retained_remainder(3, 100, &[1, 1, 1]).unwrap();
+        assert_eq!(remainder, 1);
+        let sum: i128 = [1i128, 1, 1]
+            .iter()
+            .map(|s| calculate_winnings(*s, 3, 100).unwrap())
+            .sum();
+        assert_eq!(sum + remainder, 100);
+    }
+
+    #[test]
+    fn retained_remainder_is_claim_order_independent() {
+        // Same stake vector, different enumeration orders must yield the
+        // same remainder and the same per-winner payouts.
+        let stakes = [7i128, 11, 13, 17];
+        let winning_stake: i128 = stakes.iter().sum();
+        let payout_pool: i128 = 1_000;
+        let r_a = calculate_retained_remainder(winning_stake, payout_pool, &stakes).unwrap();
+        let reversed: Vec<i128> = stakes.iter().rev().copied().collect();
+        let r_b = calculate_retained_remainder(winning_stake, payout_pool, &reversed).unwrap();
+        assert_eq!(r_a, r_b);
+        let sum: i128 = stakes
+            .iter()
+            .map(|s| calculate_winnings(*s, winning_stake, payout_pool).unwrap())
+            .sum();
+        assert_eq!(sum + r_a, payout_pool);
+    }
+
+    #[test]
+    fn retained_remainder_zero_when_pool_zero() {
+        assert_eq!(calculate_retained_remainder(10, 0, &[5, 5]).unwrap(), 0);
     }
 }

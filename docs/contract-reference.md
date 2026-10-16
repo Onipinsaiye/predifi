@@ -226,6 +226,15 @@ pub fn claim_winnings(
 - `winnings = (user_stake / winning_outcome_total_stake) × payout_pool`
 - If user has a referrer: referrer receives `referral_cut_bps` of the user's share of the protocol fee (the rest remains for treasury withdrawal).
 
+**Remainder Allocation Invariant:**
+
+Integer division truncates, so per-user payouts may not sum exactly to the payout pool. To keep accounting deterministic and independent of claim order, the contract retains the truncation dust rather than redistributing it:
+
+- `sum(all user winnings) + retained_remainder = payout_pool`
+- `retained_remainder = payout_pool - sum(floor(user_stake × payout_pool / winning_outcome_total_stake))`
+- The retained remainder stays in escrow and is withdrawable by the treasury; it is never assigned to a specific claimant.
+- This rule is applied identically on the single-claim path (`claim_winnings`) and any batch payout path, so the same stake vector always yields the same per-user amounts regardless of claim order.
+
 **Errors:**
 
 - `PoolNotResolved` - Pool not yet resolved
@@ -244,6 +253,10 @@ if winnings > 0 {
     // User won and received winnings
 }
 ```
+
+**Property Tests:**
+
+Payout property tests generate many participant counts and stake vectors and assert that escrow equals the sum of payouts plus the explicit retained remainder, accounting for every token unit.
 
 ---
 
@@ -367,6 +380,10 @@ pub fn set_referral_cut_bps(
 
 - **`get_referral_cut_bps(env: Env) -> u32`** — Returns the current referral cut in basis points (default 5000).
 - **`get_referred_volume(env: Env, referrer: Address, pool_id: u64) -> i128`** — Returns the total stake amount referred by `referrer` on the given pool (for analytics and payout context).
+
+**Remainder view:**
+
+- **`get_retained_remainder(env: Env, pool_id: u64) -> i128`** — Returns the truncation dust retained in escrow for a resolved pool (payout pool minus the sum of all distributed winnings). Always `>= 0` and deterministic for a given stake distribution.
 
 ---
 

@@ -168,6 +168,19 @@ pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
 // INV-7: Prediction.amount > 0 (no zero-stakes)
 // INV-8: Pool.end_time > creation_time (pools must have future end)
 //
+// INV-9 (Payout Remainder Allocation): For any resolved pool, the escrowed
+//        token balance is fully accounted for by the sum of all participant
+//        payouts plus an explicitly retained remainder. Integer-division dust
+//        is allocated deterministically by a rule that does NOT depend on
+//        claim order:
+//
+//          remainder = escrow - Σ(payout_i)
+//
+//        where each payout_i is computed from the participant's stake share
+//        using floor division, and the retained remainder is the accumulated
+//        dust. This invariant holds identically for single-claim and
+//        batch-claim payout paths, so no token unit is created or lost.
+//
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[contracterror]
