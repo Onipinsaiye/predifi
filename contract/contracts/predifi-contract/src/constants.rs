@@ -427,6 +427,65 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// **Used for:** Calculating `PendingFeeChange.effective_at` when queuing fee changes.
 pub const FEE_CHANGE_TIMELOCK_SECONDS: u64 = 86_400;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NO-CONTEST & REFUND SETTLEMENT CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Sentinel outcome value indicating a pool settled under the no-contest refund policy.
+///
+/// **Units:** Outcome index (dimensionless)
+/// **Value:** 4,294,967,294 (u32::MAX - 1)
+///
+/// **Rationale:** When a pool cannot be resolved (invalid oracle data, cancelled market,
+/// or explicit no-contest), it settles under a single explicit refund policy rather than
+/// remaining in an ambiguous lifecycle state. This sentinel is distinct from
+/// `UNRESOLVED_OUTCOME` (u32::MAX) so that "not yet resolved" and "settled as no-contest"
+/// are never conflated, and cannot collide with any valid outcome index (bounded by
+/// `MAX_OPTIONS_COUNT`).
+///
+/// **Impact of changes:**
+/// - Must remain distinct from `UNRESOLVED_OUTCOME` and from any valid outcome index.
+/// - Changing this would require a storage migration for pools already settled as no-contest.
+///
+/// **Used for:** Marking `pool.outcome` when a pool settles under the refund policy.
+pub const NO_CONTEST_OUTCOME: u32 = u32::MAX - 1;
+
+/// Fee in basis points applied to no-contest refunds (0 bps = no fee).
+///
+/// **Units:** Basis points (bps, where 100 bps = 1%)
+/// **Value:** 0 bps
+///
+/// **Rationale:** No-contest settlement is a safety mechanism, not a revenue event. When a
+/// market is cancelled or cannot be resolved, participants should recover their stake in
+/// full. Charging a protocol fee or paying referrals on a refund would penalize users for
+/// an outcome they did not cause. Keeping this at 0 makes the refund policy explicit and
+/// auditable: every participant recovers exactly their recorded stake.
+///
+/// **Impact of changes:**
+/// - Increasing this value would deduct a fee from refunds, breaking the invariant that
+///   total refundable value equals total escrowed stake.
+/// - Must remain 0 unless the refund policy is deliberately changed and re-audited.
+///
+/// **Used for:** Computing the refund amount in the no-contest settlement path.
+pub const NO_CONTEST_FEE_BPS: u32 = 0;
+
+/// Whether referral rewards are paid on no-contest refunds.
+///
+/// **Units:** Boolean flag
+/// **Value:** false
+///
+/// **Rationale:** Referral rewards are funded from protocol fees on resolved markets. Since
+/// no-contest settlement charges no fee (`NO_CONTEST_FEE_BPS == 0`), there is no fee pool
+/// from which to pay referrals. Setting this to false makes the rule explicit and prevents
+/// referral payouts from silently draining the escrow that must be returned to participants.
+///
+/// **Impact of changes:**
+/// - Setting this to true without a corresponding fee would break accounting conservation.
+/// - Must remain false while `NO_CONTEST_FEE_BPS` is 0.
+///
+/// **Used for:** Gating referral payout logic in the no-contest settlement path.
+pub const NO_CONTEST_PAYS_REFERRALS: bool = false;
+
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 mod tests {
@@ -508,5 +567,23 @@ mod tests {
         // At 7 decimals, 1 USDC = 10_000_000 base units.
         // Therefore 1_000_000_000 base units equals 100 USDC.
         assert_eq!(HIGH_VALUE_THRESHOLD, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_no_contest_outcome_distinct_from_unresolved() {
+        assert_ne!(NO_CONTEST_OUTCOME, UNRESOLVED_OUTCOME);
+        assert!(NO_CONTEST_OUTCOME >= MAX_OPTIONS_COUNT);
+    }
+
+    #[test]
+    fn test_no_contest_refund_policy_is_fee_free() {
+        // Refunds must return the full stake: no protocol fee, no referral payout.
+        assert_eq!(NO_CONTEST_FEE_BPS, 0);
+        assert!(!NO_CONTEST_PAYS_REFERRALS);
+    }
+
+    #[test]
+    fn test_no_contest_fee_bps_within_bounds() {
+        assert!(NO_CONTEST_FEE_BPS <= MAX_TOLERANCE);
     }
 }

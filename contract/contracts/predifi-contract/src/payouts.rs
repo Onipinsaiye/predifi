@@ -28,6 +28,8 @@
 //! | [`calculate_claim_payout`]    | Down (composed)      | Same as above — no additional rounding is introduced |
 //! | [`calculate_referral_amount`] | **Nearest** (½ up)   | Comes out of the treasury's fee share, not user funds |
 //! | [`calculate_odds_bps`]        | Down (floor)         | Display-only; never moves funds                      |
+//! | [`calculate_refund`]          | Down (floor)         | Left unclaimed in the contract's token balance       |
+//! | [`calculate_no_contest_refund`] | Down (floor)       | Left unclaimed in the contract's token balance       |
 
 use crate::safe_math::{RoundingMode, SafeMath};
 use predifi_errors::PrediFiError;
@@ -51,6 +53,37 @@ pub struct PayoutBreakdown {
     pub protocol_fee: i128,
     pub payout_pool: i128,
     pub winnings: i128,
+}
+
+/// Inputs required to compute a single participant's refund.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefundInput {
+    /// Total stake locked in the pool (all outcomes).
+    pub pool_total_stake: i128,
+    /// Caller's stake on the refunded outcome.
+    pub user_stake: i128,
+}
+
+/// Fully computed refund breakdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefundBreakdown {
+    /// Amount returned to the participant (principal only, no fees/referrals).
+    pub refund: i128,
+}
+
+/// Settlement mode for terminal lifecycle states that refund participants.
+///
+/// All three modes share the same economic rule: no protocol fee is taken,
+/// no referral is paid, and each participant recovers exactly their own
+/// stake. They are distinguished only for auditability and event emission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefundReason {
+    /// Market reached its deadline without a resolvable outcome.
+    NoContest,
+    /// Oracle returned an invalid or unusable result.
+    InvalidOracle,
+    /// Market was cancelled by an authorized party before resolution.
+    Cancelled,
 }
 
 /// Calculate protocol fee from total stake and fee bps.
@@ -139,6 +172,51 @@ pub fn calculate_claim_payout(input: &PayoutInput) -> Result<PayoutBreakdown, Pr
         payout_pool,
         winnings,
     })
+}
+
+/// Refund for a single participant in a no-contest, invalid-oracle, or
+/// cancelled market.
+///
+/// # Policy
+/// - No protocol fee is deducted.
+/// - No referral is paid.
+/// - Each participant recovers exactly their own stake (`user_stake`).
+/// - Returns `0` when the user staked nothing.
+///
+/// # Rounding
+/// This is an exact integer identity — no rounding is performed. The
+/// `refund <= pool_total_stake` check is defense-in-depth: since
+/// `user_stake` is a component of `pool_total_stake`, the condition is
+/// mathematically unreachable for valid inputs, but guards against
+/// corrupted storage.
+///
+/// # Retry safety
+/// This function is pure and idempotent: it always returns the same value
+/// for the same inputs. Callers MUST track a per-participant `refunded`
+/// flag in storage to prevent a second claim from paying twice; the math
+/// here cannot enforce that on its own.
+pub fn calculate_refund(input: &RefundInput) -> Result<RefundBreakdown, PrediFiError> {
+    if input.pool_total_stake < 0 || input.user_stake < 0 {
+        return Err(PrediFiError::ArithmeticError);
+    }
+    if input.user_stake > input.pool_total_stake {
+        return Err(PrediFiError::ArithmeticError);
+    }
+    Ok(RefundBreakdown {
+        refund: input.user_stake,
+    })
+}
+
+/// Convenience wrapper: compute a refund for a given [`RefundReason`].
+///
+/// All three reasons share identical economics (principal only, no fee, no
+/// referral). The reason is accepted so callers can emit a distinct event
+/// without branching on the math.
+pub fn calculate_no_contest_refund(
+    input: &RefundInput,
+    _reason: RefundReason,
+) -> Result<RefundBreakdown, PrediFiError> {
+    calculate_refund(input)
 }
 
 /// Referral cut taken from the claimer's proportional share of the protocol fee.
@@ -291,5 +369,76 @@ mod tests {
     #[test]
     fn payout_pool_subtracts_fee() {
         assert_eq!(calculate_payout_pool(10_000, 250).unwrap(), 9_750);
+    }
+
+    #[test]
+    fn refund_returns_exact_stake() {
+        let input = RefundInput {
+            pool_total_stake: 1_000,
+            user_stake: 400,
+        };
+        assert_eq!(calculate_refund(&input).unwrap().refund, 400);
+    }
+
+    #[test]
+    fn refund_zero_when_no_stake() {
+        let input = RefundInput {
+            pool_total_stake: 1_000,
+            user_stake: 0,
+        };
+        assert_eq!(calculate_refund(&input).unwrap().refund, 0);
+    }
+
+    #[test]
+    fn refund_rejects_negative_stakes() {
+        let input = RefundInput {
+            pool_total_stake: -1,
+            user_stake: 100,
+        };
+        assert_eq!(
+            calculate_refund(&input),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn refund_rejects_user_stake_exceeding_pool() {
+        let input = RefundInput {
+            pool_total_stake: 100,
+            user_stake: 101,
+        };
+        assert_eq!(
+            calculate_refund(&input),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn no_contest_refund_matches_plain_refund_for_all_reasons() {
+        let input = RefundInput {
+            pool_total_stake: 1_000,
+            user_stake: 250,
+        };
+        for reason in [
+            RefundReason::NoContest,
+            RefundReason::InvalidOracle,
+            RefundReason::Cancelled,
+        ] {
+            assert_eq!(
+                calculate_no_contest_refund(&input, reason).unwrap().refund,
+                250
+            );
+        }
+    }
+
+    #[test]
+    fn refund_is_idempotent_for_same_inputs() {
+        let input = RefundInput {
+            pool_total_stake: 1_000,
+            user_stake: 333,
+        };
+        let first = calculate_refund(&input).unwrap().refund;
+        let second = calculate_refund(&input).unwrap().refund;
+        assert_eq!(first, second);
     }
 }
