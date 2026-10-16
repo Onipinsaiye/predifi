@@ -73,6 +73,7 @@
 //! | [`PriceConditionSetEvent`] | `price_condition_set` | a price condition is configured |
 //! | [`PriceResolvedEvent`] | `price_resolved` | a price condition resolves |
 //! | [`ResolutionConflictEvent`] | `resolution_conflict` | resolution sources disagree |
+//! | [`ResolutionEvidenceEvent`] | `resolution_evidence` | a price-feed resolution evidence commitment is recorded |
 //! | [`AddedToWhitelistEvent`] | `added_to_whitelist` | a participant is allowlisted |
 //! | [`RemovedFromWhitelistEvent`] | `removed_from_whitelist` | a participant is removed from the allowlist |
 
@@ -1378,6 +1379,58 @@ pub struct PoolResolvedDiagEvent {
     pub winning_stake: i128,
     /// Ledger timestamp at resolution time.
     pub timestamp: u64,
+}
+
+/// 🟢 INFO — emitted alongside `PoolResolvedEvent` when a pool is resolved
+/// through the price-feed path (`resolve_pool_from_price`).
+///
+/// Carries the full evidence preimage — the exact feed observation and the
+/// comparison rule that produced the outcome — plus `evidence_hash`, the
+/// SHA-256 commitment over the stored [`crate::ResolutionEvidence`] record's
+/// XDR encoding. Auditors can fetch the persisted record via
+/// `get_resolution_evidence`, recompute the hash, and re-derive the outcome
+/// to verify the decision.
+///
+/// # Event Fields
+/// - `pool_id` - The unique identifier of the resolved pool.
+/// - `feed_pair` - The feed whose observation decided the market.
+/// - `price` - The observed feed value used for the comparison.
+/// - `feed_timestamp` - The feed-side timestamp of the observation.
+/// - `comparison_op` - The comparison applied: 0=Equal, 1=Greater, 2=Less.
+/// - `target_price` - The target value compared against.
+/// - `tolerance_bps` - The tolerance around the target, in basis points.
+/// - `outcome` - The outcome index recorded on the pool.
+/// - `evidence_hash` - SHA-256 over the `ResolutionEvidence` XDR preimage.
+///
+/// # Indexing Implications
+/// - **Audit Trail**: Indexers and auditors can pin the resolution to a single
+///   deterministic evidence commitment rather than reconstructing inputs from
+///   separate feed-update events.
+/// - **Verification**: Re-deriving `outcome` from (`price`, `target_price`,
+///   `comparison_op`, `tolerance_bps`) should always agree with this event;
+///   a mismatch indicates data corruption.
+#[contractevent(topics = ["resolution_evidence"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionEvidenceEvent {
+    /// Unique identifier of the resolved pool.
+    pub pool_id: u64,
+    /// Feed pair whose observation decided the market.
+    pub feed_pair: Symbol,
+    /// Observed feed value used for the comparison.
+    pub price: i128,
+    /// Feed-side timestamp of the observation.
+    pub feed_timestamp: u64,
+    /// Comparison operator applied: 0=Equal, 1=Greater, 2=Less.
+    pub comparison_op: u32,
+    /// Target value compared against.
+    pub target_price: i128,
+    /// Tolerance around `target_price`, in basis points.
+    pub tolerance_bps: u32,
+    /// Outcome index recorded on the pool.
+    pub outcome: u32,
+    /// SHA-256 commitment over the stored `ResolutionEvidence` XDR encoding.
+    pub evidence_hash: BytesN<32>,
 }
 
 /// 🟢 INFO — emitted when all outcome stakes are updated in a single operation.

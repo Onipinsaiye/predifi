@@ -283,6 +283,44 @@ let predictions = contract.get_user_predictions(
 
 ---
 
+### `get_resolution_evidence`
+
+Get the verifiable evidence committed when a pool was resolved through the
+price-feed path (`resolve_pool_from_price`). The record is the hash preimage of
+the `evidence_hash` carried by `ResolutionEvidenceEvent`: auditors can re-encode
+it to XDR, hash it with SHA-256, and re-derive the outcome from
+(`price`, `target_price`, `comparison_op`, `tolerance_bps`) to independently
+verify the resolution decision. The record is immutable once written.
+
+```rust
+pub fn get_resolution_evidence(
+    env: Env,
+    pool_id: u64
+) -> Option<ResolutionEvidence>
+```
+
+**Parameters:**
+
+| Parameter | Type  | Description     |
+| --------- | ----- | --------------- |
+| `pool_id` | `u64` | Pool to inspect |
+
+**Returns:** `Option<ResolutionEvidence>` — `None` for unresolved pools and for
+pools resolved via operator voting or oracle voting (those paths carry no feed
+observation to commit).
+
+**Example:**
+
+```rust
+if let Some(evidence) = contract.get_resolution_evidence(env, pool_id) {
+    // Recompute: sha256(evidence.to_xdr()) == emitted evidence_hash
+    // Re-derive: compare evidence.price to evidence.target_price
+    //            under evidence.comparison_op within evidence.tolerance_bps
+}
+```
+
+---
+
 ## Admin Functions
 
 ### `pause`
@@ -441,6 +479,27 @@ pub struct Config {
 }
 ```
 
+### `ResolutionEvidence`
+
+The stable evidence schema persisted for price-feed resolutions. This exact
+record — XDR-encoded — is the preimage of the SHA-256 `evidence_hash` emitted in
+`ResolutionEvidenceEvent`.
+
+```rust
+pub struct ResolutionEvidence {
+    pub feed_pair: Symbol,   // Feed that decided the market
+    pub price: i128,         // Observed feed value
+    pub feed_timestamp: u64, // Feed-side observation timestamp
+    pub comparison_op: u32,  // Rule applied: 0=Equal, 1=Greater, 2=Less
+    pub target_price: i128,  // Target compared against
+    pub tolerance_bps: u32,  // Tolerance around target, in basis points
+    pub outcome: u32,        // Outcome index derived and recorded
+}
+```
+
+The record is stored under `DataKey::ResolutionEvidence(pool_id)`, so the
+`pool_id` binding comes from the storage key itself.
+
 ---
 
 ## Events
@@ -528,6 +587,27 @@ PoolResolvedDiagEvent {
     total_stake: 5000,          // 5000 total tokens staked
     winning_stake: 2000,        // 2000 on outcome 1
     timestamp: 1234567890,
+}
+```
+
+### `ResolutionEvidenceEvent`
+
+Emitted atomically alongside `PoolResolvedEvent` when a pool is resolved through
+`resolve_pool_from_price`. Carries the full evidence preimage fields plus
+`evidence_hash`, the SHA-256 commitment over the stored `ResolutionEvidence`
+record's XDR encoding.
+
+```rust
+pub struct ResolutionEvidenceEvent {
+    pub pool_id: u64,           // Same pool as PoolResolvedEvent
+    pub feed_pair: Symbol,      // Feed that decided the market
+    pub price: i128,            // Observed feed value used in the comparison
+    pub feed_timestamp: u64,    // Feed-side observation timestamp
+    pub comparison_op: u32,     // 0=Equal, 1=Greater, 2=Less
+    pub target_price: i128,     // Target compared against
+    pub tolerance_bps: u32,     // Tolerance around target, in basis points
+    pub outcome: u32,           // Same outcome as PoolResolvedEvent
+    pub evidence_hash: BytesN<32>, // sha256(ResolutionEvidence XDR encoding)
 }
 ```
 
