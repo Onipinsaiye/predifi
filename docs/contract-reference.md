@@ -20,10 +20,10 @@ pub fn init(
 **Parameters:**
 
 | Parameter        | Type      | Description                            |
-| ---------------- | --------- | -------------------------------------- |
+| ---------------- | -------- | ------------------------------------- |
 | `access_control` | `Address` | Access control contract address        |
 | `treasury`       | `Address` | Treasury address for fee collection    |
-| `fee_bps`        | `u32`     | Fee in basis points (max 10000 = 100%) |
+| `fee_bps`        | `u32`      | Fee in basis points (max 10000 = 100%) |
 
 **Returns:** None
 
@@ -32,7 +32,7 @@ pub fn init(
 **Notes:**
 
 - Idempotent - safe to call multiple times
-- Only sets config if not already initialized
+-Only sets config if not already initialized
 
 ---
 
@@ -47,14 +47,14 @@ pub fn create_pool(
     token: Address,
     description: String,
     metadata_url: String
-) -> u64
+') -> u64
 ```
 
 **Parameters:**
 
 | Parameter      | Type      | Description                                  |
 | -------------- | --------- | -------------------------------------------- |
-| `end_time`     | `u64`     | Unix timestamp after which predictions close |
+| `end_time`     | `u64`      | Unix timestamp after which predictions close |
 | `token`        | `Address` | Stellar token contract for staking           |
 | `description`  | `String`  | Event description (max 256 bytes)            |
 | `metadata_url` | `String`  | Extended metadata URL (max 512 bytes)        |
@@ -65,9 +65,9 @@ pub fn create_pool(
 
 **Validations:**
 
-- `end_time` must be in the future
+- (end_time` must be in the future
 - `description` length ≤ 256 bytes
-- `metadata_url` length ≤ 512 bytes
+- (metadata_url` length ≤ 512 bytes
 
 **Example:**
 
@@ -100,12 +100,12 @@ pub fn place_prediction(
 
 **Parameters:**
 
-| Parameter  | Type              | Description                                                                                                                 |
-| ---------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `user`     | `Address`         | User placing the prediction                                                                                                 |
-| `pool_id`  | `u64`             | Pool to predict on                                                                                                          |
-| `amount`   | `i128`            | Prediction amount (in token's smallest unit)                                                                                |
-| `outcome`  | `u32`             | Outcome index (0, 1, 2, etc.)                                                                                               |
+| Parameter  | Type              | Description                                                                             |
+| --------- | ---------------- | ------------------------------------------------------------------------------------------------------- |
+| `user`    | `Address`         | User placing the prediction                                                                 |
+| `pool_id`  | `u64`             | Pool to predict on                                                                      |
+| `amount`   | `i128`            | Prediction amount (in token's smallest unit)                                                 |
+| `outcome`  | `u32`             | Outcome index (0, 1, 2, etc.)                                                              |
 | `referrer` | `Option<Address>` | Optional address that referred this user; stored on first prediction for (user, pool) and used for referral payout on claim |
 
 **Returns:** None
@@ -156,12 +156,12 @@ pub fn resolve_pool(
 **Parameters:**
 
 | Parameter  | Type      | Description                         |
-| ---------- | --------- | ----------------------------------- |
+| --------- | --------- | ------------------------------------------ |
 | `operator` | `Address` | Operator address (must have role 1) |
-| `pool_id`  | `u64`     | Pool to resolve                     |
-| `outcome`  | `u32`     | Winning outcome index               |
+| `pool_id`  | `u64`     | Pool to resolve                         |
+| `outcome`  | `u32`     | Winning outcome index                   |
 
-**Returns:** `Result<(), PredifiError>`
+**Returns:** `Result<(), PredifiError>
 
 **Events:** `PoolResolvedEvent`
 
@@ -205,11 +205,11 @@ pub fn claim_winnings(
 **Parameters:**
 
 | Parameter | Type      | Description            |
-| --------- | --------- | ---------------------- |
-| `user`    | `Address` | User claiming winnings |
-| `pool_id` | `u64`     | Pool to claim from     |
+| -------- | --------- | ---------------------- |
+| `user`   | `Address` | User claiming winnings |
+| `pool_id` | `u64`      | Pool to claim from     |
 
-**Returns:** `Result<i128, PredifiError>` - Amount claimed (0 if didn't win)
+**Returns:** `Result<i128, PredifiError>`  - Amount claimed (0 if didn't win)
 
 **Events:** `WinningsClaimedEvent`, `ReferralPaidEvent` (when user had a referrer and wins)
 
@@ -263,10 +263,10 @@ pub fn get_user_predictions(
 **Parameters:**
 
 | Parameter | Type      | Description               |
-| --------- | --------- | ------------------------- |
-| `user`    | `Address` | User address              |
-| `offset`  | `u32`     | Pagination offset         |
-| `limit`   | `u32`     | Maximum results to return |
+| -------- | --------- | -------------------------- |
+| `user`   | `Address` | User address              |
+| `offset`  | `u32`      | Pagination offset             |
+| `limit`   | `u32`      | Maximum results to return     |
 
 **Returns:** `Vec<UserPredictionDetail>`
 
@@ -287,7 +287,7 @@ let predictions = contract.get_user_predictions(
 
 ### `pause`
 
-Pause all contract operations. Requires Admin role (0).
+Pause operations according to the pause matrix. Requires Admin role (0).
 
 ```rust
 pub fn pause(env: Env, admin: Address)
@@ -296,10 +296,36 @@ pub fn pause(env: Env, admin: Address)
 **Parameters:**
 
 | Parameter | Type      | Description                      |
-| --------- | --------- | -------------------------------- |
+| -------- | --------- | ------------------------------- |
 | `admin`   | `Address` | Admin address (must have role 0) |
 
 **Events:** `PauseEvent`
+
+**Pause Matrix:**
+
+Pausing is scoped by operation. Some entry points are blocked while paused; others remain available so users can always exit safely.
+
+| Operation               | Paused behavior                                                                 |
+| ---------------------- | ---------------------------------------------------------------------------------------- |
+| `create_pool`           | Blocked (returns `Paused`)                                                              |
+| `place_prediction`       | Blocked (returns `Paused`)                                                              |
+| `resolve_pool`           | Blocked (returns `Paused`)                                                              |
+| `oracle_resolve`        | Blocked (returns `Paused`)                                                              |
+| `resolve_pool_from_price` | Blocked (returns `Paused`)                                                            |
+| `claim_winnings`         | **Allowed** — eligible claims always remain available                                     |
+| `refund`                 | **Allowed** — refunds always remain available                                                   |
+| `withdraw_fees`          | Blocked (returns `Paused`)                                                              |
+| `set_fee_bps`            | Blocked (returns `Paused`)                                                              |
+| `set_referral_cut_bps`  | Blocked (returns `Paused`)                                                              |
+| `set_treasury`           | Blocked (returns `Paused`)                                                              |
+| `unpause`               | **Allowed** — must always be callable to restore operations                             |
+| `view functions`        | **Allowed** — read-only queries are never paused                                             |
+
+**Notes:**
+
+-  `claim_winings` and `refund` are explicitly exempt from pause so users can always withdraw funds they are entitled to.
+-  `unpause` and view functions are never guarded by the pause flag.
+-  Every guarded entry point returns `Paused` when the contract is paused.
 
 ---
 
@@ -314,10 +340,32 @@ pub fn unpause(env: Env, admin: Address)
 **Parameters:**
 
 | Parameter | Type      | Description                      |
-| --------- | --------- | -------------------------------- |
+| -------- | --------- | ------------------------------- |
 | `admin`   | `Address` | Admin address (must have role 0) |
 
 **Events:** `UnpauseEvent`
+
+**Notes:**
+
+- Always allowed, even when the contract is paused.
+- Restores all operations guarded by the pause matrix.
+
+---
+
+### `is_paused`
+
+Expose the current pause state to clients.
+
+```rust
+pub fn is_paused(env: Env) -> bool
+```
+
+**Returns:** `true` if the contract is paused, `false` otherwise.
+
+**Notes:**
+
+- View function - always callable, never guarded by the pause flag.
+- Clients should use this to disable mutating UI actions while keeping claim and refund actions enabled.
 
 ---
 
@@ -336,11 +384,13 @@ pub fn set_fee_bps(
 **Parameters:**
 
 | Parameter | Type      | Description                         |
-| --------- | --------- | ----------------------------------- |
+| -------- | --------- | ---------------------------------- |
 | `admin`   | `Address` | Admin address                       |
 | `fee_bps` | `u32`     | New fee in basis points (max 10000) |
 
 **Events:** `FeeUpdateEvent`
+
+**Pause behavior:** Blocked when paused (returns `Paused`).
 
 ---
 
@@ -358,14 +408,16 @@ pub fn set_referral_cut_bps(
 
 **Parameters:**
 
-| Parameter          | Type      | Description                                                                        |
-| ------------------ | --------- | ---------------------------------------------------------------------------------- |
-| `admin`            | `Address` | Admin address                                                                      |
-| `referral_cut_bps` | `u32`     | Share of protocol fee (attributable to referred user) paid to referrer (max 10000) |
+| Parameter          | Type      | Description                                                                 |
+| ----------------- | --------- | --------------------------------------------------------------------------------------------------- |
+| `admin`            | `Address` | Admin address                                                                        |
+| `referral_cut_bps` | `u32`      | Share of protocol fee (attributable to referred user) paid to referrer (max 10000) |
+
+**Pause behavior:** Blocked when paused (returns `Paused`).
 
 **Referral view functions:**
 
-- **`get_referral_cut_bps(env: Env) -> u32`** — Returns the current referral cut in basis points (default 5000).
+- **get_referral_cut_bps(env: Env) -> u32** — Returns the current referral cut in basis points (default 5000).
 - **`get_referred_volume(env: Env, referrer: Address, pool_id: u64) -> i128`** — Returns the total stake amount referred by `referrer` on the given pool (for analytics and payout context).
 
 ---
@@ -385,11 +437,13 @@ pub fn set_treasury(
 **Parameters:**
 
 | Parameter  | Type      | Description          |
-| ---------- | --------- | -------------------- |
-| `admin`    | `Address` | Admin address        |
+| -------- | --------- | ------------------ |
+| `admin`   | `Address` | Admin address        |
 | `treasury` | `Address` | New treasury address |
 
 **Events:** `TreasuryUpdateEvent`
+
+**Pause behavior:** Blocked when paused (returns `Paused`).
 
 ---
 
@@ -475,9 +529,9 @@ pub struct PredictionPlacedEvent {
 
 Emitted when a pool is resolved and the outcome is determined. This occurs when:
 
-- An operator calls `resolve_pool()` with a valid outcome after the resolution delay
-- An oracle calls `oracle_resolve()` and the voting threshold is reached
-- `resolve_pool_from_price()` is called and the price condition is evaluated
+-  An operator calls `resolve_pool()` with a valid outcome after the resolution delay
+-  An oracle calls `oracle_resolve()` and the voting threshold is reached
+-  `resolve_pool_from_price()` is called and the price condition is evaluated
 
 The `operator` field indicates the address (operator or oracle) that triggered the resolution, or the contract itself if resolved automatically via price feed.
 
@@ -498,81 +552,3 @@ PoolResolvedEvent {
     outcome: 1,
 }
 ```
-
-### `PoolResolvedDiagEvent`
-
-Emitted alongside `PoolResolvedEvent` with enriched numeric context for monitoring and payout calculations. This diagnostic event allows off-chain systems to:
-
-- Calculate implied payouts
-- Flag anomalies (e.g., `winning_stake == 0` indicates no winners)
-- Track liquidity and stake distribution at resolution time
-
-This event is **always** published immediately after `PoolResolvedEvent`.
-
-```rust
-pub struct PoolResolvedDiagEvent {
-    pub pool_id: u64,           // Same pool as PoolResolvedEvent
-    pub outcome: u32,            // Same outcome as PoolResolvedEvent
-    pub total_stake: i128,       // Total stake across all outcomes
-    pub winning_stake: i128,     // Stake on the winning outcome (0 ⟹ no winners)
-    pub timestamp: u64,          // Ledger timestamp at resolution
-}
-```
-
-**Example**: Diagnostic data for the same resolution:
-
-```rust
-PoolResolvedDiagEvent {
-    pool_id: 12345,
-    outcome: 1,
-    total_stake: 5000,          // 5000 total tokens staked
-    winning_stake: 2000,        // 2000 on outcome 1
-    timestamp: 1234567890,
-}
-```
-
-### `WinningsClaimedEvent`
-
-Emitted when a user claims winnings.
-
-```rust
-pub struct WinningsClaimedEvent {
-    pub pool_id: u64,
-    pub user: Address,
-    pub amount: i128,
-}
-```
-
-### `RewardClaimedEvent`
-
-Emitted when a user claims a payout from the contract. This event is published for both winning claims and refund claims.
-
-```rust
-pub struct RewardClaimedEvent {
-    pub pool_id: u64,
-    pub user: Address,
-    pub amount: i128,
-    pub claim_type: String,
-}
-```
-
----
-
-## Error Codes
-
-See [Troubleshooting](./troubleshooting.md) for complete error reference.
-
-| Code | Error             | Description                   |
-| ---- | ----------------- | ----------------------------- |
-| 10   | `Unauthorized`    | Caller lacks required role    |
-| 22   | `PoolNotResolved` | Pool not yet resolved         |
-| 60   | `AlreadyClaimed`  | User already claimed winnings |
-
----
-
-## Next Steps
-
-- Start with [Quickstart](./quickstart.md)
-- Understand [Prediction Lifecycle](./prediction-lifecycle.md)
-- Learn about [Oracles](./oracles.md)
-- Review [Troubleshooting](./troubleshooting.md)

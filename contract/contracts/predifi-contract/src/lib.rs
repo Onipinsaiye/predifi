@@ -260,11 +260,71 @@ pub enum PredifiError {
     ///
     /// Callers should check `is_contract_paused()` before submitting a transaction,
     /// or listen for `PauseEvent` / `UnpauseEvent` on-chain to stay in sync.
+    ///
+    /// NOTE: With scoped pause controls, this error is only returned for
+    /// operations whose pause scope is active. See [`PauseScope`] and
+    /// [`PredifiContract::is_operation_paused`] for the operation matrix.
     ContractPaused = 83,
     InvalidAddressOrToken = 94,
     FeeChangePending = 95,
     NoFeeChangePending = 96,
     TimelockNotExpired = 97,
+}
+
+/// Explicit matrix of operations that can be individually paused.
+///
+/// The emergency pause is scoped by operation so that safety-critical exit
+/// paths (claims and refunds) can remain open while new risk-taking entry
+/// points (staking, pool creation, resolution) are frozen.
+///
+/// # Pause matrix
+///
+/// | Operation              | Entry points                                              | Pausable |
+/// |------------------------|-----------------------------------------------------------|----------|
+/// | `CreatePool`           | `create_pool`                                             | yes      |
+/// | `PlacePrediction`      | `place_prediction`                                        | yes      |
+/// | `Resolve`              | `resolve_pool`, `oracle_resolve`, `resolve_pool_from_price` | yes    |
+/// | `Cancel`               | `cancel_pool`, `emergency_cancel_pool`                    | yes      |
+/// | `Claim`                | `claim_winnings`                                          | NO (safe exit) |
+/// | `Refund`               | `claim_refund`                                            | NO (safe exit) |
+/// | `Admin`                | admin config setters, `pause`, `unpause`, `upgrade`       | NO (must always work) |
+///
+/// `Claim` and `Refund` are intentionally **not** pausable: users must always
+/// be able to withdraw funds they are entitled to, even during an emergency.
+/// Admin operations are also never pausable so the pause can be lifted.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseScope {
+    /// Pauses `create_pool`.
+    CreatePool = 0,
+    /// Pauses `place_prediction`.
+    PlacePrediction = 1,
+    /// Pauses `resolve_pool`, `oracle_resolve`, and `resolve_pool_from_price`.
+    Resolve = 2,
+    /// Pauses `cancel_pool` and `emergency_cancel_pool`.
+    Cancel = 3,
+}
+
+impl PauseScope {
+    /// Returns the `DataKey` used to persist this scope's pause flag.
+    fn storage_key(self) -> DataKey {
+        match self {
+            PauseScope::CreatePool => DataKey::PausedCreatePool,
+            PauseScope::PlacePrediction => DataKey::PausedPlacePrediction,
+            PauseScope::Resolve => DataKey::PausedResolve,
+            PauseScope::Cancel => DataKey::PausedCancel,
+        }
+    }
+
+    /// Returns the short symbol used in pause/unpause events.
+    fn symbol(self) -> Symbol {
+        match self {
+            PauseScope::CreatePool => symbol_short!("create"),
+            PauseScope::PlacePrediction => symbol_short!("predict"),
+            PauseScope::Resolve => symbol_short!("resolve"),
+            PauseScope::Cancel => symbol_short!("cancel"),
+        }
+    }
 }
 
 /// Represents the current state of a prediction market.
@@ -668,7 +728,15 @@ pub enum DataKey {
     /// Global protocol configuration: `Config` -> `Config`
     Config,
     /// Contract pause state: `Paused` -> `bool`
+    ///
+    /// Retained for backward compatibility: when `true`, ALL pausable scopes
+    /// are considered paused. New code should prefer the per-scope keys below.
     Paused,
+    /// Per-scope pause flags (issue: scoped emergency pause).
+    PausedCreatePool,
+    PausedPlacePrediction,
+    PausedResolve,
+    PausedCancel,
     /// Contract version for safe upgrade migrations: `Version` -> `u32`
     Version,
     /// Referral cut in basis points: `ReferralCutBps` -> `u32`
@@ -808,6 +876,24 @@ pub struct InitEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseEvent {
     pub admin: Address,
+}
+
+/// Emitted when a specific pause scope is engaged.
+#[contractevent(topics = ["pause_scope"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseScopeEvent {
+    pub admin: Address,
+    pub scope: Symbol,
+}
+
+/// Emitted when a specific pause scope is released.
+#[contractevent(topics = ["unpause_scope"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpauseScopeEvent {
+    pub admin: Address,
+    pub scope: Symbol,
 }
 
 #[contractevent(topics = ["unpause"])]
@@ -1975,6 +2061,61 @@ impl PredifiContract {
             return Err(PredifiError::ContractPaused);
         }
         Ok(())
+    }
+
+    /// Returns `true` if the given pause scope is currently engaged.
+    ///
+    /// The legacy global `Paused` flag is honoured as a superset: if the
+    /// global flag is set, every scope reports as paused. Otherwise the
+    /// per-scope flag is consulted.
+    fn is_scope_paused(env: &Env, scope: PauseScope) -> bool {
+        if Self::is_paused(env) {
+            return true;
+        }
+        let key = scope.storage_key();
+        let paused = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(false);
+        Self::extend_instance(env);
+        paused
+    }
+
+    /// Returns `Err(PredifiError::ContractPaused)` if the given pause scope is
+    /// currently engaged, `Ok(())` otherwise.
+    ///
+    /// This is the scoped replacement for `require_not_paused`. Every guarded
+    /// entry point calls it with the appropriate [`PauseScope`] so that the
+    /// pause matrix documented on [`PauseScope`] is enforced.
+    fn require_scope_not_paused(env: &Env, scope: PauseScope) -> Result<(), PredifiError> {
+        if Self::is_scope_paused(env, scope) {
+            return Err(PredifiError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Public read model: returns whether the given operation scope is paused.
+    ///
+    /// Clients should call this (or `get_pause_state`) before submitting a
+    /// transaction to surface a friendly "temporarily paused" message instead
+    /// of relying on a failed transaction.
+    pub fn is_operation_paused(env: Env, scope: PauseScope) -> bool {
+        Self::is_scope_paused(&env, scope)
+    }
+
+    /// Public read model: returns the full pause matrix as a `Vec<bool>`
+    /// indexed by [`PauseScope`] discriminant (0..=3).
+    ///
+    /// Index 0 = CreatePool, 1 = PlacePrediction, 2 = Resolve, 3 = Cancel.
+    /// Claim and Refund are intentionally absent — they are never pausable.
+    pub fn get_pause_state(env: Env) -> Vec<bool> {
+        let mut out = Vec::new(&env);
+        out.push_back(Self::is_scope_paused(&env, PauseScope::CreatePool));
+        out.push_back(Self::is_scope_paused(&env, PauseScope::PlacePrediction));
+        out.push_back(Self::is_scope_paused(&env, PauseScope::Resolve));
+        out.push_back(Self::is_scope_paused(&env, PauseScope::Cancel));
+        out
     }
 
     /// Set the reentrancy guard for the current transaction.

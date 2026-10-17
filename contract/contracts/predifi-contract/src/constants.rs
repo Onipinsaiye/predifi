@@ -427,6 +427,56 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// **Used for:** Calculating `PendingFeeChange.effective_at` when queuing fee changes.
 pub const FEE_CHANGE_TIMELOCK_SECONDS: u64 = 86_400;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// EMERGENCY PAUSE OPERATION MATRIX
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Operation bit for pausing pool creation (`create_pool`).
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** 1 << 0
+///
+/// **Rationale:** Pausing pool creation halts new market deployment without affecting
+/// existing pools, allowing operators to stop new exposure while preserving all
+/// user-facing exit paths.
+///
+/// **Used for:** Encoding the pause matrix in `PauseState`/authorization checks.
+pub const PAUSE_OP_CREATE_POOL: u32 = 1 << 0;
+
+/// Operation bit for pausing predictions (`place_prediction`).
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** 1 << 1
+///
+/// **Rationale:** Pausing predictions stops new stake inflow while leaving claims,
+/// refunds, and cancellations available so users can always exit.
+///
+/// **Used for:** Encoding the pause matrix in `PauseState`/authorization checks.
+pub const PAUSE_OP_PLACE_PREDICTION: u32 = 1 << 1;
+
+/// Operation bit for pausing pool resolution (`resolve_pool`).
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** 1 << 2
+///
+/// **Rationale:** Pausing resolution freezes outcome settlement without blocking
+/// claims on already-resolved pools or refunds on cancelled pools.
+///
+/// **Used for:** Encoding the pause matrix in `PauseState`/authorization checks.
+pub const PAUSE_OP_RESOLVE_POOL: u32 = 1 << 2;
+
+/// Bitmask of all pausable operations.
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** `PAUSE_OP_CREATE_POOL | PAUSE_OP_PLACE_PREDICTION | PAUSE_OP_RESOLVE_POOL`
+///
+/// **Rationale:** Safe exits (claims, refunds, cancellations) are intentionally excluded
+/// from this mask so they can never be paused, guaranteeing users can always withdraw.
+///
+/// **Used for:** Validating pause requests and exposing pause state to clients.
+pub const PAUSE_OP_ALL: u32 =
+    PAUSE_OP_CREATE_POOL | PAUSE_OP_PLACE_PREDICTION | PAUSE_OP_RESOLVE_POOL;
+
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 mod tests {
@@ -508,5 +558,20 @@ mod tests {
         // At 7 decimals, 1 USDC = 10_000_000 base units.
         // Therefore 1_000_000_000 base units equals 100 USDC.
         assert_eq!(HIGH_VALUE_THRESHOLD, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_pause_operation_bits_are_distinct() {
+        assert_eq!(PAUSE_OP_CREATE_POOL & PAUSE_OP_PLACE_PREDICTION, 0);
+        assert_eq!(PAUSE_OP_CREATE_POOL & PAUSE_OP_RESOLVE_POOL, 0);
+        assert_eq!(PAUSE_OP_PLACE_PREDICTION & PAUSE_OP_RESOLVE_POOL, 0);
+    }
+
+    #[test]
+    fn test_pause_op_all_includes_every_pausable_operation() {
+        assert_eq!(
+            PAUSE_OP_ALL,
+            PAUSE_OP_CREATE_POOL | PAUSE_OP_PLACE_PREDICTION | PAUSE_OP_RESOLVE_POOL
+        );
     }
 }

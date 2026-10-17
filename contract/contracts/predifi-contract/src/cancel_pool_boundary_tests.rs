@@ -21,10 +21,30 @@
 //! 6. **Overdue-pool failsafe** — once a pool is past
 //!    `end_time + CANCELATION_DELAY`, any address (not just the creator or a
 //!    privileged role) may cancel it.
+//!
+//! # Emergency pause matrix
+//!
+//! The contract exposes a scoped emergency pause. Each operation is guarded
+//! independently so that pausing mutating entry points does not block safe
+//! exits. The matrix is:
+//!
+//! | Entry point          | Pause scope        | Paused behavior |
+//! |----------------------|--------------------|-----------------|
+//! | `create_pool`        | `PauseScope::Create` | rejected (`Paused`) |
+//! | `place_prediction`   | `PauseScope::Predict` | rejected (`Paused`) |
+//! | `resolve_pool`       | `PauseScope::Resolve` | rejected (`Paused`) |
+//! | `cancel_pool`        | `PauseScope::Cancel`  | rejected (`Paused`) |
+//! | `claim_winnings`     | never paused       | always allowed (safe exit) |
+//! | `refund` / cancel refund path | never paused | always allowed (safe exit) |
+//!
+//! `get_pause_state` exposes the current matrix to clients so they can render
+//! the correct UI before submitting a transaction.
 
 #![cfg(test)]
 
-use crate::{MarketState, PoolConfig, PredifiContract, PredifiContractClient, PredifiError};
+use crate::{
+    MarketState, PauseScope, PoolConfig, PredifiContract, PredifiContractClient, PredifiError,
+};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
@@ -347,6 +367,40 @@ fn test_all_participants_can_refund_their_exact_stake_after_cancellation() {
     let reason = String::from_str(&env, "operator cancels pool with mixed stakes");
     ctx.client.cancel_pool(&ctx.operator, &pool_id, &reason);
     assert_eq!(ctx.client.get_pool(&pool_id).state, MarketState::Canceled);
+
+    // ── Pause matrix: cancel scope paused rejects cancel_pool ──────────────
+    let pause_env = Env::default();
+    let pause_ctx = setup(&pause_env);
+    let pause_creator = Address::generate(&pause_env);
+    let pause_pool = pause_ctx.client.create_pool(
+        &pause_creator,
+        &end_time,
+        &pause_ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &base_config(&pause_env),
+    );
+    pause_ctx
+        .client
+        .set_pause(&pause_ctx.admin, &PauseScope::Cancel, &true);
+    assert!(pause_ctx.client.get_pause_state(&PauseScope::Cancel));
+    let paused_reason = String::from_str(&pause_env, "paused cancel");
+    let paused_result =
+        pause_ctx
+            .client
+            .try_cancel_pool(&pause_ctx.operator, &pause_pool, &paused_reason);
+    assert_eq!(paused_result.unwrap_err().unwrap(), PredifiError::Paused);
+    pause_ctx
+        .client
+        .set_pause(&pause_ctx.admin, &PauseScope::Cancel, &false);
+    assert!(!pause_ctx.client.get_pause_state(&PauseScope::Cancel));
+    pause_ctx
+        .client
+        .cancel_pool(&pause_ctx.operator, &pause_pool, &paused_reason);
+    assert_eq!(
+        pause_ctx.client.get_pool(&pause_pool).state,
+        MarketState::Canceled
+    );
 
     // Every bettor gets back exactly their original stake via claim_winnings
     // (the cancel-state branch pays 100% principal, no fee).

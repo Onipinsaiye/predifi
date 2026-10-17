@@ -16,6 +16,30 @@
 //! - **`pause(env, admin)`**: Emergency pause contract execution.
 //!   - *Role Required*: Admin (0)
 //!   - *Error on Unauthorized*: Panic (`"Unauthorized: missing required role"`)
+//!
+//! ## Pause Scope Matrix
+//!
+//! The pause flag is **scoped by operation**. When the contract is paused, the
+//! following matrix determines whether each entry point is blocked:
+//!
+//! | Operation | Paused behavior |
+//! |-----------|-----------------|
+//! | `create_pool` | Blocked (`ContractPaused`) |
+//! | `place_prediction` | Blocked (`ContractPaused`) |
+//! | `resolve_pool` | Blocked (`ContractPaused`) |
+//! | `cancel_pool` | Blocked (`ContractPaused`) |
+//! | `claim_winnings` | **Allowed** — safe exit preserved |
+//! | `claim_refund` | **Allowed** — safe exit preserved |
+//! | `add_to_whitelist` / `remove_from_whitelist` | Blocked (`ContractPaused`) |
+//! | `batch_add_to_whitelist` / `batch_remove_from_whitelist` | Blocked (`ContractPaused`) |
+//! | Admin config setters (`set_fee_bps`, `set_min_stake`, …) | Blocked (`ContractPaused`) |
+//! | `upgrade_contract` | **Allowed** — needed for emergency remediation |
+//! | `pause` / `unpause` | **Allowed** — must always be callable |
+//! | Read-only queries (`is_contract_paused`, `get_*`) | **Allowed** |
+//!
+//! Clients should call `is_contract_paused` (or read `is_paused` from
+//! `get_contract_info` / `get_contract_metadata`) to determine whether
+//! non-exit operations will be rejected.
 //! - **`unpause(env, admin)`**: Resume contract execution.
 //!   - *Role Required*: Admin (0)
 //!   - *Error on Unauthorized*: Panic (`"Unauthorized: missing required role"`)
@@ -188,6 +212,7 @@ impl PredifiContract {
     ///
     /// While paused, administrative checks continue to work, but
     /// state-changing operations guarded by the pause flag are rejected.
+    /// See the module-level "Pause Scope Matrix" for the exact set of affected entry points.
     pub fn pause(env: Env, admin: Address) {
         admin.require_auth();
         if Self::require_admin_role(&env, &admin, "pause").is_err() {
@@ -237,6 +262,9 @@ impl PredifiContract {
     ///
     /// # Returns
     /// `true` if the contract is paused, `false` otherwise.
+    ///
+    /// Clients should use this to gate non-exit operations; claim and refund
+    /// paths remain callable while paused (see the Pause Scope Matrix).
     pub fn is_contract_paused(env: Env) -> bool {
         Self::is_paused(&env)
     }
@@ -756,6 +784,9 @@ impl PredifiContract {
     }
 
     /// Upgrade the contract Wasm code. Only callable by Admin (role 0).
+    ///
+    /// This operation is intentionally **not** gated by the pause flag so that
+    /// an admin can remediate an emergency while the contract is paused.
     pub fn upgrade_contract(
         env: Env,
         admin: Address,
@@ -1307,6 +1338,9 @@ impl PredifiContract {
     ///
     /// # Returns
     /// A `ContractMetadata` struct containing all protocol parameters.
+    ///
+    /// Includes `is_paused` so clients can determine which operations are
+    /// currently blocked without a separate call.
     pub fn get_contract_metadata(env: Env) -> ContractMetadata {
         let config = Self::get_config(&env);
         let current_admin = Self::get_access_control_admin(&env, &config.access_control)
