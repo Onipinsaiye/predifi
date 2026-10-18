@@ -4,6 +4,10 @@
 //! the configured Postgres instance, runs all migrations so the schema is
 //! ready, and inserts deterministic sample data via [`predifi_backend::seed`].
 //!
+//! Fixture loading is isolated by environment (#142): the binary refuses to run
+//! against production configuration by default, and destructive operations
+//! (`--fresh`) require an explicit environment confirmation.
+//!
 //! See `--help` for supported flags.
 
 use std::process::ExitCode;
@@ -11,6 +15,14 @@ use std::process::ExitCode;
 use predifi_backend::config::Config;
 use predifi_backend::seed::{run_seed, SeedConfig, SeedScenario, DEFAULT_NUM_POOLS};
 use tracing::{error, info};
+
+/// Environment variable that must be set to `1`/`true` to allow destructive
+/// seed operations (`--fresh`) against a non-production database.
+const CONFIRM_ENV_VAR: &str = "PREDIFI_SEED_CONFIRM";
+
+/// Environment variable that must be set to `1`/`true` to allow fixture
+/// loading against a production-configured database at all.
+const ALLOW_PROD_ENV_VAR: &str = "PREDIFI_SEED_ALLOW_PROD";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -82,6 +94,25 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Production isolation: refuse fixture loading against production config
+    // unless explicitly overridden.
+    if is_production(&config) && !env_flag(ALLOW_PROD_ENV_VAR) {
+        eprintln!(
+            "error: refusing to load fixtures against production configuration; \
+             set {ALLOW_PROD_ENV_VAR}=1 to override (not recommended)"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Destructive operations require explicit environment confirmation.
+    if seed_config.fresh && !env_flag(CONFIRM_ENV_VAR) {
+        eprintln!(
+            "error: --fresh is destructive and requires explicit confirmation; \
+             set {CONFIRM_ENV_VAR}=1 to proceed"
+        );
+        return ExitCode::FAILURE;
+    }
+
     info!(
         database_url = %mask_password(&config.database_url),
         "connecting to postgres"
@@ -125,6 +156,30 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Returns `true` when the environment variable is set to a truthy value.
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes")
+    )
+}
+
+/// Best-effort detection of a production-configured environment.
+///
+/// Considers `PREDIFI_ENV`/`APP_ENV`/`ENVIRONMENT` set to `production`/`prod`.
+fn is_production(config: &Config) -> bool {
+    let from_config = config.environment.as_deref();
+    let from_env = std::env::var("PREDIFI_ENV")
+        .ok()
+        .or_else(|| std::env::var("APP_ENV").ok())
+        .or_else(|| std::env::var("ENVIRONMENT").ok());
+    let value = from_config
+        .map(|s| s.to_string())
+        .or(from_env)
+        .unwrap_or_default();
+    matches!(value.to_ascii_lowercase().as_str(), "production" | "prod")
+}
+
 /// Replace the password portion of a postgres URL with `***` for logging.
 fn mask_password(url: &str) -> String {
     if let Some(after_scheme) = url.split("://").nth(1) {
@@ -151,7 +206,7 @@ fn print_help() {
     println!("    cargo run --bin predifi-seed -- [OPTIONS]");
     println!();
     println!("OPTIONS:");
-    println!("    --fresh           Truncate seed tables before inserting (destructive)");
+    println!("    --fresh           Truncate seed tables before inserting (destructive; requires {CONFIRM_ENV_VAR}=1)");
     println!("    --num-pools N     Number of pools to generate (default: {DEFAULT_NUM_POOLS})");
     println!("    --scenario NAME   Seed a targeted scenario (default: all)");
     println!("    -h, --help        Print this help message and exit");
@@ -165,6 +220,8 @@ fn print_help() {
     println!();
     println!("ENVIRONMENT:");
     println!("    PREDIFI_DATABASE_URL   Postgres connection string");
+    println!("    {CONFIRM_ENV_VAR}   Set to 1 to allow destructive --fresh operations");
+    println!("    {ALLOW_PROD_ENV_VAR}   Set to 1 to allow fixture loading against production (refused by default)");
     println!("    RUST_LOG               Tracing filter (default: info)");
 }
 
@@ -184,5 +241,17 @@ mod tests {
     fn mask_password_passes_through_url_without_password() {
         let url = "postgres://localhost:5432/predifi";
         assert_eq!(mask_password(url), url);
+    }
+
+    #[test]
+    fn env_flag_recognizes_truthy_values() {
+        std::env::set_var("PREDIFI_SEED_TEST_FLAG", "1");
+        assert!(env_flag("PREDIFI_SEED_TEST_FLAG"));
+        std::env::set_var("PREDIFI_SEED_TEST_FLAG", "true");
+        assert!(env_flag("PREDIFI_SEED_TEST_FLAG"));
+        std::env::set_var("PREDIFI_SEED_TEST_FLAG", "0");
+        assert!(!env_flag("PREDIFI_SEED_TEST_FLAG"));
+        std::env::remove_var("PREDIFI_SEED_TEST_FLAG");
+        assert!(!env_flag("PREDIFI_SEED_TEST_FLAG"));
     }
 }
