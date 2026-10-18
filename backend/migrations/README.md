@@ -135,3 +135,50 @@ databases that already ran it — hence this issue being documentation-only.
 double-check this table (or `ls backend/migrations/`) before naming a new
 migration file so prefixes are never reused again. The next migration should
 be named `011_<description>.sql`.
+
+## Upgrade compatibility matrix
+
+To verify that upgrades from each supported schema version work, the backend
+maintains a migration matrix that is exercised in CI (see
+`.github/workflows/contract-ci.yml` and the scheduled validation job). The
+matrix covers:
+
+- **Baseline snapshots** — representative prior-version schemas are kept under
+  `backend/migrations/baselines/` (one `.sql` dump per supported release,
+  named `v<release>.sql`). Each snapshot is loaded into a fresh database to
+  reproduce the schema a deployed release would have.
+- **Production-like row volumes** — each baseline is seeded with a
+  representative dataset (pools, predictions, referrals, and the
+  pre-aggregated stats tables) sized to exercise index and constraint
+  behaviour, not just empty-table DDL.
+- **Upgrade path** — the migrator is then run against the seeded baseline and
+  the result is validated for:
+  - **Indexes** — every index declared by the migrations exists and is valid
+    (`pg_index.indisvalid`).
+  - **Constraints** — primary keys, foreign keys, unique constraints, and
+    check constraints match the expected set.
+  - **Data transformations** — representative rows survive the upgrade
+    unchanged where the migration is non-destructive, and are transformed as
+    documented where it is (e.g. the `NUMERIC(32, 7)` conversion in
+    `004_enhance_schema_precision.sql`).
+- **Record preservation** — a checksum of representative rows is captured
+  before and after the upgrade; any unexpected loss or mutation fails the
+  job.
+- **Lock/runtime budgets** — each migration is timed and its lock footprint
+  recorded. Migrations that exceed the acceptable lock or runtime budget are
+  flagged in the matrix output so they can be split or made online before the
+  next release.
+
+### Deployment order across multiple migrations
+
+When an application release spans more than one migration, apply them in
+ascending version order and deploy in this sequence:
+
+1. Run the migrations (forward-only) against the target database.
+2. Deploy the application release that depends on the new schema.
+3. Only after the new release is healthy, remove any compatibility shims for
+   the previous schema in a follow-up migration.
+
+Because migrations are forward-only and there is no rollback path, a release
+that spans multiple migrations must be validated against every supported
+baseline in the matrix before it is promoted.
