@@ -160,6 +160,31 @@ jobs:
               exit 1
             fi
           done
+      - name: Record artifact provenance
+        run: |
+          WASM_DIR="target/wasm32-unknown-unknown/release"
+          PROVENANCE="${WASM_DIR}/provenance.json"
+          {
+            echo "{"
+            echo "  \"commit\": \"${GITHUB_SHA}\","
+            echo "  \"ref\": \"${GITHUB_REF}\","
+            echo "  \"run_id\": \"${GITHUB_RUN_ID}\","
+            echo "  \"workflow\": \"${GITHUB_WORKFLOW}\","
+            echo "  \"artifacts\": {"
+            FIRST=1
+            for CONTRACT in predifi_contract access_control; do
+              OPT="${WASM_DIR}/${CONTRACT}-optimized.wasm"
+              [[ -f "$OPT" ]] || continue
+              SHA=$(sha256sum "$OPT" | awk '{print $1}')
+              [[ "$FIRST" -eq 0 ]] && echo ","
+              printf '    "%s": {"sha256": "%s", "bytes": %s}' "$CONTRACT" "$SHA" "$(wc -c < "$OPT")"
+              FIRST=0
+            done
+            echo ""
+            echo "  }"
+            echo "}"
+          } > "$PROVENANCE"
+          cat "$PROVENANCE"
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -169,12 +194,63 @@ jobs:
             contract/target/wasm32-unknown-unknown/release/predifi_contract-optimized.wasm
             contract/target/wasm32-unknown-unknown/release/access_control.wasm
             contract/target/wasm32-unknown-unknown/release/access_control-optimized.wasm
+            contract/target/wasm32-unknown-unknown/release/provenance.json
           if-no-files-found: warn
           retention-days: 14
 
+  wasm-parity:
+    name: Native vs optimized WASM parity
+    needs: [wasm-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: ./contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contract/target
+          key: ${{ runner.os }}-contract-wasm-${{ hashFiles('contract/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-contract-wasm-
+      - name: Download optimized WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm-${{ github.sha }}
+          path: contract/target/wasm32-unknown-unknown/release
+      - name: Verify artifact provenance matches source commit
+        run: |
+          PROVENANCE="target/wasm32-unknown-unknown/release/provenance.json"
+          if [[ ! -f "$PROVENANCE" ]]; then
+            echo "::error::provenance.json missing from WASM artifact bundle"
+            exit 1
+          fi
+          ARTIFACT_COMMIT=$(python3 -c "import json,sys; print(json.load(open('$PROVENANCE'))['commit'])")
+          if [[ "$ARTIFACT_COMMIT" != "${GITHUB_SHA}" ]]; then
+            echo "::error::WASM artifact commit ${ARTIFACT_COMMIT} does not match source commit ${GITHUB_SHA}"
+            exit 1
+          fi
+          echo "WASM artifacts traceable to commit ${ARTIFACT_COMMIT}"
+      - name: Run native vs WASM parity suite
+        env:
+          PREDIFI_WASM_PATH: target/wasm32-unknown-unknown/release/predifi_contract-optimized.wasm
+        run: |
+          if [[ ! -f "${PREDIFI_WASM_PATH}" ]]; then
+            echo "::error::optimized WASM artifact not found at ${PREDIFI_WASM_PATH}"
+            exit 1
+          fi
+          cargo test --workspace --test wasm_parity -- --nocapture
+
   deploy-testnet:
     name: Deploy to testnet
-    needs: [check, fmt, clippy, test, wasm-build]
+    needs: [check, fmt, clippy, test, wasm-build, wasm-parity]
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 30
