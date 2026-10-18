@@ -58,7 +58,7 @@ pub async fn list_pools(
         r#"
         SELECT pool_id, name, category, tags, total_stake, end_time, created_at
         FROM pools
-        WHERE state = $1
+        WHERE stellar_canonical AND state = $1
           AND ($2::text IS NULL OR category = $2)
           AND ($3::text[] IS NULL OR tags && $3)
         ORDER BY {order_clause}
@@ -93,7 +93,7 @@ pub async fn count_pools(
     let sql = r#"
         SELECT COUNT(*)
         FROM pools
-        WHERE state = $1
+        WHERE stellar_canonical AND state = $1
           AND ($2::text IS NULL OR category = $2)
           AND ($3::text[] IS NULL OR tags && $3)
     "#;
@@ -116,6 +116,7 @@ pub async fn list_distinct_tags(pool: &PgPool) -> Result<Vec<String>, sqlx::Erro
         r#"
         SELECT DISTINCT unnest(tags) AS tag
         FROM pools
+        WHERE stellar_canonical
         ORDER BY tag
         "#,
     )

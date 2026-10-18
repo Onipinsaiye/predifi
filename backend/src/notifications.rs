@@ -221,7 +221,7 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
     let ending_soon: Vec<PoolRef> = sqlx::query_as(&format!(
         r#"
         SELECT pool_id, name FROM pools
-        WHERE state = 'active'
+        WHERE stellar_canonical AND state = 'active'
           AND end_time BETWEEN NOW() AND NOW() + INTERVAL '{POOL_ENDING_SOON_WINDOW}'
         "#
     ))
@@ -252,7 +252,8 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
 
     // 2. Resolved pools → notify everyone who predicted on them.
     let resolved: Vec<PoolRef> = sqlx::query_as(
-        "SELECT pool_id, name FROM pools WHERE state = 'settled' AND result IS NOT NULL",
+        "SELECT pool_id, name FROM pools
+         WHERE stellar_canonical AND state = 'settled' AND result IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -283,7 +284,7 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
     let expiring: Vec<PoolRef> = sqlx::query_as(&format!(
         r#"
         SELECT pool_id, name FROM pools
-        WHERE state = 'settled'
+        WHERE stellar_canonical AND state = 'settled'
           AND resolved_at IS NOT NULL
           AND resolved_at + (claim_window_seconds || ' seconds')::interval
               BETWEEN NOW() AND NOW() + INTERVAL '{CLAIM_EXPIRING_WINDOW}'
@@ -299,6 +300,7 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
             FROM predictions p
             JOIN pools pl ON pl.pool_id = p.pool_id
             WHERE p.pool_id = $1
+              AND pl.stellar_canonical
               AND NOT p.claimed
               AND pl.result IS NOT NULL AND pl.result ~ '^\d+$'
               AND pl.result::int = p.outcome
@@ -333,7 +335,8 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
     let new_pools: Vec<NewPool> = sqlx::query_as(&format!(
         r#"
         SELECT pool_id, name, category, tags FROM pools
-        WHERE created_at > NOW() - INTERVAL '{NEW_POOL_LOOKBACK}'
+        WHERE stellar_canonical
+          AND created_at > NOW() - INTERVAL '{NEW_POOL_LOOKBACK}'
         "#
     ))
     .fetch_all(pool)

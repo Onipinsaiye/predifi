@@ -1,12 +1,14 @@
 //! Stellar RPC event listener.
 //!
 //! Polls `getEvents` on the configured Stellar RPC endpoint once per ledger
-//! (~5 s). The latest processed ledger sequence is stored in the `app_state`
-//! table so the worker resumes from where it left off after a restart.
+//! (~5 s), verifies event ledgers with `getLedger`, and dispatches only after
+//! the network confirmation depth. Pending events and ledger checkpoints are
+//! persisted so restarts and shallow forks do not publish unconfirmed activity.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
@@ -27,6 +29,8 @@ pub fn worker_job_queue() -> &'static JobQueue {
 
 const POLL_INTERVAL_SECS: u64 = 5;
 const STATE_KEY: &str = "stellar_listener_latest_ledger";
+const TESTNET_CONFIRMATION_DEPTH: u64 = 2;
+const MAINNET_CONFIRMATION_DEPTH: u64 = 2;
 const INITIAL_RECONNECT_DELAY_SECS: u64 = 1;
 const MAX_RECONNECT_DELAY_SECS: u64 = 60;
 
@@ -45,7 +49,7 @@ struct GetEventsResult {
 }
 
 /// A single event returned by the Stellar RPC `getEvents` call.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct StellarEvent {
     /// Event type string, e.g. `"contract"` or `"system"`.
     #[serde(rename = "type")]
@@ -62,6 +66,13 @@ pub struct StellarEvent {
     pub topics: Option<Vec<String>>,
     /// Arbitrary JSON payload decoded from the event's XDR data field.
     pub data: Option<Value>,
+    /// Canonical ledger hash added by the listener after querying `getLedger`.
+    #[serde(
+        default,
+        rename = "ledgerHash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ledger_hash: Option<String>,
 }
 
 // ── Ledger cursor persistence ─────────────────────────────────────────────────
@@ -95,6 +106,278 @@ async fn save_cursor(pool: &PgPool, ledger: u64) {
     }
 }
 
+async fn checkpoint_sequences(
+    pool: &PgPool,
+    start_ledger: u64,
+    end_ledger: u64,
+) -> Result<Vec<u64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT ledger_sequence FROM stellar_listener_checkpoints
+         WHERE canonical AND ledger_sequence BETWEEN $1 AND $2
+         ORDER BY ledger_sequence",
+    )
+    .bind(start_ledger as i64)
+    .bind(end_ledger as i64)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(|row| row as u64).collect())
+}
+
+/// Persist a canonical checkpoint. A conflicting hash quarantines every staged
+/// event from that ledger onward so the new fork can be replayed cleanly.
+async fn store_checkpoint(
+    pool: &PgPool,
+    ledger: u64,
+    ledger_hash: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let previous = sqlx::query_scalar::<_, String>(
+        "SELECT ledger_hash FROM stellar_listener_checkpoints
+         WHERE ledger_sequence = $1 AND canonical FOR UPDATE",
+    )
+    .bind(ledger as i64)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let conflict = checkpoint_conflicts(previous.as_deref(), ledger_hash);
+
+    if conflict {
+        sqlx::query(
+            "WITH removed AS (
+                 DELETE FROM predictions prediction
+                 USING stellar_listener_events event
+                 WHERE prediction.stellar_event_key = event.event_id || ':' || event.ledger_hash
+                   AND event.ledger_sequence >= $1
+                   AND event.status = 'processed'
+                 RETURNING prediction.pool_id, prediction.amount
+             ),
+             removed_totals AS (
+                 SELECT pool_id, SUM(amount) AS amount
+                 FROM removed
+                 GROUP BY pool_id
+             )
+             UPDATE pools
+             SET total_stake = GREATEST(pools.total_stake - removed_totals.amount, 0)
+             FROM removed_totals
+             WHERE pools.pool_id = removed_totals.pool_id",
+        )
+        .bind(ledger as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM notifications
+             WHERE pool_id IN (
+                 SELECT pool_id FROM pools
+                 WHERE stellar_created_event_key IN (
+                     SELECT event_id || ':' || ledger_hash
+                     FROM stellar_listener_events
+                     WHERE ledger_sequence >= $1 AND status = 'processed'
+                 )
+                    OR stellar_state_event_key IN (
+                     SELECT event_id || ':' || ledger_hash
+                     FROM stellar_listener_events
+                     WHERE ledger_sequence >= $1 AND status = 'processed'
+                 )
+             )",
+        )
+        .bind(ledger as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE pools
+             SET state = 'active', result = NULL, resolved_at = NULL,
+                 stellar_state_event_key = NULL
+             WHERE stellar_state_event_key IN (
+                 SELECT event_id || ':' || ledger_hash
+                 FROM stellar_listener_events
+                 WHERE ledger_sequence >= $1 AND status = 'processed'
+             )",
+        )
+        .bind(ledger as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "WITH invalidated AS (
+                 UPDATE pools
+                 SET stellar_canonical = FALSE, state = 'closed'
+                 WHERE stellar_created_event_key IN (
+                     SELECT event_id || ':' || ledger_hash
+                     FROM stellar_listener_events
+                     WHERE ledger_sequence >= $1 AND status = 'processed'
+                 )
+                   AND stellar_canonical
+                 RETURNING creator
+             ),
+             invalidated_counts AS (
+                 SELECT creator, COUNT(*) AS count
+                 FROM invalidated
+                 GROUP BY creator
+             )
+             UPDATE creator_stats
+             SET pools_created = GREATEST(
+                     creator_stats.pools_created - invalidated_counts.count, 0
+                 ),
+                 updated_at = NOW()
+             FROM invalidated_counts
+             WHERE creator_stats.creator = invalidated_counts.creator",
+        )
+        .bind(ledger as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "WITH removed AS (
+                 DELETE FROM referrals referral
+                 USING stellar_listener_events event
+                 WHERE referral.stellar_event_key = event.event_id || ':' || event.ledger_hash
+                   AND event.ledger_sequence >= $1
+                   AND event.status = 'processed'
+                 RETURNING referral.referrer, referral.pool_id, referral.amount
+             ),
+             removed_totals AS (
+                 SELECT referrer, pool_id, SUM(amount) AS amount, COUNT(*) AS count
+                 FROM removed
+                 GROUP BY referrer, pool_id
+             )
+             UPDATE referrer_pool_stats
+             SET total_earned = GREATEST(referrer_pool_stats.total_earned - removed_totals.amount, 0),
+                 referral_count = GREATEST(referrer_pool_stats.referral_count - removed_totals.count, 0),
+                 last_updated = NOW()
+             FROM removed_totals
+             WHERE referrer_pool_stats.referrer = removed_totals.referrer
+               AND referrer_pool_stats.pool_id = removed_totals.pool_id",
+        )
+        .bind(ledger as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE stellar_listener_checkpoints
+             SET canonical = FALSE
+             WHERE ledger_sequence >= $1 AND canonical",
+        )
+        .bind(ledger as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE stellar_listener_events
+             SET status = 'quarantined', quarantined_at = NOW()
+             WHERE ledger_sequence >= $1 AND status != 'quarantined'",
+        )
+        .bind(ledger as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO stellar_listener_checkpoints
+             (ledger_sequence, ledger_hash, canonical, observed_at, finalized_at)
+         VALUES ($1, $2, TRUE, NOW(), NULL)
+         ON CONFLICT (ledger_sequence) DO UPDATE
+         SET ledger_hash = EXCLUDED.ledger_hash,
+             canonical = TRUE,
+             observed_at = NOW(),
+             finalized_at = NULL",
+    )
+    .bind(ledger as i64)
+    .bind(ledger_hash)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(conflict)
+}
+
+async fn stage_event(
+    pool: &PgPool,
+    event: &StellarEvent,
+    ledger_hash: &str,
+) -> Result<(), sqlx::Error> {
+    let payload =
+        serde_json::to_value(event).map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
+    sqlx::query(
+        "INSERT INTO stellar_listener_events
+             (event_id, ledger_sequence, ledger_hash, payload)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (event_id, ledger_hash) DO UPDATE
+         SET payload = EXCLUDED.payload,
+             status = 'pending',
+             processed_at = NULL,
+             quarantined_at = NULL
+         WHERE stellar_listener_events.status = 'quarantined'",
+    )
+    .bind(&event.id)
+    .bind(event.ledger as i64)
+    .bind(ledger_hash)
+    .bind(payload)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn finalize_checkpoints(
+    pool: &PgPool,
+    finalized_ledger: u64,
+    verified_ledgers: &[u64],
+) -> Result<(), sqlx::Error> {
+    let verified_ledgers: Vec<i64> = verified_ledgers.iter().map(|ledger| *ledger as i64).collect();
+    sqlx::query(
+        "UPDATE stellar_listener_checkpoints
+         SET finalized_at = COALESCE(finalized_at, NOW())
+         WHERE canonical AND ledger_sequence <= $1
+           AND ledger_sequence = ANY($2)",
+    )
+    .bind(finalized_ledger as i64)
+    .bind(verified_ledgers)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn load_pending_events(
+    pool: &PgPool,
+    finalized_ledger: u64,
+    verified_ledgers: &[u64],
+) -> Result<Vec<StellarEvent>, sqlx::Error> {
+    let verified_ledgers: Vec<i64> = verified_ledgers.iter().map(|ledger| *ledger as i64).collect();
+    let payloads = sqlx::query_scalar::<_, Value>(
+        "SELECT event.payload
+         FROM stellar_listener_events event
+         JOIN stellar_listener_checkpoints checkpoint
+           ON checkpoint.ledger_sequence = event.ledger_sequence
+          AND checkpoint.ledger_hash = event.ledger_hash
+          AND checkpoint.canonical
+          AND checkpoint.finalized_at IS NOT NULL
+         WHERE event.status = 'pending'
+           AND event.ledger_sequence <= $1
+           AND event.ledger_sequence = ANY($2)
+         ORDER BY event.ledger_sequence, event.event_id",
+    )
+    .bind(finalized_ledger as i64)
+    .bind(verified_ledgers)
+    .fetch_all(pool)
+    .await?;
+    payloads
+        .into_iter()
+        .map(|payload| {
+            serde_json::from_value(payload).map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .collect()
+}
+
+async fn mark_events_processed(pool: &PgPool, event_keys: &[String]) -> Result<(), sqlx::Error> {
+    for key in event_keys {
+        if let Some((event_id, ledger_hash)) = key.rsplit_once(':') {
+            sqlx::query(
+                "UPDATE stellar_listener_events
+                 SET status = 'processed', processed_at = NOW()
+                 WHERE event_id = $1 AND ledger_hash = $2 AND status = 'pending'",
+            )
+            .bind(event_id)
+            .bind(ledger_hash)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 // ── RPC call ──────────────────────────────────────────────────────────────────
 
 /// Fetch a batch of Stellar contract events starting from `start_ledger`.
@@ -125,8 +408,94 @@ async fn fetch_events(
         .await
         .map_err(|e| e.to_string())?;
 
+    if !resp.status().is_success() {
+        return Err(format!("getEvents returned HTTP {}", resp.status()));
+    }
     let rpc: RpcResponse = resp.json().await.map_err(|e| e.to_string())?;
     rpc.result.ok_or_else(|| "empty RPC result".to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct LedgerHashResponse {
+    result: Option<Value>,
+}
+
+#[instrument(skip(client), name = "stellar_listener.fetch_ledger_hash",
+    fields(rpc_url = %rpc_url, ledger = ledger))]
+async fn fetch_ledger_hash(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    ledger: u64,
+) -> Result<String, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLedger",
+        "params": { "sequence": ledger }
+    });
+    let response = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("getLedger returned HTTP {}", response.status()));
+    }
+    let rpc: LedgerHashResponse = response.json().await.map_err(|e| e.to_string())?;
+    let result = rpc
+        .result
+        .ok_or_else(|| format!("getLedger returned no result for ledger {ledger}"))?;
+    extract_ledger_hash(&result)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("getLedger returned no hash for ledger {ledger}"))
+}
+
+fn extract_ledger_hash(result: &Value) -> Option<&str> {
+    result
+        .get("hash")
+        .or_else(|| result.get("ledgerHash"))
+        .or_else(|| result.get("id"))
+        .or_else(|| result.get("ledger").and_then(|ledger| ledger.get("hash")))
+        .or_else(|| {
+            result
+                .get("ledger")
+                .and_then(|ledger| ledger.get("header"))
+                .and_then(|header| header.get("hash"))
+        })
+        .and_then(Value::as_str)
+}
+
+/// Confirmation depths for the public Stellar networks supported by this
+/// listener. Custom RPC hosts use the same conservative depth.
+fn confirmation_depth(rpc_url: &str) -> u64 {
+    let host = reqwest::Url::parse(rpc_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    if host.contains("mainnet") || host.contains("pubnet") {
+        MAINNET_CONFIRMATION_DEPTH
+    } else {
+        TESTNET_CONFIRMATION_DEPTH
+    }
+}
+
+fn event_key(event: &StellarEvent) -> String {
+    format!(
+        "{}:{}",
+        event.id,
+        event.ledger_hash.as_deref().unwrap_or("unverified")
+    )
+}
+
+fn checkpoint_conflicts(previous_hash: Option<&str>, observed_hash: &str) -> bool {
+    previous_hash
+        .map(|previous| previous != observed_hash)
+        .unwrap_or(false)
+}
+
+fn is_finalized(ledger: u64, latest_ledger: u64, confirmations: u64) -> bool {
+    ledger <= latest_ledger.saturating_sub(confirmations)
 }
 
 // ── Worker entry point ────────────────────────────────────────────────────────
@@ -191,16 +560,35 @@ pub async fn run_worker(
 
     // Resume from the last persisted ledger, or start from ledger 1.
     let mut cursor: u64 = load_cursor(&db).await.unwrap_or(1);
+    let confirmations = confirmation_depth(&rpc_url);
     let mut consecutive_failures: u32 = 0;
     let batch_size = max_batch_size.max(1);
-    info!(cursor, batch_size, "stellar listener starting");
+    info!(
+        cursor,
+        confirmations, batch_size, "stellar listener starting"
+    );
 
     loop {
         if consecutive_failures == 0 {
             ticker.tick().await;
         }
 
-        match fetch_events(&client, &rpc_url, cursor).await {
+        // Re-read a bounded finalized window to catch delayed deliveries and
+        // shallow forks. The event journal makes these overlapping reads safe.
+        let verification_start = cursor
+            .saturating_sub(confirmations.saturating_mul(2))
+            .max(1);
+        let fetch_start = match checkpoint_sequences(&db, verification_start, cursor).await {
+            Ok(checkpoints) if checkpoints.is_empty() && cursor > 1 => cursor,
+            Ok(_) => verification_start,
+            Err(e) => {
+                error!(error = %e, "failed to load stellar ledger checkpoints");
+                tokio::time::sleep(Duration::from_secs(INITIAL_RECONNECT_DELAY_SECS)).await;
+                continue;
+            }
+        };
+
+        match fetch_events(&client, &rpc_url, fetch_start).await {
             Ok(result) => {
                 if consecutive_failures > 0 {
                     info!(
@@ -210,33 +598,165 @@ pub async fn run_worker(
                 }
                 consecutive_failures = 0;
 
-                let count = result.events.len();
-                if count > 0 {
-                    if count > batch_size {
-                        warn!(
-                            events = count,
-                            batch_size,
-                            "stellar event batch exceeds configured maximum; processing in chunks"
-                        );
-                    }
+                let finalized_ledger = result.latest_ledger.saturating_sub(confirmations);
+                let event_count = result.events.len();
+                let existing_checkpoints =
+                    match checkpoint_sequences(&db, verification_start, result.latest_ledger).await
+                    {
+                        Ok(sequences) => sequences,
+                        Err(e) => {
+                            error!(error = %e, "failed to reload stellar checkpoints");
+                            continue;
+                        }
+                    };
+                let mut ledger_hashes = HashMap::new();
+                let mut fork_point = None;
+                let mut unresolved_ledger = None;
+                let mut verified_ledgers = HashSet::new();
 
-                    info!(
-                        ledger_start = cursor,
-                        latest_ledger = result.latest_ledger,
-                        events = count,
-                        batch_size,
-                        "stellar events received"
-                    );
-
-                    for chunk in result.events.chunks(batch_size) {
-                        process_event_batch(&db, &redis, &event_bus, chunk, batch_size).await;
+                for ledger in existing_checkpoints {
+                    match fetch_ledger_hash(&client, &rpc_url, ledger).await {
+                        Ok(hash) => {
+                            match store_checkpoint(&db, ledger, &hash).await {
+                                Ok(true) => {
+                                    fork_point = Some(
+                                        fork_point.map_or(ledger, |old: u64| old.min(ledger)),
+                                    );
+                                    verified_ledgers.insert(ledger);
+                                    ledger_hashes.insert(ledger, hash);
+                                }
+                                Ok(false) => {
+                                    ledger_hashes.insert(ledger, hash);
+                                    verified_ledgers.insert(ledger);
+                                }
+                                Err(e) => {
+                                    unresolved_ledger = Some(
+                                        unresolved_ledger
+                                            .map_or(ledger, |old: u64| old.min(ledger)),
+                                    );
+                                    error!(ledger, error = %e, "failed to update stellar checkpoint")
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            unresolved_ledger =
+                                Some(unresolved_ledger.map_or(ledger, |old| old.min(ledger)));
+                            warn!(ledger, error = %e, "could not verify stellar ledger checkpoint")
+                        }
                     }
                 }
 
-                let new_cursor = result.latest_ledger + 1;
-                if new_cursor > cursor {
-                    cursor = new_cursor;
+                let mut event_ledgers: Vec<u64> =
+                    result.events.iter().map(|event| event.ledger).collect();
+                event_ledgers.sort_unstable();
+                event_ledgers.dedup();
+
+                for ledger in event_ledgers {
+                    let hash = match ledger_hashes.get(&ledger) {
+                        Some(hash) => hash.clone(),
+                        None => match fetch_ledger_hash(&client, &rpc_url, ledger).await {
+                            Ok(hash) => {
+                                ledger_hashes.insert(ledger, hash.clone());
+                                hash
+                            }
+                            Err(e) => {
+                                unresolved_ledger =
+                                    Some(unresolved_ledger.map_or(ledger, |old| old.min(ledger)));
+                                warn!(ledger, error = %e, "cannot stage events without a canonical ledger hash");
+                                continue;
+                            }
+                        },
+                    };
+                    if !verified_ledgers.contains(&ledger) {
+                        match store_checkpoint(&db, ledger, &hash).await {
+                            Ok(true) => {
+                                fork_point =
+                                    Some(fork_point.map_or(ledger, |old: u64| old.min(ledger)));
+                                verified_ledgers.insert(ledger);
+                            }
+                            Ok(false) => {
+                                verified_ledgers.insert(ledger);
+                            }
+                            Err(e) => {
+                                unresolved_ledger =
+                                    Some(unresolved_ledger.map_or(ledger, |old| old.min(ledger)));
+                                error!(ledger, error = %e, "failed to store stellar checkpoint");
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                for mut event in result.events {
+                    let Some(hash) = ledger_hashes.get(&event.ledger) else {
+                        continue;
+                    };
+                    event.ledger_hash = Some(hash.clone());
+                    if let Err(e) = stage_event(&db, &event, hash).await {
+                        unresolved_ledger = Some(
+                            unresolved_ledger.map_or(event.ledger, |old| old.min(event.ledger)),
+                        );
+                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to stage stellar event");
+                        continue;
+                    }
+                }
+
+                if let Some(ledger) = fork_point {
+                    warn!(
+                        ledger,
+                        "stellar ledger hash conflict detected; quarantined events and rewinding listener"
+                    );
+                    redis.invalidate_pools_cache().await;
+                    cursor = cursor.min(ledger);
+                }
+
+                let verified_ledgers: Vec<u64> = verified_ledgers.into_iter().collect();
+                if let Err(e) =
+                    finalize_checkpoints(&db, finalized_ledger, &verified_ledgers).await
+                {
+                    error!(error = %e, "failed to finalize stellar ledger checkpoints");
+                    continue;
+                }
+
+                if event_count > 0 {
+                    info!(
+                        ledger_start = fetch_start,
+                        latest_ledger = result.latest_ledger,
+                        finalized_ledger,
+                        events = event_count,
+                        batch_size,
+                        "stellar events staged"
+                    );
+                }
+
+                match load_pending_events(&db, finalized_ledger, &verified_ledgers).await {
+                    Ok(pending) => {
+                        let pending: Vec<_> = pending
+                            .into_iter()
+                            .filter(|event| {
+                                is_finalized(event.ledger, result.latest_ledger, confirmations)
+                            })
+                            .collect();
+                        for chunk in pending.chunks(batch_size) {
+                            let processed =
+                                process_event_batch(&db, &redis, &event_bus, chunk, batch_size)
+                                    .await;
+                            if let Err(e) = mark_events_processed(&db, &processed).await {
+                                error!(error = %e, "failed to mark stellar events processed");
+                            }
+                        }
+                    }
+                    Err(e) => error!(error = %e, "failed to load finalized stellar events"),
+                }
+
+                let next_cursor = unresolved_ledger
+                    .map(|ledger| ledger.min(finalized_ledger.saturating_add(1)))
+                    .unwrap_or_else(|| finalized_ledger.saturating_add(1));
+                if next_cursor > cursor {
+                    cursor = next_cursor;
                     save_cursor(&db, cursor).await;
+                } else if let Some(ledger) = fork_point {
+                    save_cursor(&db, ledger).await;
                 }
             }
             Err(e) => {
@@ -267,12 +787,13 @@ async fn process_event_batch(
     event_bus: &crate::ws::EventBus,
     events: &[StellarEvent],
     max_batch_size: usize,
-) {
+) -> Vec<String> {
     let queue = worker_job_queue();
-    let mut referral_events: Vec<crate::db::ReferralPaidEvent> = Vec::new();
-    let mut referral_job_ids: Vec<String> = Vec::new();
+    let mut referral_events: Vec<(crate::db::ReferralPaidEvent, String)> = Vec::new();
+    let mut processed_event_keys = Vec::new();
 
     for event in events {
+        let key = event_key(event);
         info!(
             id = %event.id,
             event_type = %event.event_type,
@@ -280,12 +801,6 @@ async fn process_event_batch(
             contract_id = ?event.contract_id,
             "stellar event"
         );
-
-        // Idempotent skip for duplicate deliveries of the same event id.
-        if queue.already_processed(&event.id) {
-            info!(id = %event.id, "skipping already-processed event");
-            continue;
-        }
 
         let topic_matches = |needle: &str| {
             event
@@ -298,7 +813,7 @@ async fn process_event_batch(
         if event.event_type == "contract" {
             let kind = job_kind_from_topics(event.topics.as_ref());
             let job = Job {
-                id: event.id.clone(),
+                id: key.clone(),
                 kind: kind.clone(),
                 payload: event
                     .data
@@ -309,81 +824,68 @@ async fn process_event_batch(
                 ledger: Some(event.ledger),
             };
 
-            if topic_matches("pool_created") {
-                match handle_pool_created_event(db, redis, event).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process pool_created event");
-                        queue.record_failure(job, e);
-                    }
-                }
+            let result = if topic_matches("pool_created") {
+                handle_pool_created_event(db, redis, event).await
             } else if topic_matches("prediction_placed") {
-                match handle_prediction_placed_event(db, event, event_bus).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process prediction_placed event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                handle_prediction_placed_event(db, event, event_bus).await
             } else if topic_matches("pool_resolved") {
-                match handle_pool_resolved_event(db, event).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process pool_resolved event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                handle_pool_resolved_event(db, event).await
             } else if topic_matches("pool_canceled") {
-                match handle_pool_canceled_event(db, event).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process pool_canceled event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                handle_pool_canceled_event(db, event).await
             } else if topic_matches("referral_paid") {
                 match parse_referral_paid_event(event) {
-                    Ok(ev) => {
-                        referral_events.push(ev);
-                        referral_job_ids.push(event.id.clone());
+                    Ok(referral) => {
+                        referral_events.push((referral, key));
+                        continue;
                     }
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to parse referral_paid event");
-                        queue.record_failure(job, e);
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(())
+            };
+
+            match result {
+                Ok(()) => {
+                    queue.record_success(&job);
+                    processed_event_keys.push(key);
+                }
+                Err(error) => {
+                    error!(id = %event.id, ledger = event.ledger, error = %error, "failed to process stellar event");
+                    queue.record_failure(job, error);
+                }
+            }
+        } else {
+            processed_event_keys.push(key);
+        }
+    }
+
+    if !referral_events.is_empty() {
+        for chunk in referral_events.chunks(max_batch_size.max(1)) {
+            for (event, key) in chunk {
+                match crate::db::insert_referral_from_stellar_event(db, event, key).await {
+                    Ok(_) => {
+                        queue.mark_processed(key);
+                        processed_event_keys.push(key.clone());
+                    }
+                    Err(error) => {
+                        error!(id = %key, error = %error, "failed to insert referral event");
+                        queue.record_failure(
+                            Job {
+                                id: key.clone(),
+                                kind: "referral_paid".into(),
+                                payload: String::new(),
+                                attempts: 0,
+                                ledger: None,
+                            },
+                            error.to_string(),
+                        );
                     }
                 }
             }
         }
     }
 
-    if !referral_events.is_empty() {
-        match crate::db::insert_referrals_bulk(db, &referral_events, max_batch_size).await {
-            Ok(()) => {
-                for id in &referral_job_ids {
-                    queue.mark_processed(id);
-                }
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    count = referral_events.len(),
-                    "failed to bulk insert referral events"
-                );
-                for id in referral_job_ids {
-                    queue.record_failure(
-                        Job {
-                            id,
-                            kind: "referral_paid".into(),
-                            payload: String::new(),
-                            attempts: 0,
-                            ledger: None,
-                        },
-                        e.to_string(),
-                    );
-                }
-            }
-        }
-    }
+    processed_event_keys
 }
 
 async fn handle_pool_created_event(
@@ -419,7 +921,7 @@ async fn handle_pool_created_event(
         description,
     };
 
-    crate::db::insert_pool_from_event(db, &pool_event)
+    crate::db::insert_pool_from_stellar_event(db, &pool_event, &event_key(event))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -454,17 +956,19 @@ async fn handle_prediction_placed_event(
         amount,
     };
 
-    crate::db::insert_prediction_from_event_with_pool(db, &ev)
+    let inserted = crate::db::insert_prediction_from_stellar_event(db, &ev, &event_key(event))
         .await
         .map_err(|e| e.to_string())?;
 
-    event_bus.send(&serde_json::json!({
-        "type": "prediction_placed",
-        "pool_id": ev.pool_id,
-        "user_address": ev.user_address,
-        "outcome": ev.outcome,
-        "amount": ev.amount,
-    }));
+    if inserted {
+        event_bus.send(&serde_json::json!({
+            "type": "prediction_placed",
+            "pool_id": ev.pool_id,
+            "user_address": ev.user_address,
+            "outcome": ev.outcome,
+            "amount": ev.amount,
+        }));
+    }
 
     Ok(())
 }
@@ -480,7 +984,7 @@ async fn handle_pool_resolved_event(db: &PgPool, event: &StellarEvent) -> Result
     let outcome =
         extract_i32(data, "outcome").ok_or_else(|| "missing or invalid outcome".to_string())?;
 
-    crate::db::resolve_pool_in_db(db, pool_id, outcome)
+    crate::db::resolve_pool_from_stellar_event(db, pool_id, outcome, &event_key(event))
         .await
         .map_err(|e| e.to_string())
 }
@@ -494,7 +998,7 @@ async fn handle_pool_canceled_event(db: &PgPool, event: &StellarEvent) -> Result
     let pool_id =
         extract_u64(data, "pool_id").ok_or_else(|| "missing or invalid pool_id".to_string())?;
 
-    crate::db::cancel_pool_in_db(db, pool_id)
+    crate::db::cancel_pool_from_stellar_event(db, pool_id, &event_key(event))
         .await
         .map_err(|e| e.to_string())
 }
@@ -568,10 +1072,164 @@ fn extract_u64(data: &Value, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, routing::post, Json, Router};
     use std::sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     };
+    use tokio::{
+        net::TcpListener,
+        sync::{oneshot, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct RpcFixtureState(Arc<Mutex<RpcFixtureData>>);
+
+    #[derive(Default)]
+    struct RpcFixtureData {
+        latest_ledger: u64,
+        events: Vec<Value>,
+        hashes: HashMap<u64, String>,
+    }
+
+    async fn rpc_fixture(
+        State(state): State<RpcFixtureState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let fixture = state.0.lock().await;
+        let result = match request["method"].as_str() {
+            Some("getEvents") => {
+                let start = request["params"]["startLedger"].as_u64().unwrap_or(1);
+                serde_json::json!({
+                    "events": fixture.events.iter().filter(|event|
+                        event["ledger"].as_u64().unwrap_or_default() >= start
+                    ).cloned().collect::<Vec<_>>(),
+                    "latestLedger": fixture.latest_ledger
+                })
+            }
+            Some("getLedger") => {
+                let sequence = request["params"]["sequence"].as_u64().unwrap_or_default();
+                fixture
+                    .hashes
+                    .get(&sequence)
+                    .map(|hash| serde_json::json!({ "sequence": sequence, "hash": hash }))
+                    .unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        };
+        Json(serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }))
+    }
+
+    async fn start_rpc_fixture() -> (
+        String,
+        RpcFixtureState,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = RpcFixtureState(Arc::new(Mutex::new(RpcFixtureData::default())));
+        let app = Router::new()
+            .route("/", post(rpc_fixture))
+            .with_state(state.clone());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), state, shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn rpc_fixture_holds_delayed_duplicate_events_until_final_and_detects_fork() {
+        let (url, state, shutdown, server) = start_rpc_fixture().await;
+        let client = reqwest::Client::new();
+        let event = serde_json::json!({
+            "type": "contract",
+            "ledger": 10,
+            "contractId": "CABC",
+            "id": "event-10",
+            "topics": ["prediction_placed"],
+            "data": { "pool_id": 1 }
+        });
+
+        {
+            let mut fixture = state.0.lock().await;
+            fixture.latest_ledger = 11;
+            fixture.hashes.insert(10, "hash-a".into());
+        }
+        let initial = fetch_events(&client, &url, 9).await.unwrap();
+        assert!(initial.events.is_empty());
+
+        // The RPC delivers the same ledger event late and more than once.
+        {
+            let mut fixture = state.0.lock().await;
+            fixture.events = vec![event.clone(), event.clone()];
+        }
+        let delayed = fetch_events(&client, &url, 9).await.unwrap();
+        assert_eq!(delayed.events.len(), 2);
+        assert!(!is_finalized(
+            10,
+            delayed.latest_ledger,
+            TESTNET_CONFIRMATION_DEPTH
+        ));
+        let original_hash = fetch_ledger_hash(&client, &url, 10).await.unwrap();
+        assert_eq!(original_hash, "hash-a");
+
+        // A later head crosses the configured confirmation boundary. Stable
+        // event keys collapse duplicate RPC deliveries into one activity.
+        {
+            state.0.lock().await.latest_ledger = 12;
+        }
+        let confirmed = fetch_events(&client, &url, 9).await.unwrap();
+        assert!(is_finalized(
+            10,
+            confirmed.latest_ledger,
+            TESTNET_CONFIRMATION_DEPTH
+        ));
+        let mut indexed = std::collections::HashSet::new();
+        for mut event in confirmed.events {
+            event.ledger_hash = Some(original_hash.clone());
+            indexed.insert(event_key(&event));
+        }
+        assert_eq!(indexed.len(), 1);
+
+        // A conflicting canonical hash is recognized as a fork, and the
+        // replacement event has a distinct identity from the quarantined one.
+        state.0.lock().await.hashes.insert(10, "hash-b".into());
+        let replacement_hash = fetch_ledger_hash(&client, &url, 10).await.unwrap();
+        assert!(checkpoint_conflicts(
+            Some(&original_hash),
+            &replacement_hash
+        ));
+        let replacement_key = format!("event-10:{replacement_hash}");
+        indexed.retain(|key| key != "event-10:hash-a");
+        indexed.insert(replacement_key);
+        assert_eq!(indexed.len(), 1);
+
+        let _ = shutdown.send(());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn confirmation_depth_is_defined_for_public_networks_and_custom_hosts() {
+        assert_eq!(
+            confirmation_depth("https://soroban-testnet.stellar.org"),
+            TESTNET_CONFIRMATION_DEPTH
+        );
+        assert_eq!(
+            confirmation_depth("https://soroban-rpc.mainnet.stellar.gateway.fm"),
+            MAINNET_CONFIRMATION_DEPTH
+        );
+        assert_eq!(
+            confirmation_depth("https://private-rpc.example"),
+            TESTNET_CONFIRMATION_DEPTH
+        );
+    }
 
     // ── reconnect loop behaviour ──────────────────────────────────────────────
 
@@ -589,12 +1247,18 @@ mod tests {
         let after_failure = consecutive_failures + 1;
         let delay = reconnect_delay_secs(after_failure);
 
-        assert_eq!(after_failure, 1, "first failure sets consecutive_failures = 1");
+        assert_eq!(
+            after_failure, 1,
+            "first failure sets consecutive_failures = 1"
+        );
         assert_eq!(
             delay, INITIAL_RECONNECT_DELAY_SECS,
             "first failure delay must be INITIAL_RECONNECT_DELAY_SECS"
         );
-        assert!(delay > 0, "delay must be non-zero so the loop actually waits");
+        assert!(
+            delay > 0,
+            "delay must be non-zero so the loop actually waits"
+        );
     }
 
     /// Each consecutive failure must double the delay (exponential backoff)
@@ -737,7 +1401,10 @@ mod tests {
         }
 
         // After recovery the counter is zero.
-        assert_eq!(consecutive_failures, 0, "failures must be reset after success");
+        assert_eq!(
+            consecutive_failures, 0,
+            "failures must be reset after success"
+        );
 
         // Cursor advanced to latest_ledger + 1.
         assert_eq!(cursor, 21, "cursor must have advanced to 21 after success");

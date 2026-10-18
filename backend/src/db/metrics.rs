@@ -58,9 +58,9 @@ pub fn snapshot(pool: &PgPool) -> PoolSnapshot {
 pub fn record_pool_metrics(pool: &PgPool, registry: &prometheus::Registry) {
     let snap = snapshot(pool);
 
-    set_gauge(registry, "db_pool_size",              snap.size    as f64);
-    set_gauge(registry, "db_pool_idle",              snap.idle    as f64);
-    set_gauge(registry, "db_pool_active",            snap.active  as f64);
+    set_gauge(registry, "db_pool_size", snap.size as f64);
+    set_gauge(registry, "db_pool_idle", snap.idle as f64);
+    set_gauge(registry, "db_pool_active", snap.active as f64);
     set_gauge(registry, "db_pool_utilization_ratio", snap.utilization());
 
     debug!(
@@ -112,18 +112,21 @@ pub fn register_pool_gauges(
     };
 
     Ok(PoolMetricGauges {
-        size:        make("db_pool_size",              "Total connection slots in the pool")?,
-        idle:        make("db_pool_idle",              "Idle connections in the pool")?,
-        active:      make("db_pool_active",            "Active (checked-out) connections")?,
-        utilization: make("db_pool_utilization_ratio", "Fraction of pool slots in active use")?,
+        size: make("db_pool_size", "Total connection slots in the pool")?,
+        idle: make("db_pool_idle", "Idle connections in the pool")?,
+        active: make("db_pool_active", "Active (checked-out) connections")?,
+        utilization: make(
+            "db_pool_utilization_ratio",
+            "Fraction of pool slots in active use",
+        )?,
     })
 }
 
 /// Writable references to the four pool-metrics gauges.
 pub struct PoolMetricGauges {
-    pub size:        prometheus::Gauge,
-    pub idle:        prometheus::Gauge,
-    pub active:      prometheus::Gauge,
+    pub size: prometheus::Gauge,
+    pub idle: prometheus::Gauge,
+    pub active: prometheus::Gauge,
     pub utilization: prometheus::Gauge,
 }
 
@@ -154,19 +157,31 @@ mod tests {
 
     #[test]
     fn utilization_zero_when_pool_size_is_zero() {
-        let snap = PoolSnapshot { size: 0, idle: 0, active: 0 };
+        let snap = PoolSnapshot {
+            size: 0,
+            idle: 0,
+            active: 0,
+        };
         assert_eq!(snap.utilization(), 0.0);
     }
 
     #[test]
     fn utilization_one_when_all_active() {
-        let snap = PoolSnapshot { size: 10, idle: 0, active: 10 };
+        let snap = PoolSnapshot {
+            size: 10,
+            idle: 0,
+            active: 10,
+        };
         assert!((snap.utilization() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn utilization_half_when_half_active() {
-        let snap = PoolSnapshot { size: 10, idle: 5, active: 5 };
+        let snap = PoolSnapshot {
+            size: 10,
+            idle: 5,
+            active: 5,
+        };
         assert!((snap.utilization() - 0.5).abs() < f64::EPSILON);
     }
 
@@ -190,9 +205,9 @@ mod tests {
         gauges.active.set(7.0);
         gauges.utilization.set(0.7);
 
-        assert_eq!(gauges.size.get(),        10.0);
-        assert_eq!(gauges.idle.get(),         3.0);
-        assert_eq!(gauges.active.get(),       7.0);
+        assert_eq!(gauges.size.get(), 10.0);
+        assert_eq!(gauges.idle.get(), 3.0);
+        assert_eq!(gauges.active.get(), 7.0);
         assert!((gauges.utilization.get() - 0.7).abs() < f64::EPSILON);
     }
 
@@ -201,6 +216,9 @@ mod tests {
         let registry = prometheus::Registry::new();
         register_pool_gauges(&registry).expect("first registration must succeed");
         let second = register_pool_gauges(&registry);
-        assert!(second.is_err(), "duplicate registration must return an error");
+        assert!(
+            second.is_err(),
+            "duplicate registration must return an error"
+        );
     }
 }

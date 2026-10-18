@@ -38,7 +38,7 @@ pub async fn get_referral_earnings(
             COALESCE(rps.total_earned, 0)::BIGINT AS total_earned,
             rps.referral_count
         FROM referrer_pool_stats rps
-        JOIN pools pl ON pl.pool_id = rps.pool_id
+        JOIN pools pl ON pl.pool_id = rps.pool_id AND pl.stellar_canonical
         WHERE rps.referrer = $1
         ORDER BY rps.total_earned DESC
         "#,
@@ -93,6 +93,30 @@ where
     .await?;
 
     Ok(())
+}
+
+/// Insert a referral from a canonical Stellar event, deduplicated by event key.
+pub async fn insert_referral_from_stellar_event(
+    pool: &PgPool,
+    event: &ReferralPaidEvent,
+    stellar_event_key: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO referrals (referrer, user_address, pool_id, amount, stellar_event_key)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (stellar_event_key) WHERE stellar_event_key IS NOT NULL DO NOTHING
+        "#,
+    )
+    .bind(&event.referrer)
+    .bind(&event.referred_user)
+    .bind(event.pool_id as i64)
+    .bind(event.referral_amount)
+    .bind(stellar_event_key)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
