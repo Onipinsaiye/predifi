@@ -1,0 +1,58 @@
+name: Canary release gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: backend or frontend
+        required: true
+        type: choice
+        options:
+          - backend
+          - frontend
+      metrics_json:
+        description: Inline metrics JSON for staging validation
+        required: true
+        type: string
+      override_reason:
+        description: Optional manual override (audited)
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  canary-gate:
+    name: Evaluate canary policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write metrics file
+        run: |
+          printf '%s\n' '${{ inputs.metrics_json }}' > /tmp/canary-metrics.json
+
+      - name: Run canary gate
+        id: gate
+        env:
+          OVERRIDE: ${{ inputs.override_reason }}
+        run: |
+          set +e
+          if [ -n "$OVERRIDE" ]; then
+            node scripts/canary-gate.mjs --target "${{ inputs.target }}" --metrics /tmp/canary-metrics.json --override "$OVERRIDE" | tee /tmp/canary-audit.json
+          else
+            node scripts/canary-gate.mjs --target "${{ inputs.target }}" --metrics /tmp/canary-metrics.json | tee /tmp/canary-audit.json
+          fi
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Upload audit trail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-audit-${{ inputs.target }}
+          path: /tmp/canary-audit.json
