@@ -216,4 +216,70 @@ mod tests {
 
         drop(container);
     }
+
+    /// Two independent `RedisCache` handles model two API replicas sharing one
+    /// Redis. Twenty concurrent requests spread across both replicas must be
+    /// counted once: exactly five are allowed, fifteen are denied. After the
+    /// window resets, the next request starts a fresh count.
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Redis"]
+    async fn distributed_rate_limit_is_shared_across_replicas_and_resets() {
+        use crate::rate_limit::{rate_limit_key, RateLimitTier};
+
+        let (cache, container) = setup().await;
+        let replica_a = cache.clone();
+        let replica_b = cache.clone();
+        let key = rate_limit_key(RateLimitTier::Read, "203.0.113.9");
+        let limit = 5u32;
+
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let replica = if i % 2 == 0 {
+                replica_a.clone()
+            } else {
+                replica_b.clone()
+            };
+            let key = key.clone();
+            tasks.push(tokio::spawn(async move {
+                replica.rate_limit_consume(&key, 1).await
+            }));
+        }
+
+        let mut allowed = 0;
+        let mut denied = 0;
+        for task in tasks {
+            let decision = task.await.expect("task").expect("redis decision");
+            if decision.count <= limit {
+                allowed += 1;
+            } else {
+                denied += 1;
+            }
+        }
+
+        assert_eq!(allowed, limit as usize, "shared limit must be exact");
+        assert_eq!(denied, 20 - limit as usize);
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let after_reset = cache
+            .rate_limit_consume(&key, 1)
+            .await
+            .expect("redis decision after reset");
+        assert_eq!(after_reset.count, 1, "window must reset after its TTL");
+        assert!(
+            after_reset.reset_after_secs <= 1,
+            "reset should be at most the window length, got {}",
+            after_reset.reset_after_secs
+        );
+
+        drop(container);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_none_when_redis_is_unavailable() {
+        use crate::rate_limit::{rate_limit_key, RateLimitTier};
+
+        let cache = RedisCache::disabled();
+        let key = rate_limit_key(RateLimitTier::Write, "indexer");
+        assert!(cache.rate_limit_consume(&key, 60).await.is_none());
+    }
 }

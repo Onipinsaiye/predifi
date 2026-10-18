@@ -18,7 +18,7 @@
 //! and authorize before reading or writing user-scoped keys.
 
 use crate::metrics::SharedMetrics;
-use redis::{aio::ConnectionManager, AsyncCommands, ErrorKind};
+use redis::{aio::ConnectionManager, AsyncCommands, ErrorKind, Script};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
@@ -67,6 +67,39 @@ struct CacheEnvelope {
     data: serde_json::Value,
     exp: u64,
 }
+
+/// Result of one distributed rate-limit counter increment.
+///
+/// The counter is a fixed window: the first increment sets the TTL, and every
+/// subsequent increment in that window returns the same reset deadline. This is
+/// intentionally simple so the limit is identical on every replica: all
+/// instances share one Redis key and increment it atomically with the Lua
+/// script in [`RedisCache::rate_limit_consume`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    /// Number of requests observed in the current window, including this one.
+    pub count: u32,
+    /// Seconds until the window resets (at least 1 for a live window).
+    pub reset_after_secs: u64,
+}
+
+/// Atomic fixed-window counter.
+///
+/// `INCR` creates the key at 1; only that first caller sets the expiry, so a
+/// burst of concurrent requests cannot extend the window forever. `PTTL`
+/// returns the remaining milliseconds for the reset header.
+const RATE_LIMIT_SCRIPT: &str = r#"
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+"#;
 
 /// Sanitize a user-supplied string for safe use as a Redis key component.
 ///
@@ -235,7 +268,10 @@ impl RedisCache {
     /// Refuses TTL 0 (would never expire) and caps TTL at [`MAX_TTL_SECS`].
     pub async fn set<T: Serialize>(&self, key: &str, value: &T, ttl_secs: u64) {
         if ttl_secs < MIN_TTL_SECS {
-            warn!("refusing to cache {} with TTL {} (must expire)", key, ttl_secs);
+            warn!(
+                "refusing to cache {} with TTL {} (must expire)",
+                key, ttl_secs
+            );
             return;
         }
         let Some(namespaced) = namespaced_key(key) else {
@@ -406,6 +442,73 @@ impl RedisCache {
         let mut conn = manager.clone();
         let r: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
         r.is_ok()
+    }
+
+    /// Atomically increment a distributed rate-limit counter.
+    ///
+    /// Returns `None` when Redis is unavailable or the command fails, so the
+    /// caller can apply its tier-specific fail-open/fail-closed policy. The
+    /// returned `count` includes the current request; the window resets after
+    /// `reset_after_secs`.
+    ///
+    /// Every replica that talks to the same Redis sees the same counter, which
+    /// is what makes the limit hold across load-balanced instances.
+    pub async fn rate_limit_consume(
+        &self,
+        key: &str,
+        window_secs: u64,
+    ) -> Option<RateLimitDecision> {
+        if self.simulate_available {
+            return None;
+        }
+        let manager = self.manager.as_ref()?;
+        if window_secs == 0 {
+            return None;
+        }
+        let namespaced = namespaced_key(key)?;
+        let mut conn = manager.clone();
+        let window_ms = window_secs.saturating_mul(1000).max(1);
+        let started = std::time::Instant::now();
+        let result: Result<(i64, i64), redis::RedisError> = Script::new(RATE_LIMIT_SCRIPT)
+            .key(namespaced)
+            .arg(window_ms as i64)
+            .invoke_async(&mut conn)
+            .await;
+        match result {
+            Ok((count, ttl_ms)) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_redis_op(
+                        "rate_limit_incr",
+                        "ok",
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+                let reset_after_secs = if ttl_ms <= 0 {
+                    1
+                } else {
+                    (ttl_ms as u64).div_ceil(1000)
+                };
+                Some(RateLimitDecision {
+                    count: count.max(0) as u32,
+                    reset_after_secs,
+                })
+            }
+            Err(err) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_redis_op(
+                        "rate_limit_incr",
+                        "error",
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+                if is_connection_error(err.kind()) {
+                    warn!("Redis connection dropout on rate-limit INCR: {}", err);
+                } else {
+                    error!("Redis rate-limit INCR error: {}", err);
+                }
+                None
+            }
+        }
     }
 }
 
