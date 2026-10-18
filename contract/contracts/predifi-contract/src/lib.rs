@@ -104,7 +104,9 @@ pub use safe_math::{RoundingMode, SafeMath};
 //    (or `Role::Oracle`, etc.) to grant a role to any address.
 // 3. Roles can be revoked with `access_control::revoke_role`, transferred with
 //    `access_control::transfer_role`, or bulk-cleared with `revoke_all_roles`.
-// 4. Admin authority itself can be transferred via `access_control::transfer_admin`.
+// 4. Admin authority is handed over in two steps with
+//    `access_control::propose_new_admin` followed by `accept_admin_role` from the
+//    nominee (`transfer_admin` is a legacy alias that only nominates).
 // 5. Pass the deployed access-control contract address to
 //    `predifi_contract::init(access_control, treasury, fee_bps, resolution_delay)`
 //    so the predifi contract knows which access-control instance to query.

@@ -79,18 +79,40 @@
 //    - `transfer_role`: Move a role from one user to another
 //    - `revoke_all_roles`: Remove all roles from a user
 //    - The current (final) admin can never lose the Admin role via `revoke_role` /
-//      `revoke_all_roles` (they return `AdminError`); transfer admin first.
-//    - `propose_new_admin` + `accept_admin_role`: Two-step admin transfer (recommended)
-//    - `transfer_admin`: Legacy one-step admin transfer
-// 4. Any contract can check if a user has a role by calling `has_role(user, role)`.
-// 5. The `has_any_role` function allows checking if a user has any of a set of roles.
+//      `revoke_all_roles` (they return `AdminError`); hand over first.
+// 4. Admin handoff is always two-step:
+//    - `propose_new_admin(admin, nominee)` nominates a successor. This replaces
+//      any previous nomination; only the latest nominee can accept.
+//    - `accept_admin_role(nominee)` is the only way to complete the handoff.
+//      The nominee must authenticate, proving it controls a usable address.
+//    - `cancel_admin_transfer(admin)` withdraws a pending nomination. The
+//      current admin remains in office and the nominee can no longer accept.
+//    - `transfer_admin` is a legacy alias for `propose_new_admin`; it no longer
+//      transfers admin rights in one step. Deployed clients must follow the
+//      call with `accept_admin_role`.
+// 5. Any contract can check if a user has a role by calling `has_role(user, role)`.
+// 6. The `has_any_role` function allows checking if a user has any of a set of roles.
 //
 // SECURITY CONSIDERATIONS
 // ───────────────────────
 // - Only the admin can assign or revoke roles
 // - All admin operations require authentication (`require_auth`)
-// - Admin transfer supports a two-step propose/accept flow for safety
+// - Admin handoff can never complete without acceptance by the nominee, so an
+//   accidental or unavailable address cannot become admin
+// - The previous admin keeps the Admin role until acceptance, and the transfer
+//   then happens atomically; the contract is never left without an admin
 // - Role checks are performed via storage lookups in persistent storage
+//
+// MIGRATION FOR DEPLOYED INSTANCES
+// ────────────────────────────────
+// No storage migration is required. Deployed instances already store the admin
+// under `DataKey::Admin`; the pending nomination is a new, optional
+// `DataKey::ProposedAdmin` entry that reads as `None` until the first proposal.
+// After upgrading the Wasm, existing admins can immediately use
+// `propose_new_admin` / `accept_admin_role`. Any `transfer_admin` transaction
+// sent by an old client now only nominates; the nominee must accept before the
+// handoff completes. See `README.md` ("Migrating a deployed instance") for the
+// operational steps.
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -177,6 +199,38 @@ pub struct AdminTransferredEvent {
 pub struct AdminTransferProposedEvent {
     pub admin: Address,
     pub proposed_admin: Address,
+}
+
+/// Emitted when a pending nomination is replaced by a newer one. The previous
+/// nominee loses the ability to accept the handoff.
+#[contractevent(topics = ["admin_transfer_replaced"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferReplacedEvent {
+    pub admin: Address,
+    pub previous_proposed_admin: Address,
+    pub proposed_admin: Address,
+}
+
+/// Emitted when the current admin cancels a pending nomination. The cancelled
+/// nominee can no longer accept, and the current admin remains in place.
+#[contractevent(topics = ["admin_transfer_cancelled"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelledEvent {
+    pub admin: Address,
+    pub cancelled_admin: Address,
+}
+
+/// Emitted when the nominee accepts the handoff (step 2). This is emitted in
+/// addition to [`AdminTransferredEvent`], which remains the canonical event for
+/// the effective transfer and is also understood by older indexers.
+#[contractevent(topics = ["admin_transfer_accepted"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferAcceptedEvent {
+    pub admin: Address,
+    pub new_admin: Address,
 }
 
 #[contractevent(topics = ["all_roles_revoked"])]
@@ -469,37 +523,35 @@ impl AccessControl {
         Ok(())
     }
 
-    /// Transfers admin role to a new admin (legacy one-step transfer).
+    /// Legacy admin transfer entry point, retained for ABI compatibility.
+    ///
+    /// Since the two-step handoff is mandatory, this function **no longer
+    /// transfers admin rights immediately**. It behaves exactly like
+    /// [`Self::propose_new_admin`]: the current admin nominates `new_admin` and
+    /// the nominee must then call [`Self::accept_admin_role`]. This keeps
+    /// deployed clients working while ensuring a handoff can never complete
+    /// without the new administrator proving control of their address.
     ///
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InvalidData` if `new_admin` is the current admin.
     pub fn transfer_admin(
         env: &Env,
         admin_caller: &Address,
         new_admin: Address,
     ) -> Result<(), PrediFiError> {
-        admin_caller.require_auth();
-
-        let current_admin = Self::get_admin(env);
-        if admin_caller != &current_admin {
-            return Err(PrediFiError::Unauthorized);
-        }
-
-        Self::apply_admin_transfer(env, current_admin.clone(), &new_admin);
-
-        AdminTransferredEvent {
-            admin: current_admin,
-            new_admin,
-        }
-        .publish(env);
-
-        Ok(())
+        Self::propose_new_admin(env, admin_caller.clone(), new_admin)
     }
 
     /// Proposes a new admin (two-step transfer, step 1).
     ///
+    /// Replaces any existing nomination. Replacing a nomination invalidates the
+    /// previous nominee: only the most recently proposed address can accept.
+    ///
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InvalidData` if `new_admin` is the current admin; use
+    /// [`Self::cancel_admin_transfer`] to withdraw a nomination instead.
     pub fn propose_new_admin(
         env: &Env,
         current_admin: Address,
@@ -512,13 +564,67 @@ impl AccessControl {
             return Err(PrediFiError::Unauthorized);
         }
 
+        // Nominating the current admin would leave a confusing pending handoff
+        // that can be "accepted" as a no-op. Treat it as invalid input; a
+        // cancellation is the explicit way to clear a nomination.
+        if new_admin == current_admin {
+            return Err(PrediFiError::InvalidData);
+        }
+
+        let previous: Option<Address> = env.storage().instance().get(&DataKey::ProposedAdmin);
+
         env.storage()
             .instance()
-            .set(&DataKey::ProposedAdmin, &new_admin);
+            .set(&DataKey::ProposedAdmin, &new_admin.clone());
 
         AdminTransferProposedEvent {
+            admin: current_admin.clone(),
+            proposed_admin: new_admin.clone(),
+        }
+        .publish(env);
+
+        if let Some(previous) = previous {
+            if previous != new_admin {
+                AdminTransferReplacedEvent {
+                    admin: current_admin,
+                    previous_proposed_admin: previous,
+                    proposed_admin: new_admin,
+                }
+                .publish(env);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cancels a pending admin nomination (current admin only).
+    ///
+    /// The current admin stays in office and the cancelled nominee can no longer
+    /// accept. Calling this without a pending nomination returns `AdminError`,
+    /// so callers can distinguish "nothing to cancel" from a successful cancel.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `AdminError` if there is no pending nomination.
+    pub fn cancel_admin_transfer(env: &Env, current_admin: Address) -> Result<(), PrediFiError> {
+        current_admin.require_auth();
+
+        let stored_admin = Self::get_admin(env);
+        if current_admin != stored_admin {
+            return Err(PrediFiError::Unauthorized);
+        }
+
+        let cancelled_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposedAdmin)
+            .ok_or(PrediFiError::AdminError)?;
+
+        env.storage().instance().remove(&DataKey::ProposedAdmin);
+
+        AdminTransferCancelledEvent {
             admin: current_admin,
-            proposed_admin: new_admin,
+            cancelled_admin,
         }
         .publish(env);
 
@@ -527,8 +633,15 @@ impl AccessControl {
 
     /// Accepts the admin role (two-step transfer, step 2).
     ///
+    /// The caller must authenticate and must be exactly the address named in the
+    /// most recent nomination. Accepting clears the pending nomination and
+    /// atomically moves the admin role, so there is never a moment where the
+    /// contract has no administrator.
+    ///
     /// # Errors
-    /// Returns `Unauthorized` if the caller is not the proposed admin.
+    /// Returns `Unauthorized` if the caller is not the proposed admin (including
+    /// when no nomination exists, or when the nomination was replaced or
+    /// cancelled).
     pub fn accept_admin_role(env: &Env, new_admin: Address) -> Result<(), PrediFiError> {
         new_admin.require_auth();
 
@@ -539,6 +652,12 @@ impl AccessControl {
 
         let current_admin = Self::get_admin(env);
         Self::apply_admin_transfer(env, current_admin.clone(), &new_admin);
+
+        AdminTransferAcceptedEvent {
+            admin: current_admin.clone(),
+            new_admin: new_admin.clone(),
+        }
+        .publish(env);
 
         AdminTransferredEvent {
             admin: current_admin,

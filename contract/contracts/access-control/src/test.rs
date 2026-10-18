@@ -1,8 +1,20 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::testutils::{Address as _, Events};
+use soroban_sdk::{Address, Env, Symbol, TryFromVal};
+
+/// Returns true if an event with the given first topic was emitted in this test.
+fn event_emitted(env: &Env, topic: &str) -> bool {
+    let expected = Symbol::new(env, topic);
+    env.events().all().iter().any(|event| {
+        event
+            .1
+            .get(0)
+            .map(|value| Symbol::try_from_val(env, &value).is_ok_and(|symbol| symbol == expected))
+            .unwrap_or(false)
+    })
+}
 
 #[test]
 fn test_initialization() {
@@ -101,7 +113,15 @@ fn test_admin_transfer() {
     client.init(&admin1);
     assert_eq!(client.get_admin(), admin1);
 
+    // The legacy entry point now only nominates; the handoff is not complete
+    // until the nominee accepts.
     client.transfer_admin(&admin1, &admin2);
+    assert_eq!(client.get_admin(), admin1);
+    assert_eq!(client.get_proposed_admin(), Some(admin2.clone()));
+    assert!(client.has_role(&admin1, &Role::Admin));
+    assert!(!client.has_role(&admin2, &Role::Admin));
+
+    client.accept_admin_role(&admin2);
     assert_eq!(client.get_admin(), admin2);
     assert!(client.has_role(&admin2, &Role::Admin));
     assert!(!client.has_role(&admin1, &Role::Admin));
@@ -475,8 +495,8 @@ fn test_has_any_role_operator_oracle() {
     assert!(client.has_any_role(&oracle, &roles));
 }
 
-/// After `transfer_admin`, the new admin holds Admin role (0) and the old
-/// admin loses it — verifying the documented admin-transfer behaviour.
+/// After the legacy `transfer_admin` nomination is accepted, the new admin
+/// holds Admin role (0) and the old admin loses it.
 #[test]
 fn test_admin_transfer_updates_role_storage() {
     let env = Env::default();
@@ -490,6 +510,10 @@ fn test_admin_transfer_updates_role_storage() {
     client.init(&admin1);
 
     client.transfer_admin(&admin1, &admin2);
+    assert!(client.has_role(&admin1, &Role::Admin));
+    assert!(!client.has_role(&admin2, &Role::Admin));
+
+    client.accept_admin_role(&admin2);
 
     assert!(client.has_role(&admin2, &Role::Admin));
     assert!(client.is_admin(&admin2));
@@ -804,11 +828,8 @@ fn test_revoke_all_roles_removes_admin_role() {
     );
 }
 
-/// After `transfer_admin`, the old admin's Admin role is removed from
-/// persistent storage and `is_admin` returns false for them.
-///
-/// This is the primary "admin removal" path: transferring admin rights
-/// atomically removes the role from the previous holder.
+/// After the legacy `transfer_admin` nomination is accepted, the old admin's
+/// Admin role is removed and `is_admin` returns false for them.
 #[test]
 fn test_transfer_admin_removes_admin_role_from_old_admin() {
     let env = Env::default();
@@ -827,6 +848,10 @@ fn test_transfer_admin_removes_admin_role_from_old_admin() {
     assert!(!client.has_role(&new_admin, &Role::Admin));
 
     client.transfer_admin(&old_admin, &new_admin);
+    // Nomination alone must not move the role.
+    assert!(client.is_admin(&old_admin));
+    assert!(!client.is_admin(&new_admin));
+    client.accept_admin_role(&new_admin);
 
     // Old admin must have lost the Admin role entirely.
     assert!(
@@ -1075,4 +1100,320 @@ fn test_self_revocation_behaviour() {
     assert!(!client.has_role(&admin, &Role::Operator));
     assert_eq!(client.get_operator_count(), 1);
     assert!(client.has_role(&admin, &Role::Admin));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Two-step administrator handoff (issue #33)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Only the current admin can nominate a successor.
+#[test]
+fn test_non_admin_cannot_propose_new_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let nominee = Address::generate(&env);
+    client.init(&admin);
+
+    let result = client.try_propose_new_admin(&attacker, &nominee);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_proposed_admin(), None);
+}
+
+/// Accepting with no nomination is rejected and never changes the admin.
+#[test]
+fn test_accept_without_nomination_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let caller = Address::generate(&env);
+    client.init(&admin);
+
+    let result = client.try_accept_admin_role(&caller);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_admin(), admin);
+    assert!(client.has_role(&admin, &Role::Admin));
+}
+
+/// The current admin cannot nominate itself; cancellation is the explicit way
+/// to clear a handoff.
+#[test]
+fn test_proposing_current_admin_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let result = client.try_propose_new_admin(&admin, &admin);
+    assert_eq!(result, Err(Ok(PrediFiError::InvalidData)));
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_proposed_admin(), None);
+}
+
+/// Replacing a nomination invalidates the previous nominee.
+#[test]
+fn test_replaced_nomination_old_nominee_cannot_accept() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let first_nominee = Address::generate(&env);
+    let second_nominee = Address::generate(&env);
+    client.init(&admin);
+
+    client.propose_new_admin(&admin, &first_nominee);
+    client.propose_new_admin(&admin, &second_nominee);
+
+    assert_eq!(client.get_proposed_admin(), Some(second_nominee.clone()));
+
+    // The old nominee can no longer accept.
+    let result = client.try_accept_admin_role(&first_nominee);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_proposed_admin(), Some(second_nominee.clone()));
+
+    // The latest nominee can.
+    client.accept_admin_role(&second_nominee);
+    assert_eq!(client.get_admin(), second_nominee);
+}
+
+/// Cancelling a nomination removes it and permanently revokes the nominee's
+/// ability to accept. The current admin keeps full authority.
+#[test]
+fn test_cancel_admin_transfer_revokes_nomination() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let nominee = Address::generate(&env);
+    client.init(&admin);
+
+    client.propose_new_admin(&admin, &nominee);
+    client.cancel_admin_transfer(&admin);
+
+    assert_eq!(client.get_proposed_admin(), None);
+    assert_eq!(client.get_admin(), admin);
+    assert!(client.has_role(&admin, &Role::Admin));
+
+    let result = client.try_accept_admin_role(&nominee);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+
+    // The admin can still manage roles and start a new handoff.
+    let user = Address::generate(&env);
+    client.assign_role(&admin, &user, &Role::Operator);
+    assert!(client.has_role(&user, &Role::Operator));
+    client.propose_new_admin(&admin, &nominee);
+    assert_eq!(client.get_proposed_admin(), Some(nominee));
+}
+
+/// Cancellation is admin-only.
+#[test]
+fn test_non_admin_cannot_cancel_admin_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let nominee = Address::generate(&env);
+    client.init(&admin);
+    client.propose_new_admin(&admin, &nominee);
+
+    let result = client.try_cancel_admin_transfer(&attacker);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_proposed_admin(), Some(nominee));
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// Cancelling when there is nothing pending is an explicit error rather than a
+/// silent success.
+#[test]
+fn test_cancel_without_nomination_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let result = client.try_cancel_admin_transfer(&admin);
+    assert_eq!(result, Err(Ok(PrediFiError::AdminError)));
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// Accepting twice is rejected: the nomination is consumed by the first accept.
+#[test]
+fn test_accept_twice_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.init(&admin);
+
+    client.propose_new_admin(&admin, &new_admin);
+    client.accept_admin_role(&new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+
+    let result = client.try_accept_admin_role(&new_admin);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_admin(), new_admin);
+}
+
+/// A pending nomination does not alter the admin: the current admin remains the
+/// final admin, cannot be stripped, and can cancel at any point.
+#[test]
+fn test_pending_handoff_cannot_lock_out_current_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let nominee = Address::generate(&env);
+    client.init(&admin);
+    client.propose_new_admin(&admin, &nominee);
+
+    // The current admin is still the sole admin while the nomination is pending.
+    assert_eq!(client.get_admin(), admin);
+    assert!(client.is_admin(&admin));
+    assert!(!client.is_admin(&nominee));
+    assert!(!client.has_role(&nominee, &Role::Admin));
+
+    // Loss-of-admin guards still apply.
+    assert_eq!(
+        client.try_revoke_role(&admin, &admin, &Role::Admin),
+        Err(Ok(PrediFiError::AdminError))
+    );
+    assert_eq!(
+        client.try_revoke_all_roles(&admin, &admin),
+        Err(Ok(PrediFiError::AdminError))
+    );
+
+    // The admin can still perform privileged operations and cancel.
+    client.assign_role(&admin, &nominee, &Role::Operator);
+    client.cancel_admin_transfer(&admin);
+    assert_eq!(client.get_admin(), admin);
+    assert!(client.has_role(&admin, &Role::Admin));
+}
+
+/// Emits a distinct event for each stage of the handoff so indexers and
+/// monitoring can follow proposals, replacements, cancellations and acceptance.
+#[test]
+fn test_admin_handoff_emits_clear_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let first_nominee = Address::generate(&env);
+    let second_nominee = Address::generate(&env);
+    client.init(&admin);
+
+    client.propose_new_admin(&admin, &first_nominee);
+    assert!(event_emitted(&env, "admin_transfer_proposed"));
+    assert!(!event_emitted(&env, "admin_transfer_replaced"));
+
+    client.propose_new_admin(&admin, &second_nominee);
+    assert!(event_emitted(&env, "admin_transfer_replaced"));
+
+    client.cancel_admin_transfer(&admin);
+    assert!(event_emitted(&env, "admin_transfer_cancelled"));
+
+    client.propose_new_admin(&admin, &second_nominee);
+    client.accept_admin_role(&second_nominee);
+    assert!(event_emitted(&env, "admin_transfer_accepted"));
+    assert!(event_emitted(&env, "admin_transferred"));
+}
+
+/// Deployed instances that predate the handoff feature only have `Admin` and
+/// the Admin role in storage. They must remain readable after the upgrade, and
+/// the two-step flow must work without a destructive state migration.
+#[test]
+fn test_migration_compatibility_with_legacy_deployment_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+
+    let legacy_admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    // Simulate state written by an older deployment: only Admin + Admin role.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &legacy_admin.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(legacy_admin.clone(), Role::Admin), &());
+    });
+
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    // Existing state is preserved; the new pending key is simply absent.
+    assert_eq!(client.get_admin(), legacy_admin);
+    assert_eq!(client.get_proposed_admin(), None);
+    assert!(client.has_role(&legacy_admin, &Role::Admin));
+    assert_eq!(client.get_operator_count(), 0);
+
+    // No migration call is required: the upgraded two-step flow works directly.
+    client.propose_new_admin(&legacy_admin, &new_admin);
+    assert_eq!(client.get_proposed_admin(), Some(new_admin.clone()));
+    client.accept_admin_role(&new_admin);
+
+    assert_eq!(client.get_admin(), new_admin);
+    assert_eq!(client.get_proposed_admin(), None);
+    assert!(client.has_role(&new_admin, &Role::Admin));
+    assert!(!client.has_role(&legacy_admin, &Role::Admin));
+}
+
+/// A deployed instance that had already nominated an admin under the old code
+/// can still complete (or cancel) that nomination after the upgrade.
+#[test]
+fn test_migration_compatibility_with_pre_existing_nomination() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+
+    let legacy_admin = Address::generate(&env);
+    let nominee = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &legacy_admin.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposedAdmin, &nominee.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(legacy_admin.clone(), Role::Admin), &());
+    });
+
+    let client = AccessControlClient::new(&env, &contract_id);
+    assert_eq!(client.get_proposed_admin(), Some(nominee.clone()));
+
+    client.accept_admin_role(&nominee);
+    assert_eq!(client.get_admin(), nominee);
+    assert!(!client.has_role(&legacy_admin, &Role::Admin));
 }
