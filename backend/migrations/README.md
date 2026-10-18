@@ -27,7 +27,7 @@ When adding a new migration, use the **next unused integer**, run
 `sqlx migrate add <description>` (or create the file by hand) inside this
 directory, and never reuse or renumber a prefix that already exists — see
 [Duplicate prefixes](#duplicate-004-and-009-prefixes-do-not-rename) below.
-The next available prefix is **`011_`**.
+The next available prefix is **`012_`**.
 
 ## Applying migrations locally
 
@@ -79,8 +79,9 @@ against a database that has never had any migrations applied to it.
 | `009_add_predictions_indexes.sql` | Targeted indexes on `predictions` for query patterns not yet covered by an index. |
 | `009_create_user_statistics.sql` | Pre-aggregated `user_statistics` table, maintained by triggers, for user betting volume/winnings/prediction counts. |
 | `010_tags_claims_notifications.sql` | Multi-tag support on pools, claim tracking, and a notification system. |
+| `011_align_market_filter_indexes.sql` | Composite and partial indexes on `pools` for predictable status, time, creator, and outcome query plans. |
 
-All 12 files above exist in this directory today.
+All 13 files above exist in this directory today.
 
 ## Duplicate 004 and 009 prefixes (do not rename)
 
@@ -134,4 +135,4 @@ databases that already ran it — hence this issue being documentation-only.
 **Convention going forward:** always use the next unused integer prefix, and
 double-check this table (or `ls backend/migrations/`) before naming a new
 migration file so prefixes are never reused again. The next migration should
-be named `011_<description>.sql`.
+be named `012_<description>.sql`.

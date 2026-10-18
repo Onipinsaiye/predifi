@@ -300,6 +300,25 @@ const POOLS_DEFAULT_PAGE_SIZE: i64 = 20;
 /// is clamped down to it rather than rejected with 400, so a client that
 /// over-requests still gets a bounded, servable page (see #1734).
 const POOLS_MAX_PAGE_SIZE: i64 = 100;
+/// Maximum page offset for `GET /api/v1/pools` to prevent unbounded query scanning.
+const POOLS_MAX_OFFSET: i64 = 10_000;
+
+/// Parse an ISO 8601 / RFC 3339 string or Unix epoch seconds into a UTC DateTime.
+fn parse_market_timestamp(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let s = s.trim();
+    if let Ok(ts_sec) = s.parse::<i64>() {
+        // Enforce reasonable epoch bounds: 2000-01-01 to 2100-01-01
+        if ts_sec < 946684800 || ts_sec > 4102444800 {
+            return Err(format!("timestamp {ts_sec} is outside supported range (2000 to 2100)"));
+        }
+        chrono::DateTime::from_timestamp(ts_sec, 0)
+            .ok_or_else(|| format!("invalid unix timestamp: {s}"))
+    } else {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| format!("invalid RFC3339 datetime '{s}': {e}"))
+    }
+}
 
 /// Query parameters for the `GET /api/v1/pools` endpoint.
 #[derive(Debug, Deserialize)]
@@ -310,9 +329,23 @@ pub struct PoolsQuery {
     pub category: Option<NonEmptyString>,
     /// Status filter: "active" | "closed" | "settled" (default: "active")
     pub status: Option<PoolStatus>,
+    /// Creator filter: 56-character Stellar address (G... or C...)
+    pub creator: Option<StellarAddress>,
     /// Comma-separated tag filter, e.g. "btc,price-prediction". A pool
-    /// matches if any of its tags overlap this list.
+    /// matches if any of its tags overlap this list (max 10 tags).
     pub tags: Option<String>,
+    /// Single tag filter alias.
+    pub tag: Option<String>,
+    /// Earliest market end time (RFC3339 or Unix timestamp in seconds).
+    pub end_time_min: Option<String>,
+    /// Latest market end time (RFC3339 or Unix timestamp in seconds).
+    pub end_time_max: Option<String>,
+    /// Alias for end_time_min.
+    pub from_time: Option<String>,
+    /// Alias for end_time_max.
+    pub to_time: Option<String>,
+    /// Winning outcome filter for settled markets (e.g. "0", "1").
+    pub outcome: Option<String>,
     /// Page size. Missing defaults to [`POOLS_DEFAULT_PAGE_SIZE`]; a value
     /// outside `[1, POOLS_MAX_PAGE_SIZE]` is clamped into range in the
     /// handler rather than rejected — unlike most other paginated endpoints
@@ -340,6 +373,16 @@ pub struct PoolsResponse {
     pub status: String,
     pub category: Option<String>,
     pub sort_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time_min: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time_max: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 /// `GET /api/v1/pools/:id` — get detailed pool information with real-time odds.
@@ -488,21 +531,127 @@ pub async fn get_pools(
 
     let sort_by = params.sort_by.map(|s| s.as_str()).unwrap_or("new");
     let category = params.category.as_ref().map(|s| s.as_str());
-    let status = params.status.map(|s| s.as_str()).unwrap_or("active");
-    // Clamp rather than reject: a client asking for more than the max page
-    // size still gets a bounded, servable page instead of a 400 (#1734).
+
+    // Validate pagination bounds (#1734: clamp limit, enforce max offset)
     let limit = resolve_pools_page_size(params.limit);
     let offset = params.offset.map(|b| b.get()).unwrap_or(0);
-    let tags: Option<Vec<String>> = params
-        .tags
-        .as_ref()
-        .map(|s| {
-            s.split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty());
+    if offset > POOLS_MAX_OFFSET {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            format!("unbounded request: offset cannot exceed {POOLS_MAX_OFFSET}"),
+        )
+        .into_response();
+    }
+
+    // Parse and bound tag filters (max 10 tags, max 50 chars per tag)
+    let raw_tags = params.tags.or(params.tag);
+    let mut tags: Option<Vec<String>> = None;
+    if let Some(t_str) = raw_tags {
+        let parsed: Vec<String> = t_str
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if parsed.len() > 10 {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "unbounded request: tags filter cannot exceed 10 tags",
+            )
+            .into_response();
+        }
+        for t in &parsed {
+            if t.len() > 50 {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unbounded request: individual tag cannot exceed 50 characters",
+                )
+                .into_response();
+            }
+        }
+        if !parsed.is_empty() {
+            tags = Some(parsed);
+        }
+    }
+
+    // Parse and validate time filters (end_time_min <= end_time_max)
+    let raw_min = params.end_time_min.or(params.from_time);
+    let raw_max = params.end_time_max.or(params.to_time);
+
+    let end_time_min = match raw_min.as_deref() {
+        Some(s) => match parse_market_timestamp(s) {
+            Ok(dt) => Some(dt),
+            Err(e) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    format!("invalid time format for end_time_min / from_time: {e}"),
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let end_time_max = match raw_max.as_deref() {
+        Some(s) => match parse_market_timestamp(s) {
+            Ok(dt) => Some(dt),
+            Err(e) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    format!("invalid time format for end_time_max / to_time: {e}"),
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+
+    if let (Some(min), Some(max)) = (end_time_min, end_time_max) {
+        if min > max {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "contradictory filter: end_time_min cannot be greater than end_time_max",
+            )
+            .into_response();
+        }
+    }
+
+    // Validate outcome & status combination (outcome only valid for settled markets)
+    let outcome = params
+        .outcome
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    let (effective_status, outcome_filter) = match (params.status, outcome) {
+        (Some(status), Some(outcome_val)) => {
+            if status != PoolStatus::Settled {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    format!(
+                        "contradictory filter: outcome filter is only valid for settled markets, cannot be combined with status '{}'",
+                        status.as_str()
+                    ),
+                )
+                .into_response();
+            }
+            ("settled", Some(outcome_val))
+        }
+        (None, Some(outcome_val)) => {
+            // Default to settled when outcome filter is specified
+            ("settled", Some(outcome_val))
+        }
+        (Some(status), None) => (status.as_str(), None),
+        (None, None) => ("active", None),
+    };
+
+    let creator_str = params.creator.as_ref().map(|c| c.as_str());
 
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
@@ -515,7 +664,10 @@ pub async fn get_pools(
 
     // Cache-aside pattern: Step 1 — Check cache
     let mut cache_key =
-        crate::redis_cache::pools_cache_key(sort_by, category, status, limit, offset);
+        crate::redis_cache::pools_cache_key(sort_by, category, effective_status, limit, offset);
+    if let Some(c) = creator_str {
+        cache_key = format!("{cache_key}:creator:{c}");
+    }
     if let Some(tags) = &tags {
         let sanitized: Vec<String> = tags
             .iter()
@@ -526,27 +678,53 @@ pub async fn get_pools(
             cache_key = format!("{cache_key}:tags:{}", sanitized.join(","));
         }
     }
+    if let Some(min) = end_time_min {
+        cache_key = format!("{cache_key}:min:{}", min.timestamp());
+    }
+    if let Some(max) = end_time_max {
+        cache_key = format!("{cache_key}:max:{}", max.timestamp());
+    }
+    if let Some(out) = outcome_filter {
+        cache_key = format!(
+            "{cache_key}:outcome:{}",
+            crate::redis_cache::sanitize_key_component(out)
+        );
+    }
 
     if let Some(cached_response) = state.redis.get::<serde_json::Value>(&cache_key).await {
         // Cache hit — return cached data
         return (StatusCode::OK, Json(cached_response)).into_response();
     }
 
-    // Cache miss — Step 2: Fetch from database
+    // Cache miss — Step 2: Fetch from database with explicit filters
+    let filter_criteria = crate::tags::MarketFilters {
+        sort_by,
+        category,
+        tags: tags.as_deref(),
+        status: effective_status,
+        creator: creator_str,
+        end_time_min,
+        end_time_max,
+        outcome: outcome_filter,
+        limit,
+        offset,
+    };
+    let count_criteria = crate::tags::MarketCountFilters {
+        category,
+        tags: tags.as_deref(),
+        status: effective_status,
+        creator: creator_str,
+        end_time_min,
+        end_time_max,
+        outcome: outcome_filter,
+    };
+
     match tokio::try_join!(
-        crate::tags::list_pools(
-            db,
-            sort_by,
-            category,
-            tags.as_deref(),
-            status,
-            limit,
-            offset
-        ),
-        crate::tags::count_pools(db, category, tags.as_deref(), status)
+        crate::tags::list_pools_with_filters(db, &filter_criteria),
+        crate::tags::count_pools_with_filters(db, &count_criteria)
     ) {
         Ok((pools, total)) => {
-            if status == "active" {
+            if effective_status == "active" {
                 state.metrics.active_pools.set(total as f64);
             }
 
@@ -555,9 +733,14 @@ pub async fn get_pools(
                 total,
                 limit,
                 offset,
-                status: status.to_string(),
+                status: effective_status.to_string(),
                 category: category.map(|s| s.to_string()),
                 sort_by: sort_by.to_string(),
+                creator: creator_str.map(|s| s.to_string()),
+                tags,
+                end_time_min,
+                end_time_max,
+                outcome: outcome_filter.map(|s| s.to_string()),
             };
 
             let json_response = json!(&response);
@@ -2032,5 +2215,42 @@ mod pools_pagination_tests {
     fn non_positive_limit_is_clamped_up_to_one() {
         assert_eq!(resolve_pools_page_size(Some(0)), 1);
         assert_eq!(resolve_pools_page_size(Some(-5)), 1);
+    }
+}
+
+#[cfg(test)]
+mod market_filters_tests {
+    use super::*;
+
+    #[test]
+    fn parse_market_timestamp_rfc3339() {
+        let dt = parse_market_timestamp("2026-10-18T12:00:00Z").expect("valid rfc3339");
+        assert_eq!(dt.timestamp(), 1792324800);
+    }
+
+    #[test]
+    fn parse_market_timestamp_unix_seconds() {
+        let dt = parse_market_timestamp("1792324800").expect("valid unix timestamp");
+        assert_eq!(dt.timestamp(), 1792324800);
+    }
+
+    #[test]
+    fn parse_market_timestamp_rejects_out_of_range() {
+        let err_too_early = parse_market_timestamp("1000").unwrap_err();
+        assert!(err_too_early.contains("supported range"));
+
+        let err_too_late = parse_market_timestamp("5000000000").unwrap_err();
+        assert!(err_too_late.contains("supported range"));
+    }
+
+    #[test]
+    fn parse_market_timestamp_rejects_invalid_text() {
+        let err = parse_market_timestamp("not-a-timestamp").unwrap_err();
+        assert!(err.contains("invalid RFC3339"));
+    }
+
+    #[test]
+    fn pools_max_offset_is_bounded() {
+        assert_eq!(POOLS_MAX_OFFSET, 10_000);
     }
 }
