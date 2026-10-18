@@ -34,6 +34,14 @@ This directory contains comprehensive documentation for the PrediFi prediction m
 | **[contract-reference.md](./contract-reference.md)** | Smart contract API reference | Current |
 | **[FRONTEND_FEATURES.md](./FRONTEND_FEATURES.md)** | Frontend feature documentation | Current |
 
+### Architecture Decision Records
+
+| Document | Description | Status |
+|----------|-------------|--------|
+| **[adr/README.md](./adr/README.md)** | ADR workflow, status values, and decision index | Current |
+| **[adr/TEMPLATE.md](./adr/TEMPLATE.md)** | Concise template for proposed architecture decisions | Current |
+| **[adr/0001-contract-state-authoritative.md](./adr/0001-contract-state-authoritative.md)** | Contract state authority and event-derived backend projections | Accepted |
+
 ### Security & Audit Documents
 
 | Document | Description | Status |
