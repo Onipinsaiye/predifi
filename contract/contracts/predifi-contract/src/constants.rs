@@ -406,6 +406,45 @@ pub const MAX_PRICE_CONDITION_MATCH_STEPS: u32 = 4;
 /// **Used for:** Version tracking in instance storage and upgrade migration logic.
 pub const CONTRACT_VERSION: u32 = 1;
 
+/// Current storage schema version.
+///
+/// **Units:** Version number (dimensionless)
+/// **Value:** 1
+///
+/// **Rationale:** The storage schema version tracks the layout of persistent data
+/// independently from the contract code version. Code upgrades do not always require
+/// schema changes; conversely, a schema migration may span multiple code deployments.
+///
+/// Invariant: `CURRENT_SCHEMA_VERSION >= MIN_SUPPORTED_SCHEMA_VERSION`.
+///
+/// **When to bump:**
+/// - Any time a `DataKey` variant is added, removed, or its payload type changes.
+/// - Any time a `#[contracttype]` struct used in persistent storage gains or loses a field.
+///
+/// **Used for:** Written to `DataKey::SchemaVersion` on fresh init and validated in
+/// `migrate_state` before applying migration logic.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// Minimum storage schema version this binary can successfully migrate **from**.
+///
+/// **Units:** Version number (dimensionless)
+/// **Value:** 1
+///
+/// **Rationale:** Prevents silent corruption when a contract binary that only knows
+/// how to migrate from v1→v2 is accidentally run against a v3 schema (future version
+/// deployed by a newer binary). In that case the on-chain schema version would be
+/// *greater* than `CURRENT_SCHEMA_VERSION`, and any migration attempt must be rejected
+/// with `UnsupportedSchemaVersion` rather than silently corrupting state.
+///
+/// **Impact of changes:**
+/// - Raise this value when old migration paths are dropped (e.g., after all live
+///   instances have been migrated past that version).
+/// - Should never exceed `CURRENT_SCHEMA_VERSION`.
+///
+/// **Used for:** Lower-bound check in `migrate_state`: the stored schema version must
+/// satisfy `MIN_SUPPORTED_SCHEMA_VERSION <= stored <= CURRENT_SCHEMA_VERSION`.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
 /// Minimum timelock delay in seconds for protocol fee changes.
 ///
 /// **Units:** Seconds
@@ -477,6 +516,16 @@ mod tests {
     #[test]
     fn test_contract_version_is_positive() {
         assert!(CONTRACT_VERSION > 0);
+    }
+
+    #[test]
+    fn test_schema_version_constants_are_consistent() {
+        // CURRENT_SCHEMA_VERSION must be positive.
+        assert!(CURRENT_SCHEMA_VERSION > 0);
+        // MIN_SUPPORTED must not exceed CURRENT.
+        assert!(MIN_SUPPORTED_SCHEMA_VERSION <= CURRENT_SCHEMA_VERSION);
+        // Both constants must be positive.
+        assert!(MIN_SUPPORTED_SCHEMA_VERSION > 0);
     }
 
     #[test]

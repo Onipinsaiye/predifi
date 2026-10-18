@@ -107,13 +107,15 @@ use soroban_sdk::{contractimpl, Address, BytesN, Env, Symbol, Vec};
 use crate::{
     AddedToWhitelistEvent, ClaimWindowUpdateEvent, Config, ContractInfo, ContractMetadata,
     ContractPausedAlertEvent, ContractUpgradedEvent, DataKey, FeeChangeCancelEvent,
-    FeeChangeProposeEvent, FeeConfig, FeeInfo, FeeTier, FeeTiersUpdateEvent, FeeUpdateEvent, InitEvent,
-    MaxPredictionsUpdateEvent, MinPoolDurationUpdateEvent, MinStakeUpdateEvent, PauseEvent,
-    PendingFeeChange, Pool, PredictionCooldownUpdateEvent, PredifiContract, PredifiContractArgs,
-    PredifiContractClient, PredifiError, RemovedFromWhitelistEvent, ResolutionDelayUpdateEvent,
-    StorageTtlRenewedEvent, TokenWhitelistAddedEvent, TokenWhitelistRemovedEvent, UnpauseEvent,
-    UpgradeEvent, CONTRACT_VERSION, DEFAULT_GLOBAL_MIN_STAKE, DEFAULT_PREDICTION_COOLDOWN_SECONDS,
-    FEE_CHANGE_TIMELOCK_SECONDS, MAX_CLAIM_WINDOW, MAX_RESOLUTION_DELAY, MIN_CLAIM_WINDOW,
+    FeeChangeProposeEvent, FeeConfig, FeeInfo, FeeTier, FeeTiersUpdateEvent, FeeUpdateEvent,
+    InitEvent, MaxPredictionsUpdateEvent, MinPoolDurationUpdateEvent, MinStakeUpdateEvent,
+    PauseEvent, PendingFeeChange, Pool, PredictionCooldownUpdateEvent, PredifiContract,
+    PredifiContractArgs, PredifiContractClient, PredifiError, RemovedFromWhitelistEvent,
+    ResolutionDelayUpdateEvent, SchemaMigratedEvent, StorageTtlRenewedEvent,
+    TokenWhitelistAddedEvent, TokenWhitelistRemovedEvent, UnpauseEvent, UpgradeEvent,
+    CONTRACT_VERSION, CURRENT_SCHEMA_VERSION, DEFAULT_GLOBAL_MIN_STAKE,
+    DEFAULT_PREDICTION_COOLDOWN_SECONDS, FEE_CHANGE_TIMELOCK_SECONDS, MAX_CLAIM_WINDOW,
+    MAX_RESOLUTION_DELAY, MIN_CLAIM_WINDOW, MIN_SUPPORTED_SCHEMA_VERSION,
 };
 
 #[contractimpl]
@@ -163,6 +165,11 @@ impl PredifiContract {
         env.storage()
             .instance()
             .set(&DataKey::Version, &CONTRACT_VERSION);
+        // Write the schema version so post-upgrade migrations can detect
+        // which layout the on-chain data conforms to.
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
         Self::extend_instance(&env);
 
         InitEvent {
@@ -248,6 +255,20 @@ impl PredifiContract {
             .instance()
             .get(&DataKey::Version)
             .unwrap_or(0u32)
+    }
+
+    /// Return the storage schema version stored in instance storage.
+    ///
+    /// Returns `1` when the key is absent (contracts deployed before schema
+    /// version tracking was introduced are implicitly on schema v1).
+    ///
+    /// The value is written once during `init` with `CURRENT_SCHEMA_VERSION`
+    /// and updated by each successful `migrate_state` call.
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1u32)
     }
 
     /// Return the contract version as a semantic version string.
@@ -795,21 +816,99 @@ impl PredifiContract {
         Ok(())
     }
 
-    /// Post-upgrade migration logic.
+    /// Post-upgrade state migration with explicit schema version guards.
     ///
-    /// v2 migration: the deprecated `resolved` and `canceled` boolean fields have been
-    /// removed from the `Pool` struct. All state is now represented exclusively by the
-    /// `state: MarketState` field. Existing pools stored with the old schema are
-    /// automatically handled by Soroban's XDR codec — the removed fields are simply
-    /// ignored on read, so no explicit data rewrite is required.
+    /// # Guards
+    ///
+    /// 1. **Already current** — if the on-chain `SchemaVersion` equals
+    ///    `CURRENT_SCHEMA_VERSION` the function returns
+    ///    `Err(PredifiError::SchemaAlreadyMigrated)` rather than silently
+    ///    succeeding. This prevents accidental repeated migrations.
+    ///
+    /// 2. **Unknown future schema** — if the stored version is *greater* than
+    ///    `CURRENT_SCHEMA_VERSION` (i.e. the on-chain schema was written by a
+    ///    newer binary), the function returns
+    ///    `Err(PredifiError::UnsupportedSchemaVersion)` so that the operator
+    ///    knows to deploy the correct binary before migrating.
+    ///
+    /// 3. **Dropped migration path** — if the stored version is *less* than
+    ///    `MIN_SUPPORTED_SCHEMA_VERSION` (support for that migration path was
+    ///    intentionally removed), the function also returns
+    ///    `Err(PredifiError::UnsupportedSchemaVersion)`.
+    ///
+    /// # Migration table
+    ///
+    /// | Stored version | Action |
+    /// |----------------|--------|
+    /// | `< MIN_SUPPORTED_SCHEMA_VERSION` | `Err(UnsupportedSchemaVersion)` |
+    /// | `== CURRENT_SCHEMA_VERSION` | `Err(SchemaAlreadyMigrated)` |
+    /// | `> CURRENT_SCHEMA_VERSION` | `Err(UnsupportedSchemaVersion)` |
+    /// | in `[MIN_SUPPORTED, CURRENT)` | run migration, update version, emit event |
+    ///
+    /// # Adding new migrations
+    ///
+    /// When bumping `CURRENT_SCHEMA_VERSION` to `N`:
+    /// 1. Add a `if stored_version == N - 1 { /* ... */ }` block below.
+    /// 2. The block must leave all data in a state consistent with schema `N`.
+    /// 3. Do **not** change `stored_version` inside the block — the function
+    ///    updates `DataKey::SchemaVersion` to `CURRENT_SCHEMA_VERSION` after
+    ///    all migration steps have completed successfully.
+    ///
+    /// # Authorization
+    /// Requires authentication from a caller with the Admin role.
     pub fn migrate_state(env: Env, admin: Address) -> Result<(), PredifiError> {
         Self::require_not_paused(&env)?;
         admin.require_auth();
         Self::require_admin_role(&env, &admin, "migrate_state")?;
 
-        // v2 migration: Add any state migration logic here.
-        // Use Self::validate_pool_invariants(&pool) to ensure pool data consistency
-        // during migrations.
+        // Read the current on-chain schema version.  If the key is absent
+        // (contract was deployed before this feature landed) treat it as v1.
+        let stored_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1u32);
+
+        // Guard: already up-to-date — reject to signal a no-op to the caller.
+        if stored_version == CURRENT_SCHEMA_VERSION {
+            return Err(PredifiError::SchemaAlreadyMigrated);
+        }
+
+        // Guard: future schema or dropped path — we cannot safely migrate.
+        if stored_version > CURRENT_SCHEMA_VERSION
+            || stored_version < MIN_SUPPORTED_SCHEMA_VERSION
+        {
+            return Err(PredifiError::UnsupportedSchemaVersion);
+        }
+
+        // ── Per-version migration logic ──────────────────────────────────────
+        //
+        // Add a block here for each schema version bump, e.g.:
+        //
+        //   if stored_version < 2 {
+        //       // v1 → v2: populate the new DataKey::SomeNewKey with a
+        //       // sensible default derived from existing storage.
+        //   }
+        //
+        // All guard branches above guarantee that `stored_version` is in the
+        // half-open interval [MIN_SUPPORTED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION).
+        //
+        // Currently CURRENT_SCHEMA_VERSION == MIN_SUPPORTED_SCHEMA_VERSION == 1,
+        // so no reachable migration path exists yet.  The branches above will
+        // be exercised once CURRENT_SCHEMA_VERSION is bumped to 2.
+
+        // ── Finalise: advance the on-chain schema version ────────────────────
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
+        Self::extend_instance(&env);
+
+        SchemaMigratedEvent {
+            old_schema_version: stored_version,
+            new_schema_version: CURRENT_SCHEMA_VERSION,
+            migrated_by: admin,
+        }
+        .publish(&env);
 
         Ok(())
     }

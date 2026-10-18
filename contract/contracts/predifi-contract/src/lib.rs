@@ -43,6 +43,8 @@ mod pause_unpause_boundary_tests;
 // #[cfg(test)]
 // mod max_pools_stress_tests;
 #[cfg(test)]
+mod schema_version_tests;
+#[cfg(test)]
 mod update_pool_description_boundary_tests;
 #[cfg(test)]
 mod withdraw_treasury_boundary_tests;
@@ -265,6 +267,15 @@ pub enum PredifiError {
     FeeChangePending = 95,
     NoFeeChangePending = 96,
     TimelockNotExpired = 97,
+    /// The on-chain schema version is outside the range this binary can migrate.
+    ///
+    /// Returned by `migrate_state` when the stored `SchemaVersion` is either
+    /// below `MIN_SUPPORTED_SCHEMA_VERSION` (dropped migration path) or above
+    /// `CURRENT_SCHEMA_VERSION` (written by a newer binary).
+    UnsupportedSchemaVersion = 181,
+    /// `migrate_state` was called but the on-chain schema is already at
+    /// `CURRENT_SCHEMA_VERSION` — no migration was needed.
+    SchemaAlreadyMigrated = 182,
 }
 
 /// Represents the current state of a prediction market.
@@ -671,6 +682,15 @@ pub enum DataKey {
     Paused,
     /// Contract version for safe upgrade migrations: `Version` -> `u32`
     Version,
+    /// Storage schema version, independent of the code/contract version.
+    ///
+    /// Written once during `init` with the value `CURRENT_SCHEMA_VERSION` and
+    /// updated at the end of each successful `migrate_state` call. Guards prevent
+    /// re-running a migration on an already-current schema and block running a
+    /// binary that only knows older migration paths against a newer on-chain schema.
+    ///
+    /// Storage: `SchemaVersion` -> `u32`
+    SchemaVersion,
     /// Referral cut in basis points: `ReferralCutBps` -> `u32`
     ReferralCutBps,
     /// Reentrancy guard (temporary storage): `RentGuard` -> `bool`
@@ -1276,6 +1296,20 @@ pub struct ContractUpgradedEvent {
     pub old_version: u32,
     pub new_version: u32,
     pub upgraded_by: Address,
+}
+
+/// Emitted by `migrate_state` when the storage schema has been successfully
+/// advanced from `old_schema_version` to `new_schema_version`.
+#[contractevent(topics = ["schema_migrated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaMigratedEvent {
+    /// Schema version that was present on-chain before this migration.
+    pub old_schema_version: u32,
+    /// Schema version written to storage after migration completes.
+    pub new_schema_version: u32,
+    /// Admin address that triggered the migration.
+    pub migrated_by: Address,
 }
 
 #[contractevent(topics = ["oracle_init"])]
