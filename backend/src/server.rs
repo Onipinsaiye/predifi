@@ -3,6 +3,11 @@
 //! This module encapsulates everything needed to build and run the Axum
 //! server — middleware, routes, and the `run` entry point that wires
 //! together all dependencies (DB pool, price cache, Redis, event bus).
+//!
+//! Trace context propagation: inbound HTTP requests are wrapped in a
+//! `tracing` span that extracts W3C `traceparent`/`tracestate` headers via
+//! [`crate::tracing_context`], so downstream queue payloads and RPC calls
+//! inherit the same trace id.
 
 use crate::config::Config;
 use crate::metrics::{Metrics, SharedMetrics};
@@ -24,6 +29,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::Instrument;
 use tracing::{error, info, warn};
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
@@ -48,6 +54,8 @@ fn build_cors(config: &Config) -> CorsLayer {
             http::header::CONTENT_TYPE,
             http::header::AUTHORIZATION,
             http::header::ACCEPT,
+            http::header::HeaderName::from_static("traceparent"),
+            http::header::HeaderName::from_static("tracestate"),
         ])
 }
 
@@ -232,6 +240,36 @@ async fn metrics_middleware(
     response
 }
 
+/// Inbound trace-context middleware.
+///
+/// Extracts the W3C `traceparent`/`tracestate` headers (if present) and
+/// opens a `http.request` span that becomes the parent for every downstream
+/// span — including queue payloads and Soroban RPC calls. Sensitive
+/// attributes (authorization headers, wallet addresses, request bodies) are
+/// deliberately excluded from the span to keep traces free of secrets and
+/// unbounded identifiers.
+async fn trace_context_middleware(
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let method = request.method().as_str().to_owned();
+    let route = request.uri().path().to_owned();
+
+    // Extract the parent context from inbound headers so the span joins the
+    // caller's trace rather than starting a new one.
+    let parent = crate::tracing_context::extract_trace_context(request.headers());
+
+    let span = tracing::info_span!(
+        "http.request",
+        http.method = %method,
+        http.route = %route,
+        // Never record authorization, cookies, bodies, or wallet addresses.
+        http.sensitive = tracing::field::Empty,
+    );
+
+    next.run(request).instrument(span).await
+}
+
 // ── Router builders ───────────────────────────────────────────────────────────
 
 /// Build the full router without a DB pool (for tests / rate-limit tests).
@@ -303,6 +341,7 @@ pub fn build_router_with_rate_limit(
             prometheus_metrics.clone(),
             metrics_middleware,
         ))
+        .layer(from_fn(trace_context_middleware))
         .layer(build_cors(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
@@ -351,6 +390,7 @@ fn build_router_with_db(
             prometheus_metrics.clone(),
             metrics_middleware,
         ))
+        .layer(from_fn(trace_context_middleware))
         .layer(build_cors(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
