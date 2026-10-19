@@ -297,6 +297,46 @@ jobs:
         env:
           STELLAR_NETWORK: testnet
 
+  smoke-test:
+    name: Testnet smoke test
+    needs: [deploy-testnet]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: testnet
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli --features opt
+      - name: Configure testnet identity
+        env:
+          STELLAR_SECRET_KEY: ${{ secrets.STELLAR_TESTNET_SECRET_KEY }}
+        run: |
+          if [[ -z "${STELLAR_SECRET_KEY}" ]]; then
+            echo "::error::STELLAR_TESTNET_SECRET_KEY secret is not set"
+            exit 1
+          fi
+          printf '%s\n' "${STELLAR_SECRET_KEY}" | stellar keys add smoke-runner --secret-key
+          stellar network add testnet \
+            --rpc-url https://soroban-testnet.stellar.org:443 \
+            --network-passphrase "Test SDF Network ; September 2015" || true
+      - name: Verify required repo variables are set
+        env:
+          PREDIFI_ID: ${{ vars.TESTNET_PREDIFI_CONTRACT_ID }}
+          AC_ID: ${{ vars.TESTNET_AC_CONTRACT_ID }}
+        run: |
+          if [[ -z "${PREDIFI_ID}" || -z "${AC_ID}" ]]; then
+            echo "::error::Set TESTNET_PREDIFI_CONTRACT_ID and TESTNET_AC_CONTRACT_ID in repository variables (Settings → Variables)"
+            exit 1
+          fi
+      - name: Run smoke test
+        env:
+          PREDIFI_ID: ${{ vars.TESTNET_PREDIFI_CONTRACT_ID }}
+          AC_ID: ${{ vars.TESTNET_AC_CONTRACT_ID }}
+          SOURCE: smoke-runner
+          NETWORK: testnet
+        run: bash contract/scripts/testnet-smoke.sh
+
   # ── Issue #137: staging tampered-artifact verification test ──
   attestation-test:
     name: Attestation fail-closed test
