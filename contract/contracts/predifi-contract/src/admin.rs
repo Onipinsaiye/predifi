@@ -373,6 +373,8 @@ impl PredifiContract {
         config.fee_bps = pending.new_fee_bps;
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().remove(&DataKey::PendingFeeBps);
+        // Only pools created from now on snapshot the new schedule.
+        Self::bump_fee_schedule_version(&env);
         Self::extend_instance(&env);
 
         FeeUpdateEvent {
@@ -1260,6 +1262,9 @@ impl PredifiContract {
 
         env.storage().persistent().set(&DataKey::FeeTiers, &tiers);
         Self::bump_ttl(&env, &DataKey::FeeTiers);
+        // Only pools created from now on snapshot the new tiers.
+        Self::bump_fee_schedule_version(&env);
+        Self::extend_instance(&env);
 
         FeeTiersUpdateEvent {
             admin,
@@ -1290,6 +1295,7 @@ impl PredifiContract {
     /// Entries renewed:
     /// - `Pool(pool_id)` — core pool struct
     /// - `OutStakes(pool_id)` — batch outcome stakes (if present)
+    /// - `PoolFeeSchedule(pool_id)` / `ResolutionChallenge(pool_id)` (if present)
     ///
     /// # Arguments
     /// * `pool_id` - The ID of the pool whose TTLs should be renewed.
@@ -1315,6 +1321,15 @@ impl PredifiContract {
         let stakes_key = DataKey::OutStakes(pool_id);
         if env.storage().persistent().has(&stakes_key) {
             Self::extend_persistent(&env, &stakes_key);
+        }
+
+        for key in [
+            DataKey::PoolFeeSchedule(pool_id),
+            DataKey::ResolutionChallenge(pool_id),
+        ] {
+            if env.storage().persistent().has(&key) {
+                Self::extend_persistent(&env, &key);
+            }
         }
 
         StorageTtlRenewedEvent {
