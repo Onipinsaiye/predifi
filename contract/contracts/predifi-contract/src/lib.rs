@@ -24,6 +24,9 @@ mod price_feed;
 mod price_feed_simple;
 mod referral;
 mod safe_math;
+mod schema;
+#[cfg(test)]
+mod schema_version_tests;
 #[cfg(test)]
 mod safe_math_examples;
 #[cfg(test)]
@@ -265,6 +268,15 @@ pub enum PredifiError {
     FeeChangePending = 95,
     NoFeeChangePending = 96,
     TimelockNotExpired = 97,
+    /// The stored schema version is not supported by this contract binary.
+    /// Emitted when `migrate_state` is called on a contract whose on-chain
+    /// schema version is ahead of (or otherwise incompatible with) the deployed
+    /// binary.  The deployer must upgrade to a compatible binary first.
+    UnsupportedSchemaVersion = 181,
+    /// `migrate_state` was called but the on-chain schema version already
+    /// matches `CURRENT_SCHEMA_VERSION`.  This is a no-op guard to prevent
+    /// accidental repeated migrations from corrupting state.
+    SchemaMigrationAlreadyRun = 182,
 }
 
 /// Represents the current state of a prediction market.
@@ -671,6 +683,14 @@ pub enum DataKey {
     Paused,
     /// Contract version for safe upgrade migrations: `Version` -> `u32`
     Version,
+    /// Storage schema version for detecting and guarding state-layout changes:
+    /// `SchemaVersion` -> `u32`
+    ///
+    /// Written by `init()` on fresh deployment and updated by `migrate_state()`
+    /// after each successful migration.  If this key is absent the schema is
+    /// treated as version 0 (pre-versioning era), which triggers a migration to
+    /// `CURRENT_SCHEMA_VERSION` on the next `migrate_state` call.
+    SchemaVersion,
     /// Referral cut in basis points: `ReferralCutBps` -> `u32`
     ReferralCutBps,
     /// Reentrancy guard (temporary storage): `RentGuard` -> `bool`
@@ -1276,6 +1296,21 @@ pub struct ContractUpgradedEvent {
     pub old_version: u32,
     pub new_version: u32,
     pub upgraded_by: Address,
+}
+
+/// Emitted by `migrate_state` when schema migrations run successfully.
+///
+/// `from_schema` is the on-chain schema version that was in place before
+/// the migration; `to_schema` is `CURRENT_SCHEMA_VERSION` after it.
+/// Off-chain tools can listen for this event to confirm that an upgrade
+/// completed its data migration step.
+#[contractevent(topics = ["schema_migrated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaMigratedEvent {
+    pub admin: Address,
+    pub from_schema: u32,
+    pub to_schema: u32,
 }
 
 #[contractevent(topics = ["oracle_init"])]

@@ -115,6 +115,10 @@ use crate::{
     UpgradeEvent, CONTRACT_VERSION, DEFAULT_GLOBAL_MIN_STAKE, DEFAULT_PREDICTION_COOLDOWN_SECONDS,
     FEE_CHANGE_TIMELOCK_SECONDS, MAX_CLAIM_WINDOW, MAX_RESOLUTION_DELAY, MIN_CLAIM_WINDOW,
 };
+use crate::schema::{
+    read_schema_version, run_pending_migrations, validate_schema_version_for_migration,
+    write_schema_version, CURRENT_SCHEMA_VERSION,
+};
 
 #[contractimpl]
 impl PredifiContract {
@@ -163,6 +167,10 @@ impl PredifiContract {
         env.storage()
             .instance()
             .set(&DataKey::Version, &CONTRACT_VERSION);
+        // Write the schema version so upgrade migrations have a baseline to
+        // compare against.  This must be done during init so that
+        // `migrate_state` can detect whether a migration is needed.
+        write_schema_version(&env, CURRENT_SCHEMA_VERSION);
         Self::extend_instance(&env);
 
         InitEvent {
@@ -797,20 +805,53 @@ impl PredifiContract {
 
     /// Post-upgrade migration logic.
     ///
-    /// v2 migration: the deprecated `resolved` and `canceled` boolean fields have been
-    /// removed from the `Pool` struct. All state is now represented exclusively by the
-    /// `state: MarketState` field. Existing pools stored with the old schema are
-    /// automatically handled by Soroban's XDR codec — the removed fields are simply
-    /// ignored on read, so no explicit data rewrite is required.
+    /// This function enforces **explicit schema version guards** so that the
+    /// contract never silently operates on state it doesn't understand:
+    ///
+    /// 1. Reads `DataKey::SchemaVersion` from instance storage.
+    /// 2. Returns `SchemaMigrationAlreadyRun` if the stored version already
+    ///    equals `CURRENT_SCHEMA_VERSION` (idempotency guard).
+    /// 3. Returns `UnsupportedSchemaVersion` if the stored version is *ahead*
+    ///    of `CURRENT_SCHEMA_VERSION` (binary is too old for the on-chain layout).
+    /// 4. Runs the appropriate migration step(s) for each version gap.
+    /// 5. Writes `CURRENT_SCHEMA_VERSION` back to storage and emits
+    ///    `SchemaMigratedEvent`.
+    ///
+    /// # Authorization
+    /// Requires the Admin role (role 0).
+    ///
+    /// # Errors
+    /// * [`PredifiError::SchemaMigrationAlreadyRun`] – migration already done.
+    /// * [`PredifiError::UnsupportedSchemaVersion`] – binary cannot handle the
+    ///   stored schema; upgrade the binary first.
     pub fn migrate_state(env: Env, admin: Address) -> Result<(), PredifiError> {
         Self::require_not_paused(&env)?;
         admin.require_auth();
         Self::require_admin_role(&env, &admin, "migrate_state")?;
 
-        // v2 migration: Add any state migration logic here.
-        // Use Self::validate_pool_invariants(&pool) to ensure pool data consistency
-        // during migrations.
+        // ── 1. Read the schema version currently stored on-chain ────────────
+        let stored_version = read_schema_version(&env);
 
+        // ── 2 & 3. Validate that migration is both needed and possible ───────
+        validate_schema_version_for_migration(stored_version)?;
+
+        // ── 4. Execute all pending migration steps atomically ───────────────
+        //
+        // `run_pending_migrations` advances the stored schema version from
+        // `stored_version` to `CURRENT_SCHEMA_VERSION` one step at a time and
+        // writes the final version back to storage.  If any step fails the
+        // transaction is rolled back, leaving the schema version unchanged.
+        run_pending_migrations(&env, stored_version)?;
+
+        // ── 5. Emit observable event for off-chain monitors ─────────────────
+        crate::SchemaMigratedEvent {
+            admin,
+            from_schema: stored_version,
+            to_schema: CURRENT_SCHEMA_VERSION,
+        }
+        .publish(&env);
+
+        Self::extend_instance(&env);
         Ok(())
     }
 
