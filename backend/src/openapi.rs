@@ -1,6 +1,9 @@
 //! OpenAPI / Swagger documentation.
 //!
 //! The Swagger UI is served at `/swagger-ui/`.
+//!
+//! The generated spec is validated against live Axum handlers by the
+//! `openapi_contract` integration test; CI fails on stale artifacts or drift.
 
 use axum::{routing::get, Json, Router};
 use utoipa::{OpenApi, ToSchema};
@@ -480,3 +483,19 @@ pub fn swagger_router() -> Router {
         get(|| async { Json(ApiDoc::openapi()) }),
     )
 }
+
+// ── Contract validation ───────────────────────────────────────────────────────
+
+/// Returns the canonical serialized OpenAPI document.
+///
+/// Used by the contract test to (a) diff against the committed
+/// `openapi.json` artifact and (b) validate live handler responses against
+/// the published schemas. Keeping this the single source of truth ensures
+/// generated clients and runtime behavior cannot silently diverge.
+pub fn openapi_json() -> serde_json::Value {
+    serde_json::to_value(ApiDoc::openapi())
+        .expect("OpenAPI document must serialize to JSON")
+}
+
+/// Canonical path of the committed OpenAPI artifact used by the clean-diff check.
+pub const OPENAPI_ARTIFACT_PATH: &str = "openapi.json";

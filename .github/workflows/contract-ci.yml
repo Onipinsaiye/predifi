@@ -7,6 +7,8 @@ on:
       - develop
     paths:
       - "contract/**"
+      - "backend/**"
+      - "openapi/**"
       - ".github/workflows/contract-ci.yml"
   pull_request:
     branches:
@@ -14,6 +16,8 @@ on:
       - develop
     paths:
       - "contract/**"
+      - "backend/**"
+      - "openapi/**"
       - ".github/workflows/contract-ci.yml"
   workflow_dispatch:
 
@@ -151,6 +155,65 @@ jobs:
           PROPTEST_CASES: "256"
         run: cargo test -p predifi-contract --lib price_feed_proptests
 
+  contract-client:
+    name: Generated-client contract test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            backend/package-lock.json
+            openapi/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          enableCrossOsArchive: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: ${{ runner.os }}-contract-client-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-contract-client-
+      - name: Generate API clients in a clean workspace
+        run: |
+          set -euo pipefail
+          rm -rf openapi/generated
+          mkdir -p openapi/generated
+          npm --prefix openapi ci
+          npm --prefix openapi run generate
+      - name: Fail on stale generated artifacts
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- openapi/generated; then
+            echo "::error::Generated API clients are stale. Run 'npm --prefix openapi run generate' and commit the result."
+            git diff --stat -- openapi/generated
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain -- openapi/generated)" ]]; then
+            echo "::error::Untracked generated artifacts detected under openapi/generated."
+            git status --porcelain -- openapi/generated
+            exit 1
+          fi
+      - name: Execute contract cases against Axum handlers
+        env:
+          RUST_LOG: info
+          CONTRACT_SCHEMA: openapi/openapi.json
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path backend/Cargo.toml --test contract_client -- --nocapture
+      - name: Verify runtime responses match published schemas
+        env:
+          CONTRACT_SCHEMA: openapi/openapi.json
+        run: |
+          set -euo pipefail
+          npm --prefix openapi ci
+          npm --prefix openapi run validate:runtime
+
   wasm-build:
     name: WASM build verification
     runs-on: ubuntu-latest
@@ -218,7 +281,7 @@ jobs:
 
   deploy-testnet:
     name: Deploy to testnet (verified)
-    needs: [check, fmt, clippy, test, wasm-build]
+    needs: [check, fmt, clippy, test, contract-client, wasm-build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -300,7 +363,7 @@ jobs:
   # ── Issue #137: staging tampered-artifact verification test ──
   attestation-test:
     name: Attestation fail-closed test
-    needs: [wasm-build]
+    needs: [wasm-build, contract-client]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
