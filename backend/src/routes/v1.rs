@@ -15,6 +15,7 @@ use crate::metrics::SharedMetrics;
 use crate::pool_cache::PoolCache;
 use crate::price_cache::PriceCache;
 use crate::redis_cache::RedisCache;
+use crate::request_logger::LoggingLayer;
 use crate::response::{error_codes, ApiResponse};
 use crate::validated_types::{BoundedI64, NonEmptyString, PoolSortBy, PoolStatus, StellarAddress};
 
@@ -1521,6 +1522,7 @@ pub fn router(
 ) -> Router {
     use crate::rate_limit::{with_rate_limit, RateLimitTier};
 
+    let request_metrics = metrics.clone();
     let pool_cache = PoolCache::with_negative_ttl(std::time::Duration::from_secs(
         config.pool_negative_cache_ttl_secs,
     ));
@@ -1637,6 +1639,7 @@ pub fn router(
         .merge(user)
         .merge(write)
         .merge(admin)
+        .layer(LoggingLayer::with_metrics(request_metrics))
 }
 
 /// `POST /api/v1/auth/refresh` — rotate a refresh token and issue a new pair.

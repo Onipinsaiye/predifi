@@ -250,11 +250,15 @@ pub fn build_router(
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let root_routes = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state)
+        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()));
+
+    Router::new()
+        .merge(root_routes)
         .nest(
             "/api",
             routes::router(
@@ -266,9 +270,10 @@ pub fn build_router(
                 event_bus,
             ),
         )
-        .merge(openapi::swagger_router())
+        .merge(
+            openapi::swagger_router().layer(LoggingLayer::with_metrics(prometheus_metrics.clone())),
+        )
         .layer(build_cors(&config))
-        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
 
 /// Build the Axum router with a live database pool.
@@ -296,11 +301,15 @@ pub fn build_router_with_db(
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let root_routes = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state)
+        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()));
+
+    Router::new()
+        .merge(root_routes)
         .nest(
             "/api",
             routes::router_with_db(
@@ -312,9 +321,10 @@ pub fn build_router_with_db(
                 event_bus,
             ),
         )
-        .merge(openapi::swagger_router())
+        .merge(
+            openapi::swagger_router().layer(LoggingLayer::with_metrics(prometheus_metrics.clone())),
+        )
         .layer(build_cors(&config))
-        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
 
 /// Initialise tracing, build the server, and run it to completion.

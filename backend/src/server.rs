@@ -10,7 +10,6 @@ use crate::request_logger::LoggingLayer;
 use crate::shutdown;
 use axum::{
     extract::State,
-    middleware::{from_fn_with_state, Next},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -216,22 +215,6 @@ async fn metrics_handler(State(state): State<crate::routes::v1::AppState>) -> im
     }
 }
 
-async fn metrics_middleware(
-    State(metrics): State<SharedMetrics>,
-    request: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> axum::response::Response {
-    let method = request.method().to_string();
-    let path = request.uri().path().to_string();
-    let response = next.run(request).await;
-    let status = response.status().as_u16().to_string();
-    metrics
-        .http_requests_total
-        .with_label_values(&[&method, &path, &status])
-        .inc();
-    response
-}
-
 // ── Router builders ───────────────────────────────────────────────────────────
 
 /// Build the full router without a DB pool (for tests / rate-limit tests).
@@ -280,13 +263,17 @@ pub fn build_router_with_rate_limit(
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let root_routes = Router::new()
         .route("/", get(root))
         .route("/live", get(live))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
+        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()));
+
+    Router::new()
+        .merge(root_routes)
         .nest(
             "/api",
             crate::routes::router(
@@ -298,13 +285,11 @@ pub fn build_router_with_rate_limit(
                 event_bus,
             ),
         )
-        .merge(crate::openapi::swagger_router())
-        .layer(from_fn_with_state(
-            prometheus_metrics.clone(),
-            metrics_middleware,
-        ))
+        .merge(
+            crate::openapi::swagger_router()
+                .layer(LoggingLayer::with_metrics(prometheus_metrics.clone())),
+        )
         .layer(build_cors(&config))
-        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
 
 /// Build the Axum router with a live database pool.
@@ -328,13 +313,17 @@ fn build_router_with_db(
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let root_routes = Router::new()
         .route("/", get(root))
         .route("/live", get(live))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
+        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()));
+
+    Router::new()
+        .merge(root_routes)
         .nest(
             "/api",
             crate::routes::router_with_db(
@@ -346,13 +335,11 @@ fn build_router_with_db(
                 event_bus,
             ),
         )
-        .merge(crate::openapi::swagger_router())
-        .layer(from_fn_with_state(
-            prometheus_metrics.clone(),
-            metrics_middleware,
-        ))
+        .merge(
+            crate::openapi::swagger_router()
+                .layer(LoggingLayer::with_metrics(prometheus_metrics.clone())),
+        )
         .layer(build_cors(&config))
-        .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
 
 /// Probe Redis once at startup and either fail fast or record a degraded

@@ -118,6 +118,26 @@ still validating pool configuration and creating a reusable `PgPool` handle.
 filtering. The request middleware now emits structured tracing events rather
 than plain `println!` output.
 
+## Prometheus label cardinality
+
+HTTP metrics use Axum's matched route template (for example,
+`/api/v1/pools/:id`), never the raw request path. Unknown methods, statuses,
+and metric-domain values collapse to fixed `other` labels; requests without a
+matched route use `<unmatched>`. Metric vectors are private to the metrics
+module so callers must record values through the bounded helpers.
+
+The allowed label domains are: HTTP method, static route template, and status;
+database query type and result; Redis operation and result; Redis cache name
+and outcome; price-cache result; and the four fixed prediction windows
+(`1m`, `5m`, `1h`, `24h`). Wallet addresses, pool IDs, ledger IDs, and raw
+request paths must not be Prometheus labels. They may be used as request
+context in logs/traces for diagnosis; wallet addresses in the dedicated user
+context are redacted.
+
+The metrics endpoint test sends 64 distinct pool IDs, wallet addresses, and
+ledger-like paths, then checks that emitted request series remain bounded and
+contain only route templates.
+
 ---
 
 ## Docker (multi-stage)
