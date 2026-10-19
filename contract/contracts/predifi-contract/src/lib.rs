@@ -43,6 +43,7 @@ mod pause_unpause_boundary_tests;
 #[cfg(test)]
 mod resource_limit_boundary_tests;
 
+#[cfg(test)]
 mod test_utils;
 // #[cfg(test)]
 // mod max_pools_stress_tests;
@@ -51,7 +52,6 @@ mod treasury;
 mod update_pool_description_boundary_tests;
 #[cfg(test)]
 mod withdraw_treasury_boundary_tests;
-mod treasury;
 mod challenge;
 #[cfg(test)]
 mod fee_schedule_snapshot_tests;
@@ -195,7 +195,6 @@ pub enum PredifiError {
     /// The outcome value is invalid or out of bounds.
     InvalidOutcome = 25,
     AlreadyClaimed = 60,
-    PoolCanceled = 70,
     ResolutionDelayNotMet = 81,
     /// Token is not on the allowed betting whitelist.
     TokenNotWhitelisted = 91,
@@ -271,9 +270,6 @@ pub enum PredifiError {
     /// `initial_liquidity` is less than the required safety margin
     /// relative to `max_total_stake` (issue #1131).
     InitialLiquidityBelowSafetyMargin = 133,
-    /// `emergency_cancel_pool` was called but the multisig threshold
-    /// has not yet been reached (issue #1119).
-    EmergencyCancelPending = 134,
     /// The caller has already approved this emergency-cancel proposal
     /// (issue #1119).
     EmergencyCancelAlreadyApproved = 135,
@@ -289,12 +285,12 @@ pub enum PredifiError {
     /// The provider price exponent is outside
     /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
     /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
-    UnsupportedPriceExponent = 114,
+    UnsupportedPriceExponent = 202,
     /// The oracle confidence interval is too wide to resolve on: either
     /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
     /// interval crosses the price-condition boundary. Resolution is deferred
     /// until a tighter price is published.
-    PriceConfidenceTooWide = 115,
+    PriceConfidenceTooWide = 203,
 }
 
 /// Represents the current state of a prediction market.
@@ -1573,6 +1569,7 @@ pub struct ResolutionFinalizedEvent {
     pub pool_id: u64,
     pub outcome: u32,
     pub timestamp: u64,
+}
 
 /// Emitted alongside `PoolResolvedEvent` when a pool is resolved through the
 /// price-feed path (`resolve_pool_from_price`).
