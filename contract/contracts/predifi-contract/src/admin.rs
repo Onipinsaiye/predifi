@@ -110,7 +110,9 @@ use crate::{
     FeeChangeProposeEvent, FeeConfig, FeeInfo, FeeTier, FeeTiersUpdateEvent, FeeUpdateEvent, InitEvent,
     MaxPredictionsUpdateEvent, MinPoolDurationUpdateEvent, MinStakeUpdateEvent, PauseEvent,
     PendingFeeChange, Pool, PredictionCooldownUpdateEvent, PredifiContract, PredifiContractArgs,
-    PredifiContractClient, PredifiError, RemovedFromWhitelistEvent, ResolutionDelayUpdateEvent,
+    PredifiContractClient, PredifiError, RecoveryAttestation, RecoveryChecklistClearedEvent,
+    RecoveryChecklistConfiguredEvent, RecoveryCompleteEvent, RecoveryStepAttestedEvent,
+    RemovedFromWhitelistEvent, ResolutionDelayUpdateEvent,
     StorageTtlRenewedEvent, TokenWhitelistAddedEvent, TokenWhitelistRemovedEvent, UnpauseEvent,
     UpgradeEvent, CONTRACT_VERSION, DEFAULT_GLOBAL_MIN_STAKE, DEFAULT_PREDICTION_COOLDOWN_SECONDS,
     FEE_CHANGE_TIMELOCK_SECONDS, MAX_CLAIM_WINDOW, MAX_RESOLUTION_DELAY, MIN_CLAIM_WINDOW,
@@ -214,9 +216,17 @@ impl PredifiContract {
     /// Requires authentication from a caller with the Admin role.
     ///
     /// # Effects
+    /// - Verifies every step in the configured recovery checklist has been attested.
+    /// - Clears the recovery checklist and all attestations from storage.
     /// - Clears the paused state.
-    /// - Emits `UnpauseEvent`.
-    pub fn unpause(env: Env, admin: Address) {
+    /// - Emits `RecoveryCompleteEvent` and `UnpauseEvent`.
+    ///
+    /// # Errors
+    /// - Panics `"Contract already unpaused"` if not paused.
+    /// - Panics `"Unauthorized: missing required role"` if caller lacks Admin role.
+    /// - Returns `PredifiError::RecoveryChecklistNotConfigured` if no checklist is configured.
+    /// - Returns `PredifiError::RecoveryChecklistIncomplete` if any step is not yet attested.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), PredifiError> {
         admin.require_auth();
         if Self::require_admin_role(&env, &admin, "unpause").is_err() {
             panic!("Unauthorized: missing required role");
@@ -224,10 +234,208 @@ impl PredifiContract {
         if !Self::is_paused(&env) {
             panic!("Contract already unpaused");
         }
+
+        // Gate unpause behind recovery checklist completion.
+        let steps: soroban_sdk::Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecoveryChecklistConfig)
+            .ok_or(PredifiError::RecoveryChecklistNotConfigured)?;
+
+        // Verify every step has an attestation.
+        let steps_count = steps.len();
+        for step in steps.iter() {
+            let att_key = DataKey::RecoveryAttestation(step.clone());
+            if !env.storage().instance().has(&att_key) {
+                return Err(PredifiError::RecoveryChecklistIncomplete);
+            }
+        }
+
+        // All steps attested — clear checklist and attestations.
+        for step in steps.iter() {
+            env.storage()
+                .instance()
+                .remove(&DataKey::RecoveryAttestation(step));
+        }
+        env.storage().instance().remove(&DataKey::RecoveryChecklistConfig);
+
+        // Clear paused state.
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::extend_instance(&env);
 
+        let timestamp = env.ledger().timestamp();
+
+        RecoveryCompleteEvent {
+            admin: admin.clone(),
+            steps_completed: steps_count,
+            timestamp,
+        }
+        .publish(&env);
+
         UnpauseEvent { admin }.publish(&env);
+        Ok(())
+    }
+
+    /// Configure the recovery checklist that must be completed before unpause.
+    ///
+    /// Must be called while the contract IS paused. Defines the list of named
+    /// steps (e.g., `Symbol::new(&env, "funds_secured")`) that each require an
+    /// explicit admin attestation via `attest_recovery_step` before `unpause`
+    /// can proceed.
+    ///
+    /// Calling this again while steps are already configured REPLACES the
+    /// previous configuration and clears any existing attestations.
+    ///
+    /// # Errors
+    /// - Panics `"Unauthorized: missing required role"` if caller lacks Admin role.
+    /// - Returns `PredifiError::InvalidData` if `steps` is empty.
+    pub fn configure_recovery_checklist(
+        env: Env,
+        admin: Address,
+        steps: soroban_sdk::Vec<Symbol>,
+    ) -> Result<(), PredifiError> {
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "configure_recovery_checklist")?;
+        if !Self::is_paused(&env) {
+            panic!("Recovery checklist may only be configured while the contract is paused");
+        }
+        if steps.is_empty() {
+            return Err(PredifiError::InvalidData);
+        }
+
+        // Clear any stale attestations from a previous configuration.
+        if let Some(old_steps) = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::Vec<Symbol>>(&DataKey::RecoveryChecklistConfig)
+        {
+            for step in old_steps.iter() {
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::RecoveryAttestation(step));
+            }
+        }
+
+        let steps_count = steps.len();
+        env.storage()
+            .instance()
+            .set(&DataKey::RecoveryChecklistConfig, &steps);
+        Self::extend_instance(&env);
+
+        RecoveryChecklistConfiguredEvent {
+            admin,
+            steps_count,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Attest that a single recovery checklist step has been completed.
+    ///
+    /// The `step` name must appear in the checklist configured via
+    /// `configure_recovery_checklist`. Duplicate attestations for the same
+    /// step within the same pause cycle are rejected.
+    ///
+    /// # Errors
+    /// - Returns `PredifiError::RecoveryChecklistNotConfigured` if no checklist exists.
+    /// - Returns `PredifiError::InvalidData` if `step` is not in the configured list.
+    /// - Returns `PredifiError::RecoveryStepAlreadyAttested` if already attested.
+    /// - Returns `PredifiError::Unauthorized` if caller lacks Admin role.
+    pub fn attest_recovery_step(
+        env: Env,
+        admin: Address,
+        step: Symbol,
+        notes: Symbol,
+    ) -> Result<(), PredifiError> {
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "attest_recovery_step")?;
+
+        let steps: soroban_sdk::Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecoveryChecklistConfig)
+            .ok_or(PredifiError::RecoveryChecklistNotConfigured)?;
+
+        // Verify the step is in the checklist.
+        if !steps.contains(&step) {
+            return Err(PredifiError::InvalidData);
+        }
+
+        let att_key = DataKey::RecoveryAttestation(step.clone());
+
+        // Reject duplicate attestations.
+        if env.storage().instance().has(&att_key) {
+            return Err(PredifiError::RecoveryStepAlreadyAttested);
+        }
+
+        let attestation = RecoveryAttestation {
+            attested_by: admin.clone(),
+            attested_at: env.ledger().timestamp(),
+            notes: notes.clone(),
+        };
+        env.storage().instance().set(&att_key, &attestation);
+        Self::extend_instance(&env);
+
+        RecoveryStepAttestedEvent {
+            admin,
+            step,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Return the list of configured recovery checklist steps, or `None` if
+    /// no checklist is currently active.
+    pub fn get_recovery_checklist(env: Env) -> Option<soroban_sdk::Vec<Symbol>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::RecoveryChecklistConfig)
+    }
+
+    /// Return the attestation for a given recovery step, or `None` if it has
+    /// not yet been attested.
+    pub fn get_recovery_attestation(env: Env, step: Symbol) -> Option<RecoveryAttestation> {
+        env.storage()
+            .instance()
+            .get(&DataKey::RecoveryAttestation(step))
+    }
+
+    /// Clear the entire recovery checklist and all attestations.
+    ///
+    /// Only callable while paused. Allows an admin to reset the checklist
+    /// if the incident response changes after configuration.
+    ///
+    /// # Errors
+    /// - Panics if caller lacks Admin role.
+    /// - Returns `PredifiError::RecoveryChecklistNotConfigured` if no checklist exists.
+    pub fn clear_recovery_checklist(env: Env, admin: Address) -> Result<(), PredifiError> {
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "clear_recovery_checklist")?;
+
+        let steps: soroban_sdk::Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecoveryChecklistConfig)
+            .ok_or(PredifiError::RecoveryChecklistNotConfigured)?;
+
+        for step in steps.iter() {
+            env.storage()
+                .instance()
+                .remove(&DataKey::RecoveryAttestation(step));
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::RecoveryChecklistConfig);
+        Self::extend_instance(&env);
+
+        RecoveryChecklistClearedEvent {
+            admin,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
     }
 
     /// Check if the contract is paused.

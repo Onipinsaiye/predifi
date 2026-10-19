@@ -43,6 +43,8 @@ mod test_utils;
 #[cfg(test)]
 mod pause_unpause_boundary_tests;
 #[cfg(test)]
+mod recovery_checklist_tests;
+#[cfg(test)]
 mod resource_limit_boundary_tests;
 // #[cfg(test)]
 // mod max_pools_stress_tests;
@@ -186,114 +188,73 @@ pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PredifiError {
+    // ── Initialization (2) ──────────────────────────────────────────────────
     AlreadyInitializedOrConfigNotSet = 2,
+    // ── Authorization (10) ──────────────────────────────────────────────────
     Unauthorized = 10,
+    // ── Pool state (20-27) ──────────────────────────────────────────────────
     PoolNotFound = 20,
     PoolNotResolved = 22,
+    /// Pool is in an invalid state for this operation, or has been cancelled.
     InvalidPoolState = 24,
-    /// The outcome value is invalid or out of bounds.
     InvalidOutcome = 25,
-    AlreadyClaimed = 60,
-    PoolCanceled = 70,
-    ResolutionDelayNotMet = 81,
-    /// Token is not on the allowed betting whitelist.
-    TokenNotWhitelisted = 91,
-    /// Invalid amount provided (e.g., zero or negative).
-    InvalidAmount = 42,
-    /// Insufficient balance for the operation.
-    InsufficientBalance = 44,
-    /// Oracle not initialized.
-    OracleNotInitialized = 100,
-    /// Price feed not found.
-    PriceFeedNotFound = 101,
-    /// Price data expired or invalid.
-    PriceDataInvalid = 102,
-    /// Price data is older than the configured `max_price_age`.
-    PriceStale = 113,
-    /// Price condition not set for pool.
-    PriceConditionNotSet = 103,
-    /// Total pool stake cap reached or would be exceeded.
-    MaxTotalStakeExceeded = 104,
-    /// Oracles disagree on the outcome.
-    ResolutionConflict = 105,
-    /// This oracle has already cast a vote for this pool.
-    OracleAlreadyVoted = 106,
-    /// Stake amount is below the pool minimum.
-    StakeBelowMinimum = 107,
-    /// Stake amount exceeds the pool maximum.
-    StakeAboveMaximum = 108,
-    /// Stake amount is below the global protocol minimum.
-    InsufficientStake = 45,
-    /// User has exceeded the maximum number of predictions allowed per pool.
-    MaxPredictionsExceeded = 111,
-    /// A pool requested more outcomes than `MAX_OUTCOMES_PER_POOL`.
-    MaxOutcomesExceeded = 114,
-    /// A pool reached `MAX_PREDICTIONS_PER_POOL` distinct predictors.
-    MaxPredictionsPerPoolExceeded = 115,
-    /// Adding this stake would exceed `MAX_AGGREGATE_STAKE_PER_POOL`
-    /// (or the aggregate addition would overflow `i128`).
-    MaxAggregateStakeExceeded = 116,
-    /// The fee basis points exceed the maximum allowed value (10000).
-    InvalidFeeBps = 93,
-    /// Metadata URL exceeds maximum length (512 bytes).
-    MetadataUrlInvalid = 109,
-    /// An arithmetic overflow, underflow, or division by zero occurred.
-    ArithmeticError = 110,
-    /// required_resolutions exceeds the number of active operators; pool can never be resolved.
-    RequiredResolutionsExceedOperators = 200,
-    /// Rate limit exceeded, cooldown active, or suspicious activity detected.
-    RateLimitOrSuspiciousActivity = 190,
-    /// The pagination offset + limit combination overflows u32 or is otherwise invalid.
-    InvalidPagination = 92,
-    /// Generic invalid input data (e.g., a zero value where a positive value is required).
-    InvalidData = 90,
-    /// The provided timestamp is invalid (e.g., end_time too far in the future).
-    InvalidTimestamp = 80,
-    /// Pool has been flagged as disputed and cannot be modified.
     PoolDisputed = 27,
-    /// target_price must be strictly positive.
-    InvalidTargetPrice = 201,
-    /// `close_staking` called before pool.end_time has passed.
+    // ── Prediction & balance (42-45) ────────────────────────────────────────
+    InvalidAmount = 42,
+    InsufficientBalance = 44,
+    InsufficientStake = 45,
+    // ── Claims (60) ─────────────────────────────────────────────────────────
+    AlreadyClaimed = 60,
+    // ── Time / pause (80-84) ────────────────────────────────────────────────
+    InvalidTimestamp = 80,
+    ResolutionDelayNotMet = 81,
     StakingStillOpen = 82,
-    /// A time-window constraint (e.g. resolution window, claim window) is
-    /// not met for the requested operation.
-    TimeConstraintError = 84,
-    /// One of the `outcome_descriptions` exceeds `MAX_OUTCOME_DESCRIPTION_LEN`
-    /// (issue #1122).
-    OutcomeDescriptionTooLong = 130,
-    /// One of the `outcome_descriptions` is empty / shorter than
-    /// `MIN_OUTCOME_DESCRIPTION_LEN` (issue #1122).
-    OutcomeDescriptionEmpty = 131,
-    /// A timestamp that must be in the future is in the past or equal to
-    /// `env.ledger().timestamp()` (issue #1130).
-    DeadlineInPast = 132,
-    /// `initial_liquidity` is less than the required safety margin
-    /// relative to `max_total_stake` (issue #1131).
-    InitialLiquidityBelowSafetyMargin = 133,
-    /// `emergency_cancel_pool` was called but the multisig threshold
-    /// has not yet been reached (issue #1119).
-    EmergencyCancelPending = 134,
-    /// The caller has already approved this emergency-cancel proposal
-    /// (issue #1119).
-    EmergencyCancelAlreadyApproved = 135,
     /// The contract is currently paused; all state-mutating operations are blocked.
     ///
     /// Callers should check `is_contract_paused()` before submitting a transaction,
     /// or listen for `PauseEvent` / `UnpauseEvent` on-chain to stay in sync.
     ContractPaused = 83,
+    TimeConstraintError = 84,
+    // ── Data / validation (90-97) ───────────────────────────────────────────
+    /// Generic invalid input data. Also covers: invalid target price,
+    /// metadata URL too long, outcome description issues, liquidity margin,
+    /// token not whitelisted, and unknown recovery steps.
+    InvalidData = 90,
+    InvalidPagination = 92,
+    InvalidFeeBps = 93,
     InvalidAddressOrToken = 94,
     FeeChangePending = 95,
     NoFeeChangePending = 96,
     TimelockNotExpired = 97,
-    /// The provider price exponent is outside
-    /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
-    /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
-    UnsupportedPriceExponent = 114,
-    /// The oracle confidence interval is too wide to resolve on: either
-    /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
-    /// interval crosses the price-condition boundary. Resolution is deferred
-    /// until a tighter price is published.
-    PriceConfidenceTooWide = 115,
+    // ── Oracle / price (100-106) ─────────────────────────────────────────────
+    OracleNotInitialized = 100,
+    /// Price data is invalid, stale, missing, or confidence too wide.
+    /// Also covers: price condition not set, unsupported exponent.
+    PriceDataInvalid = 102,
+    MaxTotalStakeExceeded = 104,
+    ResolutionConflict = 105,
+    OracleAlreadyVoted = 106,
+    // ── Stake limits (107-108, 111, 116) ────────────────────────────────────
+    StakeBelowMinimum = 107,
+    StakeAboveMaximum = 108,
+    MaxPredictionsExceeded = 111,
+    MaxAggregateStakeExceeded = 116,
+    // ── Arithmetic (110) ────────────────────────────────────────────────────
+    ArithmeticError = 110,
+    // ── Emergency cancel (134-135) ──────────────────────────────────────────
+    EmergencyCancelPending = 134,
+    EmergencyCancelAlreadyApproved = 135,
+    // ── Rate limiting (190) ─────────────────────────────────────────────────
+    RateLimitOrSuspiciousActivity = 190,
+    // ── Pool configuration (200) ────────────────────────────────────────────
+    RequiredResolutionsExceedOperators = 200,
+    // ── Recovery checklist (210-212) ────────────────────────────────────────
+    /// No recovery checklist has been configured; call `configure_recovery_checklist` before unpausing.
+    RecoveryChecklistNotConfigured = 210,
+    /// Not all required recovery attestations have been provided yet.
+    RecoveryChecklistIncomplete = 211,
+    /// This recovery step has already been attested in the current pause cycle.
+    RecoveryStepAlreadyAttested = 212,
 }
 
 /// Represents the current state of a prediction market.
@@ -573,6 +534,21 @@ pub struct PendingFeeChange {
     pub effective_at: u64,
     /// The admin address that submitted this proposal.
     pub proposed_by: Address,
+}
+
+/// A single recovery attestation recorded for one checklist step.
+///
+/// Stored under `DataKey::RecoveryAttestation(step_name)`. Cleared when
+/// `clear_recovery_checklist` is called or when the contract unpauses.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryAttestation {
+    /// The admin address that attested this step.
+    pub attested_by: Address,
+    /// Ledger timestamp when the attestation was recorded.
+    pub attested_at: u64,
+    /// Free-form notes from the attesting admin.
+    pub notes: Symbol,
 }
 
 /// Aggregated contract metadata for frontend consumption.
@@ -857,6 +833,12 @@ pub enum DataKey {
     /// Present only while a fee proposal is queued (between a `set_fee_bps` call
     /// and the corresponding `apply_fee_bps` or `cancel_fee_proposal` call).
     PendingFeeBps,
+    /// Recovery checklist configuration set by admin after a pause.
+    /// `RecoveryChecklistConfig` -> `Vec<Symbol>` (list of required step names)
+    RecoveryChecklistConfig,
+    /// Individual attestation for a recovery checklist step.
+    /// `RecoveryAttestation(step_name)` -> `RecoveryAttestation`
+    RecoveryAttestation(Symbol),
     /// Minimum referred volume (in base token units) required before a referrer
     /// is eligible to receive a referral reward on claim.
     /// `ReferralMinVolumeBps` -> `i128`
@@ -932,6 +914,56 @@ pub struct PauseEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnpauseEvent {
     pub admin: Address,
+}
+
+/// Emitted when an admin configures the recovery checklist before unpause.
+#[contractevent(topics = ["recovery_checklist_configured"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryChecklistConfiguredEvent {
+    /// Admin that configured the checklist.
+    pub admin: Address,
+    /// Number of required recovery steps.
+    pub steps_count: u32,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Emitted when an admin attests a single recovery checklist step.
+#[contractevent(topics = ["recovery_step_attested"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryStepAttestedEvent {
+    /// Admin that attested this step.
+    pub admin: Address,
+    /// The name of the step that was attested.
+    pub step: Symbol,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Emitted when the recovery checklist is fully satisfied and unpause succeeds.
+#[contractevent(topics = ["recovery_complete"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCompleteEvent {
+    /// Admin that triggered the final unpause.
+    pub admin: Address,
+    /// Number of steps that were completed.
+    pub steps_completed: u32,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Emitted when the recovery checklist is cleared (e.g. after successful unpause or by admin).
+#[contractevent(topics = ["recovery_checklist_cleared"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryChecklistClearedEvent {
+    /// Admin that cleared the checklist.
+    pub admin: Address,
+    /// Ledger timestamp.
+    pub timestamp: u64,
 }
 
 #[contractevent(topics = ["fee_update"])]

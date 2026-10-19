@@ -166,6 +166,21 @@ impl<'a> PauseTestEnv<'a> {
         self.client
             .place_prediction(user, &pool_id, &amount, &outcome, &None, &None);
     }
+
+    /// Configure a one-step recovery checklist and attest it, so that
+    /// `unpause` can succeed. Must be called while the contract is paused.
+    fn configure_and_attest_checklist(&self) {
+        use soroban_sdk::Symbol;
+        let step = Symbol::new(&self.env, "ready");
+        let steps = soroban_sdk::vec![&self.env, step.clone()];
+        self.client
+            .configure_recovery_checklist(&self.admin, &steps);
+        self.client.attest_recovery_step(
+            &self.admin,
+            &step,
+            &Symbol::new(&self.env, "ok"),
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -414,6 +429,7 @@ fn test_1528_state_consistency_across_pause_unpause_cycle() {
     );
 
     // Unpause → pool state must be exactly restored.
+    ctx.configure_and_attest_checklist();
     ctx.client.unpause(&ctx.admin);
     assert!(!ctx.client.is_contract_paused());
 
@@ -440,6 +456,7 @@ fn test_1528_multiple_pause_unpause_cycles_preserve_state() {
     // Cycle 1.
     ctx.client.pause(&ctx.admin);
     assert!(ctx.client.is_contract_paused());
+    ctx.configure_and_attest_checklist();
     ctx.client.unpause(&ctx.admin);
     assert!(!ctx.client.is_contract_paused());
 
@@ -456,6 +473,7 @@ fn test_1528_multiple_pause_unpause_cycles_preserve_state() {
         .client
         .try_place_prediction(&user, &pool_id, &100i128, &1u32, &None, &None);
     assert_eq!(blocked, Err(Ok(PredifiError::ContractPaused)));
+    ctx.configure_and_attest_checklist();
     ctx.client.unpause(&ctx.admin);
     assert!(!ctx.client.is_contract_paused());
 
@@ -465,6 +483,7 @@ fn test_1528_multiple_pause_unpause_cycles_preserve_state() {
     // Cycle 3.
     ctx.client.pause(&ctx.admin);
     assert!(ctx.client.is_contract_paused());
+    ctx.configure_and_attest_checklist();
     ctx.client.unpause(&ctx.admin);
     assert!(!ctx.client.is_contract_paused());
 
@@ -494,6 +513,7 @@ fn test_1528_operations_resume_correctly_after_unpause() {
         Err(Ok(PredifiError::ContractPaused))
     );
 
+    ctx.configure_and_attest_checklist();
     ctx.client.unpause(&ctx.admin);
 
     // Same operation must now succeed.
@@ -517,6 +537,7 @@ fn test_1528_is_contract_paused_reflects_correct_state() {
     ctx.client.pause(&ctx.admin);
     assert!(ctx.client.is_contract_paused(), "must be paused after pause()");
 
+    ctx.configure_and_attest_checklist();
     ctx.client.unpause(&ctx.admin);
     assert!(
         !ctx.client.is_contract_paused(),
@@ -552,6 +573,7 @@ fn test_1528_update_pool_description_blocked_during_pause_restored_after_unpause
         "description must be unchanged after blocked update"
     );
 
+    ctx.configure_and_attest_checklist();
     ctx.client.unpause(&ctx.admin);
 
     ctx.client.update_pool_description(
