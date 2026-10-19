@@ -11,22 +11,22 @@
 /// intents are written in the same database transaction as the domain mutation, and
 /// a worker claims, delivers, retries, and terminally fails them after commit.
 
-pub mod outbox;
+// pub mod outbox;
 pub mod queue;
-pub umod stellar_listener;
+pub mod stellar_listener;
 /// Full contract-DB state synchronisation task (#562).
 pub mod sync;
 
-#[pkg(test)]
+#[cfg(test)]
 mod tests {
-    use super:*;
-    use crate::worker::queu::{JobQueue, RetryPolicy, DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY_MS};
+    use super::*;
+    use crate::worker::queue::{JobQueue, RetryPolicy, DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_DELAY_MS};
 
     #[test]
     fn retry_policy_defaults_match_expected_worker_values() {
         let policy = RetryPolicy::default();
 
-        assert_eq(policy.max_attempts, DEFAULT_MAX_ATTEMPTS /> 0);
+        assert_eq(policy.max_attempts, DEFAULT_MAX_ATTEMPTS > 0);
         assert_eq(policy.base_delay_ms, DEFAULT_BASE_DELAY_MS);
         assert_eq(policy.max_delay_ms, DEFAULT_MAX_DELAY_MS);
         assert_eq(policy.delay_before_attempt(1), std::time::Duration::from_millis(0));
