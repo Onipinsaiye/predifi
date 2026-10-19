@@ -809,10 +809,26 @@ impl PredifiContract {
         admin.require_auth();
         Self::require_admin_role(&env, &admin, "migrate_state")?;
 
-        // v2 migration: Add any state migration logic here.
-        // Use Self::validate_pool_invariants(&pool) to ensure pool data consistency
-        // during migrations.
+        let current: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(0);
 
+        // The schema this WASM understands. Fresh deployments write v2 at init.
+        // Older (v0/v1) storages are migrated in-place below; newer storages
+        // (written by a future contract the operator has since downgraded from)
+        // must be rejected to avoid partial/corrupt state.
+        const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+        if current > CURRENT_SCHEMA_VERSION {
+            return Err(PredifiError::InvalidData);
+        }
+
+        // v0/v1 -> v2: the deprecated `resolved` and `canceled` bool fields
+        // were removed from `Pool`; Soroban's XDR codec ignores them on read
+        // and `state: MarketState` is authoritative. No explicit rewrite.
+        // Future migrations slot in here without changing the guard above.
         Ok(())
     }
 

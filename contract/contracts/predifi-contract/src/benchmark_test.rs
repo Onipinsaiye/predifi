@@ -13,7 +13,7 @@ mod benchmark_tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Ledger},
-        token, Address, Env, String, Vec, xdr,
+        token, xdr::ToXdr, Address, Env, String, Vec,
     };
 
     mod dummy_access_control {
@@ -371,49 +371,49 @@ mod benchmark_tests {
             .persistent()
             .get(&pool_key)
             .expect("Pool must exist");
-        total += xdr::to_xdr(&pool_key).unwrap().len();
-        total += xdr::to_xdr(&pool).unwrap().len();
+        total += pool_key.to_xdr(&env).len() as usize;
+        total += pool.clone().to_xdr(&env).len() as usize;
 
         // Outcome stakes (OutStake entries)
-        for outcome in 0u32..pool.outcome_stakes.len() {
+        for outcome in 0u32..pool.options_count {
             let stake_key = DataKey::OutStake(pool_id, outcome);
             let stake: i128 = env
                 .storage()
                 .persistent()
                 .get(&stake_key)
                 .unwrap_or(0);
-            total += xdr::to_xdr(&stake_key).unwrap().len();
-            total += xdr::to_xdr(&stake).unwrap().len();
+            total += stake_key.to_xdr(&env).len() as usize;
+            total += stake.to_xdr(&env).len() as usize;
         }
 
         // Per-user prediction entries
         for user in tracked_users {
             // Prediction record
             let pred_key = DataKey::Pred(user.clone(), pool_id);
-            if let Some(pred) = env.storage().persistent().get(&pred_key) {
-                total += xdr::to_xdr(&pred_key).unwrap().len();
-                total += xdr::to_xdr(&pred).unwrap().len();
+            if let Some(pred) = env.storage().persistent().get::<_, crate::Prediction>(&pred_key) {
+                total += pred_key.to_xdr(&env).len() as usize;
+                total += pred.to_xdr(&env).len() as usize;
             }
 
             // Claimed sentinel
             let claimed_key = DataKey::Claimed(user.clone(), pool_id);
-            if let Some(claimed) = env.storage().persistent().get(&claimed_key) {
-                total += xdr::to_xdr(&claimed_key).unwrap().len();
-                total += xdr::to_xdr(&claimed).unwrap().len();
+            if let Some(claimed) = env.storage().persistent().get::<_, bool>(&claimed_key) {
+                total += claimed_key.to_xdr(&env).len() as usize;
+                total += claimed.to_xdr(&env).len() as usize;
             }
 
             // Last prediction time (global, not per-pool)
             let lpt_key = DataKey::LastPredictionTime(user.clone());
-            if let Some(lpt) = env.storage().persistent().get(&lpt_key) {
-                total += xdr::to_xdr(&lpt_key).unwrap().len();
-                total += xdr::to_xdr(&lpt).unwrap().len();
+            if let Some(lpt) = env.storage().persistent().get::<_, u64>(&lpt_key) {
+                total += lpt_key.to_xdr(&env).len() as usize;
+                total += lpt.to_xdr(&env).len() as usize;
             }
 
             // User prediction count
             let cnt_key = DataKey::UsrPrdCnt(user.clone());
-            if let Some(cnt) = env.storage().persistent().get(&cnt_key) {
-                total += xdr::to_xdr(&cnt_key).unwrap().len();
-                total += xdr::to_xdr(&cnt).unwrap().len();
+            if let Some(cnt) = env.storage().persistent().get::<_, u32>(&cnt_key) {
+                total += cnt_key.to_xdr(&env).len() as usize;
+                total += cnt.to_xdr(&env).len() as usize;
             }
         }
 
