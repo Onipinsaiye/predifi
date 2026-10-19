@@ -72,6 +72,76 @@ pub(crate) fn normalize_price_feed(
     Ok((norm_price, norm_confidence))
 }
 
+/// A single archived oracle provider vector used for deterministic regression
+/// testing of price normalization and condition matching.
+///
+/// Vectors are stored as `(price, confidence, expo, expected_price,
+/// expected_confidence)` tuples. The expected values are the canonical
+/// `PRICE_DECIMALS` fixed-point results of [`normalize_price_feed`].
+///
+/// Provenance: each vector is derived from a redacted provider response
+/// (Pyth `(price, conf, expo)` triple) captured from a reviewed source. No
+/// raw provider payloads are stored on-chain; only the redacted numeric
+/// fields and expected normalized values are archived.
+///
+/// Update review requirements: any change to this corpus must be reviewed by
+/// at least one oracle-domain maintainer and accompanied by a test update in
+/// both the contract and backend test suites. The update must not alter
+/// previously archived vectors; new vectors are appended.
+pub(crate) const ARCHIVED_ORACLE_VECTORS: &[(i128, i128, i32, i128, i128)] = &[
+    // Valid: exact exponent match, no rescaling.
+    (300_000_000_000, 1_000_000, -8, 300_000_000_000, 1_000_000),
+    // Valid: positive exponent, scaled up.
+    (3_000, 10, -5, 300_000_000_000, 1_000_000),
+    // Valid: negative exponent, truncated toward zero.
+    (3_000_000_000_000_000, 1_000_000_000, -14, 300_000_000_000, 1_000_000),
+    // Boundary: zero confidence accepted.
+    (300_000_000_000, 0, -8, 300_000_000_000, 0),
+    // Boundary: minimum exponent.
+    (1, 0, MIN_PRICE_EXPONENT, 0, 0),
+];
+
+/// Archived malformed oracle provider vectors. Each entry is
+/// `(price, confidence, expo)` and must be rejected by
+/// [`normalize_price_feed`] with the documented error.
+pub(crate) const ARCHIVED_MALFORMED_ORACLE_VECTORS: &[(i128, i128, i32)] = &[
+    // Non-positive price.
+    (0, 0, -8),
+    (-1, 0, -8),
+    // Negative confidence.
+    (300_000_000_000, -1, -8),
+    // Exponent out of range.
+    (300_000_000_000, 0, MAX_PRICE_EXPONENT + 1),
+    (300_000_000_000, 0, MIN_PRICE_EXPONENT - 1),
+    // Price finer than 10^-PRICE_DECIMALS normalizes to zero.
+    (1, 0, -20),
+];
+
+/// Archived stale oracle provider vectors. Each entry is
+/// `(timestamp, expires_at, max_price_age)` and must be rejected by
+/// [`PredifiContract::require_fresh_price_feed`] when the ledger time is
+/// `expires_at + 1`.
+pub(crate) const ARCHIVED_STALE_ORACLE_VECTORS: &[(u64, u64, u64)] = &[
+    // Expired feed.
+    (100, 200, 50),
+    // Stale feed: within expiry but older than max_price_age.
+    (100, 10_000, 50),
+];
+
+/// Archived boundary oracle provider vectors for condition matching. Each
+/// entry is `(price, confidence, target_price, comparison_op, tolerance_bps,
+/// expected_outcome)`.
+pub(crate) const ARCHIVED_BOUNDARY_ORACLE_VECTORS: &[(i128, i128, i128, u32, u32, u32)] = &[
+    // Equal: exact match, zero confidence.
+    (300_000_000_000, 0, 300_000_000_000, 0, 0, 1),
+    // Equal: interval fully inside tolerance.
+    (300_000_000_000, 1_000_000, 300_000_000_000, 0, 100, 1),
+    // Greater: interval fully above target.
+    (300_000_000_000, 0, 299_000_000_000, 1, 0, 1),
+    // Less: interval fully below target.
+    (300_000_000_000, 0, 301_000_000_000, 2, 0, 1),
+];
+
 #[contractimpl]
 impl PredifiContract {
     /// Add an oracle address to the trusted oracle whitelist. Caller must have Admin role (0).
