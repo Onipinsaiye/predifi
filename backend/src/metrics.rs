@@ -1,3 +1,4 @@
+use axum::extract::MatchedPath;
 use prometheus::{
     CounterVec, Encoder, Gauge, Histogram, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
@@ -6,15 +7,15 @@ use std::sync::Arc;
 /// Shared application metrics exposed to Prometheus.
 #[derive(Clone)]
 pub struct Metrics {
-    pub registry: Registry,
+    registry: Registry,
 
     // ── HTTP ─────────────────────────────────────────────────────────────────
-    pub http_requests_total: CounterVec,
-    pub http_request_duration_seconds: HistogramVec,
+    http_requests_total: CounterVec,
+    http_request_duration_seconds: HistogramVec,
     pub http_server_errors_total: prometheus::Counter,
 
     // ── Price cache ───────────────────────────────────────────────────────────
-    pub price_cache_fetch_total: CounterVec,
+    price_cache_fetch_total: CounterVec,
     pub price_cache_assets: Gauge,
     pub price_cache_fetch_duration_seconds: Histogram,
 
@@ -27,21 +28,21 @@ pub struct Metrics {
     // ── Database query durations ─────────────────────────────────────────────
     /// Histogram of DB query durations labelled by `query_type`
     /// (e.g. "get_pool", "list_pools", "insert_prediction", …).
-    pub db_query_duration_seconds: HistogramVec,
+    db_query_duration_seconds: HistogramVec,
     /// Total DB queries by query type and result (ok / error).
-    pub db_queries_total: CounterVec,
+    db_queries_total: CounterVec,
 
     // ── Redis operation latencies ─────────────────────────────────────────────
     /// Histogram of Redis operation durations labelled by `operation`
     /// (e.g. "get", "set", "del", "ping", "hset", …).
-    pub redis_operation_duration_seconds: HistogramVec,
+    redis_operation_duration_seconds: HistogramVec,
     /// Total Redis operations by operation type and result.
-    pub redis_operations_total: CounterVec,
+    redis_operations_total: CounterVec,
     /// Total Redis cache lookups by cache name and outcome
     /// (`"hit"` / `"miss"` / `"error"`), from [`crate::redis_cache::RedisCache`].
     /// A per-cache hit ratio can be computed as
     /// `hit / (hit + miss)` grouped by `cache_name`.
-    pub redis_cache_lookups_total: CounterVec,
+    redis_cache_lookups_total: CounterVec,
 
     // ── WebSocket ─────────────────────────────────────────────────────────────
     /// Current number of open WebSocket connections.
@@ -63,9 +64,9 @@ pub struct Metrics {
     /// Counter of predictions created, labelled by `window`
     /// (e.g. "1m", "5m", "1h", "24h") — updated by the metrics scrape path
     /// or a background roller.  See `record_prediction`.
-    pub predictions_total: CounterVec,
+    predictions_total: CounterVec,
     /// Counter of prediction amounts in stroops by `window`.
-    pub prediction_volume_stroops_total: CounterVec,
+    prediction_volume_stroops_total: CounterVec,
 
     // ── Worker queue ─────────────────────────────────────────────────────────
     /// Current number of jobs waiting or retrying in the worker queue.
@@ -321,6 +322,39 @@ impl Metrics {
 
     // ── Domain helpers ────────────────────────────────────────────────────────
 
+    /// Record HTTP metrics using a router-defined path template rather than
+    /// the request path, which may contain arbitrary identifiers.
+    pub(crate) fn record_http_request(
+        &self,
+        method: &str,
+        route: Option<&MatchedPath>,
+        status: &str,
+        duration_secs: f64,
+    ) {
+        let method = Self::bounded_label(
+            method,
+            &[
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+            ],
+        );
+        let route = route.map(MatchedPath::as_str).unwrap_or("<unmatched>");
+        let status = Self::normalize_status_label(status);
+
+        self.http_requests_total
+            .with_label_values(&[method, route, &status])
+            .inc();
+        self.http_request_duration_seconds
+            .with_label_values(&[method, route, &status])
+            .observe(duration_secs);
+        if status
+            .parse::<u16>()
+            .map(|code| code >= 500)
+            .unwrap_or(false)
+        {
+            self.http_server_errors_total.inc();
+        }
+    }
+
     /// Record worker queue depth metrics.
     pub fn record_worker_queue_depth(&self, queue_depth: usize, dlq_depth: usize) {
         self.worker_queue_depth.set(queue_depth as f64);
@@ -330,7 +364,7 @@ impl Metrics {
     /// Record the outcome of a price-cache refresh attempt.
     pub fn record_price_cache_fetch(&self, result: &str, assets: usize, duration_secs: f64) {
         self.price_cache_fetch_total
-            .with_label_values(&[result])
+            .with_label_values(&[Self::bounded_label(result, &["success", "failure"])])
             .inc();
         self.price_cache_assets.set(assets as f64);
         self.price_cache_fetch_duration_seconds
@@ -342,6 +376,17 @@ impl Metrics {
     /// `query_type` should be a short stable label such as `"get_pool"` or
     /// `"insert_prediction"`.  `result` should be `"ok"` or `"error"`.
     pub fn record_db_query(&self, query_type: &str, result: &str, duration_secs: f64) {
+        let query_type = Self::bounded_label(
+            query_type,
+            &[
+                "get_pool",
+                "list_pools",
+                "insert_prediction",
+                "update_pool",
+                "delete_pool",
+            ],
+        );
+        let result = Self::bounded_label(result, &["ok", "error"]);
         self.db_query_duration_seconds
             .with_label_values(&[query_type])
             .observe(duration_secs);
@@ -355,6 +400,8 @@ impl Metrics {
     /// `operation` should be a short stable label such as `"get"`, `"set"`,
     /// `"del"`, or `"hset"`.  `result` should be `"ok"` or `"error"`.
     pub fn record_redis_op(&self, operation: &str, result: &str, duration_secs: f64) {
+        let operation = Self::bounded_label(operation, &["get", "set", "del", "ping", "hset"]);
+        let result = Self::bounded_label(result, &["ok", "error"]);
         self.redis_operation_duration_seconds
             .with_label_values(&[operation])
             .observe(duration_secs);
@@ -370,9 +417,29 @@ impl Metrics {
     /// [`crate::redis_cache::cache_name_from_key`]). `outcome` should be one
     /// of `"hit"`, `"miss"`, or `"error"`.
     pub fn record_cache_lookup(&self, cache_name: &str, outcome: &str) {
+        let cache_name = Self::bounded_label(cache_name, &["pools", "pool", "user", "stats"]);
+        let outcome = Self::bounded_label(outcome, &["hit", "miss", "error"]);
         self.redis_cache_lookups_total
             .with_label_values(&[cache_name, outcome])
             .inc();
+    }
+
+    fn bounded_label<'a>(value: &'a str, allowed: &[&str]) -> &'a str {
+        if allowed.contains(&value) {
+            value
+        } else {
+            "other"
+        }
+    }
+
+    fn normalize_status_label(status: &str) -> String {
+        if status == "error" {
+            return "error".to_string();
+        }
+        match status.parse::<u16>() {
+            Ok(code) if (100..=599).contains(&code) => code.to_string(),
+            _ => "other".to_string(),
+        }
     }
 
     /// Increment the active WebSocket connection count (call on connect).
@@ -492,10 +559,7 @@ mod tests {
         // at least one label set has been used — seed them now.
         metrics.record_db_query("test_query", "ok", 0.001);
         metrics.record_redis_op("get", "ok", 0.0005);
-        metrics
-            .http_requests_total
-            .with_label_values(&["GET", "/health", "200"])
-            .inc();
+        metrics.record_http_request("GET", None, "200", 0.001);
 
         let families = metrics.registry.gather();
         let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
@@ -512,6 +576,40 @@ mod tests {
             names.contains(&"app_http_requests_total"),
             "app_http_requests_total must be registered after first use"
         );
+    }
+
+    #[test]
+    fn dynamic_metric_label_values_collapse_to_bounded_series() {
+        let metrics = Metrics::new().expect("Metrics::new() must succeed");
+
+        for id in 0..256 {
+            let dynamic = format!("wallet-pool-ledger-{id}");
+            metrics.record_http_request(&dynamic, None, &dynamic, 0.001);
+            metrics.record_db_query(&dynamic, &dynamic, 0.001);
+            metrics.record_redis_op(&dynamic, &dynamic, 0.001);
+            metrics.record_cache_lookup(&dynamic, &dynamic);
+            metrics.record_price_cache_fetch(&dynamic, 0, 0.001);
+        }
+
+        let text = metrics.gather_text().expect("gather_text must succeed");
+        assert!(!text.contains("wallet-pool-ledger"));
+        assert!(text.contains("method=\"other\""));
+        assert!(text.contains("path=\"<unmatched>\""));
+        assert!(text.contains("status=\"other\""));
+
+        for metric in [
+            "app_http_requests_total",
+            "app_db_queries_total",
+            "app_redis_operations_total",
+            "app_redis_cache_lookups_total",
+            "app_price_cache_fetch_total",
+        ] {
+            let count = text
+                .lines()
+                .filter(|line| line.starts_with(metric) && !line.starts_with('#'))
+                .count();
+            assert_eq!(count, 1, "{metric} should retain only one series");
+        }
     }
 
     /// `app_up` gauge is set to `1.0` immediately after initialization.
@@ -564,9 +662,7 @@ mod tests {
         let m1 = Metrics::new().expect("first Metrics::new() must succeed");
         let m2 = Metrics::new().expect("second Metrics::new() must succeed");
 
-        m1.http_requests_total
-            .with_label_values(&["GET", "/health", "200"])
-            .inc();
+        m1.record_http_request("GET", None, "200", 0.001);
 
         let m2_text = m2.gather_text().expect("gather_text() must succeed");
         assert!(
@@ -654,10 +750,7 @@ mod tests {
     #[test]
     fn http_500_responses_are_counted_by_status_label() {
         let metrics = Metrics::new().expect("Metrics::new() must succeed");
-        metrics
-            .http_requests_total
-            .with_label_values(&["GET", "/health", "500"])
-            .inc();
+        metrics.record_http_request("GET", None, "500", 0.001);
 
         let text = metrics.gather_text().expect("gather_text() must succeed");
         assert!(
@@ -672,10 +765,7 @@ mod tests {
         let metrics: SharedMetrics = Arc::new(Metrics::new().expect("Metrics::new() must succeed"));
         let cloned = metrics.clone();
 
-        cloned
-            .http_requests_total
-            .with_label_values(&["POST", "/api/v1/pools", "201"])
-            .inc();
+        cloned.record_http_request("POST", None, "201", 0.001);
 
         let text = metrics
             .gather_text()

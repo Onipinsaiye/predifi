@@ -24,7 +24,8 @@
 //!   "target": "predifi_backend::request_logger",
 //!   "span": {
 //!     "http.method": "GET",
-//!     "http.route": "/api/v1/pools/42",
+//!     "http.route": "/api/v1/pools/:id",
+//!     "http.path": "/api/v1/pools/42",
 //!     "correlation_id": "01J2K3L4M5N6P7Q8R9S0T1U2V3",
 //!     "user_address": "GABC...XYZ",
 //!     "pool_id": "42"
@@ -67,6 +68,7 @@ use std::{
     time::Instant,
 };
 
+use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, Request, Response};
 use tower::{Layer, Service};
 use tracing::{error, info, info_span, warn, Instrument};
@@ -212,6 +214,7 @@ where
         // ── Extract per-request context ────────────────────────────────────
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
+        let route = req.extensions().get::<MatchedPath>().cloned();
         let correlation_id = extract_correlation_id(req.headers());
         let user_address = extract_user_address(req.headers())
             .map(|a| redact_address(&a))
@@ -227,7 +230,8 @@ where
         let span = info_span!(
             "http.request",
             http.method = %method,
-            http.route = %path,
+            http.route = route.as_ref().map(MatchedPath::as_str).unwrap_or("<unmatched>"),
+            http.path = %path,
             correlation_id = %correlation_id,
             user_address = %user_address,
             pool_id = pool_id.as_deref().unwrap_or(""),
@@ -269,15 +273,12 @@ where
                         }
 
                         if let Some(m) = &metrics {
-                            m.http_request_duration_seconds
-                                .with_label_values(&[&method, &path, &status_label])
-                                .observe(elapsed.as_secs_f64());
-                            m.http_requests_total
-                                .with_label_values(&[&method, &path, &status_label])
-                                .inc();
-                            if status_u16 >= 500 {
-                                m.http_server_errors_total.inc();
-                            }
+                            m.record_http_request(
+                                &method,
+                                route.as_ref(),
+                                &status_label,
+                                elapsed.as_secs_f64(),
+                            );
                         }
                     }
                     Err(_) => {
@@ -286,9 +287,12 @@ where
                             "request failed with transport error"
                         );
                         if let Some(m) = &metrics {
-                            m.http_request_duration_seconds
-                                .with_label_values(&[&method, &path, "error"])
-                                .observe(elapsed.as_secs_f64());
+                            m.record_http_request(
+                                &method,
+                                route.as_ref(),
+                                "error",
+                                elapsed.as_secs_f64(),
+                            );
                         }
                     }
                 }

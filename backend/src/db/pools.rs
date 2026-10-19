@@ -155,7 +155,7 @@ pub async fn get_pools_with_filters(
         r#"
         SELECT pool_id, name, category, total_stake, end_time, created_at
         FROM pools
-        WHERE state = $1
+        WHERE stellar_canonical AND state = $1
           AND ($2::text IS NULL OR category = $2)
         ORDER BY {order_clause}
         LIMIT $3 OFFSET $4
@@ -186,7 +186,7 @@ pub async fn count_pools_with_filters(
         r#"
         SELECT COUNT(*)
         FROM pools
-        WHERE state = $1
+        WHERE stellar_canonical AND state = $1
           AND ($2::text IS NULL OR category = $2)
         "#,
     )
@@ -208,7 +208,7 @@ pub async fn get_pool_by_id(
         SELECT pool_id, name, category, total_stake, end_time, created_at,
                state, creator, token, result
         FROM pools
-        WHERE pool_id = $1
+        WHERE pool_id = $1 AND stellar_canonical
         "#,
     )
     .bind(pool_id)
@@ -226,6 +226,9 @@ pub async fn get_pool_outcome_stakes(
         SELECT outcome, COALESCE(SUM(amount), 0) AS total_stake
         FROM predictions
         WHERE pool_id = $1
+          AND EXISTS (
+              SELECT 1 FROM pools WHERE pool_id = $1 AND stellar_canonical
+          )
         GROUP BY outcome
         ORDER BY outcome
         "#,
@@ -281,12 +284,42 @@ pub async fn insert_pool_from_event(
     pool: &PgPool,
     event: &PoolCreatedEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    insert_pool_from_stellar_event_with_key(pool, event, None).await
+}
+
+/// Insert a pool while retaining the canonical event key that created it.
+pub async fn insert_pool_from_stellar_event(
+    pool: &PgPool,
+    event: &PoolCreatedEvent,
+    stellar_event_key: &str,
+) -> Result<(), sqlx::Error> {
+    insert_pool_from_stellar_event_with_key(pool, event, Some(stellar_event_key)).await
+}
+
+async fn insert_pool_from_stellar_event_with_key(
+    pool: &PgPool,
+    event: &PoolCreatedEvent,
+    stellar_event_key: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let inserted = sqlx::query(
         r#"
         INSERT INTO pools
-            (pool_id, name, category, total_stake, end_time, state, creator, token, created_at)
-        VALUES ($1, $2, $3, 0, to_timestamp($4), 'active', $5, $6, NOW())
-        ON CONFLICT (pool_id) DO NOTHING
+            (pool_id, name, category, total_stake, end_time, state, creator, token, created_at,
+             stellar_created_event_key)
+        VALUES ($1, $2, $3, 0, to_timestamp($4), 'active', $5, $6, NOW(), $7)
+        ON CONFLICT (pool_id) DO UPDATE
+        SET name = EXCLUDED.name,
+            category = EXCLUDED.category,
+            total_stake = 0,
+            end_time = EXCLUDED.end_time,
+            state = 'active',
+            creator = EXCLUDED.creator,
+            token = EXCLUDED.token,
+            result = NULL,
+            stellar_created_event_key = EXCLUDED.stellar_created_event_key,
+            stellar_state_event_key = NULL,
+            stellar_canonical = TRUE
+        WHERE NOT pools.stellar_canonical
         "#,
     )
     .bind(event.pool_id as i64)
@@ -295,11 +328,52 @@ pub async fn insert_pool_from_event(
     .bind(event.end_time as f64)
     .bind(&event.creator)
     .bind(&event.token)
+    .bind(stellar_event_key)
     .execute(pool)
     .await?;
 
-    record_pool_created_for_creator(pool, &event.creator).await?;
+    if inserted.rows_affected() > 0 {
+        record_pool_created_for_creator(pool, &event.creator).await?;
+    }
 
+    Ok(())
+}
+
+/// Mark a pool resolved and retain the event key that supplied its state.
+pub async fn resolve_pool_from_stellar_event(
+    pool: &PgPool,
+    pool_id: u64,
+    winning_outcome: i32,
+    stellar_event_key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE pools SET state = 'settled', result = $1, resolved_at = NOW(),
+                           stellar_state_event_key = $2
+         WHERE pool_id = $3 AND stellar_canonical",
+    )
+    .bind(winning_outcome.to_string())
+    .bind(stellar_event_key)
+    .bind(pool_id as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mark a pool canceled and retain the event key that supplied its state.
+pub async fn cancel_pool_from_stellar_event(
+    pool: &PgPool,
+    pool_id: u64,
+    stellar_event_key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE pools
+         SET state = 'closed', stellar_state_event_key = $1
+         WHERE pool_id = $2 AND stellar_canonical",
+    )
+    .bind(stellar_event_key)
+    .bind(pool_id as i64)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -428,7 +502,7 @@ pub async fn is_creator_reward_eligible(
         r#"
         SELECT (total_stake >= min_participation_threshold AND NOT creator_reward_paid)
         FROM pools
-        WHERE pool_id = $1
+        WHERE pool_id = $1 AND stellar_canonical
         "#,
     )
     .bind(pool_id)
@@ -470,7 +544,7 @@ pub async fn pay_creator_incentive(
     };
 
     let creator_reward_bps: i32 =
-        sqlx::query_scalar("SELECT creator_reward_bps FROM pools WHERE pool_id = $1")
+        sqlx::query_scalar("SELECT creator_reward_bps FROM pools WHERE pool_id = $1 AND stellar_canonical")
             .bind(pool_id)
             .fetch_one(pool)
             .await?;

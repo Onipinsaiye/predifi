@@ -124,7 +124,7 @@ pub async fn run_full_sync(
 
     // Fetch all pool IDs and their current DB total_stake.
     let rows = sqlx::query_as::<_, PoolStakeRow>(
-        "SELECT pool_id, total_stake FROM pools ORDER BY pool_id",
+        "SELECT pool_id, total_stake FROM pools WHERE stellar_canonical ORDER BY pool_id",
     )
     .fetch_all(db)
     .await?;
