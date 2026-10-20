@@ -9,11 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### ABI
 
+- Added contract-level ceilings for pool outcomes (`MAX_OUTCOMES_PER_POOL`),
+  distinct predictors per pool (`MAX_PREDICTIONS_PER_POOL`), and aggregate
+  stake (`MAX_AGGREGATE_STAKE_PER_POOL`).
+
 ### Error Codes
 
+- Added `MaxOutcomesExceeded` (114), `MaxPredictionsPerPoolExceeded` (115),
+  and `MaxAggregateStakeExceeded` (116).
+
 ### Events
+- Published `EVENT_SCHEMA_VERSION` and added the versioned event schema reference
+  (`docs/EVENT_SCHEMAS.md`) covering pool lifecycle, prediction, resolution, and payout
+  events, including compatibility rules and stable identifiers for idempotent indexing.
+- Added golden tests (`src/event_schema_tests.rs`) that pin exact topics and payload
+  shapes for representative lifecycle flows.
 
 ### Internal
+
+- Enforced all three resource limits before any prediction or pool state is
+  written, with overflow-safe aggregate stake accounting.
+- Added boundary tests at maximum, maximum-minus-one, and maximum-plus-one,
+  plus resource benchmarks covering CPU, memory, and persistent storage.
 
 ## [0.0.0] - 2026-09-17
 

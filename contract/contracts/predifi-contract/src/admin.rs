@@ -16,10 +16,37 @@
 //! - **`pause(env, admin)`**: Emergency pause contract execution.
 //!   - *Role Required*: Admin (0)
 //!   - *Error on Unauthorized*: Panic (`"Unauthorized: missing required role"`)
+//!
+//! ## Pause Scope Matrix
+//!
+//! The pause flag is **scoped by operation**. When the contract is paused, the
+//! following matrix determines whether each entry point is blocked:
+//!
+//! | Operation | Paused behavior |
+//! |-----------|-----------------|
+//! | `create_pool` | Blocked (`ContractPaused`) |
+//! | `place_prediction` | Blocked (`ContractPaused`) |
+//! | `resolve_pool` | Blocked (`ContractPaused`) |
+//! | `cancel_pool` | Blocked (`ContractPaused`) |
+//! | `claim_winnings` | **Allowed** — safe exit preserved |
+//! | `claim_refund` | **Allowed** — safe exit preserved |
+//! | `add_to_whitelist` / `remove_from_whitelist` | Blocked (`ContractPaused`) |
+//! | `batch_add_to_whitelist` / `batch_remove_from_whitelist` | Blocked (`ContractPaused`) |
+//! | Admin config setters (`set_fee_bps`, `set_min_stake`, …) | Blocked (`ContractPaused`) |
+//! | `upgrade_contract` | **Allowed** — needed for emergency remediation |
+//! | `pause` / `unpause` | **Allowed** — must always be callable |
+//! | Read-only queries (`is_contract_paused`, `get_*`) | **Allowed** |
+//!
+//! Clients should call `is_contract_paused` (or read `is_paused` from
+//! `get_contract_info` / `get_contract_metadata`) to determine whether
+//! non-exit operations will be rejected.
 //! - **`unpause(env, admin)`**: Resume contract execution.
 //!   - *Role Required*: Admin (0)
 //!   - *Error on Unauthorized*: Panic (`"Unauthorized: missing required role"`)
 //! - **`set_fee_bps(env, admin, fee_bps)`**: Queue a fee change proposal subject to a 7-day timelock.
+//!   - *Role Required*: Admin (0)
+//!   - *Error on Unauthorized*: `PredifiError::Unauthorized`
+//! - **`set_fee_cap(env, admin, cap_bps)`**: Set the maximum allowed treasury fee.
 //!   - *Role Required*: Admin (0)
 //!   - *Error on Unauthorized*: `PredifiError::Unauthorized`
 //! - **`apply_fee_bps(env, admin)`**: Apply a queued fee change once timelock expires.
@@ -93,6 +120,8 @@
 //! - **`get_pending_fee_change(env)`**: Query timelocked fee proposal (`Option<PendingFeeChange>`).
 //! - **`get_supported_tokens(env)`**: Query list of whitelisted token addresses (`Vec<Address>`).
 //! - **`is_token_allowed(env, token)`**: Check if a token is whitelisted (`bool`).
+//! - **`get_fee_cap(env)`**: Query the maximum allowed treasury fee (`u32`).
+//! - **`get_fee_change_delay(env)`**: Query the minimum fee-change delay (`u64`).
 //! - **`get_fees(env)`**: Query fee info (`FeeInfo`).
 //! - **`get_prediction_cooldown(env)`**: Query prediction cooldown seconds (`u64`).
 //! - **`get_contract_info(env)`**: Query aggregated contract info (`ContractInfo`).
@@ -113,7 +142,8 @@ use crate::{
     PredifiContractClient, PredifiError, RemovedFromWhitelistEvent, ResolutionDelayUpdateEvent,
     StorageTtlRenewedEvent, TokenWhitelistAddedEvent, TokenWhitelistRemovedEvent, UnpauseEvent,
     UpgradeEvent, CONTRACT_VERSION, DEFAULT_GLOBAL_MIN_STAKE, DEFAULT_PREDICTION_COOLDOWN_SECONDS,
-    FEE_CHANGE_TIMELOCK_SECONDS, MAX_CLAIM_WINDOW, MAX_RESOLUTION_DELAY, MIN_CLAIM_WINDOW,
+    FEE_CHANGE_TIMELOCK_SECONDS, MAX_CLAIM_WINDOW, MAX_FEE_BPS, MAX_RESOLUTION_DELAY,
+    MIN_CLAIM_WINDOW, MIN_FEE_CHANGE_DELAY_SECONDS,
 };
 
 #[contractimpl]
@@ -146,6 +176,12 @@ impl PredifiContract {
             soroban_sdk::panic_with_error!(&env, PredifiError::InvalidFeeBps);
         }
 
+        // Enforce the configured maximum fee cap on init so the contract
+        // cannot be deployed with a fee above the governance cap.
+        if fee_bps > MAX_FEE_BPS {
+            soroban_sdk::panic_with_error!(&env, PredifiError::InvalidFeeBps);
+        }
+
         let config = Config {
             fee_bps,
             treasury: treasury.clone(),
@@ -163,6 +199,7 @@ impl PredifiContract {
         env.storage()
             .instance()
             .set(&DataKey::Version, &CONTRACT_VERSION);
+        env.storage().instance().set(&DataKey::FeeCapBps, &MAX_FEE_BPS);
         Self::extend_instance(&env);
 
         InitEvent {
@@ -188,6 +225,7 @@ impl PredifiContract {
     ///
     /// While paused, administrative checks continue to work, but
     /// state-changing operations guarded by the pause flag are rejected.
+    /// See the module-level "Pause Scope Matrix" for the exact set of affected entry points.
     pub fn pause(env: Env, admin: Address) {
         admin.require_auth();
         if Self::require_admin_role(&env, &admin, "pause").is_err() {
@@ -230,6 +268,40 @@ impl PredifiContract {
         UnpauseEvent { admin }.publish(&env);
     }
 
+    /// Set the maximum allowed treasury fee (in basis points). Caller must have
+    /// Admin role (0). The cap bounds all future `set_fee_bps` proposals so
+    /// governance cannot raise participant fees beyond this ceiling.
+    ///
+    /// # Errors
+    /// - [`PredifiError::ContractPaused`] – contract is paused.
+    /// - [`PredifiError::Unauthorized`]   – caller lacks Admin role (0).
+    /// - [`PredifiError::InvalidFeeBps`]  – `cap_bps > MAX_FEE_BPS`.
+    pub fn set_fee_cap(env: Env, admin: Address, cap_bps: u32) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "set_fee_cap")?;
+        if cap_bps > MAX_FEE_BPS {
+            return Err(PredifiError::InvalidFeeBps);
+        }
+        env.storage().instance().set(&DataKey::FeeCapBps, &cap_bps);
+        Self::extend_instance(&env);
+        Ok(())
+    }
+
+    /// Return the current maximum allowed treasury fee in basis points.
+    pub fn get_fee_cap(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeCapBps)
+            .unwrap_or(MAX_FEE_BPS)
+    }
+
+    /// Return the minimum delay (in seconds) that must elapse between a fee
+    /// change proposal and its activation.
+    pub fn get_fee_change_delay(_env: Env) -> u64 {
+        FEE_CHANGE_TIMELOCK_SECONDS
+    }
+
     /// Check if the contract is paused.
     ///
     /// This is a public query function that allows third-party integrations
@@ -237,6 +309,9 @@ impl PredifiContract {
     ///
     /// # Returns
     /// `true` if the contract is paused, `false` otherwise.
+    ///
+    /// Clients should use this to gate non-exit operations; claim and refund
+    /// paths remain callable while paused (see the Pause Scope Matrix).
     pub fn is_contract_paused(env: Env) -> bool {
         Self::is_paused(&env)
     }
@@ -289,6 +364,10 @@ impl PredifiContract {
         if !Self::is_valid_fee_bps(fee_bps) {
             return Err(PredifiError::InvalidFeeBps);
         }
+        // Enforce the governance fee cap so a proposal cannot exceed it.
+        if fee_bps > Self::get_fee_cap(env.clone()) {
+            return Err(PredifiError::InvalidFeeBps);
+        }
         // Only one proposal may be pending at a time.
         if env.storage().instance().has(&DataKey::PendingFeeBps) {
             return Err(PredifiError::FeeChangePending);
@@ -299,9 +378,15 @@ impl PredifiContract {
             effective_at,
             proposed_by: admin.clone(),
         };
+        // Snapshot the current fee so existing pools can be audited against the
+        // fee in effect at proposal time.
+        let previous_fee_bps = Self::get_config(&env).fee_bps;
         env.storage()
             .instance()
             .set(&DataKey::PendingFeeBps, &pending);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeSnapshot, &previous_fee_bps);
         Self::extend_instance(&env);
 
         FeeChangeProposeEvent {
@@ -340,11 +425,18 @@ impl PredifiContract {
         if env.ledger().timestamp() < pending.effective_at {
             return Err(PredifiError::TimelockNotExpired);
         }
+        // Re-check the cap at activation time in case the cap was lowered.
+        if pending.new_fee_bps > Self::get_fee_cap(env.clone()) {
+            return Err(PredifiError::InvalidFeeBps);
+        }
 
         let mut config = Self::get_config(&env);
         config.fee_bps = pending.new_fee_bps;
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().remove(&DataKey::PendingFeeBps);
+        env.storage().instance().remove(&DataKey::FeeSnapshot);
+        // Only pools created from now on snapshot the new schedule.
+        Self::bump_fee_schedule_version(&env);
         Self::extend_instance(&env);
 
         FeeUpdateEvent {
@@ -376,6 +468,7 @@ impl PredifiContract {
         }
 
         env.storage().instance().remove(&DataKey::PendingFeeBps);
+        env.storage().instance().remove(&DataKey::FeeSnapshot);
         Self::extend_instance(&env);
 
         FeeChangeCancelEvent { admin }.publish(&env);
@@ -389,6 +482,13 @@ impl PredifiContract {
     /// a proposal exists and to read the `effective_at` timestamp.
     pub fn get_pending_fee_change(env: Env) -> Option<PendingFeeChange> {
         env.storage().instance().get(&DataKey::PendingFeeBps)
+    }
+
+    /// Return the fee (in bps) that was in effect when the current pending fee
+    /// change was proposed, or `None` if no proposal is queued. Useful for
+    /// auditing fee snapshots for existing pools.
+    pub fn get_fee_snapshot(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::FeeSnapshot)
     }
 
     /// Set maximum predictions per user. Caller must have Admin role (0).
@@ -756,6 +856,9 @@ impl PredifiContract {
     }
 
     /// Upgrade the contract Wasm code. Only callable by Admin (role 0).
+    ///
+    /// This operation is intentionally **not** gated by the pause flag so that
+    /// an admin can remediate an emergency while the contract is paused.
     pub fn upgrade_contract(
         env: Env,
         admin: Address,
@@ -844,6 +947,7 @@ impl PredifiContract {
             pending_fee_bps: pending.clone().map(|p| p.new_fee_bps),
             pending_fee_effective_at: pending.map(|p| p.effective_at),
             fee_change_timelock_seconds: FEE_CHANGE_TIMELOCK_SECONDS,
+            fee_cap_bps: Self::get_fee_cap(env.clone()),
         }
     }
 
@@ -882,6 +986,7 @@ impl PredifiContract {
             min_stake: config.min_stake,
             max_predictions_per_user: config.max_predictions_per_user,
             prediction_cooldown_seconds: config.prediction_cooldown_seconds,
+            fee_cap_bps: Self::get_fee_cap(env.clone()),
         }
     }
 
@@ -1229,6 +1334,9 @@ impl PredifiContract {
 
         env.storage().persistent().set(&DataKey::FeeTiers, &tiers);
         Self::bump_ttl(&env, &DataKey::FeeTiers);
+        // Only pools created from now on snapshot the new tiers.
+        Self::bump_fee_schedule_version(&env);
+        Self::extend_instance(&env);
 
         FeeTiersUpdateEvent {
             admin,
@@ -1259,6 +1367,7 @@ impl PredifiContract {
     /// Entries renewed:
     /// - `Pool(pool_id)` — core pool struct
     /// - `OutStakes(pool_id)` — batch outcome stakes (if present)
+    /// - `PoolFeeSchedule(pool_id)` / `ResolutionChallenge(pool_id)` (if present)
     ///
     /// # Arguments
     /// * `pool_id` - The ID of the pool whose TTLs should be renewed.
@@ -1286,6 +1395,15 @@ impl PredifiContract {
             Self::extend_persistent(&env, &stakes_key);
         }
 
+        for key in [
+            DataKey::PoolFeeSchedule(pool_id),
+            DataKey::ResolutionChallenge(pool_id),
+        ] {
+            if env.storage().persistent().has(&key) {
+                Self::extend_persistent(&env, &key);
+            }
+        }
+
         StorageTtlRenewedEvent {
             pool_id,
             timestamp: env.ledger().timestamp(),
@@ -1307,6 +1425,9 @@ impl PredifiContract {
     ///
     /// # Returns
     /// A `ContractMetadata` struct containing all protocol parameters.
+    ///
+    /// Includes `is_paused` so clients can determine which operations are
+    /// currently blocked without a separate call.
     pub fn get_contract_metadata(env: Env) -> ContractMetadata {
         let config = Self::get_config(&env);
         let current_admin = Self::get_access_control_admin(&env, &config.access_control)
@@ -1358,6 +1479,7 @@ impl PredifiContract {
             prediction_cooldown_seconds: config.prediction_cooldown_seconds,
             fee_tiers_count,
             oracle_initialized,
+            fee_cap_bps: Self::get_fee_cap(env.clone()),
         }
     }
 }
