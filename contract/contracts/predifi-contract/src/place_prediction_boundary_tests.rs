@@ -14,18 +14,24 @@
 //!    the cap is rejected with `MaxTotalStakeExceeded`.
 //! 4. **Pool start-time boundary** — a prediction placed at the exact
 //!    `pool.start_time` succeeds (the contract only gates on `end_time`).
-//! 5. **`i128::MAX` stake** — a single prediction for the maximum possible
-//!    `i128` amount is accepted and correctly reflected in `pool.total_stake`.
+//! 5. **Aggregate ceiling stake** — a single prediction for
+//!    `MAX_AGGREGATE_STAKE_PER_POOL` is accepted and correctly reflected in
+//!    `pool.total_stake`.
 //! 6. **Prediction cooldown boundary** — a second prediction from the same
 //!    user succeeds at exactly `cooldown_seconds` elapsed, and is rejected one
 //!    second short of that.
 //! 7. **Concurrent (repeated) predictions from the same user** — placing two
 //!    predictions on the same pool/outcome accumulates into a single
 //!    `Prediction` record without double-counting `participants_count`.
+//! 8. **Scoped emergency pause** — `place_prediction` is blocked while the
+//!    `PlacePrediction` operation is paused, and unaffected otherwise.
 
 #![cfg(test)]
 
-use crate::{PoolConfig, PredifiContract, PredifiContractClient, PredifiError};
+use crate::{
+    PoolConfig, PredifiContract, PredifiContractClient, PredifiError,
+    MAX_AGGREGATE_STAKE_PER_POOL,
+};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
@@ -37,6 +43,7 @@ use soroban_sdk::{
 // Mirrors the minimal in-process access-control stub used by the other
 // boundary-test modules in this crate (see `claim_winnings_boundary_tests`).
 
+#[allow(dead_code)]
 mod dummy_ac {
     use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
 
@@ -149,6 +156,7 @@ fn base_config(env: &Env) -> PoolConfig {
 // 1. MIN-STAKE BOUNDARY
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 #[test]
 fn test_stake_of_exactly_min_stake_succeeds() {
     let env = Env::default();
@@ -365,19 +373,19 @@ fn test_prediction_at_exact_pool_start_time_succeeds() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5. `i128::MAX` STAKE
+// 5. AGGREGATE CEILING STAKE
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_prediction_with_i128_max_amount_succeeds() {
+fn test_prediction_with_max_aggregate_stake_succeeds() {
     let env = Env::default();
     let ctx = setup(&env);
 
     let bettor = Address::generate(&env);
-    ctx.token_admin.mint(&bettor, &i128::MAX);
+    ctx.token_admin.mint(&bettor, &MAX_AGGREGATE_STAKE_PER_POOL);
 
     let end_time = 10_000u64;
-    // Unbounded max_stake / max_total_stake so nothing else interferes.
+    // Unbounded max_stake / max_total_stake so only the contract ceiling applies.
     let pool_id = ctx.client.create_pool(
         &bettor,
         &end_time,
@@ -387,12 +395,24 @@ fn test_prediction_with_i128_max_amount_succeeds() {
         &base_config(&env),
     );
 
-    ctx.client
-        .place_prediction(&bettor, &pool_id, &i128::MAX, &0, &None, &None);
+    ctx.client.place_prediction(
+        &bettor,
+        &pool_id,
+        &MAX_AGGREGATE_STAKE_PER_POOL,
+        &0,
+        &None,
+        &None,
+    );
 
-    assert_eq!(ctx.client.get_pool(&pool_id).total_stake, i128::MAX);
+    assert_eq!(
+        ctx.client.get_pool(&pool_id).total_stake,
+        MAX_AGGREGATE_STAKE_PER_POOL
+    );
     assert_eq!(ctx.token.balance(&bettor), 0);
-    assert_eq!(ctx.token.balance(&ctx.client.address), i128::MAX);
+    assert_eq!(
+        ctx.token.balance(&ctx.client.address),
+        MAX_AGGREGATE_STAKE_PER_POOL
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -516,4 +536,70 @@ fn test_repeated_predictions_same_user_same_outcome_accumulate() {
         "the user should have exactly one aggregated prediction record for this pool"
     );
     assert_eq!(predictions.get(0).unwrap().amount, 300);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. SCOPED EMERGENCY PAUSE
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// While the `PlacePrediction` operation is paused, `place_prediction` must be
+/// rejected. This locks in the scoped pause matrix so that pausing predictions
+/// does not silently allow new entries.
+#[test]
+#[should_panic]
+fn test_place_prediction_rejected_when_operation_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let bettor = Address::generate(&env);
+    ctx.token_admin.mint(&bettor, &500);
+
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &bettor,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &base_config(&env),
+    );
+
+    // Pause the place-prediction operation via the admin.
+    ctx.client
+        .pause_operation(&ctx.admin, &symbol_short!("place_pred"));
+
+    // Attempting to place a prediction while paused must revert.
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &100, &0, &None, &None);
+}
+
+/// After unpausing, `place_prediction` must succeed again, proving the pause
+/// is reversible and scoped to the operation rather than a permanent lock.
+#[test]
+fn test_place_prediction_succeeds_after_operation_unpaused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let bettor = Address::generate(&env);
+    ctx.token_admin.mint(&bettor, &500);
+
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &bettor,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &base_config(&env),
+    );
+
+    ctx.client
+        .pause_operation(&ctx.admin, &symbol_short!("place_pred"));
+    ctx.client
+        .unpause_operation(&ctx.admin, &symbol_short!("place_pred"));
+
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &100, &0, &None, &None);
+
+    assert_eq!(ctx.client.get_pool(&pool_id).total_stake, 100);
 }
