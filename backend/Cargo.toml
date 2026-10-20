@@ -65,6 +65,11 @@ path = "tests/migration_roundtrip.rs"
 required-features = ["integration-tests"]
 
 [[test]]
+name = "indexer_stress"
+path = "tests/indexer_stress.rs"
+required-features = ["integration-tests"]
+
+[[test]]
 name = "migration_integration_suite"
 path = "tests/migration_integration_suite.rs"
 

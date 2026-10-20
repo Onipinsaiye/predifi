@@ -11,6 +11,7 @@ This document outlines the commands and requirements for running test suites acr
 | **Frontend** | `cd frontend && pnpm test` | Jest + React Testing Library | No | React components, UI hooks, state managers, and formatting utilities |
 | **Backend Unit Tests** | `cd backend && cargo test` | Rust built-in test runner | No | Route validation, types, caching logic, rate limiting, and business logic |
 | **Backend Load Tests** | `cd backend && cargo test --features integration-tests --test load_pools -- --nocapture` | `testcontainers` + Axum oneshot | **Yes** (Docker daemon) | Throughput and latency percentiles for `GET /v1/pools` |
+| **Indexer Concurrency Stress** | `cd backend && cargo test --features integration-tests --test indexer_stress -- --ignored --nocapture` | `testcontainers` + Tokio | **Yes** (Docker daemon) | Concurrent ledger projections, API reads, worker backlog, PostgreSQL and Redis |
 | **Backend Integration Tests** | `cd backend && cargo test --features integration-tests` | `testcontainers` (Rust) | **Yes** (Docker daemon) | Real PostgreSQL migrations, schema roundtrips, and database queries |
 | **Contract Unit Tests** | `cd contract && cargo test` | Soroban Rust SDK test env | No | Contract mechanics, authorization checks, odds calculations, and payouts |
 | **Contract Full Workspace** | `bash contract/scripts/test_all.sh` | Bash + Cargo workspace | No | Sequential run across `predifi-errors`, `access-control`, and `predifi-contract` with summary report |
@@ -133,6 +134,36 @@ DATABASE_URL="postgres://postgres:postgres@localhost:5432/predifi" \
 REDIS_URL="redis://localhost:6379" \
 cd backend && cargo test --features integration-tests
 ```
+
+### Indexer concurrency stress test
+
+Run the scheduled Postgres/Redis stress workload locally with Docker available:
+
+```bash
+cd backend && cargo test --features integration-tests --test indexer_stress -- --ignored --nocapture
+```
+
+The repeatable fixture contains 100 pools and 10,000 ledger-derived predictions.
+During the workload, eight event producers submit 2,000 prediction projections,
+eight readers run pool-list, leaderboard, and protocol-stat queries, and four
+background queue workers persist the events. Producers also replay the same
+pool-created event concurrently, and the workload exercises Redis reads and
+cache invalidations. The connection pool is capped at 24 connections. The
+scheduled GitHub Actions run uses an `ubuntu-latest` runner with one PostgreSQL
+and one Redis testcontainer.
+
+The workload fails on any SQL operation error, deadlock, duplicate pool
+projection, incorrect creator/prediction totals, worker dead-letter, or
+undrained backlog. Its acceptance limits are:
+
+- Combined read-operation latency: p95 at most 500 ms and p99 at most 1.5 s.
+- Worker backlog: fully drained within 60 seconds after producers finish.
+- PostgreSQL deadlocks and worker dead-letters: zero.
+- Redis remains healthy and both stress cache keys are invalidated by ingestion.
+
+The `Indexer Stress` workflow runs weekly and can also be started with
+`workflow_dispatch`. It reports fixture size, workload concurrency, maximum
+observed backlog, drain duration, and latency percentiles in the test log.
 
 ---
 
