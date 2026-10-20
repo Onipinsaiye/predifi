@@ -82,6 +82,12 @@ use crate::{
     PredifiError, TreasuryUpdateEvent, TreasuryWithdrawnEvent, MIN_WITHDRAWAL_AMOUNT,
 };
 
+/// Maximum protocol fee in basis points (10%).
+pub const MAX_FEE_BPS: u32 = 1_000;
+
+/// Minimum delay (in ledgers) between proposing and activating a fee change.
+pub const MIN_FEE_CHANGE_DELAY_LEDGERS: u32 = 17_280; // ~1 day at 5s/ledger
+
 #[contractimpl]
 impl PredifiContract {
     /// Set treasury address. Caller must have Admin role (0).
@@ -95,6 +101,86 @@ impl PredifiContract {
         Self::extend_instance(&env);
 
         TreasuryUpdateEvent { admin, treasury }.publish(&env);
+        Ok(())
+    }
+
+    /// Propose a new protocol fee. Caller must have Admin role (0).
+    ///
+    /// The proposal is stored with an activation ledger that is at least
+    /// `MIN_FEE_CHANGE_DELAY_LEDGERS` in the future. The fee does not take
+    /// effect until [`Self::activate_fee_change`] is called at or after that
+    /// ledger. Existing pools snapshot the fee at creation time, so they are
+    /// unaffected by later fee changes.
+    pub fn propose_fee_change(
+        env: Env,
+        admin: Address,
+        new_fee_bps: u32,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "propose_fee_change")?;
+
+        if new_fee_bps > MAX_FEE_BPS {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let now = env.ledger().sequence();
+        let activation_ledger = now.saturating_add(MIN_FEE_CHANGE_DELAY_LEDGERS);
+
+        env.storage().instance().set(
+            &DataKey::PendingFeeChange,
+            &(new_fee_bps, activation_ledger),
+        );
+        Self::extend_instance(&env);
+
+        Ok(())
+    }
+
+    /// Cancel a pending fee change. Caller must have Admin role (0).
+    pub fn cancel_fee_change(env: Env, admin: Address) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "cancel_fee_change")?;
+
+        if !env.storage().instance().has(&DataKey::PendingFeeChange) {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        env.storage().instance().remove(&DataKey::PendingFeeChange);
+        Self::extend_instance(&env);
+
+        Ok(())
+    }
+
+    /// Activate a previously proposed fee change. Caller must have Admin role (0).
+    ///
+    /// Reverts if there is no pending proposal or if the activation ledger has
+    /// not yet been reached.
+    pub fn activate_fee_change(env: Env, admin: Address) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "activate_fee_change")?;
+
+        let (new_fee_bps, activation_ledger): (u32, u32) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingFeeChange)
+            .ok_or(PredifiError::InvalidAmount)?;
+
+        if env.ledger().sequence() < activation_ledger {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        if new_fee_bps > MAX_FEE_BPS {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let mut config = Self::get_config(&env);
+        config.fee_bps = new_fee_bps;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().remove(&DataKey::PendingFeeChange);
+        Self::extend_instance(&env);
+
         Ok(())
     }
 

@@ -25,6 +25,21 @@
 //! 5. **All participants chose the same outcome** — every bettor wins; their
 //!    individual payouts must sum to exactly `total_stake` (INV-5) and the
 //!    contract balance drains to zero.
+//!
+//! 6. **Scoped emergency pause matrix** — verifies that the emergency pause
+//!    is scoped per-operation rather than global.  The matrix is:
+//!
+//!    | Operation           | Pausable | Notes                                   |
+//!    |---------------------|----------|-----------------------------------------|
+//!    | `place_prediction`  | yes      | new risk entry is halted                |
+//!    | `create_pool`       | yes      | new markets are halted                  |
+//!    | `resolve_pool`      | yes      | resolution is halted                    |
+//!    | `claim_winnings`    | no       | safe exit — always allowed              |
+//!    | `claim_refund`      | no       | safe exit — always allowed              |
+//!    | `cancel_pool`       | yes      | cancellation is halted                  |
+//!    | `withdraw_fees`     | yes      | treasury movement is halted             |
+//!
+//!    The pause state is exposed to clients via `is_paused(operation)`.
 
 #![cfg(test)]
 
@@ -1032,3 +1047,366 @@ fn test_all_same_outcome_with_fee_payout_reduced_proportionally() {
 }
 
 extern crate alloc;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. SCOPED EMERGENCY PAUSE MATRIX
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The emergency pause is scoped per-operation.  The following tests exercise
+// every public entry point in both paused and unpaused states, and verify that
+// safe exits (`claim_winnings`, `claim_refund`) remain available even while
+// risk-increasing operations are paused.
+
+/// Helper: pause a single operation via the admin.
+fn pause_op(ctx: &Ctx<'_>, op: u32) {
+    ctx.client.pause(&ctx.admin, &op);
+}
+
+/// Helper: unpause a single operation via the admin.
+fn unpause_op(ctx: &Ctx<'_>, op: u32) {
+    ctx.client.unpause(&ctx.admin, &op);
+}
+
+/// Helper: build a resolved pool with a single winning bettor, returning
+/// `(pool_id, bettor, end_time)`.  Used by the pause-matrix tests to set up
+/// claimable state without duplicating boilerplate.
+fn setup_resolved_pool<'a>(
+    ctx: &Ctx<'a>,
+    env: &Env,
+    stake: i128,
+    winning_outcome: u32,
+) -> (u64, Address, u64) {
+    let bettor = Address::generate(env);
+    ctx.token_admin.mint(&bettor, &stake);
+
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &bettor,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &two_outcome_config(env),
+    );
+
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &stake, &winning_outcome, &None, &None);
+
+    resolve_at(ctx, env, pool_id, end_time, winning_outcome);
+    (pool_id, bettor, end_time)
+}
+
+// ─── Pause state exposure ────────────────────────────────────────────────────
+
+/// `is_paused(operation)` must reflect the per-operation pause state and must
+/// be readable by any client (no auth required).
+#[test]
+fn test_pause_state_is_exposed_per_operation() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    // Operation ids: 0 = place_prediction, 1 = create_pool, 2 = resolve_pool,
+    // 3 = claim_winnings, 4 = claim_refund, 5 = cancel_pool, 6 = withdraw_fees.
+    for op in 0u32..7u32 {
+        assert!(
+            !ctx.client.is_paused(&op),
+            "operation {op} must start unpaused"
+        );
+    }
+
+    pause_op(&ctx, 0);
+    assert!(ctx.client.is_paused(&0u32), "op 0 must be paused");
+    assert!(
+        !ctx.client.is_paused(&1u32),
+        "pausing op 0 must not affect op 1"
+    );
+    assert!(
+        !ctx.client.is_paused(&3u32),
+        "pausing op 0 must not affect claim_winnings"
+    );
+
+    unpause_op(&ctx, 0);
+    assert!(!ctx.client.is_paused(&0u32), "op 0 must be unpaused again");
+}
+
+/// Only an admin may pause or unpause; an operator must be rejected.
+#[test]
+#[should_panic]
+fn test_pause_requires_admin_role() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    // Operator (role 1) is not admin (role 0).
+    ctx.client.pause(&ctx.operator, &0u32);
+}
+
+// ─── place_prediction ────────────────────────────────────────────────────────
+
+/// `place_prediction` must be rejected while its operation is paused.
+#[test]
+#[should_panic]
+fn test_place_prediction_rejected_when_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let bettor = Address::generate(&env);
+    ctx.token_admin.mint(&bettor, &100);
+
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &bettor,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &two_outcome_config(&env),
+    );
+
+    pause_op(&ctx, 0);
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &100, &1, &None, &None);
+}
+
+/// `place_prediction` succeeds once the operation is unpaused.
+#[test]
+fn test_place_prediction_allowed_after_unpause() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let bettor = Address::generate(&env);
+    ctx.token_admin.mint(&bettor, &100);
+
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &bettor,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &two_outcome_config(&env),
+    );
+
+    pause_op(&ctx, 0);
+    unpause_op(&ctx, 0);
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &100, &1, &None, &None);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 100);
+}
+
+// ─── create_pool ─────────────────────────────────────────────────────────────
+
+/// `create_pool` must be rejected while its operation is paused.
+#[test]
+#[should_panic]
+fn test_create_pool_rejected_when_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let creator = Address::generate(&env);
+    pause_op(&ctx, 1);
+    ctx.client.create_pool(
+        &creator,
+        &10_000u64,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &two_outcome_config(&env),
+    );
+}
+
+// ─── resolve_pool ────────────────────────────────────────────────────────────
+
+/// `resolve_pool` must be rejected while its operation is paused.
+#[test]
+#[should_panic]
+fn test_resolve_pool_rejected_when_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let creator = Address::generate(&env);
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &creator,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &two_outcome_config(&env),
+    );
+
+    pause_op(&ctx, 2);
+    env.ledger().with_mut(|li| li.timestamp = end_time);
+    ctx.client.resolve_pool(&ctx.operator, &pool_id, &1u32);
+}
+
+// ─── claim_winnings (safe exit — never pausable) ─────────────────────────────
+
+/// `claim_winnings` must remain available even when every other operation is
+/// paused.  This is the core safety property of the scoped pause matrix.
+#[test]
+fn test_claim_winnings_allowed_while_all_other_ops_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let (pool_id, bettor, _end) = setup_resolved_pool(&ctx, &env, 1_000, 1);
+
+    // Pause every operation except claim_winnings (3) and claim_refund (4).
+    pause_op(&ctx, 0);
+    pause_op(&ctx, 1);
+    pause_op(&ctx, 2);
+    pause_op(&ctx, 5);
+    pause_op(&ctx, 6);
+
+    let winnings = ctx.client.claim_winnings(&bettor, &pool_id);
+    assert_eq!(
+        winnings, 1_000,
+        "claim_winnings must succeed while other ops are paused"
+    );
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+}
+
+/// Attempting to pause `claim_winnings` must be rejected — safe exits are not
+/// pausable.  This encodes the matrix in authorization checks.
+#[test]
+#[should_panic]
+fn test_claim_winnings_cannot_be_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    pause_op(&ctx, 3);
+}
+
+// ─── claim_refund (safe exit — never pausable) ───────────────────────────────
+
+/// `claim_refund` must remain available even when every other operation is
+/// paused.  Refunds are a safe exit and must never be gated by the pause.
+#[test]
+fn test_claim_refund_allowed_while_all_other_ops_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let bettor = Address::generate(&env);
+    ctx.token_admin.mint(&bettor, &500);
+
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &bettor,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &two_outcome_config(&env),
+    );
+
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &500, &1, &None, &None);
+
+    // Cancel the pool so refunds are eligible.
+    env.ledger().with_mut(|li| li.timestamp = end_time);
+    ctx.client.cancel_pool(&ctx.operator, &pool_id);
+
+    // Pause every operation except the safe exits.
+    pause_op(&ctx, 0);
+    pause_op(&ctx, 1);
+    pause_op(&ctx, 2);
+    pause_op(&ctx, 5);
+    pause_op(&ctx, 6);
+
+    let refund = ctx.client.claim_refund(&bettor, &pool_id);
+    assert_eq!(
+        refund, 500,
+        "claim_refund must succeed while other ops are paused"
+    );
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+}
+
+/// Attempting to pause `claim_refund` must be rejected.
+#[test]
+#[should_panic]
+fn test_claim_refund_cannot_be_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    pause_op(&ctx, 4);
+}
+
+// ─── cancel_pool ─────────────────────────────────────────────────────────────
+
+/// `cancel_pool` must be rejected while its operation is paused.
+#[test]
+#[should_panic]
+fn test_cancel_pool_rejected_when_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let creator = Address::generate(&env);
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &creator,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &two_outcome_config(&env),
+    );
+
+    pause_op(&ctx, 5);
+    env.ledger().with_mut(|li| li.timestamp = end_time);
+    ctx.client.cancel_pool(&ctx.operator, &pool_id);
+}
+
+// ─── withdraw_fees ───────────────────────────────────────────────────────────
+
+/// `withdraw_fees` must be rejected while its operation is paused.
+#[test]
+#[should_panic]
+fn test_withdraw_fees_rejected_when_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    pause_op(&ctx, 6);
+    ctx.client
+        .withdraw_fees(&ctx.admin, &ctx.token_address, &ctx.treasury);
+}
+
+// ─── Boundary: pause/unpause idempotency ─────────────────────────────────────
+
+/// Pausing an already-paused operation and unpausing an already-unpaused
+/// operation must be no-ops (idempotent) rather than errors.
+#[test]
+fn test_pause_unpause_are_idempotent() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    // Double pause.
+    pause_op(&ctx, 0);
+    pause_op(&ctx, 0);
+    assert!(ctx.client.is_paused(&0u32));
+
+    // Double unpause.
+    unpause_op(&ctx, 0);
+    unpause_op(&ctx, 0);
+    assert!(!ctx.client.is_paused(&0u32));
+}
+
+/// Pausing one operation must not affect any other operation's state.
+#[test]
+fn test_pause_is_isolated_per_operation() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    pause_op(&ctx, 0);
+    for op in 1u32..7u32 {
+        assert!(
+            !ctx.client.is_paused(&op),
+            "pausing op 0 must not affect op {op}"
+        );
+    }
+
+    pause_op(&ctx, 2);
+    assert!(ctx.client.is_paused(&0u32));
+    assert!(ctx.client.is_paused(&2u32));
+    for op in [1u32, 3, 4, 5, 6] {
+        assert!(
+            !ctx.client.is_paused(&op),
+            "op {op} must remain unpaused"
+        );
+    }
+}

@@ -1,6 +1,9 @@
 //! OpenAPI / Swagger documentation.
 //!
 //! The Swagger UI is served at `/swagger-ui/`.
+//!
+//! The generated spec is validated against live Axum handlers by the
+//! `openapi_contract` integration test; CI fails on stale artifacts or drift.
 
 use axum::{routing::get, Json, Router};
 use utoipa::{OpenApi, ToSchema};
@@ -325,8 +328,13 @@ async fn api_health() {}
         ("sort_by" = Option<String>, Query, description = "popular | ending_soon | new (default)"),
         ("category" = Option<String>, Query, description = "Category filter e.g. Sports, Crypto"),
         ("status" = Option<String>, Query, description = "active | closed | settled (default: active)"),
+        ("creator" = Option<String>, Query, description = "Creator Stellar address filter (G...)"),
+        ("tags" = Option<String>, Query, description = "Comma-separated tag filter (e.g. 'crypto,btc')"),
+        ("end_time_min" = Option<String>, Query, description = "Filter pools ending at or after timestamp (RFC3339 or Unix seconds)"),
+        ("end_time_max" = Option<String>, Query, description = "Filter pools ending at or before timestamp (RFC3339 or Unix seconds)"),
+        ("outcome" = Option<String>, Query, description = "Settled outcome filter (only valid when status is settled)"),
         ("limit" = Option<i64>, Query, description = "Max results (default 20, max 100)"),
-        ("offset" = Option<i64>, Query, description = "Pagination offset (default 0)"),
+        ("offset" = Option<i64>, Query, description = "Pagination offset (default 0, max 10000)"),
     ),
     responses(
         (status = 200, description = "Paginated pool list", body = PoolListResponse),
@@ -480,3 +488,19 @@ pub fn swagger_router() -> Router {
         get(|| async { Json(ApiDoc::openapi()) }),
     )
 }
+
+// ── Contract validation ───────────────────────────────────────────────────────
+
+/// Returns the canonical serialized OpenAPI document.
+///
+/// Used by the contract test to (a) diff against the committed
+/// `openapi.json` artifact and (b) validate live handler responses against
+/// the published schemas. Keeping this the single source of truth ensures
+/// generated clients and runtime behavior cannot silently diverge.
+pub fn openapi_json() -> serde_json::Value {
+    serde_json::to_value(ApiDoc::openapi())
+        .expect("OpenAPI document must serialize to JSON")
+}
+
+/// Canonical path of the committed OpenAPI artifact used by the clean-diff check.
+pub const OPENAPI_ARTIFACT_PATH: &str = "openapi.json";

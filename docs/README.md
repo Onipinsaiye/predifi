@@ -19,6 +19,7 @@ This directory contains comprehensive documentation for the PrediFi prediction m
 | **[ERROR_HANDLING_REFERENCE.md](./ERROR_HANDLING_REFERENCE.md)** | Comprehensive error codes and troubleshooting | Current |
 | **[troubleshooting.md](./troubleshooting.md)** | Common issues and solutions | Current |
 | **[prediction-lifecycle.md](./prediction-lifecycle.md)** | Prediction market lifecycle documentation | Current |
+| **[EVENT_SCHEMAS.md](./EVENT_SCHEMAS.md)** | Versioned contract event schema reference for external indexers | Current |
 | **[oracles.md](./oracles.md)** | Oracle integration documentation | Current |
 | **[resolution-challenge-window.md](./resolution-challenge-window.md)** | Post-resolution challenge window, bonds and state diagram | Current |
 | **[whitelist-events.md](./whitelist-events.md)** | Token whitelist events documentation | Current |
@@ -33,6 +34,14 @@ This directory contains comprehensive documentation for the PrediFi prediction m
 | **[health-check-endpoint.md](./health-check-endpoint.md)** | Health check endpoint documentation | Current |
 | **[contract-reference.md](./contract-reference.md)** | Smart contract API reference | Current |
 | **[FRONTEND_FEATURES.md](./FRONTEND_FEATURES.md)** | Frontend feature documentation | Current |
+
+### Architecture Decision Records
+
+| Document | Description | Status |
+|----------|-------------|--------|
+| **[adr/README.md](./adr/README.md)** | ADR workflow, status values, and decision index | Current |
+| **[adr/TEMPLATE.md](./adr/TEMPLATE.md)** | Concise template for proposed architecture decisions | Current |
+| **[adr/0001-contract-state-authoritative.md](./adr/0001-contract-state-authoritative.md)** | Contract state authority and event-derived backend projections | Accepted |
 
 ### Security & Audit Documents
 
@@ -166,6 +175,7 @@ docs/                                  # Documentation directory
 ├── ERROR_HANDLING_REFERENCE.md        # Error codes and troubleshooting
 ├── troubleshooting.md                 # Common issues and solutions
 ├── prediction-lifecycle.md            # Prediction market lifecycle
+├── EVENT_SCHEMAS.md                   # Versioned event schema reference
 ├── oracles.md                         # Oracle integration
 ├── resolution-challenge-window.md     # Resolution challenge window
 ├── whitelist-events.md                # Token whitelist events

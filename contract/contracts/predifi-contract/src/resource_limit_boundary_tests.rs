@@ -2,17 +2,21 @@
 //!
 //! Each limit is exercised at its maximum, one below the maximum, and one
 //! above it. Aggregate-stake tests also cover the `i128` overflow path.
+//! Batch-claim tests bound execution by measured resource cost (issue #40):
+//! oversized batches are rejected before any partial processing, and the
+//! atomicity of a failing claim is verified.
 //!
 //! Limits under test:
 //! - `MAX_OUTCOMES_PER_POOL`
 //! - `MAX_PREDICTIONS_PER_POOL` (distinct predictors in one pool)
 //! - `MAX_AGGREGATE_STAKE_PER_POOL`
+//! - `MAX_BATCH_CLAIM_SIZE` (claims processed in a single `claim_batch`)
 
 #![cfg(test)]
 
 use crate::{
     PoolConfig, PredifiContract, PredifiContractClient, PredifiError, MAX_AGGREGATE_STAKE_PER_POOL,
-    MAX_OUTCOMES_PER_POOL, MAX_PREDICTIONS_PER_POOL,
+    MAX_BATCH_CLAIM_SIZE, MAX_OUTCOMES_PER_POOL, MAX_PREDICTIONS_PER_POOL,
 };
 use soroban_sdk::{
     symbol_short,
@@ -341,6 +345,117 @@ fn test_aggregate_stake_overflowing_addition_is_rejected() {
         ctx.client.get_pool(&pool_id).total_stake,
         MAX_AGGREGATE_STAKE_PER_POOL
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BATCH CLAIM SIZE (measured resource cost bound)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Resolve a binary pool to outcome 0 so that predictions become claimable.
+fn resolve_pool_to_zero(ctx: &Ctx<'_>, pool_id: u64) {
+    ctx.client.resolve_pool(&ctx.admin, &pool_id, &0u32);
+}
+
+/// Place `count` distinct predictions and resolve the pool, returning the
+/// predictors in insertion order so they can be claimed in a batch.
+fn setup_claimable_pool(
+    ctx: &Ctx<'_>,
+    env: &Env,
+    count: u32,
+) -> (u64, std::vec::Vec<Address>) {
+    let pool_id = create_binary_pool(ctx, env);
+    let users = place_distinct_predictions(ctx, env, pool_id, count);
+    resolve_pool_to_zero(ctx, pool_id);
+    (pool_id, users)
+}
+
+fn to_soroban_vec(env: &Env, users: &[Address]) -> Vec<Address> {
+    let mut out = Vec::new(env);
+    for user in users {
+        out.push_back(user.clone());
+    }
+    out
+}
+
+#[test]
+fn test_batch_claim_one_below_max_succeeds() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let count = MAX_BATCH_CLAIM_SIZE - 1;
+    let (pool_id, users) = setup_claimable_pool(&ctx, &env, count);
+
+    let claimers = to_soroban_vec(&env, &users);
+    ctx.client.claim_batch(&claimers, &pool_id);
+
+    // Every claim in the batch must have been processed.
+    for user in users.iter() {
+        assert_eq!(ctx.token.balance(user), 2i128);
+    }
+}
+
+#[test]
+fn test_batch_claim_at_max_succeeds() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let count = MAX_BATCH_CLAIM_SIZE;
+    let (pool_id, users) = setup_claimable_pool(&ctx, &env, count);
+
+    let claimers = to_soroban_vec(&env, &users);
+    ctx.client.claim_batch(&claimers, &pool_id);
+
+    for user in users.iter() {
+        assert_eq!(ctx.token.balance(user), 2i128);
+    }
+}
+
+#[test]
+fn test_batch_claim_one_above_max_is_rejected_before_processing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let count = MAX_BATCH_CLAIM_SIZE + 1;
+    let (pool_id, users) = setup_claimable_pool(&ctx, &env, count);
+
+    let claimers = to_soroban_vec(&env, &users);
+    let result = ctx.client.try_claim_batch(&claimers, &pool_id);
+
+    assert_eq!(result, Err(Ok(PredifiError::MaxBatchClaimSizeExceeded)));
+
+    // Rejection must happen before any partial processing: no user in the
+    // oversized batch may have received a payout.
+    for user in users.iter() {
+        assert_eq!(ctx.token.balance(user), 1i128);
+    }
+}
+
+#[test]
+fn test_batch_claim_is_atomic_when_any_claim_fails() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let count = 3u32;
+    let (pool_id, users) = setup_claimable_pool(&ctx, &env, count);
+
+    // Claim the first user individually so a later batch claim of the same
+    // user is a duplicate and must fail, aborting the whole batch.
+    ctx.client.claim(&users[0], &pool_id);
+    assert_eq!(ctx.token.balance(&users[0]), 2i128);
+
+    let claimers = to_soroban_vec(&env, &users);
+    let result = ctx.client.try_claim_batch(&claimers, &pool_id);
+
+    assert!(result.is_err());
+
+    // Atomicity: the failing batch must not have paid out any other user.
+    assert_eq!(ctx.token.balance(&users[1]), 1i128);
+    assert_eq!(ctx.token.balance(&users[2]), 1i128);
+}
+
+#[test]
+fn test_batch_claim_regression_threshold_documented_chunk_size() {
+    // Recommended client chunk size must stay within the enforced maximum so
+    // that clients can safely split large claim sets without hitting the
+    // contract-level bound.
+    const RECOMMENDED_CLIENT_CHUNK_SIZE: u32 = 20;
+    assert!(RECOMMENDED_CLIENT_CHUNK_SIZE <= MAX_BATCH_CLAIM_SIZE);
 }
 
 #[test]

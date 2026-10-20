@@ -20,10 +20,10 @@ pub fn init(
 **Parameters:**
 
 | Parameter        | Type      | Description                            |
-| ---------------- | --------- | -------------------------------------- |
+| ---------------- | -------- | ------------------------------------- |
 | `access_control` | `Address` | Access control contract address        |
 | `treasury`       | `Address` | Treasury address for fee collection    |
-| `fee_bps`        | `u32`     | Fee in basis points (max 10000 = 100%) |
+| `fee_bps`        | `u32`      | Fee in basis points (max 10000 = 100%) |
 
 **Returns:** None
 
@@ -32,7 +32,7 @@ pub fn init(
 **Notes:**
 
 - Idempotent - safe to call multiple times
-- Only sets config if not already initialized
+-Only sets config if not already initialized
 
 ---
 
@@ -47,14 +47,14 @@ pub fn create_pool(
     token: Address,
     description: String,
     metadata_url: String
-) -> u64
+') -> u64
 ```
 
 **Parameters:**
 
 | Parameter      | Type      | Description                                  |
 | -------------- | --------- | -------------------------------------------- |
-| `end_time`     | `u64`     | Unix timestamp after which predictions close |
+| `end_time`     | `u64`      | Unix timestamp after which predictions close |
 | `token`        | `Address` | Stellar token contract for staking           |
 | `description`  | `String`  | Event description (max 256 bytes)            |
 | `metadata_url` | `String`  | Extended metadata URL (max 512 bytes)        |
@@ -65,9 +65,9 @@ pub fn create_pool(
 
 **Validations:**
 
-- `end_time` must be in the future
+- (end_time` must be in the future
 - `description` length ≤ 256 bytes
-- `metadata_url` length ≤ 512 bytes
+- (metadata_url` length ≤ 512 bytes
 
 **Example:**
 
@@ -100,12 +100,12 @@ pub fn place_prediction(
 
 **Parameters:**
 
-| Parameter  | Type              | Description                                                                                                                 |
-| ---------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `user`     | `Address`         | User placing the prediction                                                                                                 |
-| `pool_id`  | `u64`             | Pool to predict on                                                                                                          |
-| `amount`   | `i128`            | Prediction amount (in token's smallest unit)                                                                                |
-| `outcome`  | `u32`             | Outcome index (0, 1, 2, etc.)                                                                                               |
+| Parameter  | Type              | Description                                                                             |
+| --------- | ---------------- | ------------------------------------------------------------------------------------------------------- |
+| `user`    | `Address`         | User placing the prediction                                                                 |
+| `pool_id`  | `u64`             | Pool to predict on                                                                      |
+| `amount`   | `i128`            | Prediction amount (in token's smallest unit)                                                 |
+| `outcome`  | `u32`             | Outcome index (0, 1, 2, etc.)                                                              |
 | `referrer` | `Option<Address>` | Optional address that referred this user; stored on first prediction for (user, pool) and used for referral payout on claim |
 
 **Returns:** None
@@ -156,12 +156,12 @@ pub fn resolve_pool(
 **Parameters:**
 
 | Parameter  | Type      | Description                         |
-| ---------- | --------- | ----------------------------------- |
+| --------- | --------- | ------------------------------------------ |
 | `operator` | `Address` | Operator address (must have role 1) |
-| `pool_id`  | `u64`     | Pool to resolve                     |
-| `outcome`  | `u32`     | Winning outcome index               |
+| `pool_id`  | `u64`     | Pool to resolve                         |
+| `outcome`  | `u32`     | Winning outcome index                   |
 
-**Returns:** `Result<(), PredifiError>`
+**Returns:** `Result<(), PredifiError>
 
 **Events:** `PoolResolvedEvent`
 
@@ -205,11 +205,11 @@ pub fn claim_winnings(
 **Parameters:**
 
 | Parameter | Type      | Description            |
-| --------- | --------- | ---------------------- |
-| `user`    | `Address` | User claiming winnings |
-| `pool_id` | `u64`     | Pool to claim from     |
+| -------- | --------- | ---------------------- |
+| `user`   | `Address` | User claiming winnings |
+| `pool_id` | `u64`      | Pool to claim from     |
 
-**Returns:** `Result<i128, PredifiError>` - Amount claimed (0 if didn't win)
+**Returns:** `Result<i128, PredifiError>`  - Amount claimed (0 if didn't win)
 
 **Events:** `WinningsClaimedEvent`, `ReferralPaidEvent` (when user had a referrer and wins)
 
@@ -225,6 +225,15 @@ pub fn claim_winnings(
 - Payout pool = `total_pool_stake - protocol_fee`
 - `winnings = (user_stake / winning_outcome_total_stake) × payout_pool`
 - If user has a referrer: referrer receives `referral_cut_bps` of the user's share of the protocol fee (the rest remains for treasury withdrawal).
+
+**Remainder Allocation Invariant:**
+
+Integer division truncates, so per-user payouts may not sum exactly to the payout pool. To keep accounting deterministic and independent of claim order, the contract retains the truncation dust rather than redistributing it:
+
+- `sum(all user winnings) + retained_remainder = payout_pool`
+- `retained_remainder = payout_pool - sum(floor(user_stake × payout_pool / winning_outcome_total_stake))`
+- The retained remainder stays in escrow and is withdrawable by the treasury; it is never assigned to a specific claimant.
+- This rule is applied identically on the single-claim path (`claim_winnings`) and any batch payout path, so the same stake vector always yields the same per-user amounts regardless of claim order.
 
 **Errors:**
 
@@ -245,6 +254,10 @@ if winnings > 0 {
 }
 ```
 
+**Property Tests:**
+
+Payout property tests generate many participant counts and stake vectors and assert that escrow equals the sum of payouts plus the explicit retained remainder, accounting for every token unit.
+
 ---
 
 ### `get_user_predictions`
@@ -263,10 +276,10 @@ pub fn get_user_predictions(
 **Parameters:**
 
 | Parameter | Type      | Description               |
-| --------- | --------- | ------------------------- |
-| `user`    | `Address` | User address              |
-| `offset`  | `u32`     | Pagination offset         |
-| `limit`   | `u32`     | Maximum results to return |
+| -------- | --------- | -------------------------- |
+| `user`   | `Address` | User address              |
+| `offset`  | `u32`      | Pagination offset             |
+| `limit`   | `u32`      | Maximum results to return     |
 
 **Returns:** `Vec<UserPredictionDetail>`
 
@@ -283,11 +296,49 @@ let predictions = contract.get_user_predictions(
 
 ---
 
+### `get_resolution_evidence`
+
+Get the verifiable evidence committed when a pool was resolved through the
+price-feed path (`resolve_pool_from_price`). The record is the hash preimage of
+the `evidence_hash` carried by `ResolutionEvidenceEvent`: auditors can re-encode
+it to XDR, hash it with SHA-256, and re-derive the outcome from
+(`price`, `target_price`, `comparison_op`, `tolerance_bps`) to independently
+verify the resolution decision. The record is immutable once written.
+
+```rust
+pub fn get_resolution_evidence(
+    env: Env,
+    pool_id: u64
+) -> Option<ResolutionEvidence>
+```
+
+**Parameters:**
+
+| Parameter | Type  | Description     |
+| --------- | ----- | --------------- |
+| `pool_id` | `u64` | Pool to inspect |
+
+**Returns:** `Option<ResolutionEvidence>` — `None` for unresolved pools and for
+pools resolved via operator voting or oracle voting (those paths carry no feed
+observation to commit).
+
+**Example:**
+
+```rust
+if let Some(evidence) = contract.get_resolution_evidence(env, pool_id) {
+    // Recompute: sha256(evidence.to_xdr()) == emitted evidence_hash
+    // Re-derive: compare evidence.price to evidence.target_price
+    //            under evidence.comparison_op within evidence.tolerance_bps
+}
+```
+
+---
+
 ## Admin Functions
 
 ### `pause`
 
-Pause all contract operations. Requires Admin role (0).
+Pause operations according to the pause matrix. Requires Admin role (0).
 
 ```rust
 pub fn pause(env: Env, admin: Address)
@@ -296,10 +347,36 @@ pub fn pause(env: Env, admin: Address)
 **Parameters:**
 
 | Parameter | Type      | Description                      |
-| --------- | --------- | -------------------------------- |
+| -------- | --------- | ------------------------------- |
 | `admin`   | `Address` | Admin address (must have role 0) |
 
 **Events:** `PauseEvent`
+
+**Pause Matrix:**
+
+Pausing is scoped by operation. Some entry points are blocked while paused; others remain available so users can always exit safely.
+
+| Operation               | Paused behavior                                                                 |
+| ---------------------- | ---------------------------------------------------------------------------------------- |
+| `create_pool`           | Blocked (returns `Paused`)                                                              |
+| `place_prediction`       | Blocked (returns `Paused`)                                                              |
+| `resolve_pool`           | Blocked (returns `Paused`)                                                              |
+| `oracle_resolve`        | Blocked (returns `Paused`)                                                              |
+| `resolve_pool_from_price` | Blocked (returns `Paused`)                                                            |
+| `claim_winnings`         | **Allowed** — eligible claims always remain available                                     |
+| `refund`                 | **Allowed** — refunds always remain available                                                   |
+| `withdraw_fees`          | Blocked (returns `Paused`)                                                              |
+| `set_fee_bps`            | Blocked (returns `Paused`)                                                              |
+| `set_referral_cut_bps`  | Blocked (returns `Paused`)                                                              |
+| `set_treasury`           | Blocked (returns `Paused`)                                                              |
+| `unpause`               | **Allowed** — must always be callable to restore operations                             |
+| `view functions`        | **Allowed** — read-only queries are never paused                                             |
+
+**Notes:**
+
+-  `claim_winings` and `refund` are explicitly exempt from pause so users can always withdraw funds they are entitled to.
+-  `unpause` and view functions are never guarded by the pause flag.
+-  Every guarded entry point returns `Paused` when the contract is paused.
 
 ---
 
@@ -314,10 +391,32 @@ pub fn unpause(env: Env, admin: Address)
 **Parameters:**
 
 | Parameter | Type      | Description                      |
-| --------- | --------- | -------------------------------- |
+| -------- | --------- | ------------------------------- |
 | `admin`   | `Address` | Admin address (must have role 0) |
 
 **Events:** `UnpauseEvent`
+
+**Notes:**
+
+- Always allowed, even when the contract is paused.
+- Restores all operations guarded by the pause matrix.
+
+---
+
+### `is_paused`
+
+Expose the current pause state to clients.
+
+```rust
+pub fn is_paused(env: Env) -> bool
+```
+
+**Returns:** `true` if the contract is paused, `false` otherwise.
+
+**Notes:**
+
+- View function - always callable, never guarded by the pause flag.
+- Clients should use this to disable mutating UI actions while keeping claim and refund actions enabled.
 
 ---
 
@@ -336,11 +435,13 @@ pub fn set_fee_bps(
 **Parameters:**
 
 | Parameter | Type      | Description                         |
-| --------- | --------- | ----------------------------------- |
+| -------- | --------- | ---------------------------------- |
 | `admin`   | `Address` | Admin address                       |
 | `fee_bps` | `u32`     | New fee in basis points (max 10000) |
 
 **Events:** `FeeUpdateEvent`
+
+**Pause behavior:** Blocked when paused (returns `Paused`).
 
 ---
 
@@ -358,15 +459,21 @@ pub fn set_referral_cut_bps(
 
 **Parameters:**
 
-| Parameter          | Type      | Description                                                                        |
-| ------------------ | --------- | ---------------------------------------------------------------------------------- |
-| `admin`            | `Address` | Admin address                                                                      |
-| `referral_cut_bps` | `u32`     | Share of protocol fee (attributable to referred user) paid to referrer (max 10000) |
+| Parameter          | Type      | Description                                                                 |
+| ----------------- | --------- | --------------------------------------------------------------------------------------------------- |
+| `admin`            | `Address` | Admin address                                                                        |
+| `referral_cut_bps` | `u32`      | Share of protocol fee (attributable to referred user) paid to referrer (max 10000) |
+
+**Pause behavior:** Blocked when paused (returns `Paused`).
 
 **Referral view functions:**
 
-- **`get_referral_cut_bps(env: Env) -> u32`** — Returns the current referral cut in basis points (default 5000).
+- **get_referral_cut_bps(env: Env) -> u32** — Returns the current referral cut in basis points (default 5000).
 - **`get_referred_volume(env: Env, referrer: Address, pool_id: u64) -> i128`** — Returns the total stake amount referred by `referrer` on the given pool (for analytics and payout context).
+
+**Remainder view:**
+
+- **`get_retained_remainder(env: Env, pool_id: u64) -> i128`** — Returns the truncation dust retained in escrow for a resolved pool (payout pool minus the sum of all distributed winnings). Always `>= 0` and deterministic for a given stake distribution.
 
 ---
 
@@ -385,11 +492,13 @@ pub fn set_treasury(
 **Parameters:**
 
 | Parameter  | Type      | Description          |
-| ---------- | --------- | -------------------- |
-| `admin`    | `Address` | Admin address        |
+| -------- | --------- | ------------------ |
+| `admin`   | `Address` | Admin address        |
 | `treasury` | `Address` | New treasury address |
 
 **Events:** `TreasuryUpdateEvent`
+
+**Pause behavior:** Blocked when paused (returns `Paused`).
 
 ---
 
@@ -441,9 +550,34 @@ pub struct Config {
 }
 ```
 
+### `ResolutionEvidence`
+
+The stable evidence schema persisted for price-feed resolutions. This exact
+record — XDR-encoded — is the preimage of the SHA-256 `evidence_hash` emitted in
+`ResolutionEvidenceEvent`.
+
+```rust
+pub struct ResolutionEvidence {
+    pub feed_pair: Symbol,   // Feed that decided the market
+    pub price: i128,         // Observed feed value
+    pub feed_timestamp: u64, // Feed-side observation timestamp
+    pub comparison_op: u32,  // Rule applied: 0=Equal, 1=Greater, 2=Less
+    pub target_price: i128,  // Target compared against
+    pub tolerance_bps: u32,  // Tolerance around target, in basis points
+    pub outcome: u32,        // Outcome index derived and recorded
+}
+```
+
+The record is stored under `DataKey::ResolutionEvidence(pool_id)`, so the
+`pool_id` binding comes from the storage key itself.
+
 ---
 
 ## Events
+
+For the versioned, indexer-facing event schema reference — including topic names, field
+types, compatibility rules, and the stable identifiers needed for idempotent indexing —
+see [Event Schemas](./EVENT_SCHEMAS.md). The core events are listed below.
 
 ### `PoolCreatedEvent`
 
@@ -475,11 +609,30 @@ pub struct PredictionPlacedEvent {
 
 Emitted when a pool is resolved and the outcome is determined. This occurs when:
 
-- An operator calls `resolve_pool()` with a valid outcome after the resolution delay
-- An oracle calls `oracle_resolve()` and the voting threshold is reached
-- `resolve_pool_from_price()` is called and the price condition is evaluated
+-  An operator calls `resolve_pool()` with a valid outcome after the resolution delay
+-  An oracle calls `oracle_resolve()` and the voting threshold is reached
+-  `resolve_pool_from_price()` is called and the price condition is evaluated
 
 The `operator` field indicates the address (operator or oracle) that triggered the resolution, or the contract itself if resolved automatically via price feed.
+
+```rust
+pub struct PoolResolvedEvent {
+    pub pool_id: u64,     // Unique identifier for the resolved pool
+    pub operator: Address, // Address that triggered the resolution
+    pub outcome: u32,      // The determined winning outcome (0-based index)
+}
+```
+
+**Example**: When outcome 1 is selected for pool 12345 by operator addr123:
+
+```rust
+PoolResolvedEvent {
+    pool_id: 12345,
+    operator: addr123,
+    outcome: 1,
+}
+```
+on, or the contract itself if resolved automatically via price feed.
 
 ```rust
 pub struct PoolResolvedEvent {
@@ -528,6 +681,27 @@ PoolResolvedDiagEvent {
     total_stake: 5000,          // 5000 total tokens staked
     winning_stake: 2000,        // 2000 on outcome 1
     timestamp: 1234567890,
+}
+```
+
+### `ResolutionEvidenceEvent`
+
+Emitted atomically alongside `PoolResolvedEvent` when a pool is resolved through
+`resolve_pool_from_price`. Carries the full evidence preimage fields plus
+`evidence_hash`, the SHA-256 commitment over the stored `ResolutionEvidence`
+record's XDR encoding.
+
+```rust
+pub struct ResolutionEvidenceEvent {
+    pub pool_id: u64,           // Same pool as PoolResolvedEvent
+    pub feed_pair: Symbol,      // Feed that decided the market
+    pub price: i128,            // Observed feed value used in the comparison
+    pub feed_timestamp: u64,    // Feed-side observation timestamp
+    pub comparison_op: u32,     // 0=Equal, 1=Greater, 2=Less
+    pub target_price: i128,     // Target compared against
+    pub tolerance_bps: u32,     // Tolerance around target, in basis points
+    pub outcome: u32,           // Same outcome as PoolResolvedEvent
+    pub evidence_hash: BytesN<32>, // sha256(ResolutionEvidence XDR encoding)
 }
 ```
 

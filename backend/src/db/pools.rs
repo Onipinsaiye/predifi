@@ -275,10 +275,11 @@ pub async fn get_pool_with_odds(
 ///
 /// Idempotent: a second insert for the same `pool_id` is silently ignored
 /// via `ON CONFLICT (pool_id) DO NOTHING`.
-#[instrument(skip(pool), name = "db.insert_pool_from_event",
+/// Insert a pool record decoded from a `pool_created` contract event inside an existing transaction.
+#[instrument(skip(tx), name = "db.insert_pool_from_event_tx",
     fields(pool_id = event.pool_id, creator = %event.creator))]
-pub async fn insert_pool_from_event(
-    pool: &PgPool,
+pub async fn insert_pool_from_event_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
     event: &PoolCreatedEvent,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -295,11 +296,27 @@ pub async fn insert_pool_from_event(
     .bind(event.end_time as f64)
     .bind(&event.creator)
     .bind(&event.token)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
-    record_pool_created_for_creator(pool, &event.creator).await?;
+    record_pool_created_for_creator(&mut **tx, &event.creator).await?;
 
+    Ok(())
+}
+
+/// Insert a pool record decoded from a `pool_created` contract event.
+///
+/// Idempotent: a second insert for the same `pool_id` is silently ignored
+/// via `ON CONFLICT (pool_id) DO NOTHING`.
+#[instrument(skip(pool), name = "db.insert_pool_from_event",
+    fields(pool_id = event.pool_id, creator = %event.creator))]
+pub async fn insert_pool_from_event(
+    pool: &PgPool,
+    event: &PoolCreatedEvent,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    insert_pool_from_event_tx(&mut tx, event).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -381,10 +398,13 @@ pub fn calculate_odds(outcome_stakes: &[(i32, i64)], total_stake: i64) -> Vec<Ou
 ///
 /// Called automatically by [`insert_pool_from_event`] — should not need to be
 /// called directly.
-pub async fn record_pool_created_for_creator(
-    pool: &PgPool,
+pub async fn record_pool_created_for_creator<'e, E>(
+    executor: E,
     creator: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         r#"
         INSERT INTO creator_stats
@@ -396,7 +416,7 @@ pub async fn record_pool_created_for_creator(
         "#,
     )
     .bind(creator)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
