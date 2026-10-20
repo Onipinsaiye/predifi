@@ -1,5 +1,7 @@
 use soroban_sdk::{token, Address, Env};
 
+use crate::{DataKey, MarketState, Pool};
+
 pub struct TokenTestContext {
     pub token_address: Address,
     pub token: token::Client<'static>,
@@ -24,8 +26,6 @@ impl TokenTestContext {
         self.admin.mint(to, &amount);
     }
 }
-
-use crate::{DataKey, MarketState, Pool};
 
 /// Transition an existing pool to Disputed state for testing.
 ///

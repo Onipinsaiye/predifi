@@ -1,26 +1,23 @@
 //! Pool domain: prediction pool lifecycle — creation, configuration,
 //! resolution, cancellation and pool queries.
+//!
+//! Storage retention: see `RETENTION_*` constants and `bump_ttl` /
+//! `extend_persistent` / `extend_temporary` helpers in `lib.rs`.
 
 use soroban_sdk::{contractimpl, log, token, Address, Env, String, Symbol, Vec};
 
 use crate::gas_opt;
 use crate::{
-    Config, DataKey, InitialLiquidityProvidedEvent, MarketState, MaxTotalStakeIncreasedEvent, Pool,
-    PoolCanceledEvent, PoolConfig, PoolCreatedEvent, PoolDescriptionUpdatedEvent,
+    Config, DataKey, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
+    MarketOracleConfig, MarketOracleConfiguredEvent, MarketState, MaxTotalStakeIncreasedEvent,
+    Pool, PoolCanceledEvent, PoolConfig, PoolCreatedEvent, PoolDescriptionUpdatedEvent,
     PoolDisputedEvent, PoolReadyForResolutionEvent, PoolResolvedDiagEvent, PoolResolvedEvent,
     PoolStats, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
     ResolutionConflictEvent, ResolutionVoteCastEvent, StakeLimitsUpdatedEvent, StakingClosedEvent,
     CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION, EMERGENCY_CANCEL_MULTISIG_THRESHOLD,
     INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY,
-    MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
-    Config, DataKey, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
-    MarketState, MaxTotalStakeIncreasedEvent, Pool, PoolCanceledEvent, PoolConfig,
-    PoolCreatedEvent, PoolDescriptionUpdatedEvent, PoolDisputedEvent, PoolReadyForResolutionEvent,
-    PoolResolvedDiagEvent, PoolResolvedEvent, PoolStats, PredifiContract, PredifiContractArgs,
-    PredifiContractClient, PredifiError, ResolutionConflictEvent, ResolutionVoteCastEvent,
-    StakeLimitsUpdatedEvent, StakingClosedEvent, CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION,
-    EMERGENCY_CANCEL_MULTISIG_THRESHOLD, INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS,
-    MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
+    MAX_OUTCOMES_PER_POOL,
+    MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
 };
 
 #[contractimpl]
@@ -289,10 +286,102 @@ impl PredifiContract {
         Self::require_not_paused(&env)?;
         creator.require_auth();
 
+        Self::create_pool_internal(
+            &env,
+            creator,
+            end_time,
+            token,
+            options_count,
+            category,
+            config,
+        )
+    }
+
+    /// Create a new prediction pool with explicit, governed oracle configuration.
+    ///
+    /// Validates supported feed identifiers, oracle identity whitelist, and freshness bounds
+    /// before persisting the configuration at creation. The configuration is immutable thereafter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_oracle_pool(
+        env: Env,
+        creator: Address,
+        end_time: u64,
+        token: Address,
+        options_count: u32,
+        category: Symbol,
+        config: PoolConfig,
+        oracle_config: MarketOracleConfig,
+    ) -> Result<u64, PredifiError> {
+        Self::require_not_paused(&env)?;
+        creator.require_auth();
+
+        // Validate the oracle configuration bounds and supported identifiers before pool creation
+        Self::validate_market_oracle_config(&env, &oracle_config)?;
+
+        let pool_id = Self::create_pool_internal(
+            &env,
+            creator,
+            end_time,
+            token,
+            options_count,
+            category,
+            config,
+        )?;
+
+        // Persist the selected feed configuration at creation (immutable)
+        let oracle_key = DataKey::MarketOracleConfig(pool_id);
+        env.storage().persistent().set(&oracle_key, &oracle_config);
+        Self::extend_persistent(&env, &oracle_key);
+
+        // Expose configuration in contract event
+        MarketOracleConfiguredEvent {
+            pool_id,
+            oracle: oracle_config.oracle,
+            feed_id: oracle_config.feed_id,
+            max_staleness_seconds: oracle_config.max_staleness_seconds,
+        }
+        .publish(&env);
+
+        Ok(pool_id)
+    }
+
+    /// Alias for `create_oracle_pool`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_pool_with_oracle(
+        env: Env,
+        creator: Address,
+        end_time: u64,
+        token: Address,
+        options_count: u32,
+        category: Symbol,
+        config: PoolConfig,
+        oracle_config: MarketOracleConfig,
+    ) -> Result<u64, PredifiError> {
+        Self::create_oracle_pool(
+            env,
+            creator,
+            end_time,
+            token,
+            options_count,
+            category,
+            config,
+            oracle_config,
+        )
+    }
+
+    fn create_pool_internal(
+        env: &Env,
+        creator: Address,
+        end_time: u64,
+        token: Address,
+        options_count: u32,
+        category: Symbol,
+        config: PoolConfig,
+    ) -> Result<u64, PredifiError> {
         // Validate: category must be in the allowed list, return error if invalid
-        let normalized_category = match Self::validate_category(&env, &category) {
+        let normalized_category = match Self::validate_category(env, &category) {
             Ok(cat) => cat,
-            Err(e) => soroban_sdk::panic_with_error!(&env, e),
+            Err(e) => soroban_sdk::panic_with_error!(env, e),
         };
 
         // Validate: token must be on the allowed betting whitelist
@@ -1443,6 +1532,35 @@ impl PredifiContract {
             .expect("Pool not found");
         Self::extend_persistent(&env, &pool_key);
         pool
+    }
+
+    /// Returns the ledger timestamp at which the pool's persistent storage
+    /// entries may be safely archived, or `None` if the pool is still
+    /// unresolved and therefore must be retained indefinitely.
+    ///
+    /// Retention policy:
+    /// - Active / Locked / Disputed pools: `None` (retained until resolution).
+    /// - Resolved / Canceled pools: `resolution_timestamp + RETENTION_CLAIM_WINDOW`
+    ///   so that users can still claim winnings or refunds during the promised
+    ///   claim window. After this point, off-chain indexers are expected to
+    ///   have archived the pool and its stakes; on-chain entries may be
+    ///   evicted by TTL expiry.
+    pub fn get_pool_retention_deadline(env: Env, pool_id: u64) -> Option<u64> {
+        let pool_key = DataKey::Pool(pool_id);
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .expect("Pool not found");
+        Self::extend_persistent(&env, &pool_key);
+
+        match pool.state {
+            MarketState::Active | MarketState::Locked | MarketState::Disputed => None,
+            MarketState::Resolved | MarketState::Canceled => {
+                let base = pool.resolution_timestamp.unwrap_or(pool.end_time);
+                Some(base.saturating_add(crate::RETENTION_CLAIM_WINDOW))
+            }
+        }
     }
 
     /// Returns the fee schedule snapshotted when the pool was created.

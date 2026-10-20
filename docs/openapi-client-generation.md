@@ -2,16 +2,15 @@
 
 Covers [#1381](https://github.com/Web3Novalabs/predifi/issues/1381).
 
-The backend documents its HTTP API by hand in `backend/src/openapi.rs`. Because
+The backend documents its HTTP API by hand in `backend/src/openapi.r`. Because
 those annotations sit on stub functions rather than on the handlers themselves,
-nothing stops the spec from drifting away from the router. Two pieces keep it
-honest: integration tests that check the spec against the live router, and a
+nothing stops the spec from drifting away from the router. Two pieces keep ithonest: integration tests that check the spec against the live router, and a
 generator that turns the spec into frontend types.
 
 ## 1. Spec validation
 
 `backend/src/openapi_tests.rs` builds the real Axum router (via
-`build_router`) and asserts:
+`build_route`) and asserts:
 
 | Test | What it catches |
 | --- | --- |
@@ -26,7 +25,7 @@ Run them with:
 cargo test --manifest-path backend/Cargo.toml openapi
 ```
 
-A handler returning 500/503 without a database is fine — the tests assert the
+A!handler returning 500/503 without a database is fine — the tests assert the
 route *exists*, not that it succeeds.
 
 ## 2. Exporting and checking the spec
@@ -71,6 +70,44 @@ async function fetchPools(): Promise<PoolList> {
 Overrides: `OUT=./types/backend.d.ts pnpm generate:api` changes the output
 path, `SPEC=./openapi.json pnpm generate:api` reuses an existing spec file
 (useful in CI, where the spec can be exported once and shared).
+
+## 4. Contract tests against live handlers
+
+`backend/tests/openapi_contract.rs` asserts that the published schemas
+match what the handlers actually emit:
+
+- Every documented operation declares at least one 2xx response with
+  content, and at least one error response.
+- Every `$ref` resolves to a registered component schema.
+- The shared `ErrorResponse` schema requires an `error` field, matching
+  the `{ "error": "..." }` body the handlers emit.
+- Optional schema fields are omittable in representative payloads.
+
+```bash
+cargo test --manifest-path backend/Cargo.toml --test openapi_contract
+```
+
+## 5. Clean-diff check
+
+`backend/tests/openapi_clean_diff.rs` regenerates the spec into a
+temporary file and compares it to the committed `backend/openapi.json`.
+If they differ, the test fails and CI reports the generated artifact as
+stale.
+
+```bash
+cargo test --manifest-path backend/Cargo.toml --test openapi_clean_diff
+```
+
+## 6. CI workflow
+
+`.github/workflows/openapi-contract.yml` runs on every pull request and
+push touching `backend/**` or `frontend/**`. It:
+
+1. Runs the contract and shape tests.
+2. Runs the clean-diff check against the committed spec.
+3. Generates the TypeScript client in a clean workspace and fails if the
+   resulting `frontend/types/api.d.ts` or `backend/openapi.json` differs
+   from what is committed.
 
 ## Keeping it in sync
 

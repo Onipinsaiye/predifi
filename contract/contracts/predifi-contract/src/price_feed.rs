@@ -1098,6 +1098,110 @@ impl PriceFeedAdapter {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Ledger;
+
+    /// Redacted oracle fixture vector.
+    ///
+    /// Each vector captures provenance (provider, pair, redaction note) and the
+    /// expected normalized values so contract and backend tests can share the
+    /// same corpus and detect schema/interpretation drift.
+    #[derive(Clone, Debug)]
+    struct OracleVector {
+        provider: &'static str,
+        pair: &'static str,
+        provenance: &'static str,
+        price: i128,
+        confidence: i128,
+        timestamp: u64,
+        expires_at: u64,
+        expected_valid: bool,
+        expected_confidence_ratio_bps: i128,
+    }
+
+    fn vectors() -> [OracleVector; 4] {
+        [
+            OracleVector {
+                provider: "pyth",
+                pair: "BTC/USD",
+                provenance: "redacted:mainnet-sample-001",
+                price: 60_000_00000000,
+                confidence: 60_00000000,
+                timestamp: 1_000,
+                expires_at: 2_000,
+                expected_valid: true,
+                expected_confidence_ratio_bps: 100,
+            },
+            OracleVector {
+                provider: "pyth",
+                pair: "BTC/USD",
+                provenance: "redacted:stale-sample-002",
+                price: 60_000_00000000,
+                confidence: 60_00000000,
+                timestamp: 1_000,
+                expires_at: 1_500,
+                expected_valid: false,
+                expected_confidence_ratio_bps: 100,
+            },
+            OracleVector {
+                provider: "pyth",
+                pair: "ETH/USD",
+                provenance: "redacted:wide-confidence-003",
+                price: 3_000_00000000,
+                confidence: 300_00000000,
+                timestamp: 1_000,
+                expires_at: 2_000,
+                expected_valid: false,
+                expected_confidence_ratio_bps: 1_000,
+            },
+            OracleVector {
+                provider: "pyth",
+                pair: "ETH/USD",
+                provenance: "redacted:boundary-004",
+                price: 3_000_00000000,
+                confidence: 30_00000000,
+                timestamp: 1_000,
+                expires_at: 2_000,
+                expected_valid: true,
+                expected_confidence_ratio_bps: 100,
+            },
+        ]
+    }
+
+    fn setup(env: &Env) -> Address {
+        let admin = Address::generate(env);
+        let pyth = Address::generate(env);
+        env.mock_all_auths();
+        PriceFeedAdapter::init_oracle(env, &admin, pyth, 300, 100).unwrap();
+        admin
+    }
+
+    #[test]
+    fn oracle_vectors_match_normalized_values() {
+        let env = Env::default();
+        setup(&env);
+        env.ledger().set_timestamp(1_100);
+
+        for v in vectors().iter() {
+            let feed = PriceFeed {
+                pair: Symbol::new(&env, v.pair),
+                price: v.price,
+                confidence: v.confidence,
+                timestamp: v.timestamp,
+                expires_at: v.expires_at,
+            };
+
+            let ratio = (feed.confidence * 10_000) / feed.price;
+            assert_eq!(ratio, v.expected_confidence_ratio_bps, "ratio drift: {}", v.provenance);
+            assert_eq!(
+                PriceFeedAdapter::is_price_valid(&env, &feed),
+                v.expected_valid,
+                "validity drift: {}",
+                v.provenance
+            );
+        }
+    }
+}
 // #[cfg(test)]
 // mod tests;
