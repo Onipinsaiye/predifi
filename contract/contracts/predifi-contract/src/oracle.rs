@@ -1,15 +1,19 @@
 //! Oracle domain: oracle registration, price feeds, price conditions and
 //! oracle-driven pool resolution.
 
-use soroban_sdk::{contractimpl, log, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contractimpl, log, xdr::ToXdr, Address, Env, String, Symbol, Vec};
 
 use crate::{
     DataKey, MarketState, OracleCallback, OracleInitEvent, OracleResolvedEvent,
     OracleWhitelistAddedEvent, OracleWhitelistRemovedEvent, Pool, PoolResolvedDiagEvent,
     PoolResolvedEvent, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
     PriceConditionSetEvent, PriceFeedUpdatedEvent, PriceFeedsCleanedEvent, ResolutionConflictEvent,
-    ResolutionVoteCastEvent, MAX_PRICE_CONDITION_MATCH_STEPS, MAX_PRICE_EXPONENT, MAX_TOLERANCE,
-    MIN_PRICE_EXPONENT, PRICE_DECIMALS, UNRESOLVED_OUTCOME,
+    ResolutionEvidence, ResolutionEvidenceEvent, ResolutionVoteCastEvent,
+    DEFAULT_MAX_ORACLE_FRESHNESS, DEFAULT_MIN_ORACLE_FRESHNESS,
+    MarketOracleConfig, MarketOracleConfiguredEvent, OracleFreshnessBoundsSetEvent,
+    SupportedFeedAddedEvent, SupportedFeedRemovedEvent,
+    MAX_PRICE_CONDITION_MATCH_STEPS, MAX_PRICE_EXPONENT, MAX_TOLERANCE, MIN_PRICE_EXPONENT,
+    PRICE_DECIMALS, UNRESOLVED_OUTCOME,
 };
 
 /// Rescale the provider integer `value * 10^expo` to `PRICE_DECIMALS` fixed
@@ -277,6 +281,209 @@ impl PredifiContract {
             .get::<DataKey, (Address, u64, u32)>(&DataKey::OracleConfig)
     }
 
+    /// Add a supported feed identifier to the governed registry. Caller must have Admin role (0).
+    pub fn add_supported_feed(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "add_supported_feed")?;
+
+        let key = DataKey::SupportedFeed(feed_id.clone());
+        env.storage().persistent().set(&key, &true);
+        Self::extend_persistent(&env, &key);
+
+        let list_key = DataKey::SupportedFeedList;
+        let mut list: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !list.contains(&feed_id) {
+            list.push_back(feed_id.clone());
+            env.storage().persistent().set(&list_key, &list);
+            Self::extend_persistent(&env, &list_key);
+        }
+
+        SupportedFeedAddedEvent { admin, feed_id }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Remove a supported feed identifier from the governed registry. Caller must have Admin role (0).
+    pub fn remove_supported_feed(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "remove_supported_feed")?;
+
+        let key = DataKey::SupportedFeed(feed_id.clone());
+        env.storage().persistent().remove(&key);
+
+        let list_key = DataKey::SupportedFeedList;
+        let list: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut new_list = Vec::new(&env);
+        for item in list.iter() {
+            if item != feed_id {
+                new_list.push_back(item);
+            }
+        }
+
+        env.storage().persistent().set(&list_key, &new_list);
+        Self::extend_persistent(&env, &list_key);
+
+        SupportedFeedRemovedEvent { admin, feed_id }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Query whether a feed identifier is supported by governance.
+    pub fn is_feed_supported(env: Env, feed_id: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::SupportedFeed(feed_id))
+            .unwrap_or(false)
+    }
+
+    /// Return all governed supported feed identifiers.
+    pub fn get_supported_feeds(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupportedFeedList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Configure protocol-wide bounds for market oracle freshness policy. Caller must have Admin role (0).
+    pub fn set_oracle_freshness_bounds(
+        env: Env,
+        admin: Address,
+        min_freshness: u64,
+        max_freshness: u64,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "set_oracle_freshness_bounds")?;
+
+        if min_freshness == 0 || min_freshness > max_freshness {
+            return Err(PredifiError::InvalidData);
+        }
+
+        let key = DataKey::OracleFreshnessBounds;
+        env.storage()
+            .persistent()
+            .set(&key, &(min_freshness, max_freshness));
+        Self::extend_persistent(&env, &key);
+
+        OracleFreshnessBoundsSetEvent {
+            admin,
+            min_freshness,
+            max_freshness,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Return the active freshness bounds `(min_freshness, max_freshness)` in seconds.
+    pub fn get_oracle_freshness_bounds(env: Env) -> (u64, u64) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OracleFreshnessBounds)
+            .unwrap_or((DEFAULT_MIN_ORACLE_FRESHNESS, DEFAULT_MAX_ORACLE_FRESHNESS))
+    }
+
+    /// Validate that a MarketOracleConfig satisfies governed supported identifiers and bounds.
+    pub fn validate_market_oracle_config(
+        env: &Env,
+        config: &MarketOracleConfig,
+    ) -> Result<(), PredifiError> {
+        // Validate oracle identity is on trusted whitelist
+        if !Self::is_oracle_whitelisted(env, &config.oracle) {
+            return Err(PredifiError::Unauthorized);
+        }
+
+        // Validate feed identifier is supported
+        if !Self::is_feed_supported(env.clone(), config.feed_id.clone()) {
+            return Err(PredifiError::UnsupportedFeed);
+        }
+
+        // Validate freshness bounds
+        if config.max_staleness_seconds == 0 {
+            return Err(PredifiError::InvalidFreshness);
+        }
+
+        let (min_freshness, max_freshness) = Self::get_oracle_freshness_bounds(env.clone());
+        if config.max_staleness_seconds < min_freshness
+            || config.max_staleness_seconds > max_freshness
+        {
+            return Err(PredifiError::InvalidFreshness);
+        }
+
+        Ok(())
+    }
+
+    /// Read the governed oracle configuration for a market.
+    pub fn get_market_oracle_config(env: Env, pool_id: u64) -> Option<MarketOracleConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketOracleConfig(pool_id))
+    }
+
+    /// Explicitly configure market oracle configuration if not already set.
+    ///
+    /// Caller must be Admin (0) or Operator (1). Once set, configuration is IMMUTABLE.
+    pub fn set_market_oracle_config(
+        env: Env,
+        caller: Address,
+        pool_id: u64,
+        config: MarketOracleConfig,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        let is_admin = Self::require_admin_role(&env, &caller, "set_market_oracle_config").is_ok();
+        let is_operator = Self::require_role(&env, &caller, 1).is_ok();
+        if !is_admin && !is_operator {
+            return Err(PredifiError::Unauthorized);
+        }
+
+        let pool_key = DataKey::Pool(pool_id);
+        if !env.storage().persistent().has(&pool_key) {
+            return Err(PredifiError::PoolNotFound);
+        }
+
+        let oracle_key = DataKey::MarketOracleConfig(pool_id);
+        if env.storage().persistent().has(&oracle_key) {
+            return Err(PredifiError::ConfigurationImmutable);
+        }
+
+        Self::validate_market_oracle_config(&env, &config)?;
+
+        env.storage().persistent().set(&oracle_key, &config);
+        Self::extend_persistent(&env, &oracle_key);
+
+        MarketOracleConfiguredEvent {
+            pool_id,
+            oracle: config.oracle,
+            feed_id: config.feed_id,
+            max_staleness_seconds: config.max_staleness_seconds,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Set a price-based condition for automated pool resolution.
     /// Only callable by Operator (role 1).
     ///
@@ -304,6 +511,13 @@ impl PredifiContract {
         let pool_key = DataKey::Pool(pool_id);
         if !env.storage().persistent().has(&pool_key) {
             return Err(PredifiError::PoolNotFound);
+        }
+
+        // If market has explicit oracle config, price condition feed must match
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if feed_pair != market_cfg.feed_id {
+                return Err(PredifiError::InvalidData);
+            }
         }
 
         let condition_key = DataKey::PriceCondition(pool_id);
@@ -552,6 +766,7 @@ impl PredifiContract {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn require_fresh_price_feed(
         env: &Env,
         timestamp: u64,
@@ -570,6 +785,37 @@ impl PredifiContract {
 
         if current_time > timestamp.saturating_add(max_price_age) {
             return Err(PredifiError::PriceStale);
+        }
+
+        Ok(())
+    }
+
+    fn require_fresh_price_feed_for_pool(
+        env: &Env,
+        pool_id: u64,
+        timestamp: u64,
+        expires_at: u64,
+    ) -> Result<(), PredifiError> {
+        let current_time = env.ledger().timestamp();
+
+        // Check if price has expired
+        if current_time > expires_at {
+            return Err(PredifiError::PriceDataInvalid);
+        }
+
+        // If market has explicit governed oracle config, enforce market-specific freshness policy
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if current_time > timestamp.saturating_add(market_cfg.max_staleness_seconds) {
+                return Err(PredifiError::PriceStale);
+            }
+        } else {
+            // Fallback for unconfigured legacy pools
+            let (_pyth_contract, max_price_age, _min_confidence_ratio) =
+                Self::get_oracle_config(env.clone()).ok_or(PredifiError::OracleNotInitialized)?;
+
+            if current_time > timestamp.saturating_add(max_price_age) {
+                return Err(PredifiError::PriceStale);
+            }
         }
 
         Ok(())
@@ -738,6 +984,7 @@ impl PredifiContract {
         pool_id: u64,
         mut pool: Pool,
         outcome: u32,
+        evidence: ResolutionEvidence,
     ) {
         pool.state = MarketState::Resolved;
         pool.outcome = outcome;
@@ -748,10 +995,33 @@ impl PredifiContract {
         Self::bump_ttl(env, pool_key);
         Self::open_challenge_window(env, pool_id, outcome);
 
+        // Persist the verifiable evidence commitment alongside the pool so
+        // auditors can later re-derive the decision via `get_resolution_evidence`.
+        let evidence_key = DataKey::ResolutionEvidence(pool_id);
+        let evidence_hash = env
+            .crypto()
+            .sha256(&evidence.clone().to_xdr(env))
+            .to_bytes();
+        env.storage().persistent().set(&evidence_key, &evidence);
+        Self::bump_ttl(env, &evidence_key);
+
         PoolResolvedEvent {
             pool_id,
             operator: env.current_contract_address(),
             outcome,
+        }
+        .publish(env);
+
+        ResolutionEvidenceEvent {
+            pool_id,
+            feed_pair: evidence.feed_pair,
+            price: evidence.price,
+            feed_timestamp: evidence.feed_timestamp,
+            comparison_op: evidence.comparison_op,
+            target_price: evidence.target_price,
+            tolerance_bps: evidence.tolerance_bps,
+            outcome: evidence.outcome,
+            evidence_hash,
         }
         .publish(env);
     }
@@ -769,9 +1039,15 @@ impl PredifiContract {
 
         let (feed_pair, target_price, comparison_op, tolerance_bps) =
             Self::load_price_resolution_condition(&env, pool_id)?;
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if feed_pair != market_cfg.feed_id {
+                return Err(PredifiError::InvalidData);
+            }
+        }
+
         let (price, confidence, timestamp, expires_at) =
-            Self::load_price_feed_for_resolution(&env, feed_pair);
-        Self::require_fresh_price_feed(&env, timestamp, expires_at)?;
+            Self::load_price_feed_for_resolution(&env, feed_pair.clone());
+        Self::require_fresh_price_feed_for_pool(&env, pool_id, timestamp, expires_at)?;
         Self::require_confidence_within_policy(&env, price, confidence)?;
 
         let outcome = Self::price_resolution_outcome(
@@ -783,9 +1059,40 @@ impl PredifiContract {
         )?;
         let (pool_key, pool) = Self::load_resolvable_price_pool(&env, pool_id)?;
         Self::validate_price_resolution_outcome(&env, pool_id, outcome, pool.options_count)?;
-        Self::persist_price_resolution(&env, &pool_key, pool_id, pool, outcome);
+        Self::persist_price_resolution(
+            &env,
+            &pool_key,
+            pool_id,
+            pool,
+            outcome,
+            ResolutionEvidence {
+                feed_pair,
+                price,
+                feed_timestamp: timestamp,
+                comparison_op,
+                target_price,
+                tolerance_bps,
+                outcome,
+            },
+        );
 
         Ok(())
+    }
+
+    /// Read the verifiable evidence commitment recorded at price-feed
+    /// resolution, if any.
+    ///
+    /// Returns `None` for pools that have not been resolved through
+    /// `resolve_pool_from_price` (unresolved pools and pools resolved via
+    /// operator/oracle voting carry no feed observation). The returned record
+    /// is the preimage committed by the `resolution_evidence` event: auditors
+    /// recompute `sha256(record.to_xdr(env))` and compare it against the
+    /// emitted `evidence_hash`, then re-derive `outcome` from the stored
+    /// observation and rule.
+    pub fn get_resolution_evidence(env: Env, pool_id: u64) -> Option<ResolutionEvidence> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ResolutionEvidence(pool_id))
     }
 }
 
@@ -802,6 +1109,12 @@ impl OracleCallback for PredifiContract {
         oracle.require_auth();
 
         Self::require_oracle_role_for_resolution(&env, &oracle, pool_id)?;
+
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if oracle != market_cfg.oracle {
+                return Err(PredifiError::Unauthorized);
+            }
+        }
 
         let pool_key = DataKey::Pool(pool_id);
         let mut pool: Pool = env

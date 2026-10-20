@@ -65,7 +65,14 @@
 //! | [`TokenWhitelistAddedEvent`] | `token_whitelist_added` | a token is allowlisted |
 //! | [`TokenWhitelistRemovedEvent`] | `token_whitelist_removed` | a token is removed from the allowlist |
 //! | [`TreasuryWithdrawnEvent`] | `treasury_withdrawn` | treasury funds are withdrawn |
+//! | [`TreasuryFeeChangeProposedEvent`] | `treasury_fee_change_proposed` | a treasury fee change is proposed |
+//! | [`TreasuryFeeChangeActivatedEvent`] | `treasury_fee_change_activated` | a proposed treasury fee change is activated |
+//! | [`TreasuryFeeChangeCancelledEvent`] | `treasury_fee_change_cancelled` | a proposed treasury fee change is cancelled |
 //! | [`RefundClaimedEvent`] | `refund_claimed` | a refund is claimed |
+//! | [`NoContestDeclaredEvent`] | `no_contest_declared` | a pool is declared no-contest |
+//! | [`InvalidOracleDeclaredEvent`] | `invalid_oracle_declared` | a pool is declared invalid-oracle |
+//! | [`RefundPolicyAppliedEvent`] | `refund_policy_applied` | a refund policy is applied to a pool |
+//! | [`RefundPoolSettledEvent`] | `refund_pool_settled` | a refund pool is fully settled |
 //! | [`UpgradeEvent`] | `upgrade` | an upgrade is requested |
 //! | [`ContractUpgradedEvent`] | `contract_upgraded` | an upgrade is completed |
 //! | [`OracleInitEvent`] | `oracle_init` | an oracle is configured |
@@ -73,6 +80,7 @@
 //! | [`PriceConditionSetEvent`] | `price_condition_set` | a price condition is configured |
 //! | [`PriceResolvedEvent`] | `price_resolved` | a price condition resolves |
 //! | [`ResolutionConflictEvent`] | `resolution_conflict` | resolution sources disagree |
+//! | [`ResolutionEvidenceEvent`] | `resolution_evidence` | a price-feed resolution evidence commitment is recorded |
 //! | [`AddedToWhitelistEvent`] | `added_to_whitelist` | a participant is allowlisted |
 //! | [`RemovedFromWhitelistEvent`] | `removed_from_whitelist` | a participant is removed from the allowlist |
 
@@ -266,6 +274,62 @@ pub struct FeeUpdateEvent {
     pub admin: Address,
     /// New fee rate in basis points (e.g., 250 = 2.5%).
     pub fee_bps: u32,
+}
+
+/// Emitted when a treasury fee change is proposed but not yet active.
+///
+/// **When Emitted**: Inside `propose_treasury_fee_change`.
+/// **Indexing Implications**: Governance dashboards should surface pending fee
+/// changes along with their activation ledger so participants can react before
+/// the change takes effect.
+#[contractevent(topics = ["treasury_fee_change_proposed"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryFeeChangeProposedEvent {
+    /// Admin address proposing the fee change.
+    pub admin: Address,
+    /// Proposed new fee rate in basis points.
+    pub new_fee_bps: u32,
+    /// Fee rate currently in effect (snapshot at proposal time).
+    pub current_fee_bps: u32,
+    /// Ledger timestamp after which the change may be activated.
+    pub activation_time: u64,
+}
+
+/// Emitted when a previously proposed treasury fee change becomes active.
+///
+/// **When Emitted**: Inside `activate_treasury_fee_change`.
+/// **Indexing Implications**: Fee calculators and payout estimators must update
+/// their cached fee rate to `new_fee_bps` upon observing this event.
+#[contractevent(topics = ["treasury_fee_change_activated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryFeeChangeActivatedEvent {
+    /// Admin address activating the fee change.
+    pub admin: Address,
+    /// Fee rate that was in effect before activation.
+    pub old_fee_bps: u32,
+    /// Fee rate now in effect.
+    pub new_fee_bps: u32,
+    /// Ledger timestamp at activation.
+    pub timestamp: u64,
+}
+
+/// Emitted when a pending treasury fee change is cancelled by governance.
+///
+/// **When Emitted**: Inside `cancel_treasury_fee_change`.
+/// **Indexing Implications**: Governance dashboards should clear any pending
+/// fee change indicators for the contract upon observing this event.
+#[contractevent(topics = ["treasury_fee_change_cancelled"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryFeeChangeCancelledEvent {
+    /// Admin address cancelling the pending fee change.
+    pub admin: Address,
+    /// Fee rate that remains in effect after cancellation.
+    pub current_fee_bps: u32,
+    /// Ledger timestamp at cancellation.
+    pub timestamp: u64,
 }
 
 /// Emitted when tiered fee schedules are modified.
@@ -1380,6 +1444,58 @@ pub struct PoolResolvedDiagEvent {
     pub timestamp: u64,
 }
 
+/// 🟢 INFO — emitted alongside `PoolResolvedEvent` when a pool is resolved
+/// through the price-feed path (`resolve_pool_from_price`).
+///
+/// Carries the full evidence preimage — the exact feed observation and the
+/// comparison rule that produced the outcome — plus `evidence_hash`, the
+/// SHA-256 commitment over the stored [`crate::ResolutionEvidence`] record's
+/// XDR encoding. Auditors can fetch the persisted record via
+/// `get_resolution_evidence`, recompute the hash, and re-derive the outcome
+/// to verify the decision.
+///
+/// # Event Fields
+/// - `pool_id` - The unique identifier of the resolved pool.
+/// - `feed_pair` - The feed whose observation decided the market.
+/// - `price` - The observed feed value used for the comparison.
+/// - `feed_timestamp` - The feed-side timestamp of the observation.
+/// - `comparison_op` - The comparison applied: 0=Equal, 1=Greater, 2=Less.
+/// - `target_price` - The target value compared against.
+/// - `tolerance_bps` - The tolerance around the target, in basis points.
+/// - `outcome` - The outcome index recorded on the pool.
+/// - `evidence_hash` - SHA-256 over the `ResolutionEvidence` XDR preimage.
+///
+/// # Indexing Implications
+/// - **Audit Trail**: Indexers and auditors can pin the resolution to a single
+///   deterministic evidence commitment rather than reconstructing inputs from
+///   separate feed-update events.
+/// - **Verification**: Re-deriving `outcome` from (`price`, `target_price`,
+///   `comparison_op`, `tolerance_bps`) should always agree with this event;
+///   a mismatch indicates data corruption.
+#[contractevent(topics = ["resolution_evidence"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionEvidenceEvent {
+    /// Unique identifier of the resolved pool.
+    pub pool_id: u64,
+    /// Feed pair whose observation decided the market.
+    pub feed_pair: Symbol,
+    /// Observed feed value used for the comparison.
+    pub price: i128,
+    /// Feed-side timestamp of the observation.
+    pub feed_timestamp: u64,
+    /// Comparison operator applied: 0=Equal, 1=Greater, 2=Less.
+    pub comparison_op: u32,
+    /// Target value compared against.
+    pub target_price: i128,
+    /// Tolerance around `target_price`, in basis points.
+    pub tolerance_bps: u32,
+    /// Outcome index recorded on the pool.
+    pub outcome: u32,
+    /// SHA-256 commitment over the stored `ResolutionEvidence` XDR encoding.
+    pub evidence_hash: BytesN<32>,
+}
+
 /// 🟢 INFO — emitted when all outcome stakes are updated in a single operation.
 /// Useful for markets with many outcomes (e.g., 32+ teams tournament) where
 /// emitting individual events per outcome would be impractical.
@@ -1721,6 +1837,8 @@ pub struct RefundClaimedEvent {
     /// Refunded stake amount returned to user.
     pub amount: i128,
 }
+
+// ── Refund Settlement Events ─────────────────────────────────────────────────
 
 /// Emitted when a proposal to upgrade contract WASM code is published.
 ///
@@ -2358,4 +2476,54 @@ pub struct RemovedFromWhitelistEvent {
     pub removed_by: Address,
     /// Ledger timestamp.
     pub timestamp: u64,
+}
+
+/// Emitted when a market is created or configured with an explicit governed oracle configuration.
+#[contractevent(topics = ["market_oracle_configured"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketOracleConfiguredEvent {
+    /// Target pool identifier.
+    pub pool_id: u64,
+    /// Oracle identity bound to this market.
+    pub oracle: Address,
+    /// Governed supported feed identifier.
+    pub feed_id: Symbol,
+    /// Accepted freshness policy in seconds.
+    pub max_staleness_seconds: u64,
+}
+
+/// Emitted when an admin adds a supported feed identifier to the governed registry.
+#[contractevent(topics = ["supported_feed_added"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupportedFeedAddedEvent {
+    /// Admin address adding the supported feed.
+    pub admin: Address,
+    /// Governed supported feed identifier added.
+    pub feed_id: Symbol,
+}
+
+/// Emitted when an admin removes a supported feed identifier from the governed registry.
+#[contractevent(topics = ["supported_feed_removed"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupportedFeedRemovedEvent {
+    /// Admin address removing the supported feed.
+    pub admin: Address,
+    /// Governed supported feed identifier removed.
+    pub feed_id: Symbol,
+}
+
+/// Emitted when an admin updates the protocol freshness policy bounds.
+#[contractevent(topics = ["oracle_freshness_bounds_set"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleFreshnessBoundsSetEvent {
+    /// Admin address setting the bounds.
+    pub admin: Address,
+    /// Minimum allowed freshness in seconds.
+    pub min_freshness: u64,
+    /// Maximum allowed freshness in seconds.
+    pub max_freshness: u64,
 }

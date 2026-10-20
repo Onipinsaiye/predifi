@@ -1,4 +1,4 @@
-//! # Request Logging Middleware
+//! # Request Logging & Trace Context Middleware
 //!
 //! This module provides a Tower-compatible middleware layer for Axum that
 //! emits **structured JSON log lines** for every HTTP request, including:
@@ -7,6 +7,12 @@
 //! - A **correlation ID** (`x-correlation-id` / `x-request-id`) that is
 //!   propagated through the entire request chain so logs and traces from
 //!   multiple services can be joined.
+//! - **W3C Trace Context** (`traceparent` / `tracestate`) propagated from
+//!   inbound requests and injected into outbound requests and queue payloads
+//!   so a single user operation can be followed across HTTP handling, queued
+//!   work, database writes, and Soroban RPC calls.
+//! - **Sampling** decisions and **sensitive-attribute redaction** so wallet
+//!   secrets and unbounded identifiers never leak into traces.
 //! - **User context** — the authenticated wallet address extracted from the
 //!   `x-user-address` header (populated by the JWT middleware upstream).
 //! - **Pool context** — the pool ID extracted from the URL path when present
@@ -25,6 +31,7 @@
 //!   "span": {
 //!     "http.method": "GET",
 //!     "http.route": "/api/v1/pools/42",
+//!     "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
 //!     "correlation_id": "01J2K3L4M5N6P7Q8R9S0T1U2V3",
 //!     "user_address": "GABC...XYZ",
 //!     "pool_id": "42"
@@ -63,6 +70,7 @@
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -70,6 +78,7 @@ use std::{
 use axum::http::{HeaderMap, Request, Response};
 use tower::{Layer, Service};
 use tracing::{error, info, info_span, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::metrics::SharedMetrics;
@@ -77,6 +86,14 @@ use crate::metrics::SharedMetrics;
 /// Requests that take longer than this threshold are logged at `WARN` level
 /// even when the status code indicates success.
 const SLOW_REQUEST_THRESHOLD_MS: u128 = 1_000;
+
+/// Standard W3C Trace Context headers.
+pub const TRACEPARENT_HEADER: &str = "traceparent";
+pub const TRACESTATE_HEADER: &str = "tracestate";
+
+/// Maximum length of an inbound `traceparent` / `tracestate` value we accept.
+/// Longer values are treated as unbounded identifiers and dropped.
+const MAX_TRACE_HEADER_LEN: usize = 512;
 
 // ── Helper: extract a correlation ID ─────────────────────────────────────────
 
@@ -97,6 +114,151 @@ fn extract_correlation_id(headers: &HeaderMap) -> String {
         }
     }
     Uuid::new_v4().to_string()
+}
+
+// ── Trace context propagation ────────────────────────────────────────────────
+
+/// A parsed W3C `traceparent` header value.
+///
+/// Format: `version-trace_id-parent_id-flags` where `version` is 2 hex chars,
+/// `trace_id` is 32 hex chars, `parent_id` is 16 hex chars, and `flags` is 2
+/// hex chars. Only version `00` is currently defined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceParent {
+    pub version: u8,
+    pub trace_id: String,
+    pub parent_id: String,
+    pub flags: u8,
+}
+
+impl TraceParent {
+    /// Parse a `traceparent` header value, returning `None` if it is malformed,
+    /// oversized, or uses an unsupported version.
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.is_empty() || value.len() > MAX_TRACE_HEADER_LEN {
+            return None;
+        }
+        let mut parts = value.split('-');
+        let version = u8::from_str_radix(parts.next()?, 16).ok()?;
+        if version != 0 {
+            return None;
+        }
+        let trace_id = parts.next()?;
+        let parent_id = parts.next()?;
+        let flags = u8::from_str_radix(parts.next()?, 16).ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        if trace_id.len() != 32
+            || parent_id.len() != 16
+            || !trace_id.chars().all(|c| c.is_ascii_hexdigit())
+            || !parent_id.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        // All-zero trace/parent IDs are invalid per the W3C spec.
+        if trace_id.chars().all(|c| c == '0') || parent_id.chars().all(|c| c == '0') {
+            return None;
+        }
+        Some(Self {
+            version,
+            trace_id: trace_id.to_ascii_lowercase(),
+            parent_id: parent_id.to_ascii_lowercase(),
+            flags,
+        })
+    }
+
+    /// Whether the sampled bit is set in the trace flags.
+    pub fn is_sampled(&self) -> bool {
+        self.flags & 0x01 == 0x01
+    }
+
+    /// Render back to the W3C `traceparent` wire format.
+    pub fn to_header_value(&self) -> String {
+        format!(
+            "{:02x}-{}-{}-{:02x}",
+            self.version, self.trace_id, self.parent_id, self.flags
+        )
+    }
+}
+
+/// Extract the inbound `traceparent` header, if present and valid.
+fn extract_traceparent(headers: &HeaderMap) -> Option<TraceParent> {
+    headers
+        .get(TRACEPARENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(TraceParent::parse)
+}
+
+/// Extract the inbound `tracestate` header, if present and within bounds.
+fn extract_tracestate(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(TRACESTATE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= MAX_TRACE_HEADER_LEN)
+        .map(|s| s.to_string())
+}
+
+/// Sampling configuration for the logging/tracing layer.
+///
+/// The default is a 100% sample rate, which is appropriate for development.
+/// Production deployments should set a lower rate via `TRACE_SAMPLE_RATE`.
+#[derive(Clone, Copy, Debug)]
+pub struct SamplingConfig {
+    /// Fraction of root spans to sample, in `[0.0, 1.0]`.
+    pub sample_rate: f64,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self { sample_rate: 1.0 }
+    }
+}
+
+impl SamplingConfig {
+    /// Build a config from the `TRACE_SAMPLE_RATE` env var, falling back to
+    /// the default on parse failure or out-of-range values.
+    pub fn from_env() -> Self {
+        std::env::var("TRACE_SAMPLE_RATE")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|r| (0.0..=1.0).contains(r))
+            .map(|sample_rate| Self { sample_rate })
+            .unwrap_or_default()
+    }
+
+    /// Decide whether a root span (one without an inbound `traceparent`)
+    /// should be sampled. Uses a deterministic hash of the correlation ID so
+    /// the decision is stable across retries of the same logical request.
+    pub fn should_sample(&self, correlation_id: &str) -> bool {
+        if self.sample_rate >= 1.0 {
+            return true;
+        }
+        if self.sample_rate <= 0.0 {
+            return false;
+        }
+        // Cheap deterministic hash of the correlation ID.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in correlation_id.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let bucket = (hash % 10_000) as f64 / 10_000.0;
+        bucket < self.sample_rate
+    }
+}
+
+/// Redact a raw trace ID for log output, keeping only the first 8 hex chars.
+///
+/// Trace IDs are unbounded identifiers when they come from untrusted callers;
+/// truncating them keeps logs correlatable without allowing log-injection or
+/// cardinality blowups.
+pub fn redact_trace_id(trace_id: &str) -> String {
+    if trace_id.is_empty() {
+        return String::new();
+    }
+    let prefix: String = trace_id.chars().take(8).collect();
+    format!("{prefix}{REDACTED_ADDRESS_SUFFIX}")
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -155,6 +317,7 @@ fn extract_pool_id(path: &str) -> Option<String> {
 #[derive(Clone, Default)]
 pub struct LoggingLayer {
     metrics: Option<SharedMetrics>,
+    sampling: SamplingConfig,
 }
 
 impl LoggingLayer {
@@ -167,6 +330,21 @@ impl LoggingLayer {
     pub fn with_metrics(metrics: SharedMetrics) -> Self {
         Self {
             metrics: Some(metrics),
+            sampling: SamplingConfig::default(),
+        }
+    }
+
+    /// Override the sampling configuration for this layer.
+    pub fn with_sampling(mut self, sampling: SamplingConfig) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// Create a logging layer that reads sampling from the environment.
+    pub fn from_env() -> Self {
+        Self {
+            metrics: None,
+            sampling: SamplingConfig::from_env(),
         }
     }
 }
@@ -178,6 +356,7 @@ impl<S> Layer<S> for LoggingLayer {
         LoggingService {
             inner,
             metrics: self.metrics.clone(),
+            sampling: self.sampling,
         }
     }
 }
@@ -192,6 +371,7 @@ impl<S> Layer<S> for LoggingLayer {
 pub struct LoggingService<S> {
     inner: S,
     metrics: Option<SharedMetrics>,
+    sampling: SamplingConfig,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for LoggingService<S>
@@ -213,6 +393,8 @@ where
         let method = req.method().to_string();
         let path = req.uri().path().to_string();
         let correlation_id = extract_correlation_id(req.headers());
+        let traceparent = extract_traceparent(req.headers());
+        let tracestate = extract_tracestate(req.headers());
         let user_address = extract_user_address(req.headers())
             .map(|a| redact_address(&a))
             .unwrap_or_else(|| "anonymous".to_string());
@@ -220,6 +402,21 @@ where
 
         let start = Instant::now();
         let metrics = self.metrics.clone();
+        let sampling = self.sampling;
+
+        // Determine the effective trace ID and sampling decision. If the
+        // caller supplied a valid `traceparent`, honour its trace ID and
+        // sampled flag; otherwise make a fresh sampling decision based on
+        // the correlation ID.
+        let (trace_id, sampled) = match &traceparent {
+            Some(tp) => (tp.trace_id.clone(), tp.is_sampled()),
+            None => {
+                let decision = sampling.should_sample(&correlation_id);
+                let trace_id = Uuid::new_v4().simple().to_string();
+                (trace_id, decision)
+            }
+        };
+        let redacted_trace_id = redact_trace_id(&trace_id);
 
         // Build the span.  All per-request context is attached here so the
         // JSON formatter emits it once under "span", not duplicated in each
@@ -228,10 +425,33 @@ where
             "http.request",
             http.method = %method,
             http.route = %path,
+            trace_id = %redacted_trace_id,
             correlation_id = %correlation_id,
             user_address = %user_address,
             pool_id = pool_id.as_deref().unwrap_or(""),
+            sampled = sampled,
         );
+
+        // Link the span to the inbound W3C trace context, if any, so the
+        // OpenTelemetry exporter can stitch this request into the caller's
+        // trace across services.
+        if let Some(tp) = &traceparent {
+            let parent_ctx = opentelemetry::Context::new().with_remote_span_context(
+                opentelemetry::trace::SpanContext::new(
+                    opentelemetry::trace::TraceId::from_hex(&tp.trace_id)
+                        .unwrap_or_else(|_| opentelemetry::trace::TraceId::INVALID),
+                    opentelemetry::trace::SpanId::from_hex(&tp.parent_id)
+                        .unwrap_or_else(|_| opentelemetry::trace::SpanId::INVALID),
+                    opentelemetry::trace::TraceFlags::new(tp.flags),
+                    true,
+                    opentelemetry::trace::TraceState::default(),
+                ),
+            );
+            span.set_parent(parent_ctx);
+        }
+        if let Some(state) = &tracestate {
+            span.record("tracestate", state.as_str());
+        }
 
         let inner_future = self.inner.call(req);
 
@@ -300,6 +520,91 @@ where
     }
 }
 
+// ── Outbound propagation ─────────────────────────────────────────────────────
+
+/// A trace context that can be attached to outbound HTTP requests and queue
+/// payloads so downstream workers and RPC calls join the same trace.
+#[derive(Clone, Debug)]
+pub struct OutboundTraceContext {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
+}
+
+impl OutboundTraceContext {
+    /// Build an outbound context from the current tracing span.
+    ///
+    /// Call this from inside a span created by [`LoggingLayer`] (or any span
+    /// that has been linked to the inbound trace) to obtain the headers that
+    /// must be injected into the outbound request or serialized into the
+    /// queue payload.
+    pub fn from_current_span() -> Option<Self> {
+        use opentelemetry::trace::TraceContextExt;
+        let ctx = tracing::Span::current().context();
+        let span = ctx.span();
+        let span_ctx = span.span_context();
+        if !span_ctx.is_valid() {
+            return None;
+        }
+        let traceparent = format!(
+            "00-{}-{}-{:02x}",
+            span_ctx.trace_id(),
+            span_ctx.span_id(),
+            span_ctx.trace_flags().to_u8()
+        );
+        Some(Self {
+            traceparent,
+            tracestate: None,
+        })
+    }
+
+    /// Inject the trace context into an outbound [`HeaderMap`].
+    pub fn inject_headers(&self, headers: &mut HeaderMap) {
+        if let Ok(val) = self.traceparent.parse() {
+            headers.insert(TRACEPARENT_HEADER, val);
+        }
+        if let Some(state) = &self.tracestate {
+            if let Ok(val) = state.parse() {
+                headers.insert(TRACESTATE_HEADER, val);
+            }
+        }
+    }
+
+    /// Serialize the trace context into a queue payload map so workers can
+    /// re-establish the trace when they pick up the job.
+    pub fn to_queue_payload(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            TRACEPARENT_HEADER.to_string(),
+            serde_json::Value::String(self.traceparent.clone()),
+        );
+        if let Some(state) = &self.tracestate {
+            map.insert(
+                TRACESTATE_HEADER.to_string(),
+                serde_json::Value::String(state.clone()),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Restore a trace context from a queue payload produced by
+    /// [`to_queue_payload`](Self::to_queue_payload).
+    pub fn from_queue_payload(payload: &serde_json::Value) -> Option<Self> {
+        let traceparent = payload.get(TRACEPARENT_HEADER)?.as_str()?.to_string();
+        // Validate before trusting so a malformed payload cannot poison the
+        // downstream trace.
+        TraceParent::parse(&traceparent)?;
+        let tracestate = payload
+            .get(TRACESTATE_HEADER)
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() <= MAX_TRACE_HEADER_LEN)
+            .map(|s| s.to_string());
+        Some(Self {
+            traceparent,
+            tracestate,
+        })
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -353,6 +658,92 @@ mod tests {
         let id = extract_correlation_id(&headers);
         // Should be a valid UUID v4 (36 chars with dashes).
         assert_eq!(id.len(), 36, "generated ID should be a UUID: {id}");
+    }
+
+    #[test]
+    fn traceparent_parses_valid_header() {
+        let tp = TraceParent::parse(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        .expect("valid traceparent");
+        assert_eq!(tp.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(tp.parent_id, "00f067aa0ba902b7");
+        assert!(tp.is_sampled());
+    }
+
+    #[test]
+    fn traceparent_rejects_malformed_values() {
+        assert!(TraceParent::parse("").is_none());
+        assert!(TraceParent::parse("not-a-traceparent").is_none());
+        assert!(TraceParent::parse(
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"
+        )
+        .is_none());
+        assert!(TraceParent::parse(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra"
+        )
+        .is_none());
+        // Oversized values are rejected as unbounded identifiers.
+        let oversized = format!("00-{}-00f067aa0ba902b7-01", "a".repeat(600));
+        assert!(TraceParent::parse(&oversized).is_none());
+    }
+
+    #[test]
+    fn redact_trace_id_truncates_to_prefix() {
+        let redacted = redact_trace_id("4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(redacted, "4bf92f35...");
+        assert_eq!(redact_trace_id(""), "");
+    }
+
+    #[test]
+    fn sampling_config_honours_rate() {
+        let always = SamplingConfig { sample_rate: 1.0 };
+        assert!(always.should_sample("any-id"));
+        let never = SamplingConfig { sample_rate: 0.0 };
+        assert!(!never.should_sample("any-id"));
+    }
+
+    #[test]
+    fn outbound_context_round_trips_through_queue_payload() {
+        let ctx = OutboundTraceContext {
+            traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+                .to_string(),
+            tracestate: Some("vendor=value".to_string()),
+        };
+        let payload = ctx.to_queue_payload();
+        let restored = OutboundTraceContext::from_queue_payload(&payload)
+            .expect("payload should round-trip");
+        assert_eq!(restored.traceparent, ctx.traceparent);
+        assert_eq!(restored.tracestate, ctx.tracestate);
+    }
+
+    #[test]
+    fn outbound_context_rejects_invalid_queue_payload() {
+        let payload = serde_json::json!({ "traceparent": "garbage" });
+        assert!(OutboundTraceContext::from_queue_payload(&payload).is_none());
+    }
+
+    #[tokio::test]
+    async fn logging_layer_accepts_inbound_traceparent() {
+        let app = Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(LoggingLayer::new());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header(
+                        "traceparent",
+                        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
     }
 
     #[test]

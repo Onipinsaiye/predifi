@@ -28,7 +28,7 @@ When adding a new migration, use the **next unused integer**, run
 `sqlx migrate add <description>` (or create the file by hand) inside this
 directory, and never reuse or renumber a prefix that already exists — see
 [Duplicate prefixes](#duplicate-004-and-009-prefixes-do-not-rename) below.
-The next available prefix is **`011_`**.
+The next available prefix is **`012_`**.
 
 ## Applying migrations locally
 
@@ -82,8 +82,10 @@ For full deployment guidelines, rollback SQL scripts, and interrupted migration 
 | `009_add_predictions_indexes.sql` | Targeted indexes on `predictions` for query patterns not yet covered by an index. | `Share` | `IndexBuild` | **No** on large tables |
 | `009_create_user_statistics.sql` | Pre-aggregated `user_statistics` table, maintained by triggers, for user betting volume/winnings/prediction counts. | `AccessExclusive` / `RowExclusive` | `DataBackfill` | **No** on large tables |
 | `010_tags_claims_notifications.sql` | Multi-tag support on pools, claim tracking, and a notification system. | `AccessExclusive` / `Share` | `IndexBuild` | **Yes** |
+| `011_align_market_filter_indexes.sql` | Composite and partial indexes on `pools` for predictable status, time, creator, and outcome query plans. | `Share` | `IndexBuild` | **Yes** |
+| `011_create_listener_checkpoints.sql` | Dedicated listener checkpoints table and app_state compatibility table for atomic cursor persistence. | `AccessExclusive` | `MetadataOnly` | **Yes** |
 
-All 12 files above exist in this directory today.
+All 13 files above exist in this directory today.
 
 ## Duplicate 004 and 009 prefixes (do not rename)
 
@@ -137,4 +139,51 @@ databases that already ran it — hence this issue being documentation-only.
 **Convention going forward:** always use the next unused integer prefix, and
 double-check this table (or `ls backend/migrations/`) before naming a new
 migration file so prefixes are never reused again. The next migration should
-be named `011_<description>.sql`.
+be named `012_<description>.sql`.
+
+## Upgrade compatibility matrix
+
+To verify that upgrades from each supported schema version work, the backend
+maintains a migration matrix that is exercised in CI (see
+`.github/workflows/contract-ci.yml` and the scheduled validation job). The
+matrix covers:
+
+- **Baseline snapshots** — representative prior-version schemas are kept under
+  `backend/migrations/baselines/` (one `.sql` dump per supported release,
+  named `v<release>.sql`). Each snapshot is loaded into a fresh database to
+  reproduce the schema a deployed release would have.
+- **Production-like row volumes** — each baseline is seeded with a
+  representative dataset (pools, predictions, referrals, and the
+  pre-aggregated stats tables) sized to exercise index and constraint
+  behaviour, not just empty-table DDL.
+- **Upgrade path** — the migrator is then run against the seeded baseline and
+  the result is validated for:
+  - **Indexes** — every index declared by the migrations exists and is valid
+    (`pg_index.indisvalid`).
+  - **Constraints** — primary keys, foreign keys, unique constraints, and
+    check constraints match the expected set.
+  - **Data transformations** — representative rows survive the upgrade
+    unchanged where the migration is non-destructive, and are transformed as
+    documented where it is (e.g. the `NUMERIC(32, 7)` conversion in
+    `004_enhance_schema_precision.sql`).
+- **Record preservation** — a checksum of representative rows is captured
+  before and after the upgrade; any unexpected loss or mutation fails the
+  job.
+- **Lock/runtime budgets** — each migration is timed and its lock footprint
+  recorded. Migrations that exceed the acceptable lock or runtime budget are
+  flagged in the matrix output so they can be split or made online before the
+  next release.
+
+### Deployment order across multiple migrations
+
+When an application release spans more than one migration, apply them in
+ascending version order and deploy in this sequence:
+
+1. Run the migrations (forward-only) against the target database.
+2. Deploy the application release that depends on the new schema.
+3. Only after the new release is healthy, remove any compatibility shims for
+   the previous schema in a follow-up migration.
+
+Because migrations are forward-only and there is no rollback path, a release
+that spans multiple migrations must be validated against every supported
+baseline in the matrix before it is promoted.

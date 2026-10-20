@@ -1,4 +1,5 @@
 //! Database connection management and query modules.
+//! Database connection management and query modules.
 //!
 //! This module provides:
 //! - Connection pool creation with retry and exponential backoff
@@ -9,6 +10,9 @@
 //! so existing callers (`crate::db::get_active_pools`, etc.) continue to work
 //! without any changes.
 
+pub mod checkpoints;
+pub mod health;
+
 mod pools;
 mod predictions;
 mod referrals;
@@ -18,6 +22,15 @@ pub mod metrics;
 // ── Re-export every public item from each repository module ──────────────────
 // This keeps the `crate::db::*` call surface identical to the original
 // monolithic file — no changes needed in routes, workers, or other callers.
+
+pub use checkpoints::{
+    load_checkpoint,
+    resolve_startup_checkpoint,
+    save_checkpoint,
+    save_checkpoint_tx,
+    CheckpointStatus,
+    DEFAULT_LISTENER_ID,
+};
 
 pub use pools::{
     // Types
@@ -37,6 +50,7 @@ pub use pools::{
     get_pool_with_odds,
     get_pools_with_filters,
     insert_pool_from_event,
+    insert_pool_from_event_tx,
     // Business logic
     calculate_odds,
     // Creator incentives
@@ -85,6 +99,7 @@ pub use referrals::{
     get_referral_earnings,
     insert_referral_from_event,
     insert_referrals_bulk,
+    insert_referrals_bulk_tx,
 };
 
 pub use outbox::{
@@ -107,6 +122,8 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+
+pub use health::{DependencyHealth, DependencyStatus, ReadinessReport};
 
 // ── Pool creation error ───────────────────────────────────────────────────────
 
@@ -176,6 +193,19 @@ pub async fn create_pool(config: &Config) -> Result<PgPool, PoolCreationError> {
         connect,
     )
     .await
+}
+
+// ── Readiness probe ───────────────────────────────────────────────────────────
+
+/// Probe the database for readiness without blocking the caller for longer
+/// than `timeout`. Returns `true` when a trivial query succeeds within budget.
+///
+/// This is intentionally separate from [`create_pool`]: liveness must not
+/// depend on Postgres being reachable, and readiness must never trigger a
+/// restart loop when the database is temporarily down.
+pub async fn check_readiness(pool: &PgPool, timeout: Duration) -> bool {
+    let probe = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool);
+    matches!(tokio::time::timeout(timeout, probe).await, Ok(Ok(_)))
 }
 
 // ── Backoff maths ─────────────────────────────────────────────────────────────
@@ -344,6 +374,22 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.attempts, 1, "should fail after only one attempt for PoolClosed");
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_is_bounded_by_timeout() {
+        // A pool pointing at an unroutable address must not hang the probe.
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("lazy pool construction should not connect");
+        let start = std::time::Instant::now();
+        let ready = check_readiness(&pool, Duration::from_millis(100)).await;
+        assert!(!ready, "unreachable database must report not ready");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "readiness probe must return within its timeout budget"
+        );
     }
 
     #[test]

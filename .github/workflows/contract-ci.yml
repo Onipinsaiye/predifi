@@ -33,10 +33,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   WASM_SIZE_THRESHOLD_KB: 200
+  BATCH_CLAIM_BENCH_BUDGET_MS: 30000
 
 jobs:
   check:
-    name: cargo check
+    name: contract / cargo check
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -60,7 +61,7 @@ jobs:
         run: cargo check --workspace --target wasm32-unknown-unknown
 
   fmt:
-    name: cargo fmt
+    name: contract / cargo fmt
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -75,7 +76,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
-    name: cargo clippy
+    name: contract / cargo clippy
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -100,7 +101,7 @@ jobs:
         run: cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 
   test:
-    name: cargo test
+    name: contract / cargo test
     runs-on: ubuntu-latest
     timeout-minutes: 25
     defaults:
@@ -123,7 +124,7 @@ jobs:
         run: cargo test --workspace
 
   test-fuzz:
-    name: cargo test (fuzz, bounded)
+    name: contract / cargo test (fuzz, bounded)
     runs-on: ubuntu-latest
     # Bounded fuzz budget: PROPTEST_CASES=256 at ~8ms/case ≈ 2s per test × 12
     # tests ≈ 30s wallclock + cargo build ≈ 3-5min. 10-minute ceiling leaves
@@ -151,8 +152,49 @@ jobs:
           PROPTEST_CASES: "256"
         run: cargo test -p predifi-contract --lib price_feed_proptests
 
+  # Issue: bound batch-claim execution by measured resource cost.
+  # Runs the batch-claim cost benchmarks with a stable, generous budget so
+  # regressions in per-claim CPU/memory cost fail visibly instead of silently
+  # timing out. The benchmark also asserts the maximum supported batch size
+  # and atomic behavior when any claim fails.
+  batch-claim-bench:
+    name: batch-claim cost benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ./contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          enableCrossOsArchive: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contract/target
+          key: ${{ runner.os }}-contract-bench-${{ hashFiles('contract/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-contract-bench-
+      - name: Run batch-claim cost benchmarks
+        env:
+          BATCH_CLAIM_BENCH_BUDGET_MS: ${{ env.BATCH_CLAIM_BENCH_BUDGET_MS }}
+        run: |
+          set -euo pipefail
+          START=$(date +%s%3N)
+          cargo test -p predifi-contract --lib batch_claim_benchmarks \
+            -- --nocapture --test-threads=1
+          END=$(date +%s%3N)
+          ELAPSED=$(( END - START ))
+          echo "batch-claim benchmarks completed in ${ELAPSED} ms (budget ${BATCH_CLAIM_BENCH_BUDGET_MS} ms)"
+          if [[ "$ELAPSED" -gt "$BATCH_CLAIM_BENCH_BUDGET_MS" ]]; then
+            echo "::error::batch-claim benchmarks exceeded ${BATCH_CLAIM_BENCH_BUDGET_MS} ms budget"
+            exit 1
+          fi
+
   wasm-build:
-    name: WASM build verification
+    name: contract / WASM build verification
     runs-on: ubuntu-latest
     timeout-minutes: 25
     defaults:
@@ -197,6 +239,32 @@ jobs:
               exit 1
             fi
           done
+      - name: Record artifact provenance
+        run: |
+          WASM_DIR="contract/target/wasm32-unknown-unknown/release"
+          PROVENANCE="${WASM_DIR}/provenance.json"
+          {
+            echo "{"
+            echo "  \"commit\": \"${GITHUB_SHA}\","
+            echo "  \"ref\": \"${GITHUB_REF}\","
+            echo "  \"run_id\": \"${GITHUB_RUN_ID}\","
+            echo "  \"workflow\": \"${GITHUB_WORKFLOW}\","
+            echo "  \"artifacts\": {"
+            FIRST=1
+            for CONTRACT in predifi_contract access_control; do
+              OPT="${WASM_DIR}/${CONTRACT}-optimized.wasm"
+              [[ -f "$OPT" ]] || continue
+              SHA=$(sha256sum "$OPT" | awk '{print $1}')
+              [[ "$FIRST" -eq 0 ]] && echo ","
+              printf '    "%s": {"sha256": "%s", "bytes": %s}' "$CONTRACT" "$SHA" "$(wc -c < "$OPT")"
+              FIRST=0
+            done
+            echo ""
+            echo "  }"
+            echo "}"
+          } > "$PROVENANCE"
+          cat "$PROVENANCE"
+
       - name: Attest WASM build provenance (Sigstore)
         uses: actions/attest-build-provenance@v3
         with:
@@ -213,12 +281,63 @@ jobs:
             contract/target/wasm32-unknown-unknown/release/predifi_contract-optimized.wasm
             contract/target/wasm32-unknown-unknown/release/access_control.wasm
             contract/target/wasm32-unknown-unknown/release/access_control-optimized.wasm
+            contract/target/wasm32-unknown-unknown/release/provenance.json
           if-no-files-found: warn
           retention-days: 14
 
+  wasm-parity:
+    name: Native vs optimized WASM parity
+    needs: [wasm-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: ./contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contract/target
+          key: ${{ runner.os }}-contract-wasm-${{ hashFiles('contract/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-contract-wasm-
+      - name: Download optimized WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm-${{ github.sha }}
+          path: contract/target/wasm32-unknown-unknown/release
+      - name: Verify artifact provenance matches source commit
+        run: |
+          PROVENANCE="target/wasm32-unknown-unknown/release/provenance.json"
+          if [[ ! -f "$PROVENANCE" ]]; then
+            echo "::error::provenance.json missing from WASM artifact bundle"
+            exit 1
+          fi
+          ARTIFACT_COMMIT=$(python3 -c "import json,sys; print(json.load(open('$PROVENANCE'))['commit'])")
+          if [[ "$ARTIFACT_COMMIT" != "${GITHUB_SHA}" ]]; then
+            echo "::error::WASM artifact commit ${ARTIFACT_COMMIT} does not match source commit ${GITHUB_SHA}"
+            exit 1
+          fi
+          echo "WASM artifacts traceable to commit ${ARTIFACT_COMMIT}"
+      - name: Run native vs WASM parity suite
+        env:
+          PREDIFI_WASM_PATH: target/wasm32-unknown-unknown/release/predifi_contract-optimized.wasm
+        run: |
+          if [[ ! -f "${PREDIFI_WASM_PATH}" ]]; then
+            echo "::error::optimized WASM artifact not found at ${PREDIFI_WASM_PATH}"
+            exit 1
+          fi
+          cargo test --workspace --test wasm_parity -- --nocapture
+
   deploy-testnet:
     name: Deploy to testnet (verified)
-    needs: [check, fmt, clippy, test, wasm-build]
+    needs: [check, fmt, clippy, test, batch-claim-bench, wasm-build, wasm-parity]
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -299,7 +418,7 @@ jobs:
 
   # ── Issue #137: staging tampered-artifact verification test ──
   attestation-test:
-    name: Attestation fail-closed test
+    name: contract / Attestation fail-closed test
     needs: [wasm-build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -342,4 +461,3 @@ jobs:
             exit 1
           fi
           echo "Tampered artifact correctly REJECTED."
-
