@@ -50,6 +50,23 @@ pub async fn get_referral_earnings(
 
 // ── Write queries ─────────────────────────────────────────────────────────────
 
+/// Insert a batch of referral events using a single multi-row INSERT within a transaction.
+pub async fn insert_referrals_bulk_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    events: &[ReferralPaidEvent],
+    max_batch_size: usize,
+) -> Result<(), sqlx::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in events.chunks(max_batch_size.max(1)) {
+        insert_referrals_chunk(&mut **tx, chunk).await?;
+    }
+
+    Ok(())
+}
+
 /// Insert a batch of referral events using a single multi-row INSERT.
 ///
 /// Large batches are split into chunks of at most `max_batch_size` rows to
@@ -103,10 +120,13 @@ where
 /// runtime because sqlx does not support dynamic-width bulk inserts via its
 /// query-builder API.  The placeholder strings are constructed entirely from
 /// index arithmetic — no user data is interpolated into the SQL string.
-async fn insert_referrals_chunk(
-    pool: &PgPool,
+async fn insert_referrals_chunk<'e, E>(
+    executor: E,
     events: &[ReferralPaidEvent],
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     if events.is_empty() {
         return Ok(());
     }
@@ -136,7 +156,7 @@ async fn insert_referrals_chunk(
             .bind(event.referral_amount);
     }
 
-    q.execute(pool).await?;
+    q.execute(executor).await?;
     Ok(())
 }
 

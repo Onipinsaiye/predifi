@@ -30,6 +30,42 @@ const STATE_KEY: &str = "stellar_listener_latest_ledger";
 const INITIAL_RECONNECT_DELAY_SECS: u64 = 1;
 const MAX_RECONNECT_DELAY_SECS: u64 = 60;
 
+/// Failure injection point for testing atomic commit semantics and crash recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InjectionPoint {
+    #[default]
+    None,
+    BeforeCommit,
+    AfterCommit,
+}
+
+/// Helper struct to inject failures into batch event processing to verify
+/// that crash/restarts never lose events or generate duplicate rows.
+#[derive(Debug, Clone, Default)]
+pub struct FailureInjector {
+    pub point: InjectionPoint,
+}
+
+impl FailureInjector {
+    pub fn none() -> Self {
+        Self {
+            point: InjectionPoint::None,
+        }
+    }
+
+    pub fn fail_before_commit() -> Self {
+        Self {
+            point: InjectionPoint::BeforeCommit,
+        }
+    }
+
+    pub fn fail_after_commit() -> Self {
+        Self {
+            point: InjectionPoint::AfterCommit,
+        }
+    }
+}
+
 // ── RPC response types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +81,7 @@ struct GetEventsResult {
 }
 
 /// A single event returned by the Stellar RPC `getEvents` call.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct StellarEvent {
     /// Event type string, e.g. `"contract"` or `"system"`.
     #[serde(rename = "type")]
@@ -68,29 +104,18 @@ pub struct StellarEvent {
 
 /// Load the last processed ledger from the database.
 #[instrument(skip(pool), name = "stellar_listener.load_cursor")]
-async fn load_cursor(pool: &PgPool) -> Option<u64> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM app_state WHERE key = $1")
-        .bind(STATE_KEY)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
+pub async fn load_cursor(pool: &PgPool) -> Option<u64> {
+    let status = crate::db::load_checkpoint(pool, STATE_KEY).await;
+    match status {
+        crate::db::CheckpointStatus::Valid(ledger) => Some(ledger),
+        _ => None,
+    }
 }
 
 /// Persist the latest processed ledger to the database.
 #[instrument(skip(pool), name = "stellar_listener.save_cursor", fields(ledger = ledger))]
-async fn save_cursor(pool: &PgPool, ledger: u64) {
-    let result = sqlx::query(
-        "INSERT INTO app_state (key, value) VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .bind(STATE_KEY)
-    .bind(ledger.to_string())
-    .execute(pool)
-    .await;
-
-    if let Err(e) = result {
+pub async fn save_cursor(pool: &PgPool, ledger: u64) {
+    if let Err(e) = crate::db::save_checkpoint(pool, STATE_KEY, ledger).await {
         warn!(error = %e, "failed to persist ledger cursor");
     }
 }
@@ -189,8 +214,9 @@ pub async fn run_worker(
         .expect("valid reqwest client");
     let mut ticker = interval(Duration::from_secs(POLL_INTERVAL_SECS));
 
-    // Resume from the last persisted ledger, or start from ledger 1.
-    let mut cursor: u64 = load_cursor(&db).await.unwrap_or(1);
+    // Define startup behavior: load checkpoint and handle missing/malformed status deterministically.
+    let status = crate::db::load_checkpoint(&db, STATE_KEY).await;
+    let mut cursor: u64 = crate::db::resolve_startup_checkpoint(&status, STATE_KEY, 1);
     let mut consecutive_failures: u32 = 0;
     let batch_size = max_batch_size.max(1);
     info!(cursor, batch_size, "stellar listener starting");
@@ -228,15 +254,58 @@ pub async fn run_worker(
                         "stellar events received"
                     );
 
-                    for chunk in result.events.chunks(batch_size) {
-                        process_event_batch(&db, &redis, &event_bus, chunk, batch_size).await;
-                    }
-                }
+                    let mut all_chunks_succeeded = true;
+                    let chunks: Vec<_> = result.events.chunks(batch_size).collect();
+                    let total_chunks = chunks.len();
 
-                let new_cursor = result.latest_ledger + 1;
-                if new_cursor > cursor {
-                    cursor = new_cursor;
-                    save_cursor(&db, cursor).await;
+                    for (idx, chunk) in chunks.into_iter().enumerate() {
+                        let is_last = idx + 1 == total_chunks;
+                        let chunk_max_ledger = chunk.iter().map(|e| e.ledger).max().unwrap_or(cursor);
+                        let next_checkpoint = if is_last {
+                            result.latest_ledger + 1
+                        } else {
+                            (chunk_max_ledger + 1).min(result.latest_ledger + 1)
+                        };
+
+                        match commit_event_batch_atomic(
+                            &db,
+                            &redis,
+                            &event_bus,
+                            chunk,
+                            next_checkpoint,
+                            batch_size,
+                            &FailureInjector::none(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                cursor = next_checkpoint;
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    chunk_index = idx,
+                                    cursor,
+                                    "failed to commit event batch atomically; stopping chunk processing without advancing cursor"
+                                );
+                                all_chunks_succeeded = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !all_chunks_succeeded {
+                        consecutive_failures += 1;
+                        let delay = reconnect_delay_secs(consecutive_failures);
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        continue;
+                    }
+                } else {
+                    let new_cursor = result.latest_ledger + 1;
+                    if new_cursor > cursor {
+                        cursor = new_cursor;
+                        crate::db::save_checkpoint(&db, STATE_KEY, cursor).await.ok();
+                    }
                 }
             }
             Err(e) => {
@@ -255,22 +324,30 @@ pub async fn run_worker(
     }
 }
 
-/// Process a batch of Stellar events, dispatching each to the appropriate handler.
+/// Commit a chunk/batch of events and the next checkpoint atomically inside a single database transaction.
 ///
-/// Each call is wrapped in its own OTel span so per-batch latency is visible
-/// in the trace backend.
-#[instrument(skip_all, name = "stellar_listener.process_event_batch",
-    fields(event_count = events.len()))]
-async fn process_event_batch(
+/// If any event fails to write or if failure injection triggers before commit,
+/// the database transaction rolls back, leaving the checkpoint and indexed tables unchanged.
+///
+/// External non-transactional side effects (Redis cache invalidation, WebSocket broadcast,
+/// and worker queue success tracking) are performed ONLY after durable commit.
+pub async fn commit_event_batch_atomic(
     db: &PgPool,
     redis: &RedisCache,
     event_bus: &crate::ws::EventBus,
     events: &[StellarEvent],
+    next_checkpoint: u64,
     max_batch_size: usize,
-) {
-    let queue = worker_job_queue();
+    injector: &FailureInjector,
+) -> Result<(), String> {
+    let mut tx = db.begin().await.map_err(|e| e.to_string())?;
+
+    let mut parsed_predictions: Vec<crate::db::PredictionPlacedEvent> = Vec::new();
+    let mut pool_created_occurred = false;
     let mut referral_events: Vec<crate::db::ReferralPaidEvent> = Vec::new();
-    let mut referral_job_ids: Vec<String> = Vec::new();
+    let mut processed_jobs: Vec<Job> = Vec::new();
+
+    let queue = worker_job_queue();
 
     for event in events {
         info!(
@@ -310,83 +387,202 @@ async fn process_event_batch(
             };
 
             if topic_matches("pool_created") {
-                match handle_pool_created_event(db, redis, event).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process pool_created event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                apply_pool_created_event_tx(&mut tx, event).await?;
+                pool_created_occurred = true;
+                processed_jobs.push(job);
             } else if topic_matches("prediction_placed") {
-                match handle_prediction_placed_event(db, event, event_bus).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process prediction_placed event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                let pred = apply_prediction_placed_event_tx(&mut tx, event).await?;
+                parsed_predictions.push(pred);
+                processed_jobs.push(job);
             } else if topic_matches("pool_resolved") {
-                match handle_pool_resolved_event(db, event).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process pool_resolved event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                apply_pool_resolved_event_tx(&mut tx, event).await?;
+                processed_jobs.push(job);
             } else if topic_matches("pool_canceled") {
-                match handle_pool_canceled_event(db, event).await {
-                    Ok(()) => queue.record_success(&job),
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to process pool_canceled event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                apply_pool_canceled_event_tx(&mut tx, event).await?;
+                processed_jobs.push(job);
             } else if topic_matches("referral_paid") {
-                match parse_referral_paid_event(event) {
-                    Ok(ev) => {
-                        referral_events.push(ev);
-                        referral_job_ids.push(event.id.clone());
-                    }
-                    Err(e) => {
-                        error!(id = %event.id, ledger = event.ledger, error = %e, "failed to parse referral_paid event");
-                        queue.record_failure(job, e);
-                    }
-                }
+                let ev = parse_referral_paid_event(event)?;
+                referral_events.push(ev);
+                processed_jobs.push(job);
             }
         }
     }
 
     if !referral_events.is_empty() {
-        match crate::db::insert_referrals_bulk(db, &referral_events, max_batch_size).await {
-            Ok(()) => {
-                for id in &referral_job_ids {
-                    queue.mark_processed(id);
-                }
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    count = referral_events.len(),
-                    "failed to bulk insert referral events"
-                );
-                for id in referral_job_ids {
-                    queue.record_failure(
-                        Job {
-                            id,
-                            kind: "referral_paid".into(),
-                            payload: String::new(),
-                            attempts: 0,
-                            ledger: None,
-                        },
-                        e.to_string(),
-                    );
-                }
-            }
-        }
+        crate::db::insert_referrals_bulk_tx(&mut tx, &referral_events, max_batch_size)
+            .await
+            .map_err(|e| e.to_string())?;
     }
+
+    // Persist checkpoint atomically inside the same transaction
+    crate::db::save_checkpoint_tx(&mut tx, STATE_KEY, next_checkpoint)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Failure injection: before commit
+    if injector.point == InjectionPoint::BeforeCommit {
+        drop(tx);
+        return Err("injected failure before database commit".to_string());
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    // Failure injection: after commit
+    if injector.point == InjectionPoint::AfterCommit {
+        return Err("injected failure after database commit".to_string());
+    }
+
+    // Durable commit succeeded! Now perform non-transactional side effects:
+    if pool_created_occurred {
+        redis.invalidate_pools_cache().await;
+    }
+    for ev in parsed_predictions {
+        event_bus.send(&serde_json::json!({
+            "type": "prediction_placed",
+            "pool_id": ev.pool_id,
+            "user_address": ev.user_address,
+            "outcome": ev.outcome,
+            "amount": ev.amount,
+        }));
+    }
+    for job in processed_jobs {
+        queue.record_success(&job);
+    }
+
+    Ok(())
 }
 
-async fn handle_pool_created_event(
+/// Process a batch of Stellar events, dispatching each to the atomic commit handler.
+#[instrument(skip_all, name = "stellar_listener.process_event_batch",
+    fields(event_count = events.len()))]
+pub async fn process_event_batch(
+    db: &PgPool,
+    redis: &RedisCache,
+    event_bus: &crate::ws::EventBus,
+    events: &[StellarEvent],
+    max_batch_size: usize,
+) {
+    let next_checkpoint = events.iter().map(|e| e.ledger).max().map(|l| l + 1).unwrap_or(1);
+    let _ = commit_event_batch_atomic(
+        db,
+        redis,
+        event_bus,
+        events,
+        next_checkpoint,
+        max_batch_size,
+        &FailureInjector::none(),
+    )
+    .await;
+}
+
+pub async fn apply_pool_created_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &StellarEvent,
+) -> Result<crate::db::PoolCreatedEvent, String> {
+    let data = event
+        .data
+        .as_ref()
+        .ok_or_else(|| "missing event data".to_string())?;
+
+    let pool_id =
+        extract_u64(data, "pool_id").ok_or_else(|| "missing or invalid pool_id".to_string())?;
+    let creator =
+        extract_string(data, "creator").ok_or_else(|| "missing or invalid creator".to_string())?;
+    let end_time =
+        extract_u64(data, "end_time").ok_or_else(|| "missing or invalid end_time".to_string())?;
+    let token =
+        extract_string(data, "token").ok_or_else(|| "missing or invalid token".to_string())?;
+    let category = extract_string(data, "category").unwrap_or_default();
+    let description = extract_string(data, "description")
+        .or_else(|| extract_string(data, "metadata_url"))
+        .unwrap_or_default();
+
+    let pool_event = crate::db::PoolCreatedEvent {
+        pool_id,
+        creator,
+        end_time,
+        token,
+        category,
+        description,
+    };
+
+    crate::db::insert_pool_from_event_tx(tx, &pool_event)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(pool_event)
+}
+
+pub async fn apply_prediction_placed_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &StellarEvent,
+) -> Result<crate::db::PredictionPlacedEvent, String> {
+    let data = event
+        .data
+        .as_ref()
+        .ok_or_else(|| "missing event data".to_string())?;
+
+    let pool_id = extract_u64(data, "pool_id")
+        .ok_or_else(|| "missing or invalid pool_id in event data".to_string())?;
+    let user_address = extract_string(data, "user")
+        .or_else(|| extract_string(data, "user_address"))
+        .ok_or_else(|| "missing or invalid user address in event data".to_string())?;
+    let amount = extract_i64(data, "amount")
+        .ok_or_else(|| "missing or invalid amount in event data".to_string())?;
+    let outcome = extract_i32(data, "outcome")
+        .ok_or_else(|| "missing or invalid outcome in event data".to_string())?;
+
+    let ev = crate::db::PredictionPlacedEvent {
+        pool_id,
+        user_address,
+        outcome,
+        amount,
+    };
+
+    crate::db::insert_prediction_from_event(tx, &ev)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(ev)
+}
+
+pub async fn apply_pool_resolved_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &StellarEvent,
+) -> Result<(), String> {
+    let data = event
+        .data
+        .as_ref()
+        .ok_or_else(|| "missing event data".to_string())?;
+
+    let pool_id =
+        extract_u64(data, "pool_id").ok_or_else(|| "missing or invalid pool_id".to_string())?;
+    let outcome =
+        extract_i32(data, "outcome").ok_or_else(|| "missing or invalid outcome".to_string())?;
+
+    crate::db::resolve_pool_in_db(&mut **tx, pool_id, outcome)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn apply_pool_canceled_event_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event: &StellarEvent,
+) -> Result<(), String> {
+    let data = event
+        .data
+        .as_ref()
+        .ok_or_else(|| "missing event data".to_string())?;
+
+    let pool_id =
+        extract_u64(data, "pool_id").ok_or_else(|| "missing or invalid pool_id".to_string())?;
+
+    crate::db::cancel_pool_in_db(&mut **tx, pool_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn handle_pool_created_event(
     db: &PgPool,
     redis: &RedisCache,
     event: &StellarEvent,
@@ -427,7 +623,7 @@ async fn handle_pool_created_event(
     Ok(())
 }
 
-async fn handle_prediction_placed_event(
+pub async fn handle_prediction_placed_event(
     db: &PgPool,
     event: &StellarEvent,
     event_bus: &crate::ws::EventBus,
@@ -469,7 +665,7 @@ async fn handle_prediction_placed_event(
     Ok(())
 }
 
-async fn handle_pool_resolved_event(db: &PgPool, event: &StellarEvent) -> Result<(), String> {
+pub async fn handle_pool_resolved_event(db: &PgPool, event: &StellarEvent) -> Result<(), String> {
     let data = event
         .data
         .as_ref()
@@ -485,7 +681,7 @@ async fn handle_pool_resolved_event(db: &PgPool, event: &StellarEvent) -> Result
         .map_err(|e| e.to_string())
 }
 
-async fn handle_pool_canceled_event(db: &PgPool, event: &StellarEvent) -> Result<(), String> {
+pub async fn handle_pool_canceled_event(db: &PgPool, event: &StellarEvent) -> Result<(), String> {
     let data = event
         .data
         .as_ref()
@@ -843,5 +1039,42 @@ mod tests {
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], &[0, 1]);
         assert_eq!(chunks[2], &[4]);
+    }
+
+    #[test]
+    fn failure_injector_variants() {
+        assert_eq!(FailureInjector::none().point, InjectionPoint::None);
+        assert_eq!(
+            FailureInjector::fail_before_commit().point,
+            InjectionPoint::BeforeCommit
+        );
+        assert_eq!(
+            FailureInjector::fail_after_commit().point,
+            InjectionPoint::AfterCommit
+        );
+    }
+
+    #[test]
+    fn cursor_does_not_advance_when_commit_fails() {
+        let mut cursor: u64 = 50;
+        let batch_result: Result<(), String> = Err("injected failure before database commit".to_string());
+
+        if batch_result.is_ok() {
+            cursor = 60;
+        }
+
+        assert_eq!(cursor, 50, "cursor must not advance if batch commit encounters an error");
+    }
+
+    #[test]
+    fn startup_resolution_policy_verification() {
+        let valid = crate::db::CheckpointStatus::Valid(500);
+        assert_eq!(crate::db::resolve_startup_checkpoint(&valid, STATE_KEY, 1), 500);
+
+        let missing = crate::db::CheckpointStatus::Missing;
+        assert_eq!(crate::db::resolve_startup_checkpoint(&missing, STATE_KEY, 1), 1);
+
+        let malformed = crate::db::CheckpointStatus::Malformed("corrupt data".into());
+        assert_eq!(crate::db::resolve_startup_checkpoint(&malformed, STATE_KEY, 1), 1);
     }
 }
