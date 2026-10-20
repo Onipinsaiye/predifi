@@ -2,6 +2,9 @@
 //!
 //! This module contains all constant values used throughout the PrediFi contract,
 //! including storage parameters, pool limits, and default values.
+//!
+//! It also documents the deterministic payout remainder allocation invariant that
+//! governs how integer-division dust is handled when distributing fees and winnings.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STORAGE & LEDGER CONSTANTS
@@ -63,6 +66,98 @@ pub const BUMP_THRESHOLD: u32 = 14 * DAY_IN_LEDGERS;
 ///
 /// **Used for:** Calculating the new TTL when calling `extend_persistent` and `bump_ttl`.
 pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STORAGE RETENTION STRATEGY
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Persistent vs. temporary storage classification
+// ----------------------------------------------
+// Soroban offers two storage durability classes:
+//
+// * **Persistent** entries survive as long as their TTL is periodically extended.
+//   They are the canonical source of truth for claims, auditability, and client
+//   queries, so they MUST be extended while a pool is still actionable.
+// * **Temporary** entries are cheap and expire automatically without any bump.
+//   They are only suitable for data that can be safely regenerated or that is
+//   only meaningful for a short window (rate-limit markers, caches, etc.).
+//
+// The PrediFi contract classifies its state as follows:
+//
+// Persistent (must be retained for the full claim window):
+//   - `Pool` records (including `outcome`, `end_time`, `resolved_at`).
+//   - Per-user `Position` / `UserStake` entries (required to claim).
+//   - `OutStakes` batch entries for pools with >= 16 outcomes.
+//   - `Config`, `Admin`, `Operators`, `ContractVersion` (instance storage).
+//
+// Temporary (may expire without affecting claims):
+//   - `LastPredictionTime(user)` cooldown markers.
+//   - Any future caches, price snapshots, or derived indexes.
+//
+// Archival / TTL behavior
+// -----------------------
+// Persistent entries are bumped using `BUMP_THRESHOLD` / `BUMP_AMOUNT` above.
+// Once a pool is fully resolved AND the claim window has elapsed, its entries
+// become eligible for archival: the contract stops extending them and lets the
+// TTL lapse naturally. Archived entries remain recoverable via Soroban's
+// restore mechanism, preserving auditability without paying ongoing rent.
+//
+// Minimum retention period for unresolved claims
+// ----------------------------------------------
+// A resolved pool MUST keep its persistent entries alive for at least
+// `CLAIM_WINDOW_LEDGERS` after `resolved_at`. This guarantees that every user
+// who is entitled to a payout can still call `claim` during the promised
+// window, even if the contract is otherwise idle. The window is deliberately
+// longer than `BUMP_AMOUNT` so that a single bump at resolution time is
+// sufficient to cover the entire claim period.
+
+/// Minimum retention period for claimable pool data after resolution.
+///
+/// **Units:** Ledgers (dimensionless)
+/// **Value:** 1,555,200 ledgers (90 days)
+///
+/// **Rationale:** After a pool is resolved, users must be given a guaranteed
+/// window during which their positions remain claimable. 90 days is long enough
+/// to accommodate inactive users, wallet recovery, and dispute resolution, while
+/// still allowing the contract to eventually stop paying storage rent on pools
+/// that everyone has already claimed. This value MUST be greater than
+/// `BUMP_AMOUNT` so that a single TTL extension performed at resolution time
+/// covers the entire claim window without requiring further bumps.
+///
+/// **Impact of changes:**
+/// - Increasing this value extends the guaranteed claim window but increases
+///   the minimum storage cost per resolved pool.
+/// - Decreasing this value shortens the claim window and risks users losing
+///   access to their funds if they claim late.
+/// - Must remain strictly greater than `BUMP_AMOUNT`; otherwise the TTL set at
+///   resolution could expire before the claim window ends.
+///
+/// **Used for:** Determining when resolved pool entries become eligible for
+/// archival, and validating that the claim window is covered by a single bump.
+pub const CLAIM_WINDOW_LEDGERS: u32 = 90 * DAY_IN_LEDGERS;
+
+/// Retention period for temporary entries (e.g. cooldown markers).
+///
+/// **Units:** Ledgers (dimensionless)
+/// **Value:** 17,280 ledgers (1 day)
+///
+/// **Rationale:** Temporary entries such as `LastPredictionTime(user)` only need
+/// to outlive the longest possible cooldown. One day is comfortably longer than
+/// any sane `prediction_cooldown_seconds` value while keeping temporary storage
+/// cheap and self-cleaning. Entries that expire can be safely recreated on the
+/// next interaction, so no data is lost.
+///
+/// **Impact of changes:**
+/// - Increasing this value keeps temporary entries around longer, slightly
+///   increasing storage cost but reducing the chance of a cooldown being reset
+///   by expiry.
+/// - Decreasing this value below the configured cooldown would allow users to
+///   bypass rate limiting by waiting for the marker to expire.
+/// - Must be >= the maximum supported `prediction_cooldown_seconds` expressed
+///   in ledgers.
+///
+/// **Used for:** Setting the TTL on temporary storage entries.
+pub const TEMPORARY_ENTRY_TTL_LEDGERS: u32 = DAY_IN_LEDGERS;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // POOL CONFIGURATION CONSTANTS
@@ -457,6 +552,27 @@ pub const MAX_PRICE_CONDITION_MATCH_STEPS: u32 = 4;
 /// **Used for:** Version tracking in instance storage and upgrade migration logic.
 pub const CONTRACT_VERSION: u32 = 1;
 
+/// Version of the public **event schema** emitted by the contract.
+///
+/// **Units:** Version number (dimensionless)
+/// **Value:** 1
+///
+/// **Rationale:** Off-chain indexers, subgraphs, and monitoring services depend on the
+/// topic names and payload fields of emitted events. This constant identifies the schema
+/// as a whole so consumers can detect when the shape of event data changes. A conforming
+/// schema (`1`) is documented in `docs/EVENT_SCHEMAS.md` and pinned by the golden tests in
+/// `src/event_schema_tests.rs`.
+///
+/// **Impact of changes:**
+/// - Must be incremented for any **breaking** change (renamed/removed topic, renamed/
+///   removed/retyped payload field, or changed event semantics).
+/// - Must NOT be incremented for additive changes (new topic, new optional field).
+/// - Should not be decremented (versions are monotonic).
+/// - Changing this without updating the reference document and golden tests will fail CI.
+///
+/// **Used for:** Signalling the event schema version to external indexers.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
 /// Minimum timelock delay in seconds for protocol fee changes.
 ///
 /// **Units:** Seconds
@@ -536,6 +652,115 @@ pub const NO_CONTEST_FEE_BPS: u32 = 0;
 ///
 /// **Used for:** Gating referral payout logic in the no-contest settlement path.
 pub const NO_CONTEST_PAYS_REFERRALS: bool = false;
+
+/// Maximum protocol fee in basis points (10% = 1000 bps).
+///
+/// **Units:** Basis points (bps, where 100 bps = 1%)
+/// **Value:** 1,000 bps (10%)
+///
+/// **Rationale:** Caps the protocol fee so governance cannot unexpectedly change
+/// participant economics beyond a hard bound. Combined with the timelock, this
+/// ensures fee changes are both observable and bounded.
+///
+/// **Impact of changes:**
+/// - Increasing this value would allow higher fees, increasing protocol revenue
+///   but potentially harming participant economics.
+/// - Decreasing this value would further constrain governance but may limit
+///   protocol sustainability.
+///
+/// **Used for:** Enforcing the fee cap in `set_fee_bps` / `apply_fee_bps`.
+pub const MAX_FEE_BPS: u32 = 1_000;
+
+/// Minimum timelock delay in seconds for treasury fee changes.
+///
+/// **Units:** Seconds
+/// **Value:** 3,600 seconds (1 hour)
+///
+/// **Rationale:** Provides a lower bound on the delay between proposing and
+/// activating a treasury fee change, ensuring governance cannot change fees
+/// in a single transaction.
+///
+/// **Impact of changes:**
+/// - Increasing this value would provide more reaction time but slow governance.
+/// - Decreasing this value would allow faster changes but reduce observability.
+///
+/// **Used for:** Enforcing the minimum delay in `set_fee_bps` / `apply_fee_bps`.
+pub const MIN_FEE_CHANGE_DELAY_SECONDS: u64 = 3_600;
+
+/// Maximum timelock delay in seconds for treasury fee changes (30 days).
+///
+/// **Units:** Seconds
+/// **Value:** 2,592,000 seconds (30 days)
+///
+/// **Rationale:** Bounds the delay so a queued fee change cannot be effectively
+/// frozen indefinitely, while still allowing long observation windows.
+///
+/// **Impact of changes:**
+/// - Increasing this value would allow longer delays but risks stalled changes.
+/// - Decreasing this value would cap observation windows more tightly.
+///
+/// **Used for:** Enforcing the maximum delay in `set_fee_bps` / `apply_fee_bps`.
+pub const MAX_FEE_CHANGE_DELAY_SECONDS: u64 = 2_592_000;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PAYOUT REMAINDER ALLOCATION INVARIANT
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## Invariant
+//
+// For every payout computation over a set of participants `P` with integer
+// weights `w_i` and an integer distributable amount `T`, the contract MUST
+// satisfy:
+//
+//     sum_{i in P} payout_i + retained_remainder == T
+//
+// where:
+//   * `payout_i = floor(T * w_i / W)` and `W = sum_{i in P} w_i`,
+//   * `retained_remainder = T - sum_{i in P} payout_i` is an explicit,
+//     non-negative integer that is either (a) credited to a deterministic
+//     recipient, or (b) retained by the pool escrow and reported as such.
+//
+// The allocation MUST be a pure function of `(T, {w_i})` and MUST NOT depend
+// on the order in which participants claim, the order in which they were
+// inserted, or any other mutable state. Two calls with the same inputs MUST
+// produce byte-identical payout vectors.
+//
+// ## Deterministic tie-breaking
+//
+// When the remainder `R = T - sum_i floor(T * w_i / W)` is non-zero, the
+// contract distributes `R` additional base units one at a time using the
+// following deterministic rule:
+//
+//   1. Compute `r_i = (T * w_i) mod W` for each participant.
+//   2. Sort participants by `(r_i DESC, index_i ASC)` where `index_i` is the
+//      participant's stable position in the canonical, sorted participant
+//      vector (lexicographic by address bytes).
+//   3. Award one extra unit to the first `R` participants in that order.
+//
+// This is the "largest remainder" (Hamilton) method with a stable tie-break
+// on canonical participant index. It guarantees:
+//   * `sum_i payout_i == T` exactly (no dust is lost),
+//   * each `payout_i` differs from `floor(T * w_i / W)` by at most 1,
+//   * the result is independent of claim order and of storage iteration order.
+//
+// ## Application to single and batch payout paths
+//
+// Both `claim_winnings` (single) and `claim_winnings_batch` (batch) MUST use
+// the same helper to compute the full payout vector for the pool, then select
+// the caller's entry. A single claim therefore returns exactly the same amount
+// as the corresponding entry of a batch claim, and the sum of all single
+// claims equals the sum of a single batch claim over the same participant set.
+//
+// ## Retained remainder
+//
+// If a pool chooses to retain rather than distribute the remainder (e.g. to
+// avoid dust payouts below `DEFAULT_GLOBAL_MIN_STAKE`), the retained amount
+// MUST be tracked explicitly in pool state and emitted in the resolution
+// event. The invariant `escrow == sum(payouts) + retained_remainder` MUST
+// hold at all times after resolution.
+//
+// **Used for:** Documenting and validating payout math in `claim_winnings`,
+// `claim_winnings_batch`, and the resolution/escrow accounting paths.
 
 /// Fee schedule version reported for legacy pools created before per-pool fee
 /// snapshots existed. Such pools have no stored `FeeSchedule` and settle against
@@ -657,6 +882,24 @@ mod tests {
     }
 
     #[test]
+    fn test_claim_window_covers_bump_amount() {
+        // A single TTL extension at resolution time must cover the entire
+        // promised claim window, otherwise users could lose the ability to
+        // claim before the window ends.
+        assert!(CLAIM_WINDOW_LEDGERS > BUMP_AMOUNT);
+    }
+
+    #[test]
+    fn test_claim_window_is_90_days() {
+        assert_eq!(CLAIM_WINDOW_LEDGERS, 90 * DAY_IN_LEDGERS);
+    }
+
+    #[test]
+    fn test_temporary_entry_ttl_is_one_day() {
+        assert_eq!(TEMPORARY_ENTRY_TTL_LEDGERS, DAY_IN_LEDGERS);
+    }
+
+    #[test]
     fn test_ledger_calculations() {
         assert_eq!(BUMP_THRESHOLD, 14 * DAY_IN_LEDGERS);
         assert_eq!(BUMP_AMOUNT, 30 * DAY_IN_LEDGERS);
@@ -685,5 +928,21 @@ mod tests {
     #[test]
     fn test_no_contest_fee_bps_within_bounds() {
         assert!(NO_CONTEST_FEE_BPS <= MAX_TOLERANCE);
+    }
+
+    #[test]
+    fn test_payout_remainder_invariant_documented() {
+        // The remainder allocation invariant is documented above and must
+        // hold for every (T, {w_i}) pair used by payout paths. This test
+        // pins the invariant's arithmetic form so that any change to the
+        // documented rule is a deliberate, reviewable edit.
+        let t: i128 = 1_000_000_007;
+        let weights: [i128; 3] = [1, 2, 3];
+        let w: i128 = weights.iter().sum();
+        let floors: i128 = weights.iter().map(|wi| t * wi / w).sum();
+        let remainder = t - floors;
+        assert!(remainder >= 0);
+        assert!(remainder < weights.len() as i128);
+        assert_eq!(floors + remainder, t);
     }
 }

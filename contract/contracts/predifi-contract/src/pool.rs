@@ -1,18 +1,13 @@
 //! Pool domain: prediction pool lifecycle — creation, configuration,
 //! resolution, cancellation and pool queries.
+//!
+//! Storage retention: see `RETENTION_*` constants and `bump_ttl` /
+//! `extend_persistent` / `extend_temporary` helpers in `lib.rs`.
 
 use soroban_sdk::{contractimpl, log, token, Address, Env, String, Symbol, Vec};
 
 use crate::gas_opt;
 use crate::{
-    Config, DataKey, InitialLiquidityProvidedEvent, MarketState, MaxTotalStakeIncreasedEvent, Pool,
-    PoolCanceledEvent, PoolConfig, PoolCreatedEvent, PoolDescriptionUpdatedEvent,
-    PoolDisputedEvent, PoolReadyForResolutionEvent, PoolResolvedDiagEvent, PoolResolvedEvent,
-    PoolStats, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
-    ResolutionConflictEvent, ResolutionVoteCastEvent, StakeLimitsUpdatedEvent, StakingClosedEvent,
-    CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION, EMERGENCY_CANCEL_MULTISIG_THRESHOLD,
-    INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY,
-    MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
     Config, DataKey, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
     MarketState, MaxTotalStakeIncreasedEvent, Pool, PoolCanceledEvent, PoolConfig,
     PoolCreatedEvent, PoolDescriptionUpdatedEvent, PoolDisputedEvent, PoolReadyForResolutionEvent,
@@ -20,7 +15,8 @@ use crate::{
     PredifiContractClient, PredifiError, ResolutionConflictEvent, ResolutionVoteCastEvent,
     StakeLimitsUpdatedEvent, StakingClosedEvent, CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION,
     EMERGENCY_CANCEL_MULTISIG_THRESHOLD, INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS,
-    MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
+    MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY, MAX_OUTCOMES_PER_POOL,
+    MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
 };
 
 #[contractimpl]
@@ -1443,6 +1439,35 @@ impl PredifiContract {
             .expect("Pool not found");
         Self::extend_persistent(&env, &pool_key);
         pool
+    }
+
+    /// Returns the ledger timestamp at which the pool's persistent storage
+    /// entries may be safely archived, or `None` if the pool is still
+    /// unresolved and therefore must be retained indefinitely.
+    ///
+    /// Retention policy:
+    /// - Active / Locked / Disputed pools: `None` (retained until resolution).
+    /// - Resolved / Canceled pools: `resolution_timestamp + RETENTION_CLAIM_WINDOW`
+    ///   so that users can still claim winnings or refunds during the promised
+    ///   claim window. After this point, off-chain indexers are expected to
+    ///   have archived the pool and its stakes; on-chain entries may be
+    ///   evicted by TTL expiry.
+    pub fn get_pool_retention_deadline(env: Env, pool_id: u64) -> Option<u64> {
+        let pool_key = DataKey::Pool(pool_id);
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .expect("Pool not found");
+        Self::extend_persistent(&env, &pool_key);
+
+        match pool.state {
+            MarketState::Active | MarketState::Locked | MarketState::Disputed => None,
+            MarketState::Resolved | MarketState::Canceled => {
+                let base = pool.resolution_timestamp.unwrap_or(pool.end_time);
+                Some(base.saturating_add(crate::RETENTION_CLAIM_WINDOW))
+            }
+        }
     }
 
     /// Returns the fee schedule snapshotted when the pool was created.

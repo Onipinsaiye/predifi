@@ -226,6 +226,15 @@ pub fn claim_winnings(
 - `winnings = (user_stake / winning_outcome_total_stake) × payout_pool`
 - If user has a referrer: referrer receives `referral_cut_bps` of the user's share of the protocol fee (the rest remains for treasury withdrawal).
 
+**Remainder Allocation Invariant:**
+
+Integer division truncates, so per-user payouts may not sum exactly to the payout pool. To keep accounting deterministic and independent of claim order, the contract retains the truncation dust rather than redistributing it:
+
+- `sum(all user winnings) + retained_remainder = payout_pool`
+- `retained_remainder = payout_pool - sum(floor(user_stake × payout_pool / winning_outcome_total_stake))`
+- The retained remainder stays in escrow and is withdrawable by the treasury; it is never assigned to a specific claimant.
+- This rule is applied identically on the single-claim path (`claim_winnings`) and any batch payout path, so the same stake vector always yields the same per-user amounts regardless of claim order.
+
 **Errors:**
 
 - `PoolNotResolved` - Pool not yet resolved
@@ -244,6 +253,10 @@ if winnings > 0 {
     // User won and received winnings
 }
 ```
+
+**Property Tests:**
+
+Payout property tests generate many participant counts and stake vectors and assert that escrow equals the sum of payouts plus the explicit retained remainder, accounting for every token unit.
 
 ---
 
@@ -279,6 +292,44 @@ let predictions = contract.get_user_predictions(
     0,  // offset
     10  // limit
 );
+```
+
+---
+
+### `get_resolution_evidence`
+
+Get the verifiable evidence committed when a pool was resolved through the
+price-feed path (`resolve_pool_from_price`). The record is the hash preimage of
+the `evidence_hash` carried by `ResolutionEvidenceEvent`: auditors can re-encode
+it to XDR, hash it with SHA-256, and re-derive the outcome from
+(`price`, `target_price`, `comparison_op`, `tolerance_bps`) to independently
+verify the resolution decision. The record is immutable once written.
+
+```rust
+pub fn get_resolution_evidence(
+    env: Env,
+    pool_id: u64
+) -> Option<ResolutionEvidence>
+```
+
+**Parameters:**
+
+| Parameter | Type  | Description     |
+| --------- | ----- | --------------- |
+| `pool_id` | `u64` | Pool to inspect |
+
+**Returns:** `Option<ResolutionEvidence>` — `None` for unresolved pools and for
+pools resolved via operator voting or oracle voting (those paths carry no feed
+observation to commit).
+
+**Example:**
+
+```rust
+if let Some(evidence) = contract.get_resolution_evidence(env, pool_id) {
+    // Recompute: sha256(evidence.to_xdr()) == emitted evidence_hash
+    // Re-derive: compare evidence.price to evidence.target_price
+    //            under evidence.comparison_op within evidence.tolerance_bps
+}
 ```
 
 ---
@@ -368,6 +419,10 @@ pub fn set_referral_cut_bps(
 - **`get_referral_cut_bps(env: Env) -> u32`** — Returns the current referral cut in basis points (default 5000).
 - **`get_referred_volume(env: Env, referrer: Address, pool_id: u64) -> i128`** — Returns the total stake amount referred by `referrer` on the given pool (for analytics and payout context).
 
+**Remainder view:**
+
+- **`get_retained_remainder(env: Env, pool_id: u64) -> i128`** — Returns the truncation dust retained in escrow for a resolved pool (payout pool minus the sum of all distributed winnings). Always `>= 0` and deterministic for a given stake distribution.
+
 ---
 
 ### `set_treasury`
@@ -441,9 +496,34 @@ pub struct Config {
 }
 ```
 
+### `ResolutionEvidence`
+
+The stable evidence schema persisted for price-feed resolutions. This exact
+record — XDR-encoded — is the preimage of the SHA-256 `evidence_hash` emitted in
+`ResolutionEvidenceEvent`.
+
+```rust
+pub struct ResolutionEvidence {
+    pub feed_pair: Symbol,   // Feed that decided the market
+    pub price: i128,         // Observed feed value
+    pub feed_timestamp: u64, // Feed-side observation timestamp
+    pub comparison_op: u32,  // Rule applied: 0=Equal, 1=Greater, 2=Less
+    pub target_price: i128,  // Target compared against
+    pub tolerance_bps: u32,  // Tolerance around target, in basis points
+    pub outcome: u32,        // Outcome index derived and recorded
+}
+```
+
+The record is stored under `DataKey::ResolutionEvidence(pool_id)`, so the
+`pool_id` binding comes from the storage key itself.
+
 ---
 
 ## Events
+
+For the versioned, indexer-facing event schema reference — including topic names, field
+types, compatibility rules, and the stable identifiers needed for idempotent indexing —
+see [Event Schemas](./EVENT_SCHEMAS.md). The core events are listed below.
 
 ### `PoolCreatedEvent`
 
@@ -528,6 +608,27 @@ PoolResolvedDiagEvent {
     total_stake: 5000,          // 5000 total tokens staked
     winning_stake: 2000,        // 2000 on outcome 1
     timestamp: 1234567890,
+}
+```
+
+### `ResolutionEvidenceEvent`
+
+Emitted atomically alongside `PoolResolvedEvent` when a pool is resolved through
+`resolve_pool_from_price`. Carries the full evidence preimage fields plus
+`evidence_hash`, the SHA-256 commitment over the stored `ResolutionEvidence`
+record's XDR encoding.
+
+```rust
+pub struct ResolutionEvidenceEvent {
+    pub pool_id: u64,           // Same pool as PoolResolvedEvent
+    pub feed_pair: Symbol,      // Feed that decided the market
+    pub price: i128,            // Observed feed value used in the comparison
+    pub feed_timestamp: u64,    // Feed-side observation timestamp
+    pub comparison_op: u32,     // 0=Equal, 1=Greater, 2=Less
+    pub target_price: i128,     // Target compared against
+    pub tolerance_bps: u32,     // Tolerance around target, in basis points
+    pub outcome: u32,           // Same outcome as PoolResolvedEvent
+    pub evidence_hash: BytesN<32>, // sha256(ResolutionEvidence XDR encoding)
 }
 ```
 

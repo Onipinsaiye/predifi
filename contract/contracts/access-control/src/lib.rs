@@ -33,6 +33,21 @@
 // - Role 1 (Operator): resolve_pool, cancel_pool, set_stake_limits
 // - Role 3 (Oracle): oracle_resolve (OracleCallback trait)
 //
+// EXPIRING ROLES
+// ──────────────
+// The contract supports time-limited role grants through `assign_expiring_role`.
+// These grants automatically expire at a specified ledger timestamp and are
+// rejected by `has_role` after expiry. The admin can revoke expiring grants at
+// any time using `revoke_expiring_role`.
+//
+// Key features:
+// - Expiry validation: Grants with past or current timestamps are rejected
+// - Automatic expiry: `has_role` returns false for expired grants
+// - Admin revocation: The admin can revoke expiring grants before expiry
+// - Audit trail: Grant details persist even after expiry via `get_expiring_role`
+// - Independent capabilities: Expiring roles coexist with permanent roles
+// - No escalation: Users with expiring roles cannot grant roles to others
+//
 // HOW TO BOOTSTRAP THE ADMIN ROLE
 // ─────────────────────────────────
 // The access-control contract must be initialised exactly once before any
@@ -60,6 +75,14 @@
 //          --user <OPERATOR_ADDRESS> \
 //          --role '{"Operator": null}'
 //
+//   For time-limited grants, use `assign_expiring_role`:
+//     stellar contract invoke --id <ACCESS_CONTROL_ID> \
+//       -- assign_expiring_role \
+//          --admin_caller <ADMIN_ADDRESS> \
+//          --user <OPERATOR_ADDRESS> \
+//          --role '{"Operator": null}' \
+//          --expires_at <TIMESTAMP>
+//
 //   Repeat for Oracle (role 3) and any other roles needed.
 //
 // Step 4 — Pass the access-control address to predifi-contract.
@@ -74,16 +97,20 @@
 //    initial administrator. The admin role (0) is automatically assigned.
 // 2. The admin calls `assign_role(admin_caller, user, Role::Operator)` (or any
 //    other role) to grant a role to any address.
-// 3. Roles can be managed via:
+// 3. For time-limited grants, use `assign_expiring_role(admin_caller, user, role, expires_at)`.
+// 4. Roles can be managed via:
 //    - `revoke_role`: Remove a specific role from a user
+//    - `revoke_expiring_role`: Remove an expiring role grant before expiry
 //    - `transfer_role`: Move a role from one user to another
 //    - `revoke_all_roles`: Remove all roles from a user
 //    - The current (final) admin can never lose the Admin role via `revoke_role` /
 //      `revoke_all_roles` (they return `AdminError`); transfer admin first.
 //    - `propose_new_admin` + `accept_admin_role`: Two-step admin transfer (recommended)
 //    - `transfer_admin`: Legacy one-step admin transfer
-// 4. Any contract can check if a user has a role by calling `has_role(user, role)`.
-// 5. The `has_any_role` function allows checking if a user has any of a set of roles.
+// 5. Any contract can check if a user has a role by calling `has_role(user, role)`.
+//    This function automatically validates expiry for expiring role grants.
+// 6. The `has_any_role` function allows checking if a user has any of a set of roles.
+// 7. The `get_expiring_role` function allows querying expiring grant details for auditing.
 //
 // SECURITY CONSIDERATIONS
 // ───────────────────────
@@ -91,6 +118,9 @@
 // - All admin operations require authentication (`require_auth`)
 // - Admin transfer supports a two-step propose/accept flow for safety
 // - Role checks are performed via storage lookups in persistent storage
+// - Expiring roles automatically expire and are rejected by `has_role`
+// - Users with expiring roles cannot escalate or grant roles to others
+// - The root admin can always revoke expiring grants
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -187,6 +217,25 @@ pub struct AllRolesRevokedEvent {
     pub user: Address,
 }
 
+#[contractevent(topics = ["expiring_role_assigned"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiringRoleAssignedEvent {
+    pub admin: Address,
+    pub user: Address,
+    pub role: Role,
+    pub expires_at: u64,
+}
+
+#[contractevent(topics = ["expiring_role_revoked"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiringRoleRevokedEvent {
+    pub admin: Address,
+    pub user: Address,
+    pub role: Role,
+}
+
 /// Status of a prediction pool in the access control system.
 ///
 /// This enum tracks the lifecycle state of a pool for permission management.
@@ -240,6 +289,26 @@ pub enum DataKey {
     PoolCount,
     /// Count of addresses currently holding the Operator role: `OperatorCount` -> u32
     OperatorCount,
+    /// Expiring role grant: `ExpiringRole(user_address, role)` -> ExpiringRoleGrant
+    ExpiringRole(Address, Role),
+}
+
+/// Represents a time-limited role grant with an expiry timestamp.
+///
+/// This structure stores information about a role grant that automatically
+/// expires at a specific ledger timestamp. After expiry, the role is no longer
+/// valid even if the grant record remains in storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiringRoleGrant {
+    /// The address that received the role grant.
+    pub user: Address,
+    /// The role that was granted.
+    pub role: Role,
+    /// The ledger timestamp at which this grant expires (in seconds since epoch).
+    pub expires_at: u64,
+    /// The admin address that granted this role.
+    pub granted_by: Address,
 }
 
 #[contract]
@@ -376,6 +445,12 @@ impl AccessControl {
             .persistent()
             .remove(&DataKey::Role(user.clone(), role.clone()));
 
+        // Also remove expiring role grant if it exists
+        let expiring_key = DataKey::ExpiringRole(user.clone(), role.clone());
+        if env.storage().persistent().has(&expiring_key) {
+            env.storage().persistent().remove(&expiring_key);
+        }
+
         if matches!(role, Role::Operator) {
             let count: u32 = env
                 .storage()
@@ -399,9 +474,182 @@ impl AccessControl {
     }
 
     /// Checks if a user has a specific role.
+    ///
+    /// This function first checks if the user has the role in storage. If an expiring
+    /// role grant exists, it validates that the grant has not expired. Expired grants
+    /// are treated as if the role is not held.
     #[must_use]
     pub fn has_role(env: &Env, user: Address, role: Role) -> bool {
-        env.storage().persistent().has(&DataKey::Role(user, role))
+        // Check if role exists in storage
+        if !env.storage().persistent().has(&DataKey::Role(user.clone(), role.clone())) {
+            return false;
+        }
+
+        // Check if there's an expiring grant for this role
+        if let Some(grant) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ExpiringRoleGrant>(&DataKey::ExpiringRole(user.clone(), role.clone()))
+        {
+            // Validate expiry - role is valid until and including the expiry timestamp
+            let current_time = env.ledger().timestamp();
+            current_time <= grant.expires_at
+        } else {
+            // No expiring grant, so it's a permanent role
+            true
+        }
+    }
+
+    /// Assigns a role to a user with an expiry timestamp.
+    ///
+    /// This function grants a temporary role that automatically expires at the specified
+    /// ledger timestamp. The admin can revoke the grant before expiry if needed.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InvalidTimestamp` if the expiry timestamp is in the past.
+    ///
+    /// # Arguments
+    /// * `env` - The environment
+    /// * `admin_caller` - The admin address assigning the role
+    /// * `user` - The user address receiving the role
+    /// * `role` - The role to grant
+    /// * `expires_at` - The ledger timestamp when the grant expires (seconds since epoch)
+    pub fn assign_expiring_role(
+        env: &Env,
+        admin_caller: Address,
+        user: Address,
+        role: Role,
+        expires_at: u64,
+    ) -> Result<(), PrediFiError> {
+        admin_caller.require_auth();
+
+        let current_admin = Self::get_admin(env);
+        if admin_caller != current_admin {
+            return Err(PrediFiError::Unauthorized);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if expires_at <= current_time {
+            return Err(PrediFiError::InvalidTimestamp);
+        }
+
+        // Store the expiring role grant
+        let grant = ExpiringRoleGrant {
+            user: user.clone(),
+            role: role.clone(),
+            expires_at,
+            granted_by: admin_caller.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiringRole(user.clone(), role.clone()), &grant);
+
+        // Also assign the regular role for backwards compatibility
+        // The has_role check will validate expiry
+        env.storage().persistent().set(&DataKey::Role(user.clone(), role.clone()), &());
+
+        // Increment operator count if applicable
+        if matches!(role, Role::Operator) {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OperatorCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::OperatorCount, &(count + 1));
+        }
+
+        ExpiringRoleAssignedEvent {
+            admin: admin_caller,
+            user,
+            role,
+            expires_at,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    /// Revokes an expiring role grant from a user.
+    ///
+    /// This function removes an expiring role grant before its natural expiry.
+    /// The admin can revoke any expiring grant at any time.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InsufficientPermissions` if the user does not have the specified expiring role.
+    ///
+    /// # Arguments
+    /// * `env` - The environment
+    /// * `admin_caller` - The admin address revoking the role
+    /// * `user` - The user address whose role is being revoked
+    /// * `role` - The role to revoke
+    pub fn revoke_expiring_role(
+        env: &Env,
+        admin_caller: Address,
+        user: Address,
+        role: Role,
+    ) -> Result<(), PrediFiError> {
+        admin_caller.require_auth();
+
+        let current_admin = Self::get_admin(env);
+        if admin_caller != current_admin {
+            return Err(PrediFiError::Unauthorized);
+        }
+
+        // Check if the expiring role grant exists
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::ExpiringRole(user.clone(), role.clone()))
+        {
+            return Err(PrediFiError::InsufficientPermissions);
+        }
+
+        // Remove the expiring role grant
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ExpiringRole(user.clone(), role.clone()));
+
+        // Also remove the regular role entry
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Role(user.clone(), role.clone()));
+
+        // Decrement operator count if applicable
+        if matches!(role, Role::Operator) {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OperatorCount)
+                .unwrap_or(0);
+            if count > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::OperatorCount, &(count - 1));
+            }
+        }
+
+        ExpiringRoleRevokedEvent {
+            admin: admin_caller,
+            user,
+            role,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    /// Gets the expiring role grant details for a user and role.
+    ///
+    /// Returns `None` if the user does not have an expiring grant for the specified role.
+    /// Note: This returns the grant record even if it has expired; use `has_role` to check
+    /// if the role is currently valid.
+    #[must_use]
+    pub fn get_expiring_role(env: &Env, user: Address, role: Role) -> Option<ExpiringRoleGrant> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExpiringRole(user, role))
     }
 
     /// Transfers a role from one user to another.
@@ -434,6 +682,12 @@ impl AccessControl {
         env.storage()
             .persistent()
             .remove(&DataKey::Role(from.clone(), role.clone()));
+
+        // Remove expiring role grant if it exists (transfers are permanent)
+        let expiring_key = DataKey::ExpiringRole(from.clone(), role.clone());
+        if env.storage().persistent().has(&expiring_key) {
+            env.storage().persistent().remove(&expiring_key);
+        }
 
         // Only increment if `to` doesn't already hold the role
         let to_key = DataKey::Role(to.clone(), role.clone());
@@ -591,6 +845,11 @@ impl AccessControl {
             let key = DataKey::Role(user.clone(), role.clone());
             if env.storage().persistent().has(&key) {
                 env.storage().persistent().remove(&key);
+                // Also remove expiring role grant if it exists
+                let expiring_key = DataKey::ExpiringRole(user.clone(), role.clone());
+                if env.storage().persistent().has(&expiring_key) {
+                    env.storage().persistent().remove(&expiring_key);
+                }
                 // Decrement operator count if the Operator role is being removed
                 if matches!(role, Role::Operator) {
                     let count: u32 = env
@@ -617,14 +876,13 @@ impl AccessControl {
     }
 
     /// Checks if a user has any of the specified roles.
+    ///
+    /// This function uses `has_role` internally, so it also validates expiry
+    /// for expiring role grants.
     #[must_use]
     pub fn has_any_role(env: &Env, user: &Address, roles: &soroban_sdk::Vec<Role>) -> bool {
         for role in roles.iter() {
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Role(user.clone(), role))
-            {
+            if Self::has_role(env, user.clone(), role.clone()) {
                 return true;
             }
         }
