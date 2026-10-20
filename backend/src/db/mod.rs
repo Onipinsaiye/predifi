@@ -46,6 +46,9 @@ pub use pools::{
     pay_creator_incentive,
     record_pool_created_for_creator,
     resolve_pool_in_db,
+    insert_pool_from_stellar_event,
+    resolve_pool_from_stellar_event,
+    cancel_pool_from_stellar_event,
     // Pool templates
     advance_pool_template,
     create_pool_template,
@@ -75,6 +78,7 @@ pub use predictions::{
     get_users_by_winnings,
     insert_prediction_from_event,
     insert_prediction_from_event_with_pool,
+    insert_prediction_from_stellar_event,
 };
 
 pub use referrals::{
@@ -84,6 +88,7 @@ pub use referrals::{
     // Referral queries
     get_referral_earnings,
     insert_referral_from_event,
+    insert_referral_from_stellar_event,
     insert_referrals_bulk,
 };
 

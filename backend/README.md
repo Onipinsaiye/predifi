@@ -89,6 +89,17 @@ reads environment variables into a typed `Config` struct.
 If an environment variable has an invalid value (for example, a non-numeric
 port), startup fails with a clear configuration error.
 
+### Stellar event finality
+
+The listener stages RPC events with their ledger sequence and canonical hash,
+then dispatches them after two subsequent ledgers have closed. Testnet and
+mainnet use a two-ledger confirmation depth; custom RPC hosts use the same
+conservative depth. The listener re-verifies event ledger hashes before
+finalizing or dispatching. Hash conflicts quarantine events from the fork point,
+reverse their indexed prediction/referral effects, hide pools created on that
+fork, invalidate dependent notifications, and replay canonical events. The
+checkpoint, event journal, and listener cursor are persisted by migrations.
+
 ---
 
 ## SQLx connection pool

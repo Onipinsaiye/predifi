@@ -61,7 +61,7 @@ pub async fn get_profile_stats(pool: &PgPool, address: &str) -> Result<ProfileSt
             COUNT(DISTINCT p.pool_id) FILTER (WHERE pl.state = 'active')::BIGINT AS active_positions
         FROM predictions p
         JOIN pools pl ON pl.pool_id = p.pool_id
-        WHERE p.user_address = $1
+        WHERE p.user_address = $1 AND pl.stellar_canonical
         "#,
     )
     .bind(address)
@@ -146,7 +146,7 @@ pub async fn get_user_claim_status(
             ) AS claim_expired
         FROM predictions p
         JOIN pools pl ON pl.pool_id = p.pool_id
-        WHERE p.user_address = $1
+        WHERE p.user_address = $1 AND pl.stellar_canonical
         ORDER BY p.created_at DESC
         "#,
     )

@@ -162,7 +162,7 @@ pub async fn get_user_prediction_history(
             p.created_at
         FROM predictions p
         JOIN pools pl ON pl.pool_id = p.pool_id
-        WHERE p.user_address = $1
+        WHERE p.user_address = $1 AND pl.stellar_canonical
         ORDER BY p.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -197,7 +197,7 @@ pub async fn get_user_predictions(
             p.created_at  AS prediction_created_at
         FROM predictions p
         JOIN pools pl ON pl.pool_id = p.pool_id
-        WHERE p.user_address = $1
+        WHERE p.user_address = $1 AND pl.stellar_canonical
         ORDER BY p.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -252,6 +252,9 @@ pub async fn get_market_predictions(
         SELECT id, pool_id, user_address, outcome, amount, created_at
         FROM predictions
         WHERE pool_id = $1
+          AND EXISTS (
+              SELECT 1 FROM pools WHERE pool_id = $1 AND stellar_canonical
+          )
           AND ($2::bigint IS NULL OR id < $2)
         ORDER BY id DESC
         LIMIT $3
@@ -266,11 +269,13 @@ pub async fn get_market_predictions(
 
 /// Total prediction count for a pool (used for the `total` response field).
 pub async fn count_market_predictions(pool: &PgPool, pool_id: i64) -> Result<i64, sqlx::Error> {
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM predictions WHERE pool_id = $1")
-            .bind(pool_id)
-            .fetch_one(pool)
-            .await?;
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM predictions WHERE pool_id = $1
+         AND EXISTS (SELECT 1 FROM pools WHERE pool_id = $1 AND stellar_canonical)",
+    )
+    .bind(pool_id)
+    .fetch_one(pool)
+    .await?;
     Ok(count)
 }
 
@@ -286,7 +291,8 @@ pub async fn get_users_by_betting_volume(
             user_address,
             SUM(amount)  AS total_volume,
             COUNT(*)     AS prediction_count
-        FROM predictions
+        FROM predictions p
+        JOIN pools pl ON pl.pool_id = p.pool_id AND pl.stellar_canonical
         GROUP BY user_address
         ORDER BY SUM(amount) DESC
         LIMIT $1 OFFSET $2
@@ -326,6 +332,7 @@ pub async fn get_users_by_winnings(
             FROM predictions p
             JOIN pools pl ON pl.pool_id = p.pool_id
             WHERE pl.state  = 'settled'
+              AND pl.stellar_canonical
               AND pl.result IS NOT NULL
               AND p.outcome = CAST(pl.result AS INTEGER)
             GROUP BY pl.pool_id
@@ -340,6 +347,7 @@ pub async fn get_users_by_winnings(
             JOIN pools pl  ON pl.pool_id  = p.pool_id
             JOIN pool_winning_totals pwt ON pwt.pool_id = pl.pool_id
             WHERE pl.state  = 'settled'
+              AND pl.stellar_canonical
               AND pl.result IS NOT NULL
               AND p.outcome = CAST(pl.result AS INTEGER)
         ),
@@ -357,6 +365,7 @@ pub async fn get_users_by_winnings(
             FROM predictions p
             JOIN pools pl ON pl.pool_id = p.pool_id
             WHERE pl.state = 'settled'
+              AND pl.stellar_canonical
             GROUP BY p.user_address
         )
         SELECT
@@ -433,7 +442,8 @@ fn leaderboard_sql(rank_by: &str) -> String {
                    pl.state, pl.result, pl.end_time
             FROM predictions p
             JOIN pools pl ON pl.pool_id = p.pool_id
-            WHERE ($3::bigint    IS NULL OR p.pool_id    = $3)
+            WHERE pl.stellar_canonical
+              AND ($3::bigint    IS NULL OR p.pool_id    = $3)
               AND ($4::timestamptz IS NULL OR p.created_at >= $4)
         ),
         outcome_flags AS (
@@ -589,7 +599,8 @@ pub async fn get_protocol_stats(
         WITH filtered_pools AS (
             SELECT pool_id, total_stake
             FROM pools
-            WHERE ($1::text IS NULL OR category = $1)
+            WHERE stellar_canonical
+              AND ($1::text IS NULL OR category = $1)
               AND ($2::text IS NULL OR state    = $2)
         )
         SELECT
@@ -655,6 +666,45 @@ pub async fn insert_prediction_from_event_with_pool(
     insert_prediction_from_event(&mut tx, event).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Insert a prediction indexed from a canonical Stellar event.
+///
+/// The source key makes retries safe even if the worker crashes after writing
+/// the prediction but before advancing the event journal.
+pub async fn insert_prediction_from_stellar_event(
+    pool: &PgPool,
+    event: &PredictionPlacedEvent,
+    stellar_event_key: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let inserted_id: Option<i64> = sqlx::query_scalar(
+        r#"
+        INSERT INTO predictions
+            (pool_id, user_address, outcome, amount, stellar_event_key)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (stellar_event_key) WHERE stellar_event_key IS NOT NULL DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(event.pool_id as i64)
+    .bind(&event.user_address)
+    .bind(event.outcome)
+    .bind(event.amount)
+    .bind(stellar_event_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if inserted_id.is_some() {
+        sqlx::query("UPDATE pools SET total_stake = total_stake + $1 WHERE pool_id = $2")
+            .bind(event.amount)
+            .bind(event.pool_id as i64)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(inserted_id.is_some())
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
