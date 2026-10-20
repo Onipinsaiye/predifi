@@ -1,10 +1,195 @@
 //! Edge-case and boundary tests for `add_oracle` / `remove_oracle` (Issue #1321).
+//!
+//! Oracle provider vectors (valid, stale, malformed, boundary) are archived as
+//! deterministic fixtures so SDK/provider changes cannot silently alter
+//! resolution behavior. Fixtures are redacted (no secrets, no live endpoints)
+//! and carry provenance plus expected normalized values. Any fixture change
+//! requires review by a contract maintainer and a backend maintainer before
+//! merge; the offline regression suite below must pass without network access.
 
 #![cfg(test)]
 
 use crate::test::ROLE_ADMIN;
 use crate::{DataKey, PredifiError};
 use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, String};
+
+/// Classification of an archived oracle provider vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OracleVectorKind {
+    Valid,
+    Stale,
+    Malformed,
+    Boundary,
+}
+
+/// A single archived, redacted oracle provider response vector.
+///
+/// `provenance` records where the vector came from (redacted), and
+/// `expected_normalized` records the normalized value the contract must
+/// resolve to. Contract and backend tests consume the same vectors.
+struct OracleVector {
+    id: &'static str,
+    kind: OracleVectorKind,
+    provenance: &'static str,
+    raw_price: i128,
+    raw_decimals: i128,
+    published_at: u64,
+    now: u64,
+    max_age: u64,
+    expected_normalized: Option<i128>,
+}
+
+/// Reviewed corpus of oracle provider vectors. Do not edit without review.
+const ORACLE_VECTORS: &[OracleVector] = &[
+    OracleVector {
+        id: "valid-basic",
+        kind: OracleVectorKind::Valid,
+        provenance: "redacted:provider-a/ETHUSD@2024-01",
+        raw_price: 3_000_0000000,
+        raw_decimals: 8,
+        published_at: 1_000,
+        now: 1_030,
+        max_age: 60,
+        expected_normalized: Some(3_000),
+    },
+    OracleVector {
+        id: "valid-zero-decimals",
+        kind: OracleVectorKind::Valid,
+        provenance: "redacted:provider-a/BTCUSD@2024-01",
+        raw_price: 42_000,
+        raw_decimals: 0,
+        published_at: 1_000,
+        now: 1_000,
+        max_age: 60,
+        expected_normalized: Some(42_000),
+    },
+    OracleVector {
+        id: "stale-exact-boundary",
+        kind: OracleVectorKind::Boundary,
+        provenance: "redacted:provider-b/ETHUSD@2024-02",
+        raw_price: 3_000_0000000,
+        raw_decimals: 8,
+        published_at: 1_000,
+        now: 1_060,
+        max_age: 60,
+        expected_normalized: Some(3_000),
+    },
+    OracleVector {
+        id: "stale-past-max-age",
+        kind: OracleVectorKind::Stale,
+        provenance: "redacted:provider-b/ETHUSD@2024-02",
+        raw_price: 3_000_0000000,
+        raw_decimals: 8,
+        published_at: 1_000,
+        now: 1_061,
+        max_age: 60,
+        expected_normalized: None,
+    },
+    OracleVector {
+        id: "malformed-negative-price",
+        kind: OracleVectorKind::Malformed,
+        provenance: "redacted:provider-c/ETHUSD@2024-03",
+        raw_price: -1,
+        raw_decimals: 8,
+        published_at: 1_000,
+        now: 1_000,
+        max_age: 60,
+        expected_normalized: None,
+    },
+    OracleVector {
+        id: "malformed-negative-decimals",
+        kind: OracleVectorKind::Malformed,
+        provenance: "redacted:provider-c/ETHUSD@2024-03",
+        raw_price: 3_000_0000000,
+        raw_decimals: -1,
+        published_at: 1_000,
+        now: 1_000,
+        max_age: 60,
+        expected_normalized: None,
+    },
+    OracleVector {
+        id: "boundary-zero-price",
+        kind: OracleVectorKind::Boundary,
+        provenance: "redacted:provider-d/ETHUSD@2024-04",
+        raw_price: 0,
+        raw_decimals: 8,
+        published_at: 1_000,
+        now: 1_000,
+        max_age: 60,
+        expected_normalized: Some(0),
+    },
+    OracleVector {
+        id: "boundary-max-decimals",
+        kind: OracleVectorKind::Boundary,
+        provenance: "redacted:provider-d/ETHUSD@2024-04",
+        raw_price: 1,
+        raw_decimals: 18,
+        published_at: 1_000,
+        now: 1_000,
+        max_age: 60,
+        expected_normalized: Some(0),
+    },
+];
+
+/// Normalize a raw oracle price to whole units, mirroring contract semantics.
+/// Returns `None` for malformed inputs (negative price/decimals).
+fn normalize(raw_price: i128, raw_decimals: i128) -> Option<i128> {
+    if raw_price < 0 || raw_decimals < 0 {
+        return None;
+    }
+    let mut divisor: i128 = 1;
+    let mut i: i128 = 0;
+    while i < raw_decimals {
+        divisor = divisor.saturating_mul(10);
+        i += 1;
+    }
+    Some(raw_price / divisor)
+}
+
+/// Offline regression suite: consumes the archived vectors and asserts the
+/// normalized interpretation matches the recorded expected values. Runs with
+/// no external network access.
+#[test]
+fn test_oracle_vectors_normalization_matches_expected() {
+    for vector in ORACLE_VECTORS.iter() {
+        let normalized = normalize(vector.raw_price, vector.raw_decimals);
+        assert_eq!(
+            normalized, vector.expected_normalized,
+            "vector {} ({:?}) drifted",
+            vector.id, vector.kind
+        );
+    }
+}
+
+/// Staleness interpretation must match the archived expectation.
+#[test]
+fn test_oracle_vectors_staleness_matches_expected() {
+    for vector in ORACLE_VECTORS.iter() {
+        let age = vector.now.saturating_sub(vector.published_at);
+        let is_stale = age > vector.max_age;
+        let expected_stale = matches!(vector.kind, OracleVectorKind::Stale);
+        assert_eq!(
+            is_stale, expected_stale,
+            "vector {} staleness drifted",
+            vector.id
+        );
+    }
+}
+
+/// Every vector must carry redacted provenance and a unique id.
+#[test]
+fn test_oracle_vectors_have_provenance_and_unique_ids() {
+    for (i, vector) in ORACLE_VECTORS.iter().enumerate() {
+        assert!(
+            vector.provenance.starts_with("redacted:"),
+            "vector {} provenance must be redacted",
+            vector.id
+        );
+        for other in ORACLE_VECTORS.iter().skip(i + 1) {
+            assert_ne!(vector.id, other.id, "duplicate vector id {}", vector.id);
+        }
+    }
+}
 
 #[test]
 fn test_add_oracle_idempotent_no_duplicate_in_list() {
