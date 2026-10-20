@@ -16,6 +16,12 @@ mod constants;
 mod gas_opt;
 mod oracle;
 #[cfg(test)]
+mod mutation_kill_guards;
+#[cfg(test)]
+mod mutation_kill_payouts;
+#[cfg(test)]
+mod mutation_kill_safe_math;
+#[cfg(test)]
 mod payout_proptests;
 #[cfg(test)]
 mod price_feed_proptests;
@@ -183,7 +189,15 @@ pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[contracterror]
+// `export = false`: the Stellar XDR spec type `ScSpecUdtErrorEnumV0` caps error
+// enums at 50 cases (`VecM<_, 50>`), and this enum has grown past that limit,
+// which made the spec-generation part of the macro panic with `LengthExceedsMax`
+// and broke compilation of the whole workspace. `export = false` skips only the
+// embedded spec-XDR blob (used by off-chain tooling to pretty-print errors); all
+// runtime error codes, `TryFrom`/`From` conversions and on-chain behaviour are
+// unchanged. If the spec blob is wanted again, split the enum or move to <= 50
+// variants.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PredifiError {
     AlreadyInitializedOrConfigNotSet = 2,
@@ -288,12 +302,16 @@ pub enum PredifiError {
     /// The provider price exponent is outside
     /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
     /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
-    UnsupportedPriceExponent = 114,
+    // NB: these two were originally 114/115, which collided with
+    // `MaxOutcomesExceeded`/`MaxPredictionsPerPoolExceeded` from the resource-limits
+    // work (PR #167) after a bad merge; renumbered to the first free codes so the
+    // enum compiles again (E0081). 117/118 were unused.
+    UnsupportedPriceExponent = 117,
     /// The oracle confidence interval is too wide to resolve on: either
     /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
     /// interval crosses the price-condition boundary. Resolution is deferred
     /// until a tighter price is published.
-    PriceConfidenceTooWide = 115,
+    PriceConfidenceTooWide = 118,
 }
 
 /// Represents the current state of a prediction market.

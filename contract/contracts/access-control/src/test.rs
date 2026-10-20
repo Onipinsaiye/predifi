@@ -669,6 +669,58 @@ fn test_get_operator_count_decrements_on_revoke_all() {
     assert_eq!(client.get_operator_count(), 0);
 }
 
+/// Simulate an out-of-sync operator counter (e.g. roles granted before the
+/// counter existed): the Operator role is stored but `OperatorCount` is 0.
+fn desync_operator_count(env: &Env, contract_id: &Address) {
+    env.as_contract(contract_id, || {
+        env.storage().instance().set(&DataKey::OperatorCount, &0u32);
+    });
+}
+
+/// revoke_role must saturate at 0 rather than underflow when the counter is
+/// already 0 (kills the `count > 0` → `count >= 0` mutant, issue #128).
+#[test]
+fn test_revoke_role_operator_count_saturates_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let op = Address::generate(&env);
+    client.init(&admin);
+
+    client.assign_role(&admin, &op, &Role::Operator);
+    desync_operator_count(&env, &contract_id);
+
+    client.revoke_role(&admin, &op, &Role::Operator);
+    assert!(!client.has_role(&op, &Role::Operator));
+    assert_eq!(client.get_operator_count(), 0);
+}
+
+/// revoke_all_roles must saturate at 0 rather than underflow when the counter
+/// is already 0 (kills the `count > 0` → `count >= 0` mutant, issue #128).
+#[test]
+fn test_revoke_all_roles_operator_count_saturates_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let op = Address::generate(&env);
+    client.init(&admin);
+
+    client.assign_role(&admin, &op, &Role::Operator);
+    desync_operator_count(&env, &contract_id);
+
+    client.revoke_all_roles(&admin, &op);
+    assert!(!client.has_role(&op, &Role::Operator));
+    assert_eq!(client.get_operator_count(), 0);
+}
+
 /// Assigning the Operator role to the same address twice does not double-count.
 #[test]
 fn test_get_operator_count_no_double_count_on_reassign() {

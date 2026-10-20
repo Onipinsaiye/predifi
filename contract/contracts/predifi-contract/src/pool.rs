@@ -4,15 +4,9 @@
 use soroban_sdk::{contractimpl, log, token, Address, Env, String, Symbol, Vec};
 
 use crate::gas_opt;
+// NB: a merge conflict once duplicated this whole `use` block (upstream #167/#163)
+// which made `cargo test` fail with E0252 name-collision errors; keep it merged.
 use crate::{
-    Config, DataKey, InitialLiquidityProvidedEvent, MarketState, MaxTotalStakeIncreasedEvent, Pool,
-    PoolCanceledEvent, PoolConfig, PoolCreatedEvent, PoolDescriptionUpdatedEvent,
-    PoolDisputedEvent, PoolReadyForResolutionEvent, PoolResolvedDiagEvent, PoolResolvedEvent,
-    PoolStats, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
-    ResolutionConflictEvent, ResolutionVoteCastEvent, StakeLimitsUpdatedEvent, StakingClosedEvent,
-    CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION, EMERGENCY_CANCEL_MULTISIG_THRESHOLD,
-    INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY,
-    MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
     Config, DataKey, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
     MarketState, MaxTotalStakeIncreasedEvent, Pool, PoolCanceledEvent, PoolConfig,
     PoolCreatedEvent, PoolDescriptionUpdatedEvent, PoolDisputedEvent, PoolReadyForResolutionEvent,
@@ -20,7 +14,8 @@ use crate::{
     PredifiContractClient, PredifiError, ResolutionConflictEvent, ResolutionVoteCastEvent,
     StakeLimitsUpdatedEvent, StakingClosedEvent, CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION,
     EMERGENCY_CANCEL_MULTISIG_THRESHOLD, INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS,
-    MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
+    MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT,
+    MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
 };
 
 #[contractimpl]
