@@ -315,7 +315,7 @@ pub struct PoolsQuery {
     /// in this file, which use [`BoundedI64`] and reject out-of-range values.
     pub limit: Option<i64>,
     /// Zero-based page offset, minimum 0.
-    pub offset: Option<BoundedI64<0, 9223372036854775807>>,
+    pub offset: Option<crate::validated_types::PageOffset>,
 }
 
 /// Resolve the effective page size for `GET /api/v1/pools`: missing defaults
@@ -489,16 +489,22 @@ pub async fn get_pools(
     // size still gets a bounded, servable page instead of a 400 (#1734).
     let limit = resolve_pools_page_size(params.limit);
     let offset = params.offset.map(|b| b.get()).unwrap_or(0);
-    let tags: Option<Vec<String>> = params
+    let tags: Option<Vec<String>> = match params
         .tags
-        .as_ref()
-        .map(|s| {
-            s.split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty());
+        .as_deref()
+        .map(crate::validated_types::parse_tag_filter)
+        .transpose()
+    {
+        Ok(tags) => tags.filter(|v| !v.is_empty()),
+        Err(e) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                e.to_string(),
+            )
+            .into_response();
+        }
+    };
 
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
@@ -588,7 +594,7 @@ pub struct PaginationQuery {
     /// Maximum number of results to return (capped at 100, default 20).
     pub limit: Option<BoundedI64<1, 100>>,
     /// Zero-based offset for pagination (default 0).
-    pub offset: Option<BoundedI64<0, 9223372036854775807>>,
+    pub offset: Option<crate::validated_types::PageOffset>,
 }
 
 /// `GET /api/v1/users/:address/history` — paginated prediction history for a user.
@@ -678,7 +684,7 @@ pub struct LeaderboardQuery {
     /// Maximum number of results to return (capped at 100, default 20).
     pub limit: Option<BoundedI64<1, 100>>,
     /// Zero-based offset for pagination (default 0).
-    pub offset: Option<BoundedI64<0, 9223372036854775807>>,
+    pub offset: Option<crate::validated_types::PageOffset>,
     /// Ranking type: "volume" | "winnings" | "win_rate" | "streak" (default: "volume")
     pub rank_by: Option<NonEmptyString>,
     /// Time window: "week" | "month" | "all" (default: "all"). Ignored for `rank_by=winnings`.
@@ -807,7 +813,7 @@ pub struct PoolLeaderboardQuery {
     /// Maximum number of results to return (capped at 100, default 20).
     pub limit: Option<BoundedI64<1, 100>>,
     /// Zero-based offset for pagination (default 0).
-    pub offset: Option<BoundedI64<0, 9223372036854775807>>,
+    pub offset: Option<crate::validated_types::PageOffset>,
     /// Ranking type: "volume" | "win_rate" | "streak" (default: "volume")
     pub rank_by: Option<NonEmptyString>,
 }
@@ -1148,13 +1154,46 @@ pub struct CreatePoolTemplateRequest {
     pub recurrence_interval_seconds: i64,
 }
 
+/// Reject oversized text fields and out-of-range durations before any work.
+fn validate_template_request(
+    body: &CreatePoolTemplateRequest,
+) -> Result<(), crate::validated_types::ValidationError> {
+    use crate::constants::{MAX_ADDRESS_LEN, MAX_TEMPLATE_DESCRIPTION_LEN, MAX_TEMPLATE_TEXT_LEN};
+    use crate::validated_types::{validate_max_len, TemplateSeconds};
+
+    validate_max_len("creator", &body.creator, MAX_ADDRESS_LEN)?;
+    validate_max_len("name", &body.name, MAX_TEMPLATE_TEXT_LEN)?;
+    validate_max_len("category", &body.category, MAX_TEMPLATE_TEXT_LEN)?;
+    validate_max_len(
+        "description",
+        &body.description,
+        MAX_TEMPLATE_DESCRIPTION_LEN,
+    )?;
+    validate_max_len("token", &body.token, MAX_TEMPLATE_TEXT_LEN)?;
+    TemplateSeconds::new(body.duration_seconds)?;
+    TemplateSeconds::new(body.recurrence_interval_seconds)?;
+    Ok(())
+}
+
 /// `POST /api/v1/pool-templates` — save a reusable pool configuration.
 pub async fn create_pool_template_handler(
     State(state): State<AppState>,
     Json(body): Json<CreatePoolTemplateRequest>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(e) = validate_template_request(&body) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
+
     let Some(db) = &state.db else {
-        return Json(json!({ "error": "database not available" }));
+        return Json(json!({ "error": "database not available" })).into_response();
     };
 
     match crate::db::create_pool_template(
@@ -1169,8 +1208,8 @@ pub async fn create_pool_template_handler(
     )
     .await
     {
-        Ok(template) => Json(json!(template)),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        Ok(template) => Json(json!(template)).into_response(),
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
     }
 }
 
@@ -1183,14 +1222,32 @@ pub struct ListPoolTemplatesQuery {
 pub async fn list_pool_templates_handler(
     State(state): State<AppState>,
     Query(params): Query<ListPoolTemplatesQuery>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(e) = crate::validated_types::validate_max_len(
+        "creator",
+        &params.creator,
+        crate::constants::MAX_ADDRESS_LEN,
+    ) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
+
     let Some(db) = &state.db else {
-        return Json(json!({ "error": "database not available" }));
+        return Json(json!({ "error": "database not available" })).into_response();
     };
 
     match crate::db::list_pool_templates(db, &params.creator).await {
-        Ok(templates) => Json(json!({ "creator": params.creator, "templates": templates })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        Ok(templates) => {
+            Json(json!({ "creator": params.creator, "templates": templates })).into_response()
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
     }
 }
 
@@ -1269,6 +1326,14 @@ pub async fn update_pool_tags_handler(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    if let Err(e) = crate::validated_types::validate_tags(&body.tags) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1355,7 +1420,7 @@ pub async fn ingest_claim_handler(
 pub struct NotificationsQuery {
     pub unread_only: Option<bool>,
     pub limit: Option<BoundedI64<1, 100>>,
-    pub offset: Option<BoundedI64<0, 9223372036854775807>>,
+    pub offset: Option<crate::validated_types::PageOffset>,
 }
 
 /// `GET /api/v1/notifications/:address` — list a user's notifications, newest first.
@@ -1418,6 +1483,14 @@ pub async fn mark_notifications_read_handler(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    if let Err(e) = crate::validated_types::validate_notification_ids(&body.ids) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1485,6 +1558,14 @@ pub async fn set_user_interests_handler(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    if let Err(e) = crate::validated_types::validate_interests(&body.interests) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1515,7 +1596,9 @@ pub fn router(
     metrics: SharedMetrics,
     event_bus: crate::ws::EventBus,
 ) -> Router {
-    use crate::rate_limit::{with_distributed_rate_limit, RateLimitTier};
+    use crate::constants as c;
+    use crate::rate_limit::{with_distributed_rate_limit, with_rate_limit, RateLimitTier};
+    use axum::extract::DefaultBodyLimit;
 
     let pool_cache = PoolCache::with_negative_ttl(std::time::Duration::from_secs(
         config.pool_negative_cache_ttl_secs,
@@ -1533,7 +1616,10 @@ pub fn router(
 
     // Admin tier — authenticated administrative operations (no public rate limit).
     let admin = Router::new()
-        .route("/admin/log-level", patch(set_log_level))
+        .route(
+            "/admin/log-level",
+            patch(set_log_level).layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+        )
         .with_state(state.clone());
 
     // Light tier — cheap, stateless, polling-friendly endpoints.
@@ -1551,7 +1637,11 @@ pub fn router(
     // Token tier — refresh rotation and WebSocket handshake (10 req / 60 s).
     let token = with_distributed_rate_limit(
         Router::new()
-            .route("/auth/refresh", post(refresh_tokens_handler))
+            .route(
+                "/auth/refresh",
+                post(refresh_tokens_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TOKEN_REFRESH)),
+            )
             .route("/ws", get(crate::ws::ws_handler))
             .with_state(state.clone()),
         RateLimitTier::Token,
@@ -1590,12 +1680,15 @@ pub fn router(
             )
             .route(
                 "/users/:address/interests",
-                get(get_user_interests_handler).put(set_user_interests_handler),
+                get(get_user_interests_handler)
+                    .put(set_user_interests_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INTERESTS)),
             )
             .route("/notifications/:address", get(list_notifications_handler))
             .route(
                 "/notifications/:address/read",
-                post(mark_notifications_read_handler),
+                post(mark_notifications_read_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_NOTIFICATIONS_READ)),
             )
             .with_state(state.clone()),
         RateLimitTier::User,
@@ -1605,10 +1698,26 @@ pub fn router(
     // Write tier — indexer ingest (typically internal, strictest limit).
     let write = with_distributed_rate_limit(
         Router::new()
-            .route("/indexer/pool-created", post(ingest_pool_created))
-            .route("/indexer/prediction-placed", post(ingest_prediction_placed))
-            .route("/indexer/claim", post(ingest_claim_handler))
-            .route("/pools/:id/tags", patch(update_pool_tags_handler))
+            .route(
+                "/indexer/pool-created",
+                post(ingest_pool_created)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_CREATED)),
+            )
+            .route(
+                "/indexer/prediction-placed",
+                post(ingest_prediction_placed)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+            )
+            .route(
+                "/indexer/claim",
+                post(ingest_claim_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+            )
+            .route(
+                "/pools/:id/tags",
+                patch(update_pool_tags_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TAGS)),
+            )
             .with_state(state.clone()),
         RateLimitTier::Write,
         state.redis.clone(),
@@ -1626,7 +1735,9 @@ pub fn router(
         )
         .route(
             "/pool-templates",
-            get(list_pool_templates_handler).post(create_pool_template_handler),
+            get(list_pool_templates_handler)
+                .post(create_pool_template_handler)
+                .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_TEMPLATE)),
         )
         .with_state(state)
         .merge(light)

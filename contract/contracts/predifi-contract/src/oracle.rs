@@ -1,15 +1,80 @@
 //! Oracle domain: oracle registration, price feeds, price conditions and
 //! oracle-driven pool resolution.
 
-use soroban_sdk::{contractimpl, log, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contractimpl, log, xdr::ToXdr, Address, Env, String, Symbol, Vec};
 
 use crate::{
     DataKey, MarketState, OracleCallback, OracleInitEvent, OracleResolvedEvent,
     OracleWhitelistAddedEvent, OracleWhitelistRemovedEvent, Pool, PoolResolvedDiagEvent,
     PoolResolvedEvent, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
     PriceConditionSetEvent, PriceFeedUpdatedEvent, PriceFeedsCleanedEvent, ResolutionConflictEvent,
-    ResolutionVoteCastEvent, MAX_PRICE_CONDITION_MATCH_STEPS, MAX_TOLERANCE, UNRESOLVED_OUTCOME,
+    ResolutionEvidence, ResolutionEvidenceEvent, ResolutionVoteCastEvent,
+    DEFAULT_MAX_ORACLE_FRESHNESS, DEFAULT_MIN_ORACLE_FRESHNESS,
+    MarketOracleConfig, MarketOracleConfiguredEvent, OracleFreshnessBoundsSetEvent,
+    SupportedFeedAddedEvent, SupportedFeedRemovedEvent,
+    MAX_PRICE_CONDITION_MATCH_STEPS, MAX_PRICE_EXPONENT, MAX_TOLERANCE, MIN_PRICE_EXPONENT,
+    PRICE_DECIMALS, UNRESOLVED_OUTCOME,
 };
+
+/// Rescale the provider integer `value * 10^expo` to `PRICE_DECIMALS` fixed
+/// point. Returns `(scaled, inexact)`; when digits must be dropped the result is
+/// truncated toward zero and `inexact` reports a non-zero remainder.
+fn rescale_to_price_decimals(value: i128, expo: i32) -> Result<(i128, bool), PredifiError> {
+    if !(MIN_PRICE_EXPONENT..=MAX_PRICE_EXPONENT).contains(&expo) {
+        return Err(PredifiError::UnsupportedPriceExponent);
+    }
+    let shift = expo + PRICE_DECIMALS as i32;
+    let factor = 10i128
+        .checked_pow(shift.unsigned_abs())
+        .ok_or(PredifiError::ArithmeticError)?;
+    if shift >= 0 {
+        let scaled = value
+            .checked_mul(factor)
+            .ok_or(PredifiError::ArithmeticError)?;
+        Ok((scaled, false))
+    } else {
+        Ok((value / factor, value % factor != 0))
+    }
+}
+
+/// Convert a provider `(price, confidence, expo)` reading (real value
+/// `price * 10^expo`) to canonical `PRICE_DECIMALS` fixed point — the only
+/// representation stored and compared against `PriceCondition.target_price`.
+///
+/// Rounding guarantees the normalized interval `[price - conf, price + conf]`
+/// always contains the provider's interval:
+/// - `price` is truncated toward zero (it is always positive);
+/// - `confidence` is rounded up, plus one unit when truncating `price`
+///   dropped a non-zero remainder.
+///
+/// # Errors
+/// - `InvalidAmount` — `price <= 0` or `confidence < 0`.
+/// - `UnsupportedPriceExponent` — `expo` outside
+///   `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or a price finer than
+///   `10^-PRICE_DECIMALS` that would normalize to zero.
+/// - `ArithmeticError` — scaling overflows `i128`.
+pub(crate) fn normalize_price_feed(
+    price: i128,
+    confidence: i128,
+    expo: i32,
+) -> Result<(i128, i128), PredifiError> {
+    if price <= 0 || confidence < 0 {
+        return Err(PredifiError::InvalidAmount);
+    }
+    let (norm_price, price_inexact) = rescale_to_price_decimals(price, expo)?;
+    if norm_price == 0 {
+        return Err(PredifiError::UnsupportedPriceExponent);
+    }
+    let (mut norm_confidence, confidence_inexact) = rescale_to_price_decimals(confidence, expo)?;
+    for widen in [confidence_inexact, price_inexact] {
+        if widen {
+            norm_confidence = norm_confidence
+                .checked_add(1)
+                .ok_or(PredifiError::ArithmeticError)?;
+        }
+    }
+    Ok((norm_price, norm_confidence))
+}
 
 #[contractimpl]
 impl PredifiContract {
@@ -90,6 +155,10 @@ impl PredifiContract {
 
     /// Initialize the oracle configuration. Only callable by Admin (role 0).
     ///
+    /// `min_confidence_ratio` is the protocol confidence policy: the widest
+    /// accepted `confidence / price` ratio, in bps, for a feed used by
+    /// `resolve_pool_from_price` (0 accepts only exact prices).
+    ///
     /// # Errors
     /// - `InvalidData`   – `max_price_age` is 0 (every feed would be immediately stale).
     /// - `InvalidFeeBps` – `min_confidence_ratio` exceeds 10 000 bps (100 %).
@@ -142,8 +211,214 @@ impl PredifiContract {
             .get::<DataKey, (Address, u64, u32)>(&DataKey::OracleConfig)
     }
 
+    /// Add a supported feed identifier to the governed registry. Caller must have Admin role (0).
+    pub fn add_supported_feed(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "add_supported_feed")?;
+
+        let key = DataKey::SupportedFeed(feed_id.clone());
+        env.storage().persistent().set(&key, &true);
+        Self::extend_persistent(&env, &key);
+
+        let list_key = DataKey::SupportedFeedList;
+        let mut list: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !list.contains(&feed_id) {
+            list.push_back(feed_id.clone());
+            env.storage().persistent().set(&list_key, &list);
+            Self::extend_persistent(&env, &list_key);
+        }
+
+        SupportedFeedAddedEvent { admin, feed_id }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Remove a supported feed identifier from the governed registry. Caller must have Admin role (0).
+    pub fn remove_supported_feed(
+        env: Env,
+        admin: Address,
+        feed_id: Symbol,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "remove_supported_feed")?;
+
+        let key = DataKey::SupportedFeed(feed_id.clone());
+        env.storage().persistent().remove(&key);
+
+        let list_key = DataKey::SupportedFeedList;
+        let list: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut new_list = Vec::new(&env);
+        for item in list.iter() {
+            if item != feed_id {
+                new_list.push_back(item);
+            }
+        }
+
+        env.storage().persistent().set(&list_key, &new_list);
+        Self::extend_persistent(&env, &list_key);
+
+        SupportedFeedRemovedEvent { admin, feed_id }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Query whether a feed identifier is supported by governance.
+    pub fn is_feed_supported(env: Env, feed_id: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::SupportedFeed(feed_id))
+            .unwrap_or(false)
+    }
+
+    /// Return all governed supported feed identifiers.
+    pub fn get_supported_feeds(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupportedFeedList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Configure protocol-wide bounds for market oracle freshness policy. Caller must have Admin role (0).
+    pub fn set_oracle_freshness_bounds(
+        env: Env,
+        admin: Address,
+        min_freshness: u64,
+        max_freshness: u64,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        admin.require_auth();
+        Self::require_admin_role(&env, &admin, "set_oracle_freshness_bounds")?;
+
+        if min_freshness == 0 || min_freshness > max_freshness {
+            return Err(PredifiError::InvalidData);
+        }
+
+        let key = DataKey::OracleFreshnessBounds;
+        env.storage()
+            .persistent()
+            .set(&key, &(min_freshness, max_freshness));
+        Self::extend_persistent(&env, &key);
+
+        OracleFreshnessBoundsSetEvent {
+            admin,
+            min_freshness,
+            max_freshness,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Return the active freshness bounds `(min_freshness, max_freshness)` in seconds.
+    pub fn get_oracle_freshness_bounds(env: Env) -> (u64, u64) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OracleFreshnessBounds)
+            .unwrap_or((DEFAULT_MIN_ORACLE_FRESHNESS, DEFAULT_MAX_ORACLE_FRESHNESS))
+    }
+
+    /// Validate that a MarketOracleConfig satisfies governed supported identifiers and bounds.
+    pub fn validate_market_oracle_config(
+        env: &Env,
+        config: &MarketOracleConfig,
+    ) -> Result<(), PredifiError> {
+        // Validate oracle identity is on trusted whitelist
+        if !Self::is_oracle_whitelisted(env, &config.oracle) {
+            return Err(PredifiError::Unauthorized);
+        }
+
+        // Validate feed identifier is supported
+        if !Self::is_feed_supported(env.clone(), config.feed_id.clone()) {
+            return Err(PredifiError::UnsupportedFeed);
+        }
+
+        // Validate freshness bounds
+        if config.max_staleness_seconds == 0 {
+            return Err(PredifiError::InvalidFreshness);
+        }
+
+        let (min_freshness, max_freshness) = Self::get_oracle_freshness_bounds(env.clone());
+        if config.max_staleness_seconds < min_freshness
+            || config.max_staleness_seconds > max_freshness
+        {
+            return Err(PredifiError::InvalidFreshness);
+        }
+
+        Ok(())
+    }
+
+    /// Read the governed oracle configuration for a market.
+    pub fn get_market_oracle_config(env: Env, pool_id: u64) -> Option<MarketOracleConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketOracleConfig(pool_id))
+    }
+
+    /// Explicitly configure market oracle configuration if not already set.
+    ///
+    /// Caller must be Admin (0) or Operator (1). Once set, configuration is IMMUTABLE.
+    pub fn set_market_oracle_config(
+        env: Env,
+        caller: Address,
+        pool_id: u64,
+        config: MarketOracleConfig,
+    ) -> Result<(), PredifiError> {
+        Self::require_not_paused(&env)?;
+        caller.require_auth();
+
+        let is_admin = Self::require_admin_role(&env, &caller, "set_market_oracle_config").is_ok();
+        let is_operator = Self::require_role(&env, &caller, 1).is_ok();
+        if !is_admin && !is_operator {
+            return Err(PredifiError::Unauthorized);
+        }
+
+        let pool_key = DataKey::Pool(pool_id);
+        if !env.storage().persistent().has(&pool_key) {
+            return Err(PredifiError::PoolNotFound);
+        }
+
+        let oracle_key = DataKey::MarketOracleConfig(pool_id);
+        if env.storage().persistent().has(&oracle_key) {
+            return Err(PredifiError::ConfigurationImmutable);
+        }
+
+        Self::validate_market_oracle_config(&env, &config)?;
+
+        env.storage().persistent().set(&oracle_key, &config);
+        Self::extend_persistent(&env, &oracle_key);
+
+        MarketOracleConfiguredEvent {
+            pool_id,
+            oracle: config.oracle,
+            feed_id: config.feed_id,
+            max_staleness_seconds: config.max_staleness_seconds,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Set a price-based condition for automated pool resolution.
     /// Only callable by Operator (role 1).
+    ///
+    /// `target_price` is in canonical `PRICE_DECIMALS` fixed point (see
+    /// [`normalize_price_feed`]), e.g. `3_000.00 USD` = `300_000_000_000`.
     pub fn set_price_condition(
         env: Env,
         operator: Address,
@@ -166,6 +441,13 @@ impl PredifiContract {
         let pool_key = DataKey::Pool(pool_id);
         if !env.storage().persistent().has(&pool_key) {
             return Err(PredifiError::PoolNotFound);
+        }
+
+        // If market has explicit oracle config, price condition feed must match
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if feed_pair != market_cfg.feed_id {
+                return Err(PredifiError::InvalidData);
+            }
         }
 
         let condition_key = DataKey::PriceCondition(pool_id);
@@ -206,12 +488,44 @@ impl PredifiContract {
 
     /// Update price feed data from an external oracle.
     /// Only callable by authorized oracles.
+    ///
+    /// `price` and `confidence` must already be in canonical `PRICE_DECIMALS`
+    /// fixed point; this is `update_price_feed_with_expo` with exponent `-8`.
     pub fn update_price_feed(
         env: Env,
         oracle: Address,
         feed_pair: Symbol,
         price: i128,
         confidence: i128,
+        timestamp: u64,
+        expires_at: u64,
+    ) -> Result<(), PredifiError> {
+        Self::update_price_feed_with_expo(
+            env,
+            oracle,
+            feed_pair,
+            price,
+            confidence,
+            -(PRICE_DECIMALS as i32),
+            timestamp,
+            expires_at,
+        )
+    }
+
+    /// Update price feed data from a provider reading expressed as
+    /// `price * 10^expo` (e.g. a Pyth `(price, conf, expo)` triple).
+    /// Only callable by authorized oracles.
+    ///
+    /// The reading is converted with [`normalize_price_feed`] before any
+    /// validation, deviation check or storage, so feeds published with
+    /// different exponents compare identically.
+    pub fn update_price_feed_with_expo(
+        env: Env,
+        oracle: Address,
+        feed_pair: Symbol,
+        price: i128,
+        confidence: i128,
+        expo: i32,
         timestamp: u64,
         expires_at: u64,
     ) -> Result<(), PredifiError> {
@@ -243,6 +557,8 @@ impl PredifiContract {
         if confidence < 0 {
             return Err(PredifiError::InvalidAmount);
         }
+
+        let (price, confidence) = normalize_price_feed(price, confidence, expo)?;
 
         let feed_key = DataKey::PriceFeed(feed_pair.clone());
 
@@ -347,20 +663,40 @@ impl PredifiContract {
         removed
     }
 
-    /// Load the current price and expiry timestamp for the configured feed.
+    /// Load the current price, confidence and timestamps for the configured feed.
     ///
     /// This intentionally preserves the previous missing-feed behavior:
     /// callers panic with "Feed not found" when the feed has not been updated.
-    fn load_price_feed_for_resolution(env: &Env, feed_pair: Symbol) -> (i128, u64, u64) {
-        let (price, _confidence, timestamp, expires_at): (i128, i128, u64, u64) = env
-            .storage()
+    fn load_price_feed_for_resolution(env: &Env, feed_pair: Symbol) -> (i128, i128, u64, u64) {
+        env.storage()
             .persistent()
             .get(&DataKey::PriceFeed(feed_pair))
-            .expect("Feed not found");
-
-        (price, timestamp, expires_at)
+            .expect("Feed not found")
     }
 
+    /// Reject feeds whose confidence interval is wider than the protocol policy
+    /// (`confidence * 10_000 > price * min_confidence_ratio`). The boundary
+    /// itself is accepted.
+    fn require_confidence_within_policy(
+        env: &Env,
+        price: i128,
+        confidence: i128,
+    ) -> Result<(), PredifiError> {
+        let (_pyth_contract, _max_price_age, max_confidence_bps) =
+            Self::get_oracle_config(env.clone()).ok_or(PredifiError::OracleNotInitialized)?;
+        let width = confidence
+            .checked_mul(MAX_TOLERANCE as i128)
+            .ok_or(PredifiError::ArithmeticError)?;
+        let allowed = price
+            .checked_mul(max_confidence_bps as i128)
+            .ok_or(PredifiError::ArithmeticError)?;
+        if width > allowed {
+            return Err(PredifiError::PriceConfidenceTooWide);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn require_fresh_price_feed(
         env: &Env,
         timestamp: u64,
@@ -379,6 +715,37 @@ impl PredifiContract {
 
         if current_time > timestamp.saturating_add(max_price_age) {
             return Err(PredifiError::PriceStale);
+        }
+
+        Ok(())
+    }
+
+    fn require_fresh_price_feed_for_pool(
+        env: &Env,
+        pool_id: u64,
+        timestamp: u64,
+        expires_at: u64,
+    ) -> Result<(), PredifiError> {
+        let current_time = env.ledger().timestamp();
+
+        // Check if price has expired
+        if current_time > expires_at {
+            return Err(PredifiError::PriceDataInvalid);
+        }
+
+        // If market has explicit governed oracle config, enforce market-specific freshness policy
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if current_time > timestamp.saturating_add(market_cfg.max_staleness_seconds) {
+                return Err(PredifiError::PriceStale);
+            }
+        } else {
+            // Fallback for unconfigured legacy pools
+            let (_pyth_contract, max_price_age, _min_confidence_ratio) =
+                Self::get_oracle_config(env.clone()).ok_or(PredifiError::OracleNotInitialized)?;
+
+            if current_time > timestamp.saturating_add(max_price_age) {
+                return Err(PredifiError::PriceStale);
+            }
         }
 
         Ok(())
@@ -419,8 +786,16 @@ impl PredifiContract {
     /// Match a stored price condition in a fixed, explicitly bounded number of checks.
     ///
     /// Operators: 0=Equal, 1=Greater, 2=Less. Outcome: 0=No, 1=Yes.
-    fn price_resolution_outcome(
+    ///
+    /// The whole confidence interval `[price - confidence, price + confidence]`
+    /// must fall on one side of the condition: the outcome is Yes only if every
+    /// price in it meets the condition, No only if none does. Otherwise the
+    /// interval crosses the boundary and `PriceConfidenceTooWide` is returned
+    /// so resolution is deferred. With `confidence == 0` this is the
+    /// plain point comparison.
+    pub(crate) fn price_resolution_outcome(
         price: i128,
+        confidence: i128,
         target_price: i128,
         comparison_op: u32,
         tolerance_bps: u32,
@@ -435,22 +810,37 @@ impl PredifiContract {
             .checked_add(tolerance_amount)
             .ok_or(PredifiError::ArithmeticError)?;
 
+        let low = price
+            .checked_sub(confidence)
+            .ok_or(PredifiError::ArithmeticError)?;
+        let high = price
+            .checked_add(confidence)
+            .ok_or(PredifiError::ArithmeticError)?;
+
+        // (every price in the interval meets the condition, none does)
         let mut steps = 0u32;
-        let condition_met = match comparison_op {
+        let (all_met, none_met) = match comparison_op {
             0 => {
                 steps += 2;
-                price >= lower_bound && price <= upper_bound
+                (
+                    low >= lower_bound && high <= upper_bound,
+                    high < lower_bound || low > upper_bound,
+                )
             }
             1 => {
                 steps += 1;
-                price > upper_bound
+                (low > upper_bound, high <= upper_bound)
             }
             2 => {
                 steps += 1;
-                price < lower_bound
+                (high < lower_bound, low >= lower_bound)
             }
             _ => return Err(PredifiError::InvalidData),
         };
+        if !all_met && !none_met {
+            return Err(PredifiError::PriceConfidenceTooWide);
+        }
+        let condition_met = all_met;
 
         steps += 2;
         if steps > MAX_PRICE_CONDITION_MATCH_STEPS {
@@ -524,14 +914,26 @@ impl PredifiContract {
         pool_id: u64,
         mut pool: Pool,
         outcome: u32,
+        evidence: ResolutionEvidence,
     ) {
         pool.state = MarketState::Resolved;
         pool.outcome = outcome;
-        pool.fee_bps = Self::calculate_dynamic_fee(env, &pool);
+        pool.fee_bps = Self::calculate_dynamic_fee(env, pool_id, &pool);
         pool.resolution_timestamp = Some(env.ledger().timestamp()); // Record resolution time
 
         env.storage().persistent().set(pool_key, &pool);
         Self::bump_ttl(env, pool_key);
+        Self::open_challenge_window(env, pool_id, outcome);
+
+        // Persist the verifiable evidence commitment alongside the pool so
+        // auditors can later re-derive the decision via `get_resolution_evidence`.
+        let evidence_key = DataKey::ResolutionEvidence(pool_id);
+        let evidence_hash = env
+            .crypto()
+            .sha256(&evidence.clone().to_xdr(env))
+            .to_bytes();
+        env.storage().persistent().set(&evidence_key, &evidence);
+        Self::bump_ttl(env, &evidence_key);
 
         PoolResolvedEvent {
             pool_id,
@@ -539,25 +941,88 @@ impl PredifiContract {
             outcome,
         }
         .publish(env);
+
+        ResolutionEvidenceEvent {
+            pool_id,
+            feed_pair: evidence.feed_pair,
+            price: evidence.price,
+            feed_timestamp: evidence.feed_timestamp,
+            comparison_op: evidence.comparison_op,
+            target_price: evidence.target_price,
+            tolerance_bps: evidence.tolerance_bps,
+            outcome: evidence.outcome,
+            evidence_hash,
+        }
+        .publish(env);
     }
 
     /// Automatically resolve a pool based on its configured price condition.
     /// Anyone can trigger this once the pool's end time and resolution delay have passed.
+    ///
+    /// # Errors (confidence policy)
+    /// - `PriceConfidenceTooWide` — `confidence / price` exceeds the oracle's
+    ///   `min_confidence_ratio`, or the confidence interval crosses the
+    ///   condition boundary. The pool stays `Active`; retry once a tighter
+    ///   price is published.
     pub fn resolve_pool_from_price(env: Env, pool_id: u64) -> Result<(), PredifiError> {
         Self::require_not_paused(&env)?;
 
         let (feed_pair, target_price, comparison_op, tolerance_bps) =
             Self::load_price_resolution_condition(&env, pool_id)?;
-        let (price, timestamp, expires_at) = Self::load_price_feed_for_resolution(&env, feed_pair);
-        Self::require_fresh_price_feed(&env, timestamp, expires_at)?;
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if feed_pair != market_cfg.feed_id {
+                return Err(PredifiError::InvalidData);
+            }
+        }
 
-        let outcome =
-            Self::price_resolution_outcome(price, target_price, comparison_op, tolerance_bps)?;
+        let (price, confidence, timestamp, expires_at) =
+            Self::load_price_feed_for_resolution(&env, feed_pair.clone());
+        Self::require_fresh_price_feed_for_pool(&env, pool_id, timestamp, expires_at)?;
+        Self::require_confidence_within_policy(&env, price, confidence)?;
+
+        let outcome = Self::price_resolution_outcome(
+            price,
+            confidence,
+            target_price,
+            comparison_op,
+            tolerance_bps,
+        )?;
         let (pool_key, pool) = Self::load_resolvable_price_pool(&env, pool_id)?;
         Self::validate_price_resolution_outcome(&env, pool_id, outcome, pool.options_count)?;
-        Self::persist_price_resolution(&env, &pool_key, pool_id, pool, outcome);
+        Self::persist_price_resolution(
+            &env,
+            &pool_key,
+            pool_id,
+            pool,
+            outcome,
+            ResolutionEvidence {
+                feed_pair,
+                price,
+                feed_timestamp: timestamp,
+                comparison_op,
+                target_price,
+                tolerance_bps,
+                outcome,
+            },
+        );
 
         Ok(())
+    }
+
+    /// Read the verifiable evidence commitment recorded at price-feed
+    /// resolution, if any.
+    ///
+    /// Returns `None` for pools that have not been resolved through
+    /// `resolve_pool_from_price` (unresolved pools and pools resolved via
+    /// operator/oracle voting carry no feed observation). The returned record
+    /// is the preimage committed by the `resolution_evidence` event: auditors
+    /// recompute `sha256(record.to_xdr(env))` and compare it against the
+    /// emitted `evidence_hash`, then re-derive `outcome` from the stored
+    /// observation and rule.
+    pub fn get_resolution_evidence(env: Env, pool_id: u64) -> Option<ResolutionEvidence> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ResolutionEvidence(pool_id))
     }
 }
 
@@ -574,6 +1039,12 @@ impl OracleCallback for PredifiContract {
         oracle.require_auth();
 
         Self::require_oracle_role_for_resolution(&env, &oracle, pool_id)?;
+
+        if let Some(market_cfg) = Self::get_market_oracle_config(env.clone(), pool_id) {
+            if oracle != market_cfg.oracle {
+                return Err(PredifiError::Unauthorized);
+            }
+        }
 
         let pool_key = DataKey::Pool(pool_id);
         let mut pool: Pool = env
@@ -684,7 +1155,7 @@ impl OracleCallback for PredifiContract {
         if new_outcome_votes >= pool.required_resolutions {
             pool.state = MarketState::Resolved;
             pool.outcome = outcome;
-            pool.fee_bps = Self::calculate_dynamic_fee(&env, &pool);
+            pool.fee_bps = Self::calculate_dynamic_fee(&env, pool_id, &pool);
             pool.resolution_timestamp = Some(env.ledger().timestamp()); // Record resolution time
 
             env.storage().persistent().set(&pool_key, &pool);
@@ -693,6 +1164,7 @@ impl OracleCallback for PredifiContract {
             Self::extend_persistent(&env, &pool_key);
             // Remove from global active index now that the pool is resolved.
             Self::remove_from_active_index(&env, pool_id);
+            Self::open_challenge_window(&env, pool_id, outcome);
 
             // Retrieve winning-outcome stake for the diagnostic event efficiently
             let winning_stake = Self::get_outcome_stake(env.clone(), pool_id, outcome);

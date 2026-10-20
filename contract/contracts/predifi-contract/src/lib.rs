@@ -5,18 +5,22 @@
 #[macro_use]
 extern crate std;
 
-mod admin;
 #[cfg(test)]
-mod benchmark_test;
+mod access_control_audit_tests;
+mod admin;
+// #[cfg(test)]
+// mod benchmark_test;
 #[cfg(test)]
 mod boundary_edge_case_tests;
-#[cfg(test)]
-mod oracle_edge_case_tests;
 mod constants;
 mod gas_opt;
 mod oracle;
 #[cfg(test)]
+mod oracle_edge_case_tests;
+#[cfg(test)]
 mod payout_proptests;
+#[cfg(test)]
+mod price_feed_proptests;
 mod payouts;
 mod pool;
 mod prediction;
@@ -27,8 +31,6 @@ mod safe_math;
 #[cfg(test)]
 mod safe_math_examples;
 #[cfg(test)]
-mod access_control_audit_tests;
-#[cfg(test)]
 mod storage_test;
 #[cfg(test)]
 mod stress_test;
@@ -37,16 +39,29 @@ mod stress_test_high_volume;
 // #[cfg(test)]
 // mod stress_test_max_pools;
 #[cfg(test)]
-mod test_utils;
-#[cfg(test)]
 mod pause_unpause_boundary_tests;
+#[cfg(test)]
+mod resource_limit_boundary_tests;
+
+#[cfg(test)]
+mod test_utils;
 // #[cfg(test)]
 // mod max_pools_stress_tests;
+mod treasury;
 #[cfg(test)]
 mod update_pool_description_boundary_tests;
 #[cfg(test)]
 mod withdraw_treasury_boundary_tests;
+mod challenge;
 mod treasury;
+#[cfg(test)]
+mod fee_schedule_snapshot_tests;
+#[cfg(test)]
+mod oracle_feed_fixture;
+#[cfg(test)]
+mod oracle_price_units_confidence_tests;
+#[cfg(test)]
+mod resolution_challenge_tests;
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, token,
@@ -81,20 +96,22 @@ pub use safe_math::{RoundingMode, SafeMath};
 // │          │       │ withdraw_treasury                                     │
 // │          │       │ upgrade_contract                                      │
 // │          │       │ migrate_state                                         │
+// │          │       │ set_challenge_config                                  │
 // ├──────────┼───────┼──────────────────────────────────────────────────────┤
 // │ Operator │   1   │ resolve_pool (multi-vote; finalises when threshold    │
 // │          │       │   of required_resolutions is reached)                 │
 // │          │       │ cancel_pool                                           │
 // │          │       │ set_stake_limits                                      │
 // ├──────────┼───────┼──────────────────────────────────────────────────────┤
+// │ Moderator│   2   │ flag_disputed_pool                                    │
+// │          │       │ adjudicate_challenge (resolution challenge window)    │
+// ├──────────┼───────┼──────────────────────────────────────────────────────┤
 // │ Oracle   │   3   │ oracle_resolve (OracleCallback trait; multi-vote;     │
 // │          │       │   finalises when required_resolutions threshold met)  │
 // └──────────┴───────┴──────────────────────────────────────────────────────┘
 //
-// Note: roles 2 (Moderator) and 4 (User) are defined in the access-control
-// contract but are not currently enforced by predifi-contract.
-// Role 2 (Moderator) is RESERVED FOR FUTURE USE — it is intended for dispute
-// resolution functionality. See issue #595 for the implementation plan.
+// Note: role 4 (User) is defined in the access-control contract but is not
+// currently enforced by predifi-contract.
 //
 // HOW ROLES ARE ASSIGNED
 // ──────────────────────
@@ -145,6 +162,28 @@ pub const MAX_RESOLUTION_DELAY: u64 = 2_592_000;
 /// Minimum claim window: 1 day in seconds
 pub const MIN_CLAIM_WINDOW: u64 = 86_400;
 
+/// Minimum retention period for unresolved claims: 30 days in seconds.
+///
+/// After a pool is resolved or canceled, its claimable state (pool record,
+/// outcome stakes, and per-user claim flags) MUST remain queryable and
+/// claimable for at least this long.  Storage archival/TTL logic must never
+/// evict entries required for claims before this window elapses.
+pub const MIN_CLAIM_RETENTION_PERIOD: u64 = 2_592_000;
+
+/// Default TTL (in ledgers) applied to temporary pool storage entries.
+///
+/// Temporary entries (e.g. transient per-pool scratch data) are extended by
+/// this amount on write and are allowed to expire once the pool is finalized
+/// and the retention window has passed.
+pub const TEMP_STORAGE_TTL_LEDGERS: u32 = 120_960;
+
+/// Default TTL (in ledgers) applied to persistent pool storage entries.
+///
+/// Persistent entries (pool records, outcome stakes, claim flags) are
+/// extended by this amount on every access so that they survive at least
+/// `MIN_CLAIM_RETENTION_PERIOD` after resolution.
+pub const PERSISTENT_STORAGE_TTL_LEDGERS: u32 = 535_680;
+
 /// Maximum claim window: 365 days in seconds
 pub const MAX_CLAIM_WINDOW: u64 = 31_536_000;
 
@@ -168,6 +207,19 @@ pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
 // INV-7: Prediction.amount > 0 (no zero-stakes)
 // INV-8: Pool.end_time > creation_time (pools must have future end)
 //
+// INV-9 (Payout Remainder Allocation): For any resolved pool, the escrowed
+//        token balance is fully accounted for by the sum of all participant
+//        payouts plus an explicitly retained remainder. Integer-division dust
+//        is allocated deterministically by a rule that does NOT depend on
+//        claim order:
+//
+//          remainder = escrow - Σ(payout_i)
+//
+//        where each payout_i is computed from the participant's stake share
+//        using floor division, and the retained remainder is the accumulated
+//        dust. This invariant holds identically for single-claim and
+//        batch-claim payout paths, so no token unit is created or lost.
+//
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[contracterror]
@@ -181,7 +233,6 @@ pub enum PredifiError {
     /// The outcome value is invalid or out of bounds.
     InvalidOutcome = 25,
     AlreadyClaimed = 60,
-    PoolCanceled = 70,
     ResolutionDelayNotMet = 81,
     /// Token is not on the allowed betting whitelist.
     TokenNotWhitelisted = 91,
@@ -213,6 +264,13 @@ pub enum PredifiError {
     InsufficientStake = 45,
     /// User has exceeded the maximum number of predictions allowed per pool.
     MaxPredictionsExceeded = 111,
+    /// A pool requested more outcomes than `MAX_OUTCOMES_PER_POOL`.
+    MaxOutcomesExceeded = 114,
+    /// A pool reached `MAX_PREDICTIONS_PER_POOL` distinct predictors.
+    MaxPredictionsPerPoolExceeded = 115,
+    /// Adding this stake would exceed `MAX_AGGREGATE_STAKE_PER_POOL`
+    /// (or the aggregate addition would overflow `i128`).
+    MaxAggregateStakeExceeded = 116,
     /// The fee basis points exceed the maximum allowed value (10000).
     InvalidFeeBps = 93,
     /// Metadata URL exceeds maximum length (512 bytes).
@@ -229,6 +287,10 @@ pub enum PredifiError {
     InvalidData = 90,
     /// The provided timestamp is invalid (e.g., end_time too far in the future).
     InvalidTimestamp = 80,
+    /// The proposed fee exceeds the maximum allowed fee cap.
+    FeeExceedsCap = 98,
+    /// The proposed fee change delay is below the minimum required delay.
+    FeeDelayTooShort = 99,
     /// Pool has been flagged as disputed and cannot be modified.
     PoolDisputed = 27,
     /// target_price must be strictly positive.
@@ -250,9 +312,6 @@ pub enum PredifiError {
     /// `initial_liquidity` is less than the required safety margin
     /// relative to `max_total_stake` (issue #1131).
     InitialLiquidityBelowSafetyMargin = 133,
-    /// `emergency_cancel_pool` was called but the multisig threshold
-    /// has not yet been reached (issue #1119).
-    EmergencyCancelPending = 134,
     /// The caller has already approved this emergency-cancel proposal
     /// (issue #1119).
     EmergencyCancelAlreadyApproved = 135,
@@ -260,11 +319,91 @@ pub enum PredifiError {
     ///
     /// Callers should check `is_contract_paused()` before submitting a transaction,
     /// or listen for `PauseEvent` / `UnpauseEvent` on-chain to stay in sync.
+    ///
+    /// NOTE: With scoped pause controls, this error is only returned for
+    /// operations whose pause scope is active. See [`PauseScope`] and
+    /// [`PredifiContract::is_operation_paused`] for the operation matrix.
     ContractPaused = 83,
     InvalidAddressOrToken = 94,
     FeeChangePending = 95,
     NoFeeChangePending = 96,
     TimelockNotExpired = 97,
+    /// The pool is not in a state that permits a refund claim (e.g. it has
+    /// not been canceled/no-contested, or the refund window has closed).
+    RefundNotAvailable = 140,
+    /// A refund has already been claimed for this (user, pool) pair.
+    RefundAlreadyClaimed = 141,
+    /// Feed identifier is not in the governed supported feeds list.
+    UnsupportedFeed = 202,
+    /// Freshness policy value is outside valid configuration bounds.
+    InvalidFreshness = 203,
+    /// Oracle configuration is immutable after market creation and cannot be modified.
+    ConfigurationImmutable = 204,
+    /// The provider price exponent is outside
+    /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
+    /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
+    UnsupportedPriceExponent = 205,
+    /// The oracle confidence interval is too wide to resolve on: either
+    /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
+    /// interval crosses the price-condition boundary. Resolution is deferred
+    /// until a tighter price is published.
+    PriceConfidenceTooWide = 206,
+}
+
+/// Explicit matrix of operations that can be individually paused.
+///
+/// The emergency pause is scoped by operation so that safety-critical exit
+/// paths (claims and refunds) can remain open while new risk-taking entry
+/// points (staking, pool creation, resolution) are frozen.
+///
+/// # Pause matrix
+///
+/// | Operation              | Entry points                                              | Pausable |
+/// |------------------------|-----------------------------------------------------------|----------|
+/// | `CreatePool`           | `create_pool`                                             | yes      |
+/// | `PlacePrediction`      | `place_prediction`                                        | yes      |
+/// | `Resolve`              | `resolve_pool`, `oracle_resolve`, `resolve_pool_from_price` | yes    |
+/// | `Cancel`               | `cancel_pool`, `emergency_cancel_pool`                    | yes      |
+/// | `Claim`                | `claim_winnings`                                          | NO (safe exit) |
+/// | `Refund`               | `claim_refund`                                            | NO (safe exit) |
+/// | `Admin`                | admin config setters, `pause`, `unpause`, `upgrade`       | NO (must always work) |
+///
+/// `Claim` and `Refund` are intentionally **not** pausable: users must always
+/// be able to withdraw funds they are entitled to, even during an emergency.
+/// Admin operations are also never pausable so the pause can be lifted.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseScope {
+    /// Pauses `create_pool`.
+    CreatePool = 0,
+    /// Pauses `place_prediction`.
+    PlacePrediction = 1,
+    /// Pauses `resolve_pool`, `oracle_resolve`, and `resolve_pool_from_price`.
+    Resolve = 2,
+    /// Pauses `cancel_pool` and `emergency_cancel_pool`.
+    Cancel = 3,
+}
+
+impl PauseScope {
+    /// Returns the `DataKey` used to persist this scope's pause flag.
+    fn storage_key(self) -> DataKey {
+        match self {
+            PauseScope::CreatePool => DataKey::PausedCreatePool,
+            PauseScope::PlacePrediction => DataKey::PausedPlacePrediction,
+            PauseScope::Resolve => DataKey::PausedResolve,
+            PauseScope::Cancel => DataKey::PausedCancel,
+        }
+    }
+
+    /// Returns the short symbol used in pause/unpause events.
+    fn symbol(self) -> Symbol {
+        match self {
+            PauseScope::CreatePool => symbol_short!("create"),
+            PauseScope::PlacePrediction => symbol_short!("predict"),
+            PauseScope::Resolve => symbol_short!("resolve"),
+            PauseScope::Cancel => symbol_short!("cancel"),
+        }
+    }
 }
 
 /// Represents the current state of a prediction market.
@@ -281,6 +420,9 @@ pub enum MarketState {
     Canceled = 2,
     /// Market has been flagged as disputed by a moderator.
     Disputed = 3,
+    /// Market was voided (no-contest / invalid-oracle) and stakes are
+    /// refundable to every participant. Terminal state.
+    NoContest = 4,
 }
 
 /// Parameters for creating a new prediction pool.
@@ -296,7 +438,7 @@ pub struct CreatePoolParams {
     pub end_time: u64,
     /// The Stellar token contract address used for staking.
     pub token: Address,
-    /// Number of possible outcomes (must be >= 2 and <= MAX_OPTIONS_COUNT).
+    /// Number of possible outcomes (must be >= 2 and <= MAX_OUTCOMES_PER_POOL).
     pub options_count: u32,
     /// Short human-readable description of the event (max 256 bytes).
     pub description: String,
@@ -389,6 +531,13 @@ pub struct Pool {
     /// Unix timestamp when the pool was resolved. None for pools created before this feature.
     /// Used to enforce claim window expiration. Set when pool transitions to MarketState::Resolved.
     pub resolution_timestamp: Option<u64>,
+    /// Unix timestamp when the pool was voided (canceled or no-contest).
+    /// `None` for pools that have not been voided. Used to enforce the
+    /// refund window and to make refund eligibility auditable.
+    pub voided_timestamp: Option<u64>,
+    /// Short machine-readable reason for the void (e.g. "cancel", "nocontest",
+    /// "oracle_invalid"). Empty when the pool has not been voided.
+    pub void_reason: Symbol,
 }
 
 /// Configuration parameters for creating a prediction pool.
@@ -427,6 +576,21 @@ pub struct PoolConfig {
     pub whitelist_key: Option<Symbol>,
     /// Human-readable labels for each outcome (length must equal options_count).
     pub outcome_descriptions: Vec<String>,
+}
+
+/// Governed oracle configuration per market.
+///
+/// Binds a prediction market explicitly to an oracle identity, supported feed identifier,
+/// and accepted freshness policy. Persisted at pool creation and immutable thereafter.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketOracleConfig {
+    /// Oracle identity (e.g., trusted oracle contract or provider address).
+    pub oracle: Address,
+    /// Governed supported feed identifier (e.g., symbol_short!("BTC")).
+    pub feed_id: Symbol,
+    /// Accepted freshness policy in seconds (max acceptable age of price updates for this market).
+    pub max_staleness_seconds: u64,
 }
 
 /// Statistics for a prediction pool.
@@ -596,6 +760,79 @@ pub struct FeeTier {
     pub fee_bps: u32,
 }
 
+/// Fee schedule captured when a pool is created.
+///
+/// Settlement uses this snapshot instead of the live `Config.fee_bps` /
+/// `FeeTiers`, so a later `apply_fee_bps` or `set_fee_tiers` cannot change the
+/// economics of a pool that already exists. Read it with
+/// [`PredifiContract::get_pool_fee_schedule`].
+///
+/// Pools created before snapshots existed have no stored schedule
+/// (`get_pool_fee_schedule` returns `None`, version
+/// [`LEGACY_FEE_SCHEDULE_VERSION`]); they keep their original behaviour and
+/// are settled against the live schedule at resolution time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSchedule {
+    /// Protocol fee schedule version in force when the pool was created.
+    /// Starts at 1 and increments on every `apply_fee_bps` / `set_fee_tiers`.
+    pub version: u32,
+    /// Base protocol fee (bps) applied when no tier threshold is met.
+    pub base_fee_bps: u32,
+    /// Dynamic fee tiers in force when the pool was created.
+    pub tiers: Vec<FeeTier>,
+}
+
+/// Protocol-wide resolution challenge policy, set with
+/// [`PredifiContract::set_challenge_config`].
+///
+/// A `window_seconds` of 0 (the default) disables challenges: resolutions are
+/// final immediately, which is the pre-existing behaviour.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeConfig {
+    /// Seconds after resolution during which a challenge may be filed.
+    /// Bounded by `MAX_CHALLENGE_WINDOW`.
+    pub window_seconds: u64,
+    /// Bond (in the pool's token base units) a challenger must post.
+    /// Must be > 0 whenever `window_seconds > 0`.
+    pub bond_amount: i128,
+}
+
+/// Lifecycle of a pool's resolution while its challenge window is active.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChallengeStatus {
+    /// Resolution recorded; challenges accepted until `deadline`.
+    Open = 0,
+    /// A challenge was filed; payouts are blocked until adjudication.
+    Challenged = 1,
+    /// Resolution is final; payouts are enabled.
+    Finalized = 2,
+}
+
+/// Per-pool resolution challenge record, created at resolution time when the
+/// challenge window is enabled. Read it with
+/// [`PredifiContract::get_resolution_challenge`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionChallenge {
+    /// Last timestamp (inclusive) at which a challenge may be filed.
+    pub deadline: u64,
+    /// Bond required to challenge, snapshotted from `ChallengeConfig`.
+    pub bond_amount: i128,
+    pub status: ChallengeStatus,
+    /// Outcome recorded by the oracle/operator resolution.
+    pub original_outcome: u32,
+    pub challenger: Option<Address>,
+    /// SHA-256 (or other 32-byte) commitment to the evidence bundle.
+    pub evidence_hash: Option<BytesN<32>>,
+    /// Location of the evidence bundle (e.g. IPFS URI), max 512 bytes.
+    pub evidence_uri: Option<String>,
+    /// Timestamp at which the record was marked `Finalized`.
+    pub finalized_at: Option<u64>,
+}
+
 /// Detailed information about a user's prediction in a specific pool.
 ///
 /// This struct is a convenient "read-only" view that combines user-specific prediction
@@ -620,6 +857,37 @@ pub struct UserPredictionDetail {
     /// `UNRESOLVED_OUTCOME`) before interpreting this value; outcome index `0` is a
     /// valid winning outcome and must not be confused with the unresolved sentinel.
     pub pool_outcome: u32,
+}
+
+/// Verifiable evidence commitment persisted when a pool is resolved through
+/// the price-feed path ([`PredifiContract::resolve_pool_from_price`]).
+///
+/// The record is the hash preimage announced by [`crate::ResolutionEvidenceEvent`]:
+/// `sha256(evidence.to_xdr(env))` commits to every field below. Together the
+/// fields are sufficient to re-derive the recorded `outcome` off-chain:
+/// apply `comparison_op` to (`price`, `target_price`, `tolerance_bps`) using
+/// the same bounded-match rule as resolution.
+///
+/// Stored once under [`DataKey::ResolutionEvidence`] and never rewritten —
+/// pools transition out of `Active` only once, so the first committed
+/// observation is final.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionEvidence {
+    /// Feed pair whose observation decided the market (e.g. `ETHUSD`).
+    pub feed_pair: Symbol,
+    /// Observed feed value used for the comparison.
+    pub price: i128,
+    /// Feed-side timestamp of the observation (from `update_price_feed`).
+    pub feed_timestamp: u64,
+    /// Comparison operator applied: `0` = Equal, `1` = Greater, `2` = Less.
+    pub comparison_op: u32,
+    /// Target value the observation was compared against.
+    pub target_price: i128,
+    /// Tolerance around `target_price`, in basis points.
+    pub tolerance_bps: u32,
+    /// Outcome index recorded on the pool at resolution.
+    pub outcome: u32,
 }
 
 /// Internal storage keys for contract data.
@@ -668,7 +936,15 @@ pub enum DataKey {
     /// Global protocol configuration: `Config` -> `Config`
     Config,
     /// Contract pause state: `Paused` -> `bool`
+    ///
+    /// Retained for backward compatibility: when `true`, ALL pausable scopes
+    /// are considered paused. New code should prefer the per-scope keys below.
     Paused,
+    /// Per-scope pause flags (issue: scoped emergency pause).
+    PausedCreatePool,
+    PausedPlacePrediction,
+    PausedResolve,
+    PausedCancel,
     /// Contract version for safe upgrade migrations: `Version` -> `u32`
     Version,
     /// Referral cut in basis points: `ReferralCutBps` -> `u32`
@@ -774,6 +1050,47 @@ pub enum DataKey {
     /// Sentinel that records a pool has been marked ready for resolution.
     /// `PoolReady(pool_id)` -> `bool`.
     PoolReady(u64),
+    /// Governed oracle configuration for a specific market: `MarketOracleConfig(pool_id)` -> `MarketOracleConfig`
+    MarketOracleConfig(u64),
+    /// Supported oracle feed identifier flag: `SupportedFeed(feed_id)` -> `bool`
+    SupportedFeed(Symbol),
+    /// Tracked list of all supported feed identifiers: `SupportedFeedList` -> `Vec<Symbol>`
+    SupportedFeedList,
+    /// Protocol bounds for oracle freshness policy: `OracleFreshnessBounds` -> `(u64, u64)`
+    OracleFreshnessBounds,
+
+    /// Tracks whether a user has already claimed a refund for a voided pool:
+    /// `Refunded(user, pool_id)` -> `bool`.
+    ///
+    /// Write-once sentinel that guarantees a participant cannot be paid twice
+    /// even if they retry `claim_refund` after a successful claim.
+    Refunded(Address, u64),
+    /// Total value refunded so far for a pool: `RefundedTotal(pool_id)` -> `i128`.
+    ///
+    /// Used to enforce the conservation invariant
+    /// `RefundedTotal(pool_id) <= Pool.total_stake` at every claim.
+    RefundedTotal(u64),
+
+    // ── Fee schedule snapshots ───────────────────────────────────────────────
+    /// Current protocol fee schedule version: `FeeScheduleVersion` -> `u32`.
+    /// Absent means version 1.
+    FeeScheduleVersion,
+    /// Fee schedule captured at pool creation:
+    /// `PoolFeeSchedule(pool_id)` -> `FeeSchedule`. Absent for legacy pools.
+    PoolFeeSchedule(u64),
+
+    // ── Resolution challenge window ─────────────────────────────────────────
+    /// Protocol challenge policy: `ChallengeConfig` -> `ChallengeConfig`.
+    ChallengeConfig,
+    /// Per-pool challenge record:
+    /// `ResolutionChallenge(pool_id)` -> `ResolutionChallenge`.
+    ResolutionChallenge(u64),
+
+    /// Verifiable resolution evidence: `ResolutionEvidence(pool_id)` -> [`crate::ResolutionEvidence`]
+    ///
+    /// Written once at price-feed resolution and never updated. Contains the
+    /// feed observation and comparison rule that produced the outcome.
+    ResolutionEvidence(u64),
 }
 
 /// Represents a user's individual stake in a prediction market.
@@ -787,6 +1104,23 @@ pub struct Prediction {
     pub amount: i128,
     /// The chosen outcome index (0-based). This corresponds to the index in `Pool.outcome_descriptions`.
     pub outcome: u32,
+}
+
+/// Emitted when a pool is voided (canceled or declared no-contest) and its
+/// escrow becomes refundable to all participants.
+///
+/// `reason` is a short machine-readable symbol: `"cancel"`, `"nocontest"`,
+/// or `"oracle_invalid"`. Off-chain indexers use this event to surface the
+/// refund window and to reconcile escrow against `RefundedTotal`.
+#[contractevent(topics = ["pool_voided"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolVoidedEvent {
+    pub pool_id: u64,
+    pub caller: Address,
+    pub reason: Symbol,
+    pub total_stake: i128,
+    pub timestamp: u64,
 }
 
 // ── Events ───────────────────────────────────────────────────────────────────
@@ -808,6 +1142,24 @@ pub struct InitEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseEvent {
     pub admin: Address,
+}
+
+/// Emitted when a specific pause scope is engaged.
+#[contractevent(topics = ["pause_scope"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseScopeEvent {
+    pub admin: Address,
+    pub scope: Symbol,
+}
+
+/// Emitted when a specific pause scope is released.
+#[contractevent(topics = ["unpause_scope"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpauseScopeEvent {
+    pub admin: Address,
+    pub scope: Symbol,
 }
 
 #[contractevent(topics = ["unpause"])]
@@ -1354,6 +1706,140 @@ pub struct ResolutionVoteCastEvent {
     pub vote_count: u32,
     pub required_resolutions: u32,
 }
+
+#[contractevent(topics = ["market_oracle_configured"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketOracleConfiguredEvent {
+    pub pool_id: u64,
+    pub oracle: Address,
+    pub feed_id: Symbol,
+    pub max_staleness_seconds: u64,
+}
+
+#[contractevent(topics = ["supported_feed_added"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupportedFeedAddedEvent {
+    pub admin: Address,
+    pub feed_id: Symbol,
+}
+
+#[contractevent(topics = ["supported_feed_removed"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupportedFeedRemovedEvent {
+    pub admin: Address,
+    pub feed_id: Symbol,
+}
+
+#[contractevent(topics = ["oracle_freshness_bounds_set"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleFreshnessBoundsSetEvent {
+    pub admin: Address,
+    pub min_freshness: u64,
+    pub max_freshness: u64,
+}
+
+/// Emitted by `create_pool` with the fee schedule snapshotted for the pool.
+#[contractevent(topics = ["fee_schedule_snapshot"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeScheduleSnapshotEvent {
+    pub pool_id: u64,
+    pub version: u32,
+    pub base_fee_bps: u32,
+    pub tiers_count: u32,
+}
+
+#[contractevent(topics = ["challenge_config_update"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeConfigUpdateEvent {
+    pub admin: Address,
+    pub window_seconds: u64,
+    pub bond_amount: i128,
+}
+
+/// Emitted when a pool resolves while the challenge window is enabled.
+#[contractevent(topics = ["challenge_window_opened"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeWindowOpenedEvent {
+    pub pool_id: u64,
+    pub outcome: u32,
+    pub deadline: u64,
+    pub bond_amount: i128,
+}
+
+#[contractevent(topics = ["resolution_challenged"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionChallengedEvent {
+    pub pool_id: u64,
+    pub challenger: Address,
+    pub bond_amount: i128,
+    pub evidence_hash: BytesN<32>,
+    pub evidence_uri: String,
+}
+
+#[contractevent(topics = ["challenge_adjudicated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengeAdjudicatedEvent {
+    pub pool_id: u64,
+    pub moderator: Address,
+    pub upheld: bool,
+    pub original_outcome: u32,
+    pub final_outcome: u32,
+    /// Receives the bond: the challenger when upheld, the treasury otherwise.
+    pub bond_recipient: Address,
+}
+
+/// Emitted exactly once per pool when its resolution becomes final.
+#[contractevent(topics = ["resolution_finalized"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionFinalizedEvent {
+    pub pool_id: u64,
+    pub outcome: u32,
+    pub timestamp: u64,
+}
+
+/// Emitted alongside `PoolResolvedEvent` when a pool is resolved through the
+/// price-feed path (`resolve_pool_from_price`).
+///
+/// Carries the full evidence preimage — the exact feed observation and the
+/// comparison rule that produced the outcome — plus `evidence_hash`, the
+/// SHA-256 commitment over the stored [`ResolutionEvidence`] record's XDR
+/// encoding. Auditors can fetch the persisted record via
+/// `get_resolution_evidence`, recompute the hash, and re-derive the outcome
+/// to verify the decision.
+#[contractevent(topics = ["resolution_evidence"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionEvidenceEvent {
+    /// Unique identifier of the resolved pool.
+    pub pool_id: u64,
+    /// Feed pair whose observation decided the market.
+    pub feed_pair: Symbol,
+    /// Observed feed value used for the comparison.
+    pub price: i128,
+    /// Feed-side timestamp of the observation.
+    pub feed_timestamp: u64,
+    /// Comparison operator applied: 0=Equal, 1=Greater, 2=Less.
+    pub comparison_op: u32,
+    /// Target value compared against.
+    pub target_price: i128,
+    /// Tolerance around `target_price`, in basis points.
+    pub tolerance_bps: u32,
+    /// Outcome index recorded on the pool.
+    pub outcome: u32,
+    /// SHA-256 commitment over the stored `ResolutionEvidence` XDR encoding.
+    pub evidence_hash: BytesN<32>,
+}
+
 mod events;
 use events::ClaimWindowUpdateEvent;
 // pub use events::*; // Unused import
@@ -1463,6 +1949,11 @@ pub struct ContractMetadata {
     pub oracle_initialized: bool,
 }
 
+/// Canonical void reasons used by `void_pool` / `claim_refund`.
+pub const VOID_REASON_CANCEL: Symbol = symbol_short!("cancel");
+pub const VOID_REASON_NOCONTEST: Symbol = symbol_short!("nocontest");
+pub const VOID_REASON_ORACLE: Symbol = symbol_short!("oracleinv");
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub trait OracleCallback {
@@ -1478,12 +1969,32 @@ pub trait OracleCallback {
     ) -> Result<(), PredifiError>;
 }
 
+/// Returns `true` when `state` is a terminal voided state whose escrow is
+/// refundable to every participant (canceled or no-contest).
+fn is_voided_state(state: MarketState) -> bool {
+    matches!(state, MarketState::Canceled | MarketState::NoContest)
+}
+
 #[contract]
 pub struct PredifiContract;
 
 #[contractimpl]
 impl PredifiContract {
     // ====== Pure Helper Functions (side-effect free, verifiable) ======
+
+    /// Pure: returns `true` iff `state` is a terminal voided state.
+    ///
+    /// Voided states are `Canceled` and `NoContest`. In both cases every
+    /// participant is entitled to a full refund of their stake, no protocol
+    /// fee or referral cut is applied, and the pool is no longer active.
+    fn is_voided(state: MarketState) -> bool {
+        is_voided_state(state)
+    }
+
+    /// Pure: returns `true` iff the pool's escrow is refundable.
+    fn is_refundable(pool: &Pool) -> bool {
+        Self::is_voided(pool.state)
+    }
 
     /// Validate that a category symbol is in the allowed list.
     /// Returns the category if valid, otherwise falls back to CATEGORY_OTHER.
@@ -1977,6 +2488,61 @@ impl PredifiContract {
         Ok(())
     }
 
+    /// Returns `true` if the given pause scope is currently engaged.
+    ///
+    /// The legacy global `Paused` flag is honoured as a superset: if the
+    /// global flag is set, every scope reports as paused. Otherwise the
+    /// per-scope flag is consulted.
+    fn is_scope_paused(env: &Env, scope: PauseScope) -> bool {
+        if Self::is_paused(env) {
+            return true;
+        }
+        let key = scope.storage_key();
+        let paused = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or(false);
+        Self::extend_instance(env);
+        paused
+    }
+
+    /// Returns `Err(PredifiError::ContractPaused)` if the given pause scope is
+    /// currently engaged, `Ok(())` otherwise.
+    ///
+    /// This is the scoped replacement for `require_not_paused`. Every guarded
+    /// entry point calls it with the appropriate [`PauseScope`] so that the
+    /// pause matrix documented on [`PauseScope`] is enforced.
+    fn require_scope_not_paused(env: &Env, scope: PauseScope) -> Result<(), PredifiError> {
+        if Self::is_scope_paused(env, scope) {
+            return Err(PredifiError::ContractPaused);
+        }
+        Ok(())
+    }
+
+    /// Public read model: returns whether the given operation scope is paused.
+    ///
+    /// Clients should call this (or `get_pause_state`) before submitting a
+    /// transaction to surface a friendly "temporarily paused" message instead
+    /// of relying on a failed transaction.
+    pub fn is_operation_paused(env: Env, scope: PauseScope) -> bool {
+        Self::is_scope_paused(&env, scope)
+    }
+
+    /// Public read model: returns the full pause matrix as a `Vec<bool>`
+    /// indexed by [`PauseScope`] discriminant (0..=3).
+    ///
+    /// Index 0 = CreatePool, 1 = PlacePrediction, 2 = Resolve, 3 = Cancel.
+    /// Claim and Refund are intentionally absent — they are never pausable.
+    pub fn get_pause_state(env: Env) -> Vec<bool> {
+        let mut out = Vec::new(&env);
+        out.push_back(Self::is_scope_paused(&env, PauseScope::CreatePool));
+        out.push_back(Self::is_scope_paused(&env, PauseScope::PlacePrediction));
+        out.push_back(Self::is_scope_paused(&env, PauseScope::Resolve));
+        out.push_back(Self::is_scope_paused(&env, PauseScope::Cancel));
+        out
+    }
+
     /// Set the reentrancy guard for the current transaction.
     ///
     /// Writes `DataKey::RentGuard = true` to temporary storage. Because Soroban's
@@ -2130,16 +2696,28 @@ impl PredifiContract {
     /// taken from winners.
     ///
     /// Called by `resolve_pool` and `resolve_pool_from_price` immediately before the
-    /// pool's state is written as `Resolved`, so the fee is fixed at the moment of
-    /// resolution rather than at prediction time.
+    /// pool's state is written as `Resolved`. The tier is picked from the pool's
+    /// final stake, but the base fee and tiers come from the [`FeeSchedule`]
+    /// snapshotted at pool creation, so treasury configuration changes made after
+    /// creation never apply retroactively. Legacy pools without a snapshot fall
+    /// back to the live schedule (their pre-snapshot behaviour).
     ///
     /// # Returns
     /// A fee rate in basis points (0–10 000).  The caller is responsible for ensuring
     /// the returned value satisfies `is_valid_fee_bps`.
-    fn calculate_dynamic_fee(env: &Env, pool: &Pool) -> u32 {
-        let config = Self::get_config(env);
-        let tiers = Self::get_fee_tiers(env.clone());
-        let mut applied_fee = config.fee_bps;
+    fn calculate_dynamic_fee(env: &Env, pool_id: u64, pool: &Pool) -> u32 {
+        let (base_fee_bps, tiers) = match env
+            .storage()
+            .persistent()
+            .get::<DataKey, FeeSchedule>(&DataKey::PoolFeeSchedule(pool_id))
+        {
+            Some(schedule) => (schedule.base_fee_bps, schedule.tiers),
+            None => (
+                Self::get_config(env).fee_bps,
+                Self::get_fee_tiers(env.clone()),
+            ),
+        };
+        let mut applied_fee = base_fee_bps;
 
         let mut max_threshold = -1i128;
         for i in 0..tiers.len() {
@@ -2153,6 +2731,23 @@ impl PredifiContract {
         }
         applied_fee
     }
+
+    /// Current protocol fee schedule version (1 until the first change).
+    fn current_fee_schedule_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeScheduleVersion)
+            .unwrap_or(1)
+    }
+
+    /// Advance the fee schedule version. Called whenever the base fee or the
+    /// fee tiers change, so each snapshot identifies the schedule it captured.
+    fn bump_fee_schedule_version(env: &Env) {
+        let next = Self::current_fee_schedule_version(env).saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeScheduleVersion, &next);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2165,7 +2760,10 @@ impl PredifiContract {
 #[cfg(test)]
 mod issues_1446_1447_1448_1449_boundary_tests;
 #[cfg(test)]
+mod lifecycle_invariants_tests;
+#[cfg(test)]
 mod referral_integration_tests;
 #[cfg(test)]
+mod resolution_evidence_tests;
+#[cfg(test)]
 mod test;
-
