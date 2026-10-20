@@ -73,6 +73,7 @@ use tracing::{error, info, info_span, warn, Instrument};
 use uuid::Uuid;
 
 use crate::metrics::SharedMetrics;
+use crate::trace_propagation::{self, TRACEPARENT_HEADER};
 
 /// Requests that take longer than this threshold are logged at `WARN` level
 /// even when the status code indicates success.
@@ -217,6 +218,10 @@ where
             .map(|a| redact_address(&a))
             .unwrap_or_else(|| "anonymous".to_string());
         let pool_id = extract_pool_id(&path);
+        // Continue the W3C trace context from `traceparent`, or start a new
+        // (possibly unsampled) root when the client did not send one.
+        let trace_ctx = trace_propagation::from_headers_or_new(req.headers());
+        let traceparent_echo = trace_ctx.to_traceparent();
 
         let start = Instant::now();
         let metrics = self.metrics.clone();
@@ -231,72 +236,82 @@ where
             correlation_id = %correlation_id,
             user_address = %user_address,
             pool_id = pool_id.as_deref().unwrap_or(""),
+            trace_id = %trace_ctx.trace_id,
+            span_id = %trace_ctx.span_id,
+            sampled = trace_ctx.sampled,
         );
+        // Link the OTel span to the (possibly remote) parent so traces join
+        // upstream services when telemetry is enabled.
+        trace_ctx.set_as_parent(&span);
 
         let inner_future = self.inner.call(req);
 
-        Box::pin(
-            async move {
-                let result = inner_future.await;
-                let elapsed = start.elapsed();
-                let elapsed_ms = elapsed.as_millis();
+        let scoped = trace_propagation::scope(trace_ctx, async move {
+            let mut result = inner_future.await;
+            let elapsed = start.elapsed();
+            let elapsed_ms = elapsed.as_millis();
 
-                match &result {
-                    Ok(response) => {
-                        let status = response.status();
-                        let status_u16 = status.as_u16();
-                        let status_label = status_u16.to_string();
+            match &mut result {
+                Ok(response) => {
+                    let status = response.status();
+                    let status_u16 = status.as_u16();
+                    let status_label = status_u16.to_string();
 
-                        // Emit at WARN for slow requests or server errors.
-                        if status_u16 >= 500 {
-                            warn!(
-                                http.status_code = status_u16,
-                                http.duration_ms = elapsed_ms,
-                                "request complete with server error"
-                            );
-                        } else if elapsed_ms >= SLOW_REQUEST_THRESHOLD_MS {
-                            warn!(
-                                http.status_code = status_u16,
-                                http.duration_ms = elapsed_ms,
-                                "request complete (slow)"
-                            );
-                        } else {
-                            info!(
-                                http.status_code = status_u16,
-                                http.duration_ms = elapsed_ms,
-                                "request complete"
-                            );
-                        }
-
-                        if let Some(m) = &metrics {
-                            m.http_request_duration_seconds
-                                .with_label_values(&[&method, &path, &status_label])
-                                .observe(elapsed.as_secs_f64());
-                            m.http_requests_total
-                                .with_label_values(&[&method, &path, &status_label])
-                                .inc();
-                            if status_u16 >= 500 {
-                                m.http_server_errors_total.inc();
-                            }
-                        }
+                    // Echo the active trace context so clients and gateways
+                    // can join this service's trace.
+                    if let Ok(value) = http::HeaderValue::from_str(&traceparent_echo) {
+                        response.headers_mut().insert(TRACEPARENT_HEADER, value);
                     }
-                    Err(_) => {
-                        error!(
+
+                    // Emit at WARN for slow requests or server errors.
+                    if status_u16 >= 500 {
+                        warn!(
+                            http.status_code = status_u16,
                             http.duration_ms = elapsed_ms,
-                            "request failed with transport error"
+                            "request complete with server error"
                         );
-                        if let Some(m) = &metrics {
-                            m.http_request_duration_seconds
-                                .with_label_values(&[&method, &path, "error"])
-                                .observe(elapsed.as_secs_f64());
+                    } else if elapsed_ms >= SLOW_REQUEST_THRESHOLD_MS {
+                        warn!(
+                            http.status_code = status_u16,
+                            http.duration_ms = elapsed_ms,
+                            "request complete (slow)"
+                        );
+                    } else {
+                        info!(
+                            http.status_code = status_u16,
+                            http.duration_ms = elapsed_ms,
+                            "request complete"
+                        );
+                    }
+
+                    if let Some(m) = &metrics {
+                        m.http_request_duration_seconds
+                            .with_label_values(&[&method, &path, &status_label])
+                            .observe(elapsed.as_secs_f64());
+                        m.http_requests_total
+                            .with_label_values(&[&method, &path, &status_label])
+                            .inc();
+                        if status_u16 >= 500 {
+                            m.http_server_errors_total.inc();
                         }
                     }
                 }
-
-                result
+                Err(_) => {
+                    error!(
+                        http.duration_ms = elapsed_ms,
+                        "request failed with transport error"
+                    );
+                    if let Some(m) = &metrics {
+                        m.http_request_duration_seconds
+                            .with_label_values(&[&method, &path, "error"])
+                            .observe(elapsed.as_secs_f64());
+                    }
+                }
             }
-            .instrument(span),
-        )
+
+            result
+        });
+        Box::pin(scoped.instrument(span))
     }
 }
 

@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
+
+use crate::trace_propagation::{self, TraceContext};
 
 /// Default maximum delivery attempts before a job is dead-lettered.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
@@ -95,6 +97,10 @@ pub struct Job {
     pub attempts: u32,
     /// Optional ledger for diagnostics.
     pub ledger: Option<u64>,
+    /// W3C trace context of the request that produced this job, so the
+    /// worker can rejoin the originating trace when processing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_context: Option<TraceContext>,
 }
 
 /// Entry parked in the dead-letter queue after exhausting retries.
@@ -191,10 +197,17 @@ impl JobQueue {
     }
 
     /// Enqueue a job for (re)processing. No-ops if already processed.
-    pub fn enqueue(&self, job: Job) -> bool {
+    ///
+    /// When `job.trace_context` is `None` it is filled from the ambient
+    /// task-local context, so jobs created inside an HTTP request or worker
+    /// span automatically carry the originating trace.
+    pub fn enqueue(&self, mut job: Job) -> bool {
         if self.already_processed(&job.id) {
             info!(job_id = %job.id, kind = %job.kind, "skipping duplicate job (idempotent)");
             return false;
+        }
+        if job.trace_context.is_none() {
+            job.trace_context = trace_propagation::current();
         }
         self.inner
             .pending
@@ -352,6 +365,11 @@ impl JobQueue {
     }
 
     /// Run `handler` with retry/DLQ/idempotency semantics for a single job.
+    ///
+    /// The job's [`TraceContext`] (or the ambient task-local context) is
+    /// restored for the duration of processing so database and RPC work done
+    /// by the handler joins the originating trace, and a `worker.job` span
+    /// links the stages together.
     pub async fn process_with_retry<F, Fut>(&self, mut job: Job, handler: F) -> Result<(), String>
     where
         F: Fn(Job) -> Fut,
@@ -362,48 +380,73 @@ impl JobQueue {
             return Ok(());
         }
 
-        loop {
-            let delay = self.inner.policy.delay_before_attempt(job.attempts + 1);
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
+        let ctx = job
+            .trace_context
+            .clone()
+            .or_else(trace_propagation::current);
+        let span = tracing::info_span!(
+            "worker.job",
+            job_id = %job.id,
+            kind = %job.kind,
+            trace_id = %ctx.as_ref().map(|c| c.trace_id.as_str()).unwrap_or(""),
+            attempts = job.attempts as u64,
+            payload_preview = %trace_propagation::payload_preview(&job.payload),
+        );
+        if let Some(ctx) = &ctx {
+            ctx.set_as_parent(&span);
+        }
 
-            match handler(job.clone()).await {
-                Ok(()) => {
-                    self.record_success(&job);
-                    return Ok(());
+        // `Span` is `Clone`; the retry loop records updated attempt counts on a
+        // clone so the original remains available to `.instrument(span)` below.
+        let span_loop = span.clone();
+
+        let process = async move {
+            loop {
+                let delay = self.inner.policy.delay_before_attempt(job.attempts + 1);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
                 }
-                Err(e) => {
-                    job.attempts = job.attempts.saturating_add(1);
-                    if !self.inner.policy.should_retry(job.attempts) {
+                span_loop.record("attempts", job.attempts as u64);
+
+                match handler(job.clone()).await {
+                    Ok(()) => {
+                        self.record_success(&job);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        job.attempts = job.attempts.saturating_add(1);
+                        if !self.inner.policy.should_retry(job.attempts) {
+                            self.inner
+                                .last_failure_ms
+                                .store(unix_ms_now(), Ordering::Relaxed);
+                            self.inner
+                                .consecutive_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.push_dlq(DeadLetterEntry {
+                                job: job.clone(),
+                                last_error: e.clone(),
+                                failed_at_unix_ms: unix_ms_now(),
+                            });
+                            return Err(e);
+                        }
+                        warn!(
+                            job_id = %job.id,
+                            attempts = job.attempts,
+                            error = %e,
+                            "retrying job"
+                        );
                         self.inner
                             .last_failure_ms
                             .store(unix_ms_now(), Ordering::Relaxed);
                         self.inner
                             .consecutive_failures
                             .fetch_add(1, Ordering::Relaxed);
-                        self.push_dlq(DeadLetterEntry {
-                            job: job.clone(),
-                            last_error: e.clone(),
-                            failed_at_unix_ms: unix_ms_now(),
-                        });
-                        return Err(e);
                     }
-                    warn!(
-                        job_id = %job.id,
-                        attempts = job.attempts,
-                        error = %e,
-                        "retrying job"
-                    );
-                    self.inner
-                        .last_failure_ms
-                        .store(unix_ms_now(), Ordering::Relaxed);
-                    self.inner
-                        .consecutive_failures
-                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
-        }
+        };
+
+        trace_propagation::scope_optional(ctx, process.instrument(span)).await
     }
 }
 
@@ -707,6 +750,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: Some(1),
+            trace_context: None,
         };
         assert!(q.enqueue(job.clone()));
         q.mark_processed("evt-1");
@@ -727,6 +771,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: None,
+            trace_context: None,
         };
         q.record_failure(job.clone(), "boom");
         assert_eq!(q.dead_letters().len(), 0); // first failure → retry
@@ -750,6 +795,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: None,
+            trace_context: None,
         };
         q.record_failure(job, "fatal");
         assert_eq!(q.dead_letters().len(), 1);
@@ -768,6 +814,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: None,
+            trace_context: None,
         };
         q.record_success(&job);
         let h = q.health();
@@ -792,6 +839,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: None,
+            trace_context: None,
         };
         let result = q
             .process_with_retry(job, |_j| {
@@ -824,6 +872,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: None,
+            trace_context: None,
         };
         let result = q
             .process_with_retry(job, |_j| async { Err("always".into()) })

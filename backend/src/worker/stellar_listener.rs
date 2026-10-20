@@ -307,6 +307,8 @@ async fn process_event_batch(
                     .unwrap_or_default(),
                 attempts: 0,
                 ledger: Some(event.ledger),
+                // Chain-derived jobs have no originating HTTP trace to join.
+                trace_context: None,
             };
 
             if topic_matches("pool_created") {
@@ -377,6 +379,7 @@ async fn process_event_batch(
                             payload: String::new(),
                             attempts: 0,
                             ledger: None,
+                            trace_context: None,
                         },
                         e.to_string(),
                     );

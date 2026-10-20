@@ -30,6 +30,7 @@ pub mod session;
 pub mod shutdown;
 pub mod tags;
 pub mod telemetry;
+pub mod trace_propagation;
 pub mod tracing_context;
 pub mod validated_types;
 pub mod worker;
