@@ -6,6 +6,9 @@
 //! - Withdrawal by a non-admin fails with `Unauthorized`
 //! - Withdrawal of a non-whitelisted token (admin can withdraw any token)
 //! - Treasury balance consistency after multiple withdrawals
+//! - Treasury fee change timelock: proposal, delay boundaries, cap enforcement,
+//!   cancellation by authorized governance, and fee snapshot behavior for
+//!   existing pools.
 
 #![cfg(test)]
 
@@ -131,6 +134,12 @@ impl<'a> TreasuryTestEnv<'a> {
 
     fn treasury_balance(&self) -> i128 {
         self.token.balance(&self.treasury)
+    }
+
+    fn advance_time(&self, seconds: u64) {
+        self.env.ledger().with_mut(|li| {
+            li.timestamp += seconds;
+        });
     }
 }
 
@@ -495,4 +504,258 @@ fn test_1523_withdraw_i128_max_against_small_balance_fails() {
 
     assert_eq!(ctx.contract_balance(), 100);
     assert_eq!(ctx.treasury_balance(), 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1523 — Treasury fee change timelock, cap, cancellation, and snapshot tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The maximum fee cap must be enforced at proposal time. Any proposal that
+/// exceeds the configured maximum fee must be rejected with `InvalidAmount`.
+#[test]
+fn test_1523_propose_fee_change_above_cap_is_rejected() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000; // 10% in bps
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    let result = ctx.client.try_propose_treasury_fee(&ctx.admin, &(max_fee + 1));
+    assert_eq!(
+        result,
+        Err(Ok(PredifiError::InvalidAmount)),
+        "proposing a fee above the cap must return InvalidAmount"
+    );
+}
+
+/// A proposal at exactly the maximum fee cap must be accepted.
+#[test]
+fn test_1523_propose_fee_change_at_cap_is_accepted() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    ctx.client.propose_treasury_fee(&ctx.admin, &max_fee);
+
+    let pending = ctx.client.get_pending_treasury_fee();
+    assert_eq!(pending.fee_bps, max_fee);
+}
+
+/// Activation before the minimum delay has elapsed must fail with
+/// `TimelockNotElapsed`.
+#[test]
+fn test_1523_activate_before_delay_fails() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    ctx.client.propose_treasury_fee(&ctx.admin, &500u32);
+
+    // Advance less than the minimum delay.
+    ctx.advance_time(min_delay - 1);
+
+    let result = ctx.client.try_activate_treasury_fee(&ctx.admin);
+    assert_eq!(
+        result,
+        Err(Ok(PredifiError::TimelockNotElapsed)),
+        "activation before the delay must return TimelockNotElapsed"
+    );
+}
+
+/// Activation at exactly the minimum delay boundary must succeed.
+#[test]
+fn test_1523_activate_at_delay_boundary_succeeds() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    ctx.client.propose_treasury_fee(&ctx.admin, &500u32);
+
+    ctx.advance_time(min_delay);
+
+    ctx.client.activate_treasury_fee(&ctx.admin);
+    assert_eq!(ctx.client.get_treasury_fee(), 500u32);
+}
+
+/// Activation after the minimum delay has elapsed must succeed and update the
+/// active fee.
+#[test]
+fn test_1523_activate_after_delay_succeeds() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    ctx.client.propose_treasury_fee(&ctx.admin, &750u32);
+
+    ctx.advance_time(min_delay + 100);
+
+    ctx.client.activate_treasury_fee(&ctx.admin);
+    assert_eq!(ctx.client.get_treasury_fee(), 750u32);
+}
+
+/// A pending proposal can be cancelled by authorized governance before
+/// activation, and the active fee remains unchanged.
+#[test]
+fn test_1523_cancel_pending_fee_change_by_admin() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    let original_fee = ctx.client.get_treasury_fee();
+    ctx.client.propose_treasury_fee(&ctx.admin, &900u32);
+
+    ctx.client.cancel_treasury_fee(&ctx.admin);
+
+    // Even after the delay, activation must fail because the proposal was cancelled.
+    ctx.advance_time(min_delay + 100);
+    let result = ctx.client.try_activate_treasury_fee(&ctx.admin);
+    assert_eq!(
+        result,
+        Err(Ok(PredifiError::NoPendingFeeChange)),
+        "activation after cancellation must return NoPendingFeeChange"
+    );
+    assert_eq!(
+        ctx.client.get_treasury_fee(),
+        original_fee,
+        "active fee must remain unchanged after cancellation"
+    );
+}
+
+/// A non-admin caller must not be able to cancel a pending fee change.
+#[test]
+fn test_1523_cancel_pending_fee_change_by_non_admin_fails() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    ctx.client.propose_treasury_fee(&ctx.admin, &900u32);
+
+    let result = ctx.client.try_cancel_treasury_fee(&ctx.operator);
+    assert_eq!(
+        result,
+        Err(Ok(PredifiError::Unauthorized)),
+        "non-admin must not be able to cancel a pending fee change"
+    );
+}
+
+/// A non-admin caller must not be able to propose a fee change.
+#[test]
+fn test_1523_propose_fee_change_by_non_admin_fails() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    let result = ctx.client.try_propose_treasury_fee(&ctx.operator, &500u32);
+    assert_eq!(
+        result,
+        Err(Ok(PredifiError::Unauthorized)),
+        "non-admin must not be able to propose a fee change"
+    );
+}
+
+/// Existing pools must retain the fee that was active when they were created,
+/// even after a new fee is activated. This is the fee snapshot behavior.
+#[test]
+fn test_1523_existing_pool_keeps_fee_snapshot_after_change() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let max_fee: u32 = 1_000;
+    let min_delay: u64 = 3_600;
+    ctx.client
+        .set_treasury_fee_bounds(&ctx.admin, &max_fee, &min_delay);
+
+    let initial_fee = ctx.client.get_treasury_fee();
+
+    // Create a pool under the initial fee.
+    let pool_id = ctx.client.create_pool(
+        &ctx.admin,
+        &ctx.token_address,
+        &1_000i128,
+        &2u32,
+        &(env.ledger().timestamp() + 10_000),
+    );
+
+    let snapshot_before = ctx.client.get_pool_fee(&pool_id);
+    assert_eq!(
+        snapshot_before, initial_fee,
+        "pool must snapshot the fee active at creation time"
+    );
+
+    // Propose and activate a new fee.
+    ctx.client.propose_treasury_fee(&ctx.admin, &500u32);
+    ctx.advance_time(min_delay);
+    ctx.client.activate_treasury_fee(&ctx.admin);
+
+    assert_eq!(ctx.client.get_treasury_fee(), 500u32);
+
+    // The existing pool must still report its original snapshot.
+    let snapshot_after = ctx.client.get_pool_fee(&pool_id);
+    assert_eq!(
+        snapshot_after, initial_fee,
+        "existing pool must retain its original fee snapshot after a fee change"
+    );
+}
+
+/// Setting fee bounds must be restricted to authorized governance.
+#[test]
+fn test_1523_set_fee_bounds_by_non_admin_fails() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let result = ctx
+        .client
+        .try_set_treasury_fee_bounds(&ctx.operator, &1_000u32, &3_600u64);
+    assert_eq!(
+        result,
+        Err(Ok(PredifiError::Unauthorized)),
+        "non-admin must not be able to set fee bounds"
+    );
+}
+
+/// Setting a zero minimum delay must be rejected to preserve the timelock
+/// guarantee.
+#[test]
+fn test_1523_set_zero_min_delay_is_rejected() {
+    let env = Env::default();
+    let ctx = TreasuryTestEnv::new(&env);
+
+    let result = ctx
+        .client
+        .try_set_treasury_fee_bounds(&ctx.admin, &1_000u32, &0u64);
+    assert_eq!(
+        result,
+        Err(Ok(PredifiError::InvalidAmount)),
+        "zero minimum delay must be rejected"
+    );
 }

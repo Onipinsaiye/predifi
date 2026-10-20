@@ -1,6 +1,8 @@
 #[cfg(test)]
 extern crate std;
 #[cfg(test)]
+use crate::payouts::calculate_claim_payout_with_remainder;
+#[cfg(test)]
 use crate::payouts::{calculate_claim_payout, calculate_payout_pool, PayoutInput};
 #[cfg(test)]
 use crate::safe_math::{RoundingMode, SafeMath};
@@ -266,6 +268,81 @@ proptest! {
             total_claimed,
             total_stake
         );
+    }
+
+    /// Issue #1753 — deterministic remainder allocation invariant.
+    ///
+    /// The allocation invariant is: for any set of winners and any stake
+    /// distribution, the sum of all individual payouts plus an explicit
+    /// retained remainder equals the payout pool exactly.  The remainder is
+    /// the integer-division dust that cannot be attributed to any single
+    /// winner without breaking the "no winner receives more than their exact
+    /// proportional share" rule.  It is *retained* by the contract (not
+    /// distributed) so that the result is independent of claim order.
+    ///
+    /// This property test generates many participant counts and stake
+    /// distributions and asserts:
+    ///   sum(payouts) + retained_remainder == payout_pool
+    /// and that the retained remainder is strictly less than the number of
+    /// winners (the maximum possible dust from truncating integer division).
+    #[test]
+    fn prop_remainder_allocation_is_deterministic_and_exact(
+        winner_stakes in prop::collection::vec(1i128..=1_000_000_000i128, 1..50),
+        losing_stake in 0i128..=1_000_000_000i128,
+        fee_bps in 0..=10_000u32,
+    ) {
+        let winning_stake: i128 = winner_stakes.iter().sum();
+        let total_stake = winning_stake + losing_stake;
+
+        let payout_pool = calculate_payout_pool(total_stake, fee_bps as i128).unwrap();
+
+        let mut total_paid = 0i128;
+        let mut total_remainder = 0i128;
+        for &user_stake in winner_stakes.iter() {
+            let breakdown = calculate_claim_payout_with_remainder(&PayoutInput {
+                pool_total_stake: total_stake,
+                fee_bps: fee_bps as i128,
+                user_stake,
+                winning_stake,
+            }).unwrap();
+            total_paid += breakdown.winnings;
+            total_remainder += breakdown.retained_remainder;
+        }
+
+        // The allocation invariant: every token unit is accounted for.
+        prop_assert_eq!(
+            total_paid + total_remainder,
+            payout_pool,
+            "payouts ({}) + retained remainder ({}) != payout pool ({})",
+            total_paid,
+            total_remainder,
+            payout_pool
+        );
+
+        // The retained remainder is bounded by the number of winners, since
+        // each winner's truncation loses strictly less than 1 unit.
+        prop_assert!(
+            total_remainder < winner_stakes.len() as i128,
+            "retained remainder ({}) must be < number of winners ({})",
+            total_remainder,
+            winner_stakes.len()
+        );
+
+        // Determinism: recomputing in a different order yields the same totals.
+        let mut reversed_paid = 0i128;
+        let mut reversed_remainder = 0i128;
+        for &user_stake in winner_stakes.iter().rev() {
+            let breakdown = calculate_claim_payout_with_remainder(&PayoutInput {
+                pool_total_stake: total_stake,
+                fee_bps: fee_bps as i128,
+                user_stake,
+                winning_stake,
+            }).unwrap();
+            reversed_paid += breakdown.winnings;
+            reversed_remainder += breakdown.retained_remainder;
+        }
+        prop_assert_eq!(total_paid, reversed_paid);
+        prop_assert_eq!(total_remainder, reversed_remainder);
     }
 }
 

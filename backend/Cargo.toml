@@ -65,6 +65,14 @@ path = "tests/migration_roundtrip.rs"
 required-features = ["integration-tests"]
 
 [[test]]
+name = "shared_fixtures"
+path = "tests/shared_fixtures.rs"
+
+[[test]]
+name = "market_filter_performance"
+path = "tests/market_filter_performance.rs"
+
+[[test]]
 name = "migration_integration_suite"
 path = "tests/migration_integration_suite.rs"
 
