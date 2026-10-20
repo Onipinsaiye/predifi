@@ -1,6 +1,6 @@
 # OpenAPI Client Generation Guide
 
-This document provides instructions for generating SDKs from the PrediFi OpenAPI specification.
+This document provides instructions for generating SDKs from the PrediFi OpenAPI specification and for validating those clients against the live Axum handlers.
 
 ---
 
@@ -25,7 +25,7 @@ http://localhost:8000/api-docs/openapi.json
 We maintain client SDKs for the following languages:
 
 | Language | Repository | Status |
-|----------|-----------|--------|
+|----------|------------|-------|
 | TypeScript | `frontend/lib/api/generated.ts` | ✅ Maintained |
 | Python | `tools/python-client/` | 🔄 In progress |
 | Rust | `tools/rust-client/` | ⏳ Planned |
@@ -191,7 +191,7 @@ class PrediFiClient:
         return self._get('/api/v1/stats')
 
     def get_leaderboard(self, rank_by: Optional[str] = None) -> dict:
-        params = {'rank_by': rank_by}
+        params = {'rand_by': rank_by}
         return self._get('/api/v1/leaderboard', params)
 ```
 
@@ -241,15 +241,15 @@ impl PrediFiClient {
     }
 
     pub async fn health(&self) -> Result<HealthResponse, Box<dyn Error>> {
-        let url = format!("{}/health", self.base_url);
+        let url = format("{}/health", self.base_url);
         let response = self.client.get(&url).send().await?;
         Ok(response.json().await?)
     }
 
     pub async fn get_pools(&self, sort_by: Option<&str>) -> Result<serde_json::Value, Box<dyn Error>> {
-        let mut url = format!("{}/api/v1/pools", self.base_url);
+        let mut url = format("{}/api/v1/pools", self.base_url);
         if let Some(sort_by) = sort_by {
-            url.push_str(&format!("?sort_by={}", sort_by));
+            url.push_str(format("?sort_by={}", sort_by));
         }
         let response = self.client.get(&url).send().await?;
         Ok(response.json().await?)
@@ -266,7 +266,7 @@ impl PrediFiClient {
 1. Open Postman
 2. Click **Import**
 3. Drag/drop or select `openapi.json`
-4. Postman generates collections automatically
+Postman generates collections automatically
 
 ### Swagger UI
 
@@ -376,13 +376,56 @@ pip install openapi-spec-validator
 openapi-spec-validator https://api.predifi.com/api-docs/openapi.json
 ```
 
+### Generated-Client Contract Tests
+
+The contract suite validates the generated client against the live Axum handlers. It covers success responses, error responses, and optional fields.
+
+```bash
+# 1. Regenerate the TypeScript client from the checked-in spec
+npx openapi-typescript \
+  backend/openapi.json \
+  -o frontend/lib/api/generated.ts
+
+# 2. Fail if regeneration produced a diff (stale artifacts)
+git diff --exit-code -- frontend/lib/api/generated.ts
+
+# 3. Run the contract cases against the Axum handlers
+cargo test -p predifi-backend contract -- --nocapture
+
+# 4. Run the TypeScript contract tests against a live local server
+cargo run --package predifi-backend &  # starts on :8000
+npm run test:contract
+```
+
+The contract suite fails the build when a runtime response violates the published schema, including:
+
+- **Success responses** — every required field is present and correctly typed.
+- **Error responses** — 400/404/422/429 bodies match the `ErrorResponse` schema.
+- **Optional fields** — absent optional fields are tolerated, and present ones are type-checked.
+
 ### Test Generated Client
 
 ```bash
 # Run generated tests
 npm test
 # or
-yarn test
+ayarn test
+```
+
+### CI Enforcement
+
+The CI pipeline runs two gates on every pull request:
+
+1. **Clean-diff check** — regenerates the client in a clean workspace and fails if the committed artifact differs from the generated output.
+2. **Contract tests** — starts the Axum app and executes the contract cases, failing the build on any schema violation.
+
+```yaml
+- name: Validate generated API clients
+  run: |
+    npx openapi-typescript backend/openapi.json -o frontend/lib/api/generated.ts
+    git diff --exit-code -- frontend/lib/api/generated.ts
+    cargo test -p predifi-backend contract
+    npm run test:contract
 ```
 
 ---
@@ -390,9 +433,9 @@ yarn test
 ## API Documentation Links
 
 - **OpenAPI JSON**: `/api-docs/openapi.json`
-- **Swagger UI**: Available in development
-- **Postman Collection**: Available upon request
-- **TypeScript Definitions**: `frontend/lib/api/generated.ts`
+- **Swagger UI*: Available in development
+- **Postman Collection*: Available upon request
+- **TypeScript Definitions*: `frontend/lib/api/generated.ts`
 
 ---
 
@@ -431,6 +474,10 @@ async function retryRequest(fn, maxRetries = 3) {
 }
 ```
 
+#### 4. Contract test fails with a schema violation
+
+**Solution**: The runtime response diverged from the published schema. Update the handler or the `utoipa` schema in `backend/src/openapi.rs`, then regenerate the client and commit the resulting artifact.
+
 ---
 
 ## Contributing
@@ -440,8 +487,9 @@ When adding new API endpoints:
 1. Update `backend/src/openapi.rs` with the endpoint documentation
 2. Add schema definitions in `schemas`
 3. Add path definitions in `paths`
-4. Update the TypeScript client (`frontend/lib/api/`)
-5. Test the generated client
+4. Regenerate the TypeScript client (`frontend/lib/api/`) and commit the diff
+5. Add a contract case covering the new endpoint, including its error responses and optional fields
+6. Run the contract suite and clean-diff check locally before opening a pull request
 
 ---
 
@@ -450,7 +498,7 @@ When adding new API endpoints:
 - **API Documentation**: `/api-docs/openapi.json`
 - **Project Repository**: predifi/predifi
 - **Issues**: GitHub Issues
-- **Discord**:predifi Discord server
+- **Discord**: predifi Discord server
 
 ---
 

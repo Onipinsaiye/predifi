@@ -1,0 +1,126 @@
+name: Mutation Testing
+
+# Scoped mutation testing of security-critical accounting and authorization
+# logic (issue #128). Scope, test filters and the survivor gate live in
+# mutation-testing/run.py; see mutation-testing/README.md.
+#
+# Runtime is bounded two ways:
+#   * PRs only mutate lines changed in the PR (`--diff-base`): a handful of
+#     mutants, typically 5-15 min including the cold build.
+#   * Full baselines (push to main, weekly, manual) fan out one job per suite
+#     shard (~30 mutants each, ~2 min per predifi-contract mutant / 2 jobs),
+#     each hard-capped at 45 minutes.
+
+on:
+  pull_request:
+    paths:
+      - "contract/contracts/predifi-contract/src/payouts.rs"
+      - "contract/contracts/predifi-contract/src/safe_math.rs"
+      - "contract/contracts/predifi-contract/src/lib.rs"
+      - "contract/contracts/access-control/src/lib.rs"
+      - "backend/src/jwt.rs"
+      - "mutation-testing/**"
+      - ".github/workflows/mutation-testing.yml"
+  push:
+    branches: [main]
+    paths:
+      - "contract/contracts/predifi-contract/src/payouts.rs"
+      - "contract/contracts/predifi-contract/src/safe_math.rs"
+      - "contract/contracts/predifi-contract/src/lib.rs"
+      - "contract/contracts/access-control/src/lib.rs"
+      - "backend/src/jwt.rs"
+      - "mutation-testing/**"
+  schedule:
+    - cron: "0 3 * * 1" # weekly full baseline, Monday 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_MUTANTS_VERSION: "27.1.0"
+
+jobs:
+  diff:
+    name: Mutants on changed lines
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            contract
+            backend
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@${{ env.CARGO_MUTANTS_VERSION }}
+
+      - name: Run mutation tests on PR diff
+        run: python3 mutation-testing/run.py --diff-base "origin/${{ github.base_ref }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-pr-${{ github.event.pull_request.number }}
+          path: mutation-testing/out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  full:
+    name: Baseline ${{ matrix.suite }} ${{ matrix.shard }}
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suite: contract-math, shard: 0/4 }
+          - { suite: contract-math, shard: 1/4 }
+          - { suite: contract-math, shard: 2/4 }
+          - { suite: contract-math, shard: 3/4 }
+          - { suite: contract-guards, shard: 0/1 }
+          - { suite: access-control, shard: 0/1 }
+          - { suite: backend-jwt, shard: 0/1 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            contract
+            backend
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@${{ env.CARGO_MUTANTS_VERSION }}
+
+      - name: Run mutation tests
+        run: python3 mutation-testing/run.py --suite ${{ matrix.suite }} --shard ${{ matrix.shard }}
+
+      - name: Artifact name
+        id: name
+        run: echo "value=mutants-${{ matrix.suite }}-$(echo '${{ matrix.shard }}' | tr / -)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.name.outputs.value }}
+          path: mutation-testing/out/
+          if-no-files-found: ignore
+          retention-days: 30

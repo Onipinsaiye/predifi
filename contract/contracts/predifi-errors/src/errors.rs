@@ -17,6 +17,8 @@
 //! | 160 | `OracleError` | Oracle not set, invalid, or stale |
 //! | 161 | `ResolutionError` | Unauthorized or duplicate resolution attempt |
 //! | 180 | `AdminError` | Pause / upgrade / version error |
+//! | 181 | `UnsupportedSchemaVersion` | Deployed binary cannot migrate this on-chain schema |
+//! | 182 | `SchemaMigrationAlreadyRun` | Migration already applied; repeated call blocked |
 //! | 190 | `RateLimitOrSuspiciousActivity` | Possible spam or abuse detected |
 //!
 //! ### 🟡 MEDIUM — Alert within 15 minutes; user-impacting but not critical
@@ -39,7 +41,7 @@
 //! Horizon returns contract errors as `Error(Contract, #<code>)` in the
 //! transaction result XDR.  Match with:
 //! ```text
-//! Error\(Contract, #(10|11|120|121|122|160|161|180|190)\)
+//! Error\(Contract, #(10|11|120|121|122|160|161|180|181|182|190)\)
 //! ```
 //! to catch all HIGH-severity errors in a single regex rule.
 
@@ -49,10 +51,6 @@ use soroban_sdk::contracterror;
 /// The error type covers all cases across Predifi contracts.
 /// Gap-based numbering allows future error codes to be added without
 /// renumbering existing ones or breaking client-side mappings.
-///
-/// Note: Soroban limits the number of error variants to 32.
-/// This enum is optimized to stay within that limit while providing
-/// comprehensive error coverage through consolidated error variants.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -151,9 +149,20 @@ pub enum PrediFiError {
     /// Resolution error or unauthorized resolver.
     ResolutionError = 161,
 
-    // -- Emergency & Admin (180) -----------------------------------------------
+    // -- Emergency & Admin (180-182) -------------------------------------------
     /// Contract pause, emergency, version, or upgrade error.
     AdminError = 180,
+    /// The stored schema version is not supported by this contract binary.
+    /// Emitted when `migrate_state` is called on a contract whose on-chain
+    /// schema version is ahead of (or otherwise incompatible with) the binary
+    /// that is currently deployed.  The deployer must upgrade to a compatible
+    /// binary before calling `migrate_state`.
+    UnsupportedSchemaVersion = 181,
+    /// `migrate_state` was called but the on-chain schema version already
+    /// matches `CURRENT_SCHEMA_VERSION`, meaning the migration has already run
+    /// (or no migration is necessary).  This is a no-op guard to prevent
+    /// accidental repeated migrations from corrupting state.
+    SchemaMigrationAlreadyRun = 182,
 
     // -- Rate Limiting & Spam Prevention (190) ---------------------------------
     /// Rate limit exceeded, cooldown not elapsed, or suspicious activity.
@@ -202,7 +211,9 @@ impl PrediFiError {
             Self::StorageError | Self::ConsistencyError | Self::BalanceMismatch => "storage",
             Self::TokenError | Self::WithdrawalOrTreasuryError => "token",
             Self::OracleError | Self::ResolutionError => "oracle",
-            Self::AdminError => "admin",
+            Self::AdminError | Self::UnsupportedSchemaVersion | Self::SchemaMigrationAlreadyRun => {
+                "admin"
+            }
             Self::RateLimitOrSuspiciousActivity => "rate_limiting",
             Self::RequiredResolutionsExceedOperators => "pool_configuration",
         }
@@ -254,6 +265,8 @@ impl PrediFiError {
             Self::OracleError => "ORACLE_ERROR",
             Self::ResolutionError => "ORACLE_RESOLUTION_ERROR",
             Self::AdminError => "ADMIN_ERROR",
+            Self::UnsupportedSchemaVersion => "ADMIN_UNSUPPORTED_SCHEMA_VERSION",
+            Self::SchemaMigrationAlreadyRun => "ADMIN_SCHEMA_MIGRATION_ALREADY_RUN",
             Self::RateLimitOrSuspiciousActivity => "RATE_LIMIT_OR_SUSPICIOUS_ACTIVITY",
             Self::RequiredResolutionsExceedOperators => {
                 "POOL_REQUIRED_RESOLUTIONS_EXCEED_OPERATORS"
@@ -274,7 +287,9 @@ impl PrediFiError {
             | Self::BalanceMismatch
             | Self::RewardError
             | Self::StateError
-            | Self::AdminError => false,
+            | Self::AdminError
+            | Self::UnsupportedSchemaVersion
+            | Self::SchemaMigrationAlreadyRun => false,
             // Recoverable: user can fix by changing input or waiting
             _ => true,
         }
@@ -352,6 +367,12 @@ impl PrediFiError {
 
             // Emergency & Admin
             Self::AdminError => "Administrative operation failed (pause/emergency/version/upgrade)",
+            Self::UnsupportedSchemaVersion => {
+                "On-chain schema version is not supported by this contract binary; deploy a compatible binary before migrating"
+            }
+            Self::SchemaMigrationAlreadyRun => {
+                "Schema migration has already run for this version; call migrate_state only once per upgrade"
+            }
 
             // Rate Limiting & Spam Prevention
             Self::RateLimitOrSuspiciousActivity => "Rate limit exceeded, cooldown active, or suspicious activity detected",
@@ -448,6 +469,8 @@ mod tests {
             PrediFiError::OracleError,
             PrediFiError::ResolutionError,
             PrediFiError::AdminError,
+            PrediFiError::UnsupportedSchemaVersion,
+            PrediFiError::SchemaMigrationAlreadyRun,
             PrediFiError::RateLimitOrSuspiciousActivity,
             PrediFiError::RequiredResolutionsExceedOperators,
         ];
@@ -800,6 +823,26 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_schema_version() {
+        let e = PrediFiError::UnsupportedSchemaVersion;
+        assert_eq!(e.code(), 181);
+        assert_eq!(e.category(), "admin");
+        assert_eq!(e.label(), "ADMIN_UNSUPPORTED_SCHEMA_VERSION");
+        assert!(!e.is_recoverable());
+        assert!(e.as_str().contains("schema"));
+    }
+
+    #[test]
+    fn schema_migration_already_run() {
+        let e = PrediFiError::SchemaMigrationAlreadyRun;
+        assert_eq!(e.code(), 182);
+        assert_eq!(e.category(), "admin");
+        assert_eq!(e.label(), "ADMIN_SCHEMA_MIGRATION_ALREADY_RUN");
+        assert!(!e.is_recoverable());
+        assert!(e.as_str().contains("migration"));
+    }
+
+    #[test]
     fn rate_limit_or_suspicious_activity() {
         let e = PrediFiError::RateLimitOrSuspiciousActivity;
         assert_eq!(e.code(), 190);
@@ -864,6 +907,8 @@ mod tests {
             PrediFiError::OracleError,
             PrediFiError::ResolutionError,
             PrediFiError::AdminError,
+            PrediFiError::UnsupportedSchemaVersion,
+            PrediFiError::SchemaMigrationAlreadyRun,
             PrediFiError::RateLimitOrSuspiciousActivity,
             PrediFiError::RequiredResolutionsExceedOperators,
         ];

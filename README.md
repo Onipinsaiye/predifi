@@ -138,7 +138,30 @@ Built with **Next.js**, **Tailwind CSS**, and **TypeScript**
 
 ## 🚀 Development
 
-### Prerequisites
+### ⚡ One-Command Full-Stack Environment (Docker)
+
+Start the Axum backend, Next.js frontend, PostgreSQL, Redis, and local Stellar network with a single command:
+
+```bash
+docker compose up
+```
+
+| Service | Local URL / Port | Description |
+| :--- | :--- | :--- |
+| **Frontend** | [http://localhost:3001](http://localhost:3001) | Next.js prediction market UI with hot reload |
+| **Backend API** | [http://localhost:3000](http://localhost:3000) | Axum REST & WebSocket API, `/health` endpoint |
+| **PostgreSQL** | `localhost:5432` | Database (`predifi`), automatically migrated and seeded |
+| **Redis** | `localhost:6379` | Cache & rate limiting |
+| **Stellar / Soroban** | [http://localhost:8000](http://localhost:8000) | Standalone local network & Soroban RPC (`/rpc`) |
+
+> 📖 **Complete Dev Guide:** See [docs/local-development.md](./docs/local-development.md) for health checks, port mapping, seeded accounts, workflows, and teardown.
+> 🔐 **Environment Variables:** See [docs/environment-variables.md](./docs/environment-variables.md) for full configuration reference.
+
+---
+
+### Manual / Component Development
+
+#### Prerequisites
 
 * Rust → https://www.rust-lang.org/tools/install
 * Soroban CLI → https://soroban.stellar.org/docs/getting-started/setup

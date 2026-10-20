@@ -17,7 +17,7 @@
  * the local backend default so the dashboard works out of the box in dev.
  */
 export const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
 
 /** WebSocket base derived from the HTTP API base. */
 export function wsBaseUrl(): string {
@@ -163,6 +163,37 @@ export async function fetchWithTimeout(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/** Type guard to validate PoolsResponse shape. */
+function isPoolsResponse(obj: unknown): obj is PoolsResponse {
+  if (!obj || typeof obj !== "object") return false;
+  const response = obj as Record<string, unknown>;
+  return (
+    Array.isArray(response.pools) &&
+    response.pools.every((p: unknown) => {
+      if (!p || typeof p !== "object") return false;
+      const pool = p as Record<string, unknown>;
+      return (
+        typeof pool.pool_id === "number" &&
+        typeof pool.name === "string" &&
+        typeof pool.category === "string" &&
+        Array.isArray(pool.tags) &&
+        typeof pool.total_stake === "number" &&
+        typeof pool.end_time === "number" &&
+        typeof pool.created_at === "string" &&
+        typeof pool.state === "string" &&
+        typeof pool.creator === "string" &&
+        typeof pool.token === "string" &&
+        (pool.result === null || typeof pool.result === "string")
+      );
+    }) &&
+    typeof response.total === "number" &&
+    typeof response.limit === "number" &&
+    typeof response.offset === "number" &&
+    typeof response.status === "string" &&
+    typeof response.sort_by === "string"
+  );
 }
 
 /**

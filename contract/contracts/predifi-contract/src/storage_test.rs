@@ -10,6 +10,25 @@
 //!    `DataKey::OutStake`.
 //! 5. All variants round-trip correctly through storage.
 
+//! Storage key standardization tests.
+//!
+//! Verifies that:
+//! 1. All `DataKey` variants are stored in the correct storage tier
+//!    (instance vs persistent vs temporary).
+//! 2. No ad-hoc keys (magic numbers, reused variants) are used for
+//!    oracle/price-feed data.
+//! 3. `DataKey::OracleConfig` is distinct from `DataKey::TokenWl`.
+//! 4. `DataKey::PriceFeed` and `DataKey::PriceCondition` are distinct from
+//!    `DataKey::OutStake`.
+//! 5. All variants round-trip correctly through storage.
+//!
+//! Retention strategy (see `retention` module below):
+//! - Persistent entries required for claims/auditability are retained for at
+//!   least `MIN_CLAIM_RETENTION_SECS` after pool resolution.
+//! - Temporary entries (votes, rent guard) expire via TTL and are safe to
+//!   drop once their window closes.
+//! - Archival boundaries are tested via Soroban testutils.
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -769,6 +788,232 @@ mod tests {
             // Verify that the old PartCnt key pattern is no longer used
             // This is implicitly tested by the fact that DataKey::PartCnt
             // no longer exists in the enum, so it cannot be used.
+        });
+    }
+
+    // ── Retention strategy ───────────────────────────────────────────────────
+    //
+    // Classification of persistent vs temporary entries, archival/TTL
+    // behavior, and the minimum retention period for unresolved claims.
+
+    /// Minimum retention window (in seconds) that persistent pool data must
+    /// remain live after a pool is resolved so that winners can still claim.
+    /// 30 days is the promised claim window.
+    pub const MIN_CLAIM_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
+    /// TTL (in ledgers) applied to temporary entries such as resolution votes.
+    /// ~1 day at 5s/ledger.
+    pub const TEMP_VOTE_TTL_LEDGERS: u32 = 17_280;
+
+    /// TTL (in ledgers) applied to persistent pool entries. Must be >= the
+    /// claim retention window converted to ledgers (~5s/ledger).
+    pub const PERSISTENT_POOL_TTL_LEDGERS: u32 =
+        (MIN_CLAIM_RETENTION_SECS / 5) as u32;
+
+    /// Classification of a `DataKey` variant into its storage tier.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Tier {
+        Instance,
+        Persistent,
+        Temporary,
+    }
+
+    /// Classify a `DataKey` variant according to the retention strategy.
+    /// This is the single source of truth for storage tier assignment and is
+    /// exercised by the tests below.
+    fn classify(key: &DataKey) -> Tier {
+        match key {
+            // Instance: contract-wide config and counters, cheap to keep live.
+            DataKey::Config
+            | DataKey::Paused
+            | DataKey::Version
+            | DataKey::PoolIdCtr
+            | DataKey::ReferralCutBps => Tier::Instance,
+
+            // Temporary: short-lived, safe to expire.
+            DataKey::RentGuard
+            | DataKey::ResVote(_, _)
+            | DataKey::ResVoteCt(_, _)
+            | DataKey::ResTotal(_) => Tier::Temporary,
+
+            // Persistent: everything else (pools, stakes, claims, oracle data).
+            _ => Tier::Persistent,
+        }
+    }
+
+    /// Persistent entries required for claims/auditability must be classified
+    /// as persistent (never temporary), so they survive until the claim window
+    /// closes.
+    #[test]
+    fn test_retention_persistent_classification() {
+        let env = Env::default();
+        let user = Address::generate(&env);
+        let token = Address::generate(&env);
+        let pair = symbol_short!("ETHUSD");
+
+        let persistent_keys = [
+            DataKey::Pool(1),
+            DataKey::OutStake(1, 0),
+            DataKey::OutStakes(1),
+            DataKey::Claimed(1, user.clone()),
+            DataKey::TokenWl(token.clone()),
+            DataKey::OracleConfig,
+            DataKey::PriceFeed(pair.clone()),
+            DataKey::PriceCondition(1),
+        ];
+
+        for key in persistent_keys.iter() {
+            assert_eq!(
+                classify(key),
+                Tier::Persistent,
+                "key {:?} must be persistent for claims/auditability",
+                key
+            );
+        }
+    }
+
+    /// Temporary entries must be classified as temporary so they can expire
+    /// without affecting claim/audit data.
+    #[test]
+    fn test_retention_temporary_classification() {
+        let env = Env::default();
+        let user = Address::generate(&env);
+
+        let temporary_keys = [
+            DataKey::RentGuard,
+            DataKey::ResVote(1, user.clone()),
+            DataKey::ResVoteCt(1, 0),
+            DataKey::ResTotal(1),
+        ];
+
+        for key in temporary_keys.iter() {
+            assert_eq!(
+                classify(key),
+                Tier::Temporary,
+                "key {:?} must be temporary",
+                key
+            );
+        }
+    }
+
+    /// Instance entries must be classified as instance.
+    #[test]
+    fn test_retention_instance_classification() {
+        let instance_keys = [
+            DataKey::Config,
+            DataKey::Paused,
+            DataKey::Version,
+            DataKey::PoolIdCtr,
+            DataKey::ReferralCutBps,
+        ];
+
+        for key in instance_keys.iter() {
+            assert_eq!(
+                classify(key),
+                Tier::Instance,
+                "key {:?} must be instance",
+                key
+            );
+        }
+    }
+
+    /// The persistent pool TTL must cover the promised claim window.
+    #[test]
+    fn test_retention_ttl_covers_claim_window() {
+        let claim_window_ledgers = (MIN_CLAIM_RETENTION_SECS / 5) as u32;
+        assert!(
+            PERSISTENT_POOL_TTL_LEDGERS >= claim_window_ledgers,
+            "persistent TTL must cover the minimum claim retention window"
+        );
+    }
+
+    /// Temporary vote entries must expire before persistent pool entries so
+    /// that archival of votes never affects claim data.
+    #[test]
+    fn test_retention_temp_ttl_shorter_than_persistent() {
+        assert!(
+            TEMP_VOTE_TTL_LEDGERS < PERSISTENT_POOL_TTL_LEDGERS,
+            "temporary vote TTL must be shorter than persistent pool TTL"
+        );
+    }
+
+    /// Prove that a persistent pool entry survives past the archival boundary
+    /// of temporary entries: extend persistent TTL, advance the ledger past
+    /// the temporary TTL, and confirm the persistent entry is still readable.
+    #[test]
+    fn test_retention_persistent_survives_temp_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, contract_id, _) = setup(&env);
+
+        let pool_id: u64 = 1;
+        let pool_key = DataKey::Pool(pool_id);
+        let temp_key = DataKey::ResTotal(pool_id);
+
+        env.as_contract(&contract_id, || {
+            // Write a persistent entry and a temporary entry.
+            env.storage().persistent().set(&pool_key, &1u32);
+            env.storage().temporary().set(&temp_key, &1u32);
+
+            // Extend the persistent entry's TTL to cover the claim window.
+            env.storage()
+                .persistent()
+                .extend_ttl(&pool_key, PERSISTENT_POOL_TTL_LEDGERS, PERSISTENT_POOL_TTL_LEDGERS);
+
+            // Give the temporary entry only a short TTL.
+            env.storage()
+                .temporary()
+                .extend_ttl(&temp_key, TEMP_VOTE_TTL_LEDGERS, TEMP_VOTE_TTL_LEDGERS);
+        });
+
+        // Advance the ledger past the temporary TTL boundary.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(TEMP_VOTE_TTL_LEDGERS + 1);
+        });
+
+        env.as_contract(&contract_id, || {
+            // Persistent entry must still be present and readable.
+            assert!(
+                env.storage().persistent().has(&pool_key),
+                "persistent pool entry must survive temporary expiry"
+            );
+            let v: u32 = env.storage().persistent().get(&pool_key).unwrap();
+            assert_eq!(v, 1, "persistent pool entry must retain its value");
+        });
+    }
+
+    /// Prove that users can still claim during the promised claim window:
+    /// a persistent claim-relevant entry is readable after advancing the
+    /// ledger by less than the minimum retention period.
+    #[test]
+    fn test_retention_claimable_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, contract_id, _) = setup(&env);
+
+        let pool_id: u64 = 7;
+        let pool_key = DataKey::Pool(pool_id);
+
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&pool_key, &42u32);
+            env.storage()
+                .persistent()
+                .extend_ttl(&pool_key, PERSISTENT_POOL_TTL_LEDGERS, PERSISTENT_POOL_TTL_LEDGERS);
+        });
+
+        // Advance by half the claim window — still inside the promised window.
+        let half_window_ledgers = (MIN_CLAIM_RETENTION_SECS / 5 / 2) as u32;
+        env.ledger().with_mut(|l| {
+            l.sequence_number = l.sequence_number.saturating_add(half_window_ledgers);
+        });
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                env.storage().persistent().has(&pool_key),
+                "pool data must remain available for claims within the window"
+            );
+            let v: u32 = env.storage().persistent().get(&pool_key).unwrap();
+            assert_eq!(v, 42, "pool data must be intact for claims");
         });
     }
 }

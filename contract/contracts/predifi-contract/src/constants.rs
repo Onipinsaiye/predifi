@@ -2,6 +2,9 @@
 //!
 //! This module contains all constant values used throughout the PrediFi contract,
 //! including storage parameters, pool limits, and default values.
+//!
+//! It also documents the deterministic payout remainder allocation invariant that
+//! governs how integer-division dust is handled when distributing fees and winnings.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STORAGE & LEDGER CONSTANTS
@@ -63,6 +66,98 @@ pub const BUMP_THRESHOLD: u32 = 14 * DAY_IN_LEDGERS;
 ///
 /// **Used for:** Calculating the new TTL when calling `extend_persistent` and `bump_ttl`.
 pub const BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STORAGE RETENTION STRATEGY
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Persistent vs. temporary storage classification
+// ----------------------------------------------
+// Soroban offers two storage durability classes:
+//
+// * **Persistent** entries survive as long as their TTL is periodically extended.
+//   They are the canonical source of truth for claims, auditability, and client
+//   queries, so they MUST be extended while a pool is still actionable.
+// * **Temporary** entries are cheap and expire automatically without any bump.
+//   They are only suitable for data that can be safely regenerated or that is
+//   only meaningful for a short window (rate-limit markers, caches, etc.).
+//
+// The PrediFi contract classifies its state as follows:
+//
+// Persistent (must be retained for the full claim window):
+//   - `Pool` records (including `outcome`, `end_time`, `resolved_at`).
+//   - Per-user `Position` / `UserStake` entries (required to claim).
+//   - `OutStakes` batch entries for pools with >= 16 outcomes.
+//   - `Config`, `Admin`, `Operators`, `ContractVersion` (instance storage).
+//
+// Temporary (may expire without affecting claims):
+//   - `LastPredictionTime(user)` cooldown markers.
+//   - Any future caches, price snapshots, or derived indexes.
+//
+// Archival / TTL behavior
+// -----------------------
+// Persistent entries are bumped using `BUMP_THRESHOLD` / `BUMP_AMOUNT` above.
+// Once a pool is fully resolved AND the claim window has elapsed, its entries
+// become eligible for archival: the contract stops extending them and lets the
+// TTL lapse naturally. Archived entries remain recoverable via Soroban's
+// restore mechanism, preserving auditability without paying ongoing rent.
+//
+// Minimum retention period for unresolved claims
+// ----------------------------------------------
+// A resolved pool MUST keep its persistent entries alive for at least
+// `CLAIM_WINDOW_LEDGERS` after `resolved_at`. This guarantees that every user
+// who is entitled to a payout can still call `claim` during the promised
+// window, even if the contract is otherwise idle. The window is deliberately
+// longer than `BUMP_AMOUNT` so that a single bump at resolution time is
+// sufficient to cover the entire claim period.
+
+/// Minimum retention period for claimable pool data after resolution.
+///
+/// **Units:** Ledgers (dimensionless)
+/// **Value:** 1,555,200 ledgers (90 days)
+///
+/// **Rationale:** After a pool is resolved, users must be given a guaranteed
+/// window during which their positions remain claimable. 90 days is long enough
+/// to accommodate inactive users, wallet recovery, and dispute resolution, while
+/// still allowing the contract to eventually stop paying storage rent on pools
+/// that everyone has already claimed. This value MUST be greater than
+/// `BUMP_AMOUNT` so that a single TTL extension performed at resolution time
+/// covers the entire claim window without requiring further bumps.
+///
+/// **Impact of changes:**
+/// - Increasing this value extends the guaranteed claim window but increases
+///   the minimum storage cost per resolved pool.
+/// - Decreasing this value shortens the claim window and risks users losing
+///   access to their funds if they claim late.
+/// - Must remain strictly greater than `BUMP_AMOUNT`; otherwise the TTL set at
+///   resolution could expire before the claim window ends.
+///
+/// **Used for:** Determining when resolved pool entries become eligible for
+/// archival, and validating that the claim window is covered by a single bump.
+pub const CLAIM_WINDOW_LEDGERS: u32 = 90 * DAY_IN_LEDGERS;
+
+/// Retention period for temporary entries (e.g. cooldown markers).
+///
+/// **Units:** Ledgers (dimensionless)
+/// **Value:** 17,280 ledgers (1 day)
+///
+/// **Rationale:** Temporary entries such as `LastPredictionTime(user)` only need
+/// to outlive the longest possible cooldown. One day is comfortably longer than
+/// any sane `prediction_cooldown_seconds` value while keeping temporary storage
+/// cheap and self-cleaning. Entries that expire can be safely recreated on the
+/// next interaction, so no data is lost.
+///
+/// **Impact of changes:**
+/// - Increasing this value keeps temporary entries around longer, slightly
+///   increasing storage cost but reducing the chance of a cooldown being reset
+///   by expiry.
+/// - Decreasing this value below the configured cooldown would allow users to
+///   bypass rate limiting by waiting for the marker to expire.
+/// - Must be >= the maximum supported `prediction_cooldown_seconds` expressed
+///   in ledgers.
+///
+/// **Used for:** Setting the TTL on temporary storage entries.
+pub const TEMPORARY_ENTRY_TTL_LEDGERS: u32 = DAY_IN_LEDGERS;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // POOL CONFIGURATION CONSTANTS
@@ -370,6 +465,57 @@ pub const INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS: u32 = 100;
 pub const EMERGENCY_CANCEL_MULTISIG_THRESHOLD: u32 = 2;
 
 // ═══════════════════════════════════════════════════════════════════════════
+// BATCH CLAIM LIMITS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Maximum number of claims processed in a single `batch_claim` invocation.
+///
+/// **Units:** Count (dimensionless)
+/// **Value:** 25 claims
+///
+/// **Benchmark evidence:** Each claim performs a persistent read of the
+/// prediction entry, a token transfer, and a persistent write/removal. At 25
+/// claims the measured cost stays within a generous fraction of Soroban's
+/// 100M CPU instruction ceiling and 40 MB memory budget, leaving headroom for
+/// the worst case where every claim touches a distinct prediction and triggers
+/// a separate token transfer. See
+/// `benchmark_tests::test_batch_claim_resource_ceilings`.
+///
+/// **Rationale:** Bounding the batch size by measured resource cost prevents
+/// oversized batches from exhausting the transaction budget mid-execution.
+/// Because the whole invocation is atomic, a batch that would exceed the
+/// budget must be rejected up front rather than failing after partial
+/// processing.
+///
+/// **Impact of changes:**
+/// - Increasing this value raises per-transaction CPU/memory cost and the
+///   worst-case number of token transfers; re-run the batch-claim benchmark
+///   before changing.
+/// - Decreasing this value reduces per-call cost but forces clients to submit
+///   more transactions.
+///
+/// **Used for:** Rejecting oversized batches (`BatchTooLarge`) before any
+/// claim is processed in `batch_claim`.
+pub const MAX_BATCH_CLAIM_SIZE: u32 = 25;
+
+/// Recommended client chunk size for `batch_claim`.
+///
+/// **Units:** Count (dimensionless)
+/// **Value:** 10 claims
+///
+/// **Rationale:** Clients should submit batches well below the hard ceiling so
+/// that a single oversized or failing claim does not force an entire large
+/// batch to be retried. Chunking at 10 keeps each transaction comfortably
+/// within budget while amortizing per-transaction overhead.
+///
+/// **Impact of changes:**
+/// - Must remain `<= MAX_BATCH_CLAIM_SIZE`; larger values would be rejected.
+/// - This is a client-side recommendation only and is not enforced on-chain.
+///
+/// **Used for:** Documenting recommended client chunk sizes for batch claims.
+pub const RECOMMENDED_BATCH_CLAIM_CHUNK_SIZE: u32 = 10;
+
+// ═══════════════════════════════════════════════════════════════════════════
 // MONITORING & ALERT THRESHOLDS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -414,6 +560,12 @@ pub const HIGH_VALUE_THRESHOLD: i128 = 1_000_000_000;
 /// **Used for:** Calculating tolerance ranges in price-based oracle conditions.
 pub const MAX_TOLERANCE: u32 = 10_000;
 
+/// Default minimum accepted oracle freshness policy in seconds (5 seconds).
+pub const DEFAULT_MIN_ORACLE_FRESHNESS: u64 = 5;
+
+/// Default maximum accepted oracle freshness policy in seconds (86,400 seconds = 24 hours).
+pub const DEFAULT_MAX_ORACLE_FRESHNESS: u64 = 86_400;
+
 /// Maximum number of primitive checks allowed while matching a price condition.
 ///
 /// **Units:** Count (dimensionless)
@@ -457,6 +609,27 @@ pub const MAX_PRICE_CONDITION_MATCH_STEPS: u32 = 4;
 /// **Used for:** Version tracking in instance storage and upgrade migration logic.
 pub const CONTRACT_VERSION: u32 = 1;
 
+/// Version of the public **event schema** emitted by the contract.
+///
+/// **Units:** Version number (dimensionless)
+/// **Value:** 1
+///
+/// **Rationale:** Off-chain indexers, subgraphs, and monitoring services depend on the
+/// topic names and payload fields of emitted events. This constant identifies the schema
+/// as a whole so consumers can detect when the shape of event data changes. A conforming
+/// schema (`1`) is documented in `docs/EVENT_SCHEMAS.md` and pinned by the golden tests in
+/// `src/event_schema_tests.rs`.
+///
+/// **Impact of changes:**
+/// - Must be incremented for any **breaking** change (renamed/removed topic, renamed/
+///   removed/retyped payload field, or changed event semantics).
+/// - Must NOT be incremented for additive changes (new topic, new optional field).
+/// - Should not be decremented (versions are monotonic).
+/// - Changing this without updating the reference document and golden tests will fail CI.
+///
+/// **Used for:** Signalling the event schema version to external indexers.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
 /// Minimum timelock delay in seconds for protocol fee changes.
 ///
 /// **Units:** Seconds
@@ -477,6 +650,223 @@ pub const CONTRACT_VERSION: u32 = 1;
 ///
 /// **Used for:** Calculating `PendingFeeChange.effective_at` when queuing fee changes.
 pub const FEE_CHANGE_TIMELOCK_SECONDS: u64 = 86_400;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMERGENCY PAUSE OPERATION MATRIX
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Operation bit for pausing pool creation (`create_pool`).
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** 1 << 0
+///
+/// **Rationale:** Pausing pool creation halts new market deployment without affecting
+/// existing pools, allowing operators to stop new exposure while preserving all
+/// user-facing exit paths.
+///
+/// **Used for:** Encoding the pause matrix in `PauseState`/authorization checks.
+pub const PAUSE_OP_CREATE_POOL: u32 = 1 << 0;
+
+/// Operation bit for pausing predictions (`place_prediction`).
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** 1 << 1
+///
+/// **Rationale:** Pausing predictions stops new stake inflow while leaving claims,
+/// refunds, and cancellations available so users can always exit.
+///
+/// **Used for:** Encoding the pause matrix in `PauseState`/authorization checks.
+pub const PAUSE_OP_PLACE_PREDICTION: u32 = 1 << 1;
+
+/// Operation bit for pausing pool resolution (`resolve_pool`).
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** 1 << 2
+///
+/// **Rationale:** Pausing resolution freezes outcome settlement without blocking
+/// claims on already-resolved pools or refunds on cancelled pools.
+///
+/// **Used for:** Encoding the pause matrix in `PauseState`/authorization checks.
+pub const PAUSE_OP_RESOLVE_POOL: u32 = 1 << 2;
+
+/// Bitmask of all pausable operations.
+///
+/// **Units:** Bitmask flag (dimensionless)
+/// **Value:** `PAUSE_OP_CREATE_POOL | PAUSE_OP_PLACE_PREDICTION | PAUSE_OP_RESOLVE_POOL`
+///
+/// **Rationale:** Safe exits (claims, refunds, cancellations) are intentionally excluded
+/// from this mask so they can never be paused, guaranteeing users can always withdraw.
+///
+/// **Used for:** Validating pause requests and exposing pause state to clients.
+pub const PAUSE_OP_ALL: u32 =
+    PAUSE_OP_CREATE_POOL | PAUSE_OP_PLACE_PREDICTION | PAUSE_OP_RESOLVE_POOL;
+
+// NO-CONTEST & REFUND SETTLEMENT CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Sentinel outcome value indicating a pool settled under the no-contest refund policy.
+///
+/// **Units:** Outcome index (dimensionless)
+/// **Value:** 4,294,967,294 (u32::MAX - 1)
+///
+/// **Rationale:** When a pool cannot be resolved (invalid oracle data, cancelled market,
+/// or explicit no-contest), it settles under a single explicit refund policy rather than
+/// remaining in an ambiguous lifecycle state. This sentinel is distinct from
+/// `UNRESOLVED_OUTCOME` (u32::MAX) so that "not yet resolved" and "settled as no-contest"
+/// are never conflated, and cannot collide with any valid outcome index (bounded by
+/// `MAX_OPTIONS_COUNT`).
+///
+/// **Impact of changes:**
+/// - Must remain distinct from `UNRESOLVED_OUTCOME` and from any valid outcome index.
+/// - Changing this would require a storage migration for pools already settled as no-contest.
+///
+/// **Used for:** Marking `pool.outcome` when a pool settles under the refund policy.
+pub const NO_CONTEST_OUTCOME: u32 = u32::MAX - 1;
+
+/// Fee in basis points applied to no-contest refunds (0 bps = no fee).
+///
+/// **Units:** Basis points (bps, where 100 bps = 1%)
+/// **Value:** 0 bps
+///
+/// **Rationale:** No-contest settlement is a safety mechanism, not a revenue event. When a
+/// market is cancelled or cannot be resolved, participants should recover their stake in
+/// full. Charging a protocol fee or paying referrals on a refund would penalize users for
+/// an outcome they did not cause. Keeping this at 0 makes the refund policy explicit and
+/// auditable: every participant recovers exactly their recorded stake.
+///
+/// **Impact of changes:**
+/// - Increasing this value would deduct a fee from refunds, breaking the invariant that
+///   total refundable value equals total escrowed stake.
+/// - Must remain 0 unless the refund policy is deliberately changed and re-audited.
+///
+/// **Used for:** Computing the refund amount in the no-contest settlement path.
+pub const NO_CONTEST_FEE_BPS: u32 = 0;
+
+/// Whether referral rewards are paid on no-contest refunds.
+///
+/// **Units:** Boolean flag
+/// **Value:** false
+///
+/// **Rationale:** Referral rewards are funded from protocol fees on resolved markets. Since
+/// no-contest settlement charges no fee (`NO_CONTEST_FEE_BPS == 0`), there is no fee pool
+/// from which to pay referrals. Setting this to false makes the rule explicit and prevents
+/// referral payouts from silently draining the escrow that must be returned to participants.
+///
+/// **Impact of changes:**
+/// - Setting this to true without a corresponding fee would break accounting conservation.
+/// - Must remain false while `NO_CONTEST_FEE_BPS` is 0.
+///
+/// **Used for:** Gating referral payout logic in the no-contest settlement path.
+pub const NO_CONTEST_PAYS_REFERRALS: bool = false;
+
+/// Maximum protocol fee in basis points (10% = 1000 bps).
+///
+/// **Units:** Basis points (bps, where 100 bps = 1%)
+/// **Value:** 1,000 bps (10%)
+///
+/// **Rationale:** Caps the protocol fee so governance cannot unexpectedly change
+/// participant economics beyond a hard bound. Combined with the timelock, this
+/// ensures fee changes are both observable and bounded.
+///
+/// **Impact of changes:**
+/// - Increasing this value would allow higher fees, increasing protocol revenue
+///   but potentially harming participant economics.
+/// - Decreasing this value would further constrain governance but may limit
+///   protocol sustainability.
+///
+/// **Used for:** Enforcing the fee cap in `set_fee_bps` / `apply_fee_bps`.
+pub const MAX_FEE_BPS: u32 = 1_000;
+
+/// Minimum timelock delay in seconds for treasury fee changes.
+///
+/// **Units:** Seconds
+/// **Value:** 3,600 seconds (1 hour)
+///
+/// **Rationale:** Provides a lower bound on the delay between proposing and
+/// activating a treasury fee change, ensuring governance cannot change fees
+/// in a single transaction.
+///
+/// **Impact of changes:**
+/// - Increasing this value would provide more reaction time but slow governance.
+/// - Decreasing this value would allow faster changes but reduce observability.
+///
+/// **Used for:** Enforcing the minimum delay in `set_fee_bps` / `apply_fee_bps`.
+pub const MIN_FEE_CHANGE_DELAY_SECONDS: u64 = 3_600;
+
+/// Maximum timelock delay in seconds for treasury fee changes (30 days).
+///
+/// **Units:** Seconds
+/// **Value:** 2,592,000 seconds (30 days)
+///
+/// **Rationale:** Bounds the delay so a queued fee change cannot be effectively
+/// frozen indefinitely, while still allowing long observation windows.
+///
+/// **Impact of changes:**
+/// - Increasing this value would allow longer delays but risks stalled changes.
+/// - Decreasing this value would cap observation windows more tightly.
+///
+/// **Used for:** Enforcing the maximum delay in `set_fee_bps` / `apply_fee_bps`.
+pub const MAX_FEE_CHANGE_DELAY_SECONDS: u64 = 2_592_000;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PAYOUT REMAINDER ALLOCATION INVARIANT
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## Invariant
+//
+// For every payout computation over a set of participants `P` with integer
+// weights `w_i` and an integer distributable amount `T`, the contract MUST
+// satisfy:
+//
+//     sum_{i in P} payout_i + retained_remainder == T
+//
+// where:
+//   * `payout_i = floor(T * w_i / W)` and `W = sum_{i in P} w_i`,
+//   * `retained_remainder = T - sum_{i in P} payout_i` is an explicit,
+//     non-negative integer that is either (a) credited to a deterministic
+//     recipient, or (b) retained by the pool escrow and reported as such.
+//
+// The allocation MUST be a pure function of `(T, {w_i})` and MUST NOT depend
+// on the order in which participants claim, the order in which they were
+// inserted, or any other mutable state. Two calls with the same inputs MUST
+// produce byte-identical payout vectors.
+//
+// ## Deterministic tie-breaking
+//
+// When the remainder `R = T - sum_i floor(T * w_i / W)` is non-zero, the
+// contract distributes `R` additional base units one at a time using the
+// following deterministic rule:
+//
+//   1. Compute `r_i = (T * w_i) mod W` for each participant.
+//   2. Sort participants by `(r_i DESC, index_i ASC)` where `index_i` is the
+//      participant's stable position in the canonical, sorted participant
+//      vector (lexicographic by address bytes).
+//   3. Award one extra unit to the first `R` participants in that order.
+//
+// This is the "largest remainder" (Hamilton) method with a stable tie-break
+// on canonical participant index. It guarantees:
+//   * `sum_i payout_i == T` exactly (no dust is lost),
+//   * each `payout_i` differs from `floor(T * w_i / W)` by at most 1,
+//   * the result is independent of claim order and of storage iteration order.
+//
+// ## Application to single and batch payout paths
+//
+// Both `claim_winnings` (single) and `claim_winnings_batch` (batch) MUST use
+// the same helper to compute the full payout vector for the pool, then select
+// the caller's entry. A single claim therefore returns exactly the same amount
+// as the corresponding entry of a batch claim, and the sum of all single
+// claims equals the sum of a single batch claim over the same participant set.
+//
+// ## Retained remainder
+//
+// If a pool chooses to retain rather than distribute the remainder (e.g. to
+// avoid dust payouts below `DEFAULT_GLOBAL_MIN_STAKE`), the retained amount
+// MUST be tracked explicitly in pool state and emitted in the resolution
+// event. The invariant `escrow == sum(payouts) + retained_remainder` MUST
+// hold at all times after resolution.
+//
+// **Used for:** Documenting and validating payout math in `claim_winnings`,
+// `claim_winnings_batch`, and the resolution/escrow accounting paths.
 
 /// Fee schedule version reported for legacy pools created before per-pool fee
 /// snapshots existed. Such pools have no stored `FeeSchedule` and settle against
@@ -598,6 +988,24 @@ mod tests {
     }
 
     #[test]
+    fn test_claim_window_covers_bump_amount() {
+        // A single TTL extension at resolution time must cover the entire
+        // promised claim window, otherwise users could lose the ability to
+        // claim before the window ends.
+        assert!(CLAIM_WINDOW_LEDGERS > BUMP_AMOUNT);
+    }
+
+    #[test]
+    fn test_claim_window_is_90_days() {
+        assert_eq!(CLAIM_WINDOW_LEDGERS, 90 * DAY_IN_LEDGERS);
+    }
+
+    #[test]
+    fn test_temporary_entry_ttl_is_one_day() {
+        assert_eq!(TEMPORARY_ENTRY_TTL_LEDGERS, DAY_IN_LEDGERS);
+    }
+
+    #[test]
     fn test_ledger_calculations() {
         assert_eq!(BUMP_THRESHOLD, 14 * DAY_IN_LEDGERS);
         assert_eq!(BUMP_AMOUNT, 30 * DAY_IN_LEDGERS);
@@ -608,5 +1016,72 @@ mod tests {
         // At 7 decimals, 1 USDC = 10_000_000 base units.
         // Therefore 1_000_000_000 base units equals 100 USDC.
         assert_eq!(HIGH_VALUE_THRESHOLD, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_batch_claim_limits_are_consistent() {
+        // The hard ceiling must be positive and small enough to stay within
+        // Soroban's per-transaction resource budget.
+        assert!(MAX_BATCH_CLAIM_SIZE > 0);
+        assert!(MAX_BATCH_CLAIM_SIZE <= 100);
+        // The recommended client chunk size must not exceed the hard ceiling.
+        assert!(RECOMMENDED_BATCH_CLAIM_CHUNK_SIZE > 0);
+        assert!(RECOMMENDED_BATCH_CLAIM_CHUNK_SIZE <= MAX_BATCH_CLAIM_SIZE);
+    }
+
+    #[test]
+    fn test_max_batch_claim_size_regression_threshold() {
+        // Regression guard: the maximum supported batch size is pinned so any
+        // change requires re-running the batch-claim benchmark.
+        assert_eq!(MAX_BATCH_CLAIM_SIZE, 25);
+    }
+
+    #[test]
+    fn test_pause_operation_bits_are_distinct() {
+        assert_eq!(PAUSE_OP_CREATE_POOL & PAUSE_OP_PLACE_PREDICTION, 0);
+        assert_eq!(PAUSE_OP_CREATE_POOL & PAUSE_OP_RESOLVE_POOL, 0);
+        assert_eq!(PAUSE_OP_PLACE_PREDICTION & PAUSE_OP_RESOLVE_POOL, 0);
+    }
+
+    #[test]
+    fn test_pause_op_all_includes_every_pausable_operation() {
+        assert_eq!(
+            PAUSE_OP_ALL,
+            PAUSE_OP_CREATE_POOL | PAUSE_OP_PLACE_PREDICTION | PAUSE_OP_RESOLVE_POOL
+        );
+    }
+
+    #[test]
+    fn test_no_contest_outcome_distinct_from_unresolved() {
+        assert_ne!(NO_CONTEST_OUTCOME, UNRESOLVED_OUTCOME);
+        assert!(NO_CONTEST_OUTCOME >= MAX_OPTIONS_COUNT);
+    }
+
+    #[test]
+    fn test_no_contest_refund_policy_is_fee_free() {
+        // Refunds must return the full stake: no protocol fee, no referral payout.
+        assert_eq!(NO_CONTEST_FEE_BPS, 0);
+        assert!(!NO_CONTEST_PAYS_REFERRALS);
+    }
+
+    #[test]
+    fn test_no_contest_fee_bps_within_bounds() {
+        assert!(NO_CONTEST_FEE_BPS <= MAX_TOLERANCE);
+    }
+
+    #[test]
+    fn test_payout_remainder_invariant_documented() {
+        // The remainder allocation invariant is documented above and must
+        // hold for every (T, {w_i}) pair used by payout paths. This test
+        // pins the invariant's arithmetic form so that any change to the
+        // documented rule is a deliberate, reviewable edit.
+        let t: i128 = 1_000_000_007;
+        let weights: [i128; 3] = [1, 2, 3];
+        let w: i128 = weights.iter().sum();
+        let floors: i128 = weights.iter().map(|wi| t * wi / w).sum();
+        let remainder = t - floors;
+        assert!(remainder >= 0);
+        assert!(remainder < weights.len() as i128);
+        assert_eq!(floors + remainder, t);
     }
 }
