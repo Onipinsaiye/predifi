@@ -12,8 +12,8 @@
 mod pools;
 mod predictions;
 mod referrals;
-pub mod outbox;
 pub mod metrics;
+pub mod outbox;
 
 // ── Re-export every public item from each repository module ──────────────────
 // This keeps the `crate::db::*` call surface identical to the original
@@ -87,17 +87,7 @@ pub use referrals::{
     insert_referrals_bulk,
 };
 
-pub use outbox::{
-    // Types
-    ClaimedNotification,
-    NotificationIntent,
-    NotificationOutboxRow,
-    // Outbox queries
-    claim_notification_intents,
-    enqueue_notification_intent,
-    mark_notification_failed,
-    mark_notification_sent,
-};
+pub use outbox::{ClaimedNotification, NotificationIntent};
 
 use std::time::Duration;
 
