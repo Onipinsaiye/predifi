@@ -339,7 +339,7 @@ flowchart LR
     ContractState --> Claim
 ```
 
-The contract is the source of truth for pool state, stakes, resolution, and payouts. The backend improves queryability and operational visibility, while the frontend presents current market state and submits signed user actions.
+The contract is the source of truth for pool state, stakes, resolution, and payouts. The backend improves queryability and operational visibility, while the frontend presents current market state and submits signed user actions. See [ADR-0001](./adr/0001-contract-state-authoritative.md) for the compatibility, reconciliation, and recovery consequences of this boundary.
 
 ```mermaid
 sequenceDiagram

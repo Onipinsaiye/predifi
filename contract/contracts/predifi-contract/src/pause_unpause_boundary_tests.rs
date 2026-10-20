@@ -3,9 +3,12 @@
 //! Coverage:
 //! - Pausing an already-paused contract must fail
 //! - Unpausing an already-unpaused contract must fail
-//! - All state-mutating operations are blocked while paused
+//! - Pause is scoped by operation: only the operations in the pause matrix
+//!   are blocked while paused; safe exits (eligible claims, refunds) remain
+//!   available so users can always recover funds.
 //! - Non-admin cannot pause or unpause
 //! - State consistency is preserved across pause / unpause cycles
+//! - Every public operation is exercised in both paused and unpaused states
 
 #![cfg(test)]
 
@@ -324,6 +327,11 @@ fn test_1528_cancel_pool_blocked_while_paused() {
 }
 
 /// While the contract is paused, `claim_winnings` must return `ContractPaused`.
+///
+/// NOTE: claims are a safe exit and are intentionally NOT part of the pause
+/// matrix. This test asserts the scoped behavior: an eligible claim must
+/// still succeed while the contract is paused. See
+/// `test_1754_paused_contract_allows_safe_exits` below.
 #[test]
 fn test_1528_claim_winnings_blocked_while_paused() {
     let env = Env::default();
@@ -338,11 +346,11 @@ fn test_1528_claim_winnings_blocked_while_paused() {
     ctx.client.pause(&ctx.admin);
 
     let result = ctx.client.try_claim_winnings(&user, &pool_id);
-    assert_eq!(
-        result,
-        Err(Ok(PredifiError::ContractPaused)),
-        "claim_winnings must return ContractPaused when contract is paused"
+    assert!(
+        result.is_ok(),
+        "claim_winnings is a safe exit and must remain available while paused"
     );
+    assert_eq!(ctx.client.get_pool(&pool_id).state, MarketState::Resolved);
 }
 
 /// A non-admin address must not be able to pause the contract.
@@ -526,6 +534,9 @@ fn test_1528_is_contract_paused_reflects_correct_state() {
 
 /// `update_pool_description` must be blocked while the contract is paused
 /// and succeed after unpausing. State must be consistent throughout.
+///
+/// `update_pool_description` is part of the pause matrix (it mutates pool
+/// metadata) and must therefore be rejected while paused.
 #[test]
 fn test_1528_update_pool_description_blocked_during_pause_restored_after_unpause() {
     let env = Env::default();
@@ -569,6 +580,11 @@ fn test_1528_update_pool_description_blocked_during_pause_restored_after_unpause
 // ═══════════════════════════════════════════════════════════════════════════
 // #1754 — Every state-changing entry point must reject calls while paused
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// NOTE: This test now reflects the scoped pause matrix. Operations that are
+// part of the matrix must return `ContractPaused`; safe exits (claims and
+// refunds) are asserted separately in
+// `test_1754_paused_contract_allows_safe_exits`.
 //
 // `require_not_paused` is the first statement in every state-mutating public
 // function, before any other validation (auth, role checks, pool lookups).
@@ -843,21 +859,105 @@ fn test_1754_paused_contract_rejects_every_state_changing_entry_point() {
             .try_place_prediction(&dummy_user, &pool_id, &1_000i128, &0u32, &None, &None),
         Err(Ok(PredifiError::ContractPaused))
     );
-    assert_eq!(
-        ctx.client.try_claim_winnings(&dummy_user, &pool_id),
-        Err(Ok(PredifiError::ContractPaused))
-    );
-    assert_eq!(
-        ctx.client
-            .try_batch_claim_winnings(&dummy_user, &empty_pool_ids),
-        Err(Ok(PredifiError::ContractPaused))
-    );
-    assert_eq!(
-        ctx.client.try_claim_refund(&dummy_user, &pool_id),
-        Err(Ok(PredifiError::ContractPaused))
-    );
+    // Claims and refunds are safe exits and are intentionally NOT asserted
+    // here — they are covered by `test_1754_paused_contract_allows_safe_exits`.
+    // The pause matrix only blocks the operations asserted above.
 
     // Pause state and pool data must be untouched by any of the rejected calls above.
     assert!(ctx.client.is_contract_paused());
     assert_eq!(ctx.client.get_pool(&pool_id).state, MarketState::Active);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1754 — Safe exits remain available while paused
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The pause matrix deliberately excludes claim and refund paths so that
+// users can always recover funds even while the contract is paused. These
+// tests assert that eligible claims and refunds succeed while paused, and
+// that ineligible claims still fail with their normal (non-pause) error.
+#[test]
+fn test_1754_paused_contract_allows_safe_exits() {
+    let env = Env::default();
+    let ctx = PauseTestEnv::new(&env);
+
+    // Resolved pool: eligible claim must succeed while paused.
+    let resolved_pool = ctx.create_pool(2_000);
+    let winner = Address::generate(&env);
+    ctx.stake(&winner, resolved_pool, 1_000, 0);
+    ctx.advance_time(2_001);
+    ctx.client.resolve_pool(&ctx.operator, &resolved_pool, &0u32);
+
+    // Cancelled pool: refund must succeed while paused.
+    let cancelled_pool = ctx.create_pool(7_200);
+    let refundee = Address::generate(&env);
+    ctx.stake(&refundee, cancelled_pool, 500, 1);
+    ctx.client.cancel_pool(
+        &ctx.operator,
+        &cancelled_pool,
+        &String::from_str(&env, "safe exit refund"),
+    );
+
+    ctx.client.pause(&ctx.admin);
+    assert!(ctx.client.is_contract_paused());
+
+    // Eligible claim succeeds while paused.
+    assert!(
+        ctx.client.try_claim_winnings(&winner, &resolved_pool).is_ok(),
+        "eligible claim_winnings must succeed while paused"
+    );
+
+    // Eligible refund succeeds while paused.
+    assert!(
+        ctx.client.try_claim_refund(&refundee, &cancelled_pool).is_ok(),
+        "eligible claim_refund must succeed while paused"
+    );
+
+    // Ineligible claim still fails with its normal error, not ContractPaused.
+    let stranger = Address::generate(&env);
+    let ineligible = ctx.client.try_claim_winnings(&stranger, &resolved_pool);
+    assert!(
+        ineligible.is_err(),
+        "ineligible claim must still fail while paused"
+    );
+    assert_ne!(
+        ineligible,
+        Err(Ok(PredifiError::ContractPaused)),
+        "ineligible claim must fail with its normal error, not ContractPaused"
+    );
+
+    // Pause state is unaffected by safe-exit calls.
+    assert!(ctx.client.is_contract_paused());
+}
+
+/// Boundary: pause/unpause toggling must not change the set of operations
+/// that are allowed. After unpausing, matrix operations become available
+/// again and safe exits remain available.
+#[test]
+fn test_1754_pause_matrix_boundary_toggle() {
+    let env = Env::default();
+    let ctx = PauseTestEnv::new(&env);
+
+    let pool_id = ctx.create_pool(7_200);
+    let user = Address::generate(&env);
+    ctx.token_admin.mint(&user, &1_000i128);
+
+    // Unpaused: matrix operation allowed.
+    ctx.client
+        .place_prediction(&user, &pool_id, &1_000i128, &0u32, &None, &None);
+    assert_eq!(ctx.client.get_pool(&pool_id).total_stake, 1_000);
+
+    // Paused: matrix operation blocked.
+    ctx.client.pause(&ctx.admin);
+    assert_eq!(
+        ctx.client
+            .try_place_prediction(&user, &pool_id, &1i128, &1u32, &None, &None),
+        Err(Ok(PredifiError::ContractPaused))
+    );
+
+    // Unpaused again: matrix operation allowed.
+    ctx.client.unpause(&ctx.admin);
+    ctx.client
+        .place_prediction(&user, &pool_id, &1i128, &1u32, &None, &None);
+    assert_eq!(ctx.client.get_pool(&pool_id).total_stake, 1_001);
 }
