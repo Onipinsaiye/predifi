@@ -1,10 +1,13 @@
 use crate::config::Config;
+use crate::health::{self, DependencyProbes};
 use crate::price_cache::PriceCache;
 use crate::redis_cache::RedisCache;
 use crate::ws::EventBus;
+use axum::routing::get;
 use axum::Router;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub mod v1;
 
@@ -20,10 +23,20 @@ pub fn router(
     metrics: crate::metrics::SharedMetrics,
     event_bus: EventBus,
 ) -> Router {
-    Router::new().nest(
-        "/v1",
-        v1::router(config, cache, redis, pool, metrics, event_bus),
-    )
+    let probes = DependencyProbes::new(pool.clone(), redis.clone());
+    let readiness = health::ReadinessState::new(
+        probes,
+        health::DependencyTimeouts::default(),
+        Duration::from_secs(5),
+    );
+    Router::new()
+        .route("/healthz", get(health::liveness))
+        .route("/readyz", get(health::readiness))
+        .with_state(readiness)
+        .nest(
+            "/v1",
+            v1::router(config, cache, redis, pool, metrics, event_bus),
+        )
 }
 
 /// Build the versioned API router with a live PostgreSQL connection pool.
@@ -37,10 +50,20 @@ pub fn router_with_db(
     metrics: crate::metrics::SharedMetrics,
     event_bus: EventBus,
 ) -> Router {
-    Router::new().nest(
-        "/v1",
-        v1::router(config, cache, redis, Some(db), metrics, event_bus),
-    )
+    let probes = DependencyProbes::new(Some(db.clone()), redis.clone());
+    let readiness = health::ReadinessState::new(
+        probes,
+        health::DependencyTimeouts::default(),
+        Duration::from_secs(5),
+    );
+    Router::new()
+        .route("/healthz", get(health::liveness))
+        .route("/readyz", get(health::readiness))
+        .with_state(readiness)
+        .nest(
+            "/v1",
+            v1::router(config, cache, redis, Some(db), metrics, event_bus),
+        )
 }
 
 #[cfg(test)]
@@ -50,6 +73,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use sqlx::postgres::PgPoolOptions;
+    use std::time::Instant;
     use tower::ServiceExt;
 
     use crate::config::Config;
@@ -216,6 +240,72 @@ mod tests {
             body.contains("\"version\":\"v1\""),
             "router_with_db should nest under /v1, got: {body}"
         );
+    }
+
+    // ── Liveness / readiness separation ──────────────────────────────────────
+
+    /// Liveness must succeed even when dependencies are unavailable, so the
+    /// process is not restarted during a Postgres/Redis/Soroban outage.
+    #[tokio::test]
+    async fn healthz_is_live_without_dependencies() {
+        let response = build_router_without_db()
+            .oneshot(get("/healthz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Readiness must fail (503) when the database pool is missing, removing
+    /// the instance from service without triggering a restart loop.
+    #[tokio::test]
+    async fn readyz_is_not_ready_without_db() {
+        let response = build_router_without_db()
+            .oneshot(get("/readyz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Readiness must fail (503) when the database is unreachable, and the
+    /// response must complete within the dependency timeout budget.
+    #[tokio::test]
+    async fn readyz_is_not_ready_with_unreachable_db_and_bounded_latency() {
+        let started = Instant::now();
+        let response = build_router_with_lazy_db()
+            .oneshot(get("/readyz"))
+            .await
+            .expect("request failed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "readiness probe exceeded dependency timeout budget: {elapsed:?}"
+        );
+    }
+
+    /// Liveness must remain OK while the database is unreachable.
+    #[tokio::test]
+    async fn healthz_is_live_with_unreachable_db() {
+        let response = build_router_with_lazy_db()
+            .oneshot(get("/healthz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Readiness must fail (503) when Redis is disabled/unavailable.
+    #[tokio::test]
+    async fn readyz_is_not_ready_without_redis() {
+        let response = build_router_without_db()
+            .oneshot(get("/readyz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // ── Market predictions: no-DB guard ──────────────────────────────────────

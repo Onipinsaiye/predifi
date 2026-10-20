@@ -28,21 +28,21 @@ pnpm install
 
 ## Local backend
 
-The frontend points to `http://localhost:8080` by default. To use a backend at
+The frontend points to `http://localhost:3000` by default. To use a backend at
 another URL, set `NEXT_PUBLIC_API_BASE_URL` before starting the dev server:
 
 ```bash
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8080 pnpm dev
+NEXT_PUBLIC_API_BASE_URL=http://localhost:3000 pnpm dev
 ```
 
-In PowerShell, use `$env:NEXT_PUBLIC_API_BASE_URL = "http://localhost:8080"`
+In PowerShell, use `$env:NEXT_PUBLIC_API_BASE_URL = "http://localhost:3000"`
 and then run `pnpm dev`.
 
 ## Environment variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:8080` | Base URL of the PrediFi backend API used by the data layer in `lib/api`. |
+| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:3000` | Base URL of the PrediFi backend API used by the data layer in `lib/api`. |
 
 ## Data fetching & caching
 
