@@ -559,6 +559,39 @@ mod benchmark_tests {
             "prediction storage ceiling exceeded"
         );
 
+        // Per-user prediction entries
+        for user in tracked_users {
+            // Prediction record
+            let pred_key = DataKey::Pred(user.clone(), pool_id);
+            if let Some(pred) = env.storage().persistent().get::<_, crate::Prediction>(&pred_key) {
+                total += pred_key.to_xdr(&env).len() as usize;
+                total += pred.to_xdr(&env).len() as usize;
+            }
+
+            // Claimed sentinel
+            let claimed_key = DataKey::Claimed(user.clone(), pool_id);
+            if let Some(claimed) = env.storage().persistent().get::<_, bool>(&claimed_key) {
+                total += claimed_key.to_xdr(&env).len() as usize;
+                total += claimed.to_xdr(&env).len() as usize;
+            }
+
+            // Last prediction time (global, not per-pool)
+            let lpt_key = DataKey::LastPredictionTime(user.clone());
+            if let Some(lpt) = env.storage().persistent().get::<_, u64>(&lpt_key) {
+                total += lpt_key.to_xdr(&env).len() as usize;
+                total += lpt.to_xdr(&env).len() as usize;
+            }
+
+            // User prediction count
+            let cnt_key = DataKey::UsrPrdCnt(user.clone());
+            if let Some(cnt) = env.storage().persistent().get::<_, u32>(&cnt_key) {
+                total += cnt_key.to_xdr(&env).len() as usize;
+                total += cnt.to_xdr(&env).len() as usize;
+            }
+        }
+
+        total
+
         // ── Aggregate stake ceiling: single stake at the cap ──────────────
         let aggregate_outcomes = make_outcomes(&env, 2);
         let aggregate_pool = client.create_pool(

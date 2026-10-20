@@ -198,3 +198,102 @@ async fn spec_is_served_as_valid_json() {
         "spec must declare an OpenAPI 3.x version"
     );
 }
+
+/// Shared, language-neutral protocol fixtures (#126) live under
+/// `fixtures/protocol/`. The backend consumes the same JSON the contract and
+/// frontend tests do, so a pool/event/amount example can never drift between
+/// languages. This validates the fixture envelope (schema + version metadata)
+/// and the deterministic network values the Rust and TypeScript conformance
+/// tests both decode.
+const PROTOCOL_FIXTURES: &str = include_str!("../../fixtures/protocol/lifecycle.json");
+
+/// The fixture schema version this backend understands. Bump together with
+/// the TypeScript consumer when the fixture shape changes.
+const SUPPORTED_FIXTURE_SCHEMA: &str = "predifi.protocol.fixtures";
+const SUPPORTED_FIXTURE_VERSION: u32 = 1;
+
+#[test]
+fn protocol_fixtures_declare_schema_and_version() {
+    let fixtures: Value =
+        serde_json::from_str(PROTOCOL_FIXTURES).expect("protocol fixtures must be valid JSON");
+
+    assert_eq!(
+        fixtures["schema"].as_str(),
+        Some(SUPPORTED_FIXTURE_SCHEMA),
+        "fixture schema identifier must match the consumer"
+    );
+    assert_eq!(
+        fixtures["version"].as_u64(),
+        Some(SUPPORTED_FIXTURE_VERSION as u64),
+        "fixture version must match the consumer"
+    );
+}
+
+#[test]
+fn protocol_fixtures_have_deterministic_network_values() {
+    let fixtures: Value =
+        serde_json::from_str(PROTOCOL_FIXTURES).expect("protocol fixtures must be valid JSON");
+
+    let pool = &fixtures["pool"];
+    assert!(
+        pool["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "pool fixture must carry a fixed id"
+    );
+    assert!(
+        pool["contract"].as_str().is_some_and(|c| !c.is_empty()),
+        "pool fixture must carry a fixed contract address"
+    );
+    assert!(
+        pool["ledger"].as_u64().is_some(),
+        "pool fixture must carry a fixed ledger sequence"
+    );
+
+    let event = &fixtures["event"];
+    assert!(
+        event["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "event fixture must carry a fixed id"
+    );
+    assert!(
+        event["ledger"].as_u64().is_some(),
+        "event fixture must carry a fixed ledger sequence"
+    );
+
+    let amount = &fixtures["amount"];
+    assert!(
+        amount["stroops"].as_str().is_some_and(|s| !s.is_empty()),
+        "amount fixture must carry a fixed stroops value as a string"
+    );
+}
+
+/// The representative lifecycle fixture must decode to the same state and
+/// amount values the TypeScript conformance test asserts. Amounts are compared
+/// as strings so no precision is lost across the language boundary.
+#[test]
+fn lifecycle_fixture_decodes_to_expected_state_and_amount() {
+    let fixtures: Value =
+        serde_json::from_str(PROTOCOL_FIXTURES).expect("protocol fixtures must be valid JSON");
+
+    let lifecycle = &fixtures["lifecycle"];
+    assert_eq!(
+        lifecycle["state"].as_str(),
+        Some("settled"),
+        "lifecycle fixture must settle to a known state"
+    );
+
+    let expected_amount = lifecycle["amount"]["stroops"]
+        .as_str()
+        .expect("lifecycle amount must be a string");
+    let fixture_amount = fixtures["amount"]["stroops"]
+        .as_str()
+        .expect("amount fixture must be a string");
+
+    assert_eq!(
+        expected_amount, fixture_amount,
+        "lifecycle amount must match the shared amount fixture"
+    );
+
+    let decoded: u128 = expected_amount
+        .parse()
+        .expect("amount must decode as an integer in Rust");
+    assert!(decoded > 0, "decoded amount must be positive");
+}
