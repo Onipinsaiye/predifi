@@ -1,15 +1,16 @@
 //! Oracle domain: oracle registration, price feeds, price conditions and
 //! oracle-driven pool resolution.
 
-use soroban_sdk::{contractimpl, log, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contractimpl, log, xdr::ToXdr, Address, Env, String, Symbol, Vec};
 
 use crate::{
     DataKey, MarketState, OracleCallback, OracleInitEvent, OracleResolvedEvent,
     OracleWhitelistAddedEvent, OracleWhitelistRemovedEvent, Pool, PoolResolvedDiagEvent,
     PoolResolvedEvent, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
     PriceConditionSetEvent, PriceFeedUpdatedEvent, PriceFeedsCleanedEvent, ResolutionConflictEvent,
-    ResolutionVoteCastEvent, MAX_PRICE_CONDITION_MATCH_STEPS, MAX_PRICE_EXPONENT, MAX_TOLERANCE,
-    MIN_PRICE_EXPONENT, PRICE_DECIMALS, UNRESOLVED_OUTCOME,
+    ResolutionEvidence, ResolutionEvidenceEvent, ResolutionVoteCastEvent,
+    MAX_PRICE_CONDITION_MATCH_STEPS, MAX_PRICE_EXPONENT, MAX_TOLERANCE, MIN_PRICE_EXPONENT,
+    PRICE_DECIMALS, UNRESOLVED_OUTCOME,
 };
 
 /// Rescale the provider integer `value * 10^expo` to `PRICE_DECIMALS` fixed
@@ -668,6 +669,7 @@ impl PredifiContract {
         pool_id: u64,
         mut pool: Pool,
         outcome: u32,
+        evidence: ResolutionEvidence,
     ) {
         pool.state = MarketState::Resolved;
         pool.outcome = outcome;
@@ -678,10 +680,33 @@ impl PredifiContract {
         Self::bump_ttl(env, pool_key);
         Self::open_challenge_window(env, pool_id, outcome);
 
+        // Persist the verifiable evidence commitment alongside the pool so
+        // auditors can later re-derive the decision via `get_resolution_evidence`.
+        let evidence_key = DataKey::ResolutionEvidence(pool_id);
+        let evidence_hash = env
+            .crypto()
+            .sha256(&evidence.clone().to_xdr(env))
+            .to_bytes();
+        env.storage().persistent().set(&evidence_key, &evidence);
+        Self::bump_ttl(env, &evidence_key);
+
         PoolResolvedEvent {
             pool_id,
             operator: env.current_contract_address(),
             outcome,
+        }
+        .publish(env);
+
+        ResolutionEvidenceEvent {
+            pool_id,
+            feed_pair: evidence.feed_pair,
+            price: evidence.price,
+            feed_timestamp: evidence.feed_timestamp,
+            comparison_op: evidence.comparison_op,
+            target_price: evidence.target_price,
+            tolerance_bps: evidence.tolerance_bps,
+            outcome: evidence.outcome,
+            evidence_hash,
         }
         .publish(env);
     }
@@ -700,7 +725,7 @@ impl PredifiContract {
         let (feed_pair, target_price, comparison_op, tolerance_bps) =
             Self::load_price_resolution_condition(&env, pool_id)?;
         let (price, confidence, timestamp, expires_at) =
-            Self::load_price_feed_for_resolution(&env, feed_pair);
+            Self::load_price_feed_for_resolution(&env, feed_pair.clone());
         Self::require_fresh_price_feed(&env, timestamp, expires_at)?;
         Self::require_confidence_within_policy(&env, price, confidence)?;
 
@@ -713,9 +738,40 @@ impl PredifiContract {
         )?;
         let (pool_key, pool) = Self::load_resolvable_price_pool(&env, pool_id)?;
         Self::validate_price_resolution_outcome(&env, pool_id, outcome, pool.options_count)?;
-        Self::persist_price_resolution(&env, &pool_key, pool_id, pool, outcome);
+        Self::persist_price_resolution(
+            &env,
+            &pool_key,
+            pool_id,
+            pool,
+            outcome,
+            ResolutionEvidence {
+                feed_pair,
+                price,
+                feed_timestamp: timestamp,
+                comparison_op,
+                target_price,
+                tolerance_bps,
+                outcome,
+            },
+        );
 
         Ok(())
+    }
+
+    /// Read the verifiable evidence commitment recorded at price-feed
+    /// resolution, if any.
+    ///
+    /// Returns `None` for pools that have not been resolved through
+    /// `resolve_pool_from_price` (unresolved pools and pools resolved via
+    /// operator/oracle voting carry no feed observation). The returned record
+    /// is the preimage committed by the `resolution_evidence` event: auditors
+    /// recompute `sha256(record.to_xdr(env))` and compare it against the
+    /// emitted `evidence_hash`, then re-derive `outcome` from the stored
+    /// observation and rule.
+    pub fn get_resolution_evidence(env: Env, pool_id: u64) -> Option<ResolutionEvidence> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ResolutionEvidence(pool_id))
     }
 }
 

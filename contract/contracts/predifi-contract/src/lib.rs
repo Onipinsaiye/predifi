@@ -5,16 +5,18 @@
 #[macro_use]
 extern crate std;
 
+#[cfg(test)]
+mod access_control_audit_tests;
 mod admin;
 #[cfg(test)]
 mod benchmark_test;
 #[cfg(test)]
 mod boundary_edge_case_tests;
-#[cfg(test)]
-mod oracle_edge_case_tests;
 mod constants;
 mod gas_opt;
 mod oracle;
+#[cfg(test)]
+mod oracle_edge_case_tests;
 #[cfg(test)]
 mod payout_proptests;
 #[cfg(test)]
@@ -29,8 +31,6 @@ mod safe_math;
 #[cfg(test)]
 mod safe_math_examples;
 #[cfg(test)]
-mod access_control_audit_tests;
-#[cfg(test)]
 mod storage_test;
 #[cfg(test)]
 mod stress_test;
@@ -39,18 +39,19 @@ mod stress_test_high_volume;
 // #[cfg(test)]
 // mod stress_test_max_pools;
 #[cfg(test)]
-mod test_utils;
-#[cfg(test)]
 mod pause_unpause_boundary_tests;
 #[cfg(test)]
 mod resource_limit_boundary_tests;
+
+#[cfg(test)]
+mod test_utils;
 // #[cfg(test)]
 // mod max_pools_stress_tests;
+mod treasury;
 #[cfg(test)]
 mod update_pool_description_boundary_tests;
 #[cfg(test)]
 mod withdraw_treasury_boundary_tests;
-mod treasury;
 mod challenge;
 #[cfg(test)]
 mod fee_schedule_snapshot_tests;
@@ -181,6 +182,19 @@ pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
 // INV-7: Prediction.amount > 0 (no zero-stakes)
 // INV-8: Pool.end_time > creation_time (pools must have future end)
 //
+// INV-9 (Payout Remainder Allocation): For any resolved pool, the escrowed
+//        token balance is fully accounted for by the sum of all participant
+//        payouts plus an explicitly retained remainder. Integer-division dust
+//        is allocated deterministically by a rule that does NOT depend on
+//        claim order:
+//
+//          remainder = escrow - Σ(payout_i)
+//
+//        where each payout_i is computed from the participant's stake share
+//        using floor division, and the retained remainder is the accumulated
+//        dust. This invariant holds identically for single-claim and
+//        batch-claim payout paths, so no token unit is created or lost.
+//
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[contracterror]
@@ -194,7 +208,6 @@ pub enum PredifiError {
     /// The outcome value is invalid or out of bounds.
     InvalidOutcome = 25,
     AlreadyClaimed = 60,
-    PoolCanceled = 70,
     ResolutionDelayNotMet = 81,
     /// Token is not on the allowed betting whitelist.
     TokenNotWhitelisted = 91,
@@ -274,9 +287,6 @@ pub enum PredifiError {
     /// `initial_liquidity` is less than the required safety margin
     /// relative to `max_total_stake` (issue #1131).
     InitialLiquidityBelowSafetyMargin = 133,
-    /// `emergency_cancel_pool` was called but the multisig threshold
-    /// has not yet been reached (issue #1119).
-    EmergencyCancelPending = 134,
     /// The caller has already approved this emergency-cancel proposal
     /// (issue #1119).
     EmergencyCancelAlreadyApproved = 135,
@@ -292,12 +302,12 @@ pub enum PredifiError {
     /// The provider price exponent is outside
     /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
     /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
-    UnsupportedPriceExponent = 114,
+    UnsupportedPriceExponent = 202,
     /// The oracle confidence interval is too wide to resolve on: either
     /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
     /// interval crosses the price-condition boundary. Resolution is deferred
     /// until a tighter price is published.
-    PriceConfidenceTooWide = 115,
+    PriceConfidenceTooWide = 203,
 }
 
 /// Represents the current state of a prediction market.
@@ -728,6 +738,37 @@ pub struct UserPredictionDetail {
     pub pool_outcome: u32,
 }
 
+/// Verifiable evidence commitment persisted when a pool is resolved through
+/// the price-feed path ([`PredifiContract::resolve_pool_from_price`]).
+///
+/// The record is the hash preimage announced by [`crate::ResolutionEvidenceEvent`]:
+/// `sha256(evidence.to_xdr(env))` commits to every field below. Together the
+/// fields are sufficient to re-derive the recorded `outcome` off-chain:
+/// apply `comparison_op` to (`price`, `target_price`, `tolerance_bps`) using
+/// the same bounded-match rule as resolution.
+///
+/// Stored once under [`DataKey::ResolutionEvidence`] and never rewritten —
+/// pools transition out of `Active` only once, so the first committed
+/// observation is final.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionEvidence {
+    /// Feed pair whose observation decided the market (e.g. `ETHUSD`).
+    pub feed_pair: Symbol,
+    /// Observed feed value used for the comparison.
+    pub price: i128,
+    /// Feed-side timestamp of the observation (from `update_price_feed`).
+    pub feed_timestamp: u64,
+    /// Comparison operator applied: `0` = Equal, `1` = Greater, `2` = Less.
+    pub comparison_op: u32,
+    /// Target value the observation was compared against.
+    pub target_price: i128,
+    /// Tolerance around `target_price`, in basis points.
+    pub tolerance_bps: u32,
+    /// Outcome index recorded on the pool at resolution.
+    pub outcome: u32,
+}
+
 /// Internal storage keys for contract data.
 ///
 /// All variants use PascalCase. Abbreviated names are preserved for existing
@@ -895,6 +936,12 @@ pub enum DataKey {
     /// Per-pool challenge record:
     /// `ResolutionChallenge(pool_id)` -> `ResolutionChallenge`.
     ResolutionChallenge(u64),
+
+    /// Verifiable resolution evidence: `ResolutionEvidence(pool_id)` -> [`crate::ResolutionEvidence`]
+    ///
+    /// Written once at price-feed resolution and never updated. Contains the
+    /// feed observation and comparison rule that produced the outcome.
+    ResolutionEvidence(u64),
 }
 
 /// Represents a user's individual stake in a prediction market.
@@ -1539,6 +1586,39 @@ pub struct ResolutionFinalizedEvent {
     pub pool_id: u64,
     pub outcome: u32,
     pub timestamp: u64,
+}
+
+/// Emitted alongside `PoolResolvedEvent` when a pool is resolved through the
+/// price-feed path (`resolve_pool_from_price`).
+///
+/// Carries the full evidence preimage — the exact feed observation and the
+/// comparison rule that produced the outcome — plus `evidence_hash`, the
+/// SHA-256 commitment over the stored [`ResolutionEvidence`] record's XDR
+/// encoding. Auditors can fetch the persisted record via
+/// `get_resolution_evidence`, recompute the hash, and re-derive the outcome
+/// to verify the decision.
+#[contractevent(topics = ["resolution_evidence"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionEvidenceEvent {
+    /// Unique identifier of the resolved pool.
+    pub pool_id: u64,
+    /// Feed pair whose observation decided the market.
+    pub feed_pair: Symbol,
+    /// Observed feed value used for the comparison.
+    pub price: i128,
+    /// Feed-side timestamp of the observation.
+    pub feed_timestamp: u64,
+    /// Comparison operator applied: 0=Equal, 1=Greater, 2=Less.
+    pub comparison_op: u32,
+    /// Target value compared against.
+    pub target_price: i128,
+    /// Tolerance around `target_price`, in basis points.
+    pub tolerance_bps: u32,
+    /// Outcome index recorded on the pool.
+    pub outcome: u32,
+    /// SHA-256 commitment over the stored `ResolutionEvidence` XDR encoding.
+    pub evidence_hash: BytesN<32>,
 }
 mod events;
 use events::ClaimWindowUpdateEvent;
@@ -2381,5 +2461,7 @@ impl PredifiContract {
 mod issues_1446_1447_1448_1449_boundary_tests;
 #[cfg(test)]
 mod referral_integration_tests;
+#[cfg(test)]
+mod resolution_evidence_tests;
 #[cfg(test)]
 mod test;
