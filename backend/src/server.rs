@@ -21,6 +21,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -51,9 +52,35 @@ fn build_cors(config: &Config) -> CorsLayer {
         ])
 }
 
+// ── Health contracts ─────────────────────────────────────────────────────────
+
+/// Maximum time the readiness probe will spend probing a single dependency.
+/// Keeps `/ready` latency bounded even when a dependency is hanging.
+const READINESS_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Startup grace period: for this long after process start, readiness probes
+/// report `starting` (503) without probing dependencies, so orchestrators do
+/// not restart the instance while it is still warming up.
+const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
+/// Process start time, used to enforce the startup grace period.
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn live() -> axum::response::Response {
+    use axum::http::StatusCode;
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "alive", "service": "predifi-backend" })),
+    )
+        .into_response()
+}
+
+/// Liveness probe: reports only process health. Never touches dependencies,
+/// so a Postgres/Redis/RPC outage cannot cause the orchestrator to restart a
+/// healthy process.
+async fn liveness() -> axum::response::Response {
     use axum::http::StatusCode;
     (
         StatusCode::OK,
@@ -197,6 +224,81 @@ async fn ready(State(state): State<crate::routes::v1::AppState>) -> axum::respon
     }
 }
 
+/// Readiness probe: reports whether this instance can currently serve traffic.
+///
+/// Each dependency is probed independently under a bounded timeout budget so
+/// that a single hanging dependency cannot blow up the overall response
+/// latency. Unhealthy dependencies make the endpoint return 503, which
+/// removes the instance from service without triggering a restart.
+async fn readiness(State(state): State<crate::routes::v1::AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let started = PROCESS_START.get_or_init(Instant::now);
+    if started.elapsed() < STARTUP_GRACE {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "starting",
+                "service": "predifi-backend",
+                "grace_remaining_secs": STARTUP_GRACE
+                    .saturating_sub(started.elapsed())
+                    .as_secs(),
+            })),
+        )
+            .into_response();
+    }
+
+    let (db_status, db_error) = match &state.db {
+        Some(db) => match tokio::time::timeout(
+            READINESS_DEPENDENCY_TIMEOUT,
+            sqlx::query("SELECT 1").execute(db),
+        )
+        .await
+        {
+            Ok(Ok(_)) => ("ok", None),
+            Ok(Err(_)) => ("unreachable", Some("database ping failed".to_string())),
+            Err(_) => ("timeout", Some("database ping timed out".to_string())),
+        },
+        None => (
+            "not_configured",
+            Some("database pool is not configured".to_string()),
+        ),
+    };
+
+    let (redis_status, redis_error) = if !state.redis.is_available() {
+        (
+            "not_configured",
+            Some("Redis is not configured".to_string()),
+        )
+    } else {
+        match tokio::time::timeout(READINESS_DEPENDENCY_TIMEOUT, state.redis.ping()).await {
+            Ok(true) => ("ok", None),
+            Ok(false) => ("unreachable", Some("Redis ping failed".to_string())),
+            Err(_) => ("timeout", Some("Redis ping timed out".to_string())),
+        }
+    };
+
+    let (price_cache_status, price_cache_error) = if state.cache.snapshot().is_empty() {
+        ("not_ready", Some("price cache is empty".to_string()))
+    } else {
+        ("ok", None)
+    };
+
+    let ready = db_status == "ok" && redis_status == "ok" && price_cache_status == "ok";
+
+    let body = json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "dependencies": { "db": db_status, "redis": redis_status, "price_cache": price_cache_status },
+        "errors":       { "db": db_error, "redis": redis_error,   "price_cache": price_cache_error  }
+    });
+
+    if ready {
+        (StatusCode::OK, Json(body)).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
+}
+
 async fn root() -> Json<serde_json::Value> {
     Json(json!({ "message": "Welcome to the PrediFi backend", "api": "/api/v1" }))
 }
@@ -283,8 +385,10 @@ pub fn build_router_with_rate_limit(
     Router::new()
         .route("/", get(root))
         .route("/live", get(live))
+        .route("/liveness", get(liveness))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/readiness", get(readiness))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
         .nest(
@@ -331,8 +435,10 @@ fn build_router_with_db(
     Router::new()
         .route("/", get(root))
         .route("/live", get(live))
+        .route("/liveness", get(liveness))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/readiness", get(readiness))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
         .nest(
@@ -410,6 +516,9 @@ pub async fn run_with_signal<F>(config: Config, signal: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Record process start so readiness probes honour the startup grace period.
+    PROCESS_START.get_or_init(Instant::now);
+
     let pool = crate::db::create_pool(&config)
         .await
         .unwrap_or_else(|error| {

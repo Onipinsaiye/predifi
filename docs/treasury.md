@@ -6,7 +6,7 @@ becomes unavailable.
 
 ## Authority
 
-All treasury withdrawal functions are restricted to the **Admin** — the
+All treasury withdrawal functions are restricted to the **Admin* — the
 account holding **role 0** in the companion access-control contract.
 
 The Admin must satisfy two checks before any withdrawal is executed:
@@ -43,6 +43,52 @@ Requests exceeding the contract balance are rejected with `InsufficientBalance`.
 **There is no per-period limit.** An admin may call `withdraw_treasury` any
 number of times per ledger close without a cooldown, rate-limit, or cap.
 
+## Treasury Fee Changes (Timelock & Caps)
+
+To prevent governance from unexpectedly changing participant economics in a
+single transaction, all treasury fee changes are observable and bounded.
+
+### Fee caps
+
+| Parameter | Value |
+|---|---|
+| Maximum treasury fee (BPS) | `MAX_TREASURY_FEE_BPS` = **1000** (10.00%) |
+| Minimum fee (BPS) | `TREASURY_PSEUDO_MIN_FEE_BPS` = **0** |
+
+Any proposel fee above `MAX_TREASURY_FEE_BPS` is rejected with
+`PredifiError::FeeCapExceeded`.
+
+### Timelock
+
+Fee changes are split into two steps:
+
+1. **Propose** — `admin` calls `propose_treasury_fee_change(new_fee_bps)`.
+   The proposal is stored with an activation ledger timestamp of
+   `now + min_delay`. No fee change takes effect yet.
+2. **Activate** — after the delay has elapsed, admin calls
+   `activate_treasury_fee_change()`. The fee is updated and the proposal
+   is cleared.
+
+| Parameter | Value |
+|---|---|
+| Minimum delay (ledgers) | `MIN_FEE_CHANGE_DELAY` = **17280** (1~'days) |
+
+Attempting to activate before the delay elapses returns
+`PredifiError::TimelockNotElapsed`.
+
+### Cancellation
+
+Authorized governance (the Admin) may cancel a pending proposal at any time
+before activation via `cancel_treasury_fee_change()`. The proposal is discarded
+and no fee change occurs.
+
+### Fee snapshot for existing pools
+
+Existing pools snapshot the treasury fee at the time the pool is created.
+Subsequent fee changes do not retroactively alter the economics of already
+created pools. The snapshoted fee is read from the pool record, not from the
+current global treasury fee setting.
+
 ## Unavailable Authority
 
 The contract does **not** implement a multi-signature scheme, a timelock,
@@ -55,7 +101,7 @@ If the Admin private key is lost or the Admin is otherwise unavailable:
 - **Funds still in the contract** cannot be recovered — both
   `withdraw_treasury` and `emergency_withdraw` require the Admin role, and
   there is no fallback path.
-- **Pausing the contract** does not help: `emergency_withdraw` bypasses the
+- -*Pausing the contract** does not help: `emergency_withdraw` bypasses the
   pause check but still requires the Admin role.
 
 Operators should secure the Admin key off-chain (e.g. multi-sig, hardware
