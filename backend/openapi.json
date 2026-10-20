@@ -29,6 +29,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Database error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -223,6 +233,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid pagination parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Market not found",
             "content": {
@@ -354,6 +374,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid pool identifier",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Pool not found",
             "content": {
@@ -375,7 +405,24 @@
         "operationId": "api_get_prices",
         "responses": {
           "200": {
-            "description": "Latest cached asset prices"
+            "description": "Latest cached asset prices",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PricesResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Price cache unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -404,6 +451,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ReferralEarningsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid Stellar address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -499,6 +556,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid Stellar address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Database error",
             "content": {
@@ -560,6 +627,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid Stellar address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Database error",
             "content": {
@@ -597,6 +674,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ReferralEarningsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid Stellar address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -760,6 +847,31 @@
           },
           "version": {
             "type": "string"
+          }
+        }
+      },
+      "PricesResponse": {
+        "type": "object",
+        "description": "OpenAPI schema for the latest cached asset prices response.",
+        "required": [
+          "prices",
+          "updated_at"
+        ],
+        "properties": {
+          "prices": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "description": "Map of asset symbol to latest cached price."
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Timestamp of the most recent cache update; null when no prices are cached."
           }
         }
       },

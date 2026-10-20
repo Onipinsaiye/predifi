@@ -1,0 +1,75 @@
+name: Scheduled Capacity Load Test
+
+on:
+  schedule:
+    - cron: '0 2 * * 0' # Run every Sunday at 2:00 AM
+  workflow_dispatch:    # Allow manual triggers from the UI
+
+jobs:
+  capacity-test:
+    name: Run Capacity Load Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: predifi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: ./backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and Seed Database
+        env:
+          DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/predifi_test
+        run: |
+          cargo build --release
+          cargo run --bin predifi-seed -- --fresh
+
+      - name: Start Backend Server
+        env:
+          DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/predifi_test
+          REDIS_URL: redis://localhost:6379
+          PREDIFI_DB_MAX_CONNECTIONS: 50
+        run: |
+          cargo run --release &
+          sleep 5 # Wait for Axum to bind to port 3000
+
+      - name: Execute Load Test
+        env:
+          RUN_CAPACITY_TEST: "1"
+        run: cargo test --test load_tests -- --nocapture > capacity-test-results.txt
+
+      - name: Upload Results Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: capacity-test-results
+          path: backend/capacity-test-results.txt
