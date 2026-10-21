@@ -33,12 +33,13 @@ export const metadata: Metadata = {
 
 export default function CreatePoolPage() {
   return (
-    <div className="min-h-screen bg-[#0A0A0A] p-6 lg:p-8">
-      <div className="mx-auto max-w-2xl space-y-6">
-        {/* Header */}
-        <div className="space-y-1">
-          <h1 className="text-3xl font-bold text-white">Create a Pool</h1>
-          <p className="text-zinc-400 text-sm">
+    <div className="min-h-screen bg-[#0A0A0A] px-3 py-4 sm:px-6 sm:py-6 lg:p-8 overflow-x-hidden">
+      <div className="mx-auto w-full max-w-2xl space-y-4 sm:space-y-6">
+        <div className="space-y-1 px-0.5">
+          <h1 className="text-2xl sm:text-3xl font-bold text-white leading-tight">
+            Create a Pool
+          </h1>
+          <p className="text-zinc-400 text-sm leading-relaxed">
             Define a prediction market and invite others to stake on the
             outcome.
           </p>
