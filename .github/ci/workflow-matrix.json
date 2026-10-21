@@ -10,6 +10,9 @@
     },
     "Frontend CI/CD": {
       "file": ".github/workflows/frontend-ci.yml"
+    },
+    "Secret Scanning": {
+      "file": ".github/workflows/secret-scanning.yml"
     }
   },
   "boundaries": [
@@ -60,6 +63,17 @@
         "rustfmt.toml"
       ],
       "dependents": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "secret-scanning-config",
+      "description": "Secret scanning rules, allow-list and canary fixtures define the credential-leak gate. A change to the scanner configuration or to the canary must run the Secret Scanning workflow so the controlled failure path stays verified.",
+      "samples": [
+        ".github/secret-scanning.rules.yaml",
+        ".github/secret-scanning-allowlist.yml",
+        ".github/secret-scanning/canary.env",
+        ".github/workflows/secret-scanning.yml"
+      ],
+      "dependents": ["Secret Scanning"]
     }
   ],
   "fixtures": [
@@ -122,6 +136,26 @@
       "id": "workflow-self",
       "changed": [".github/workflows/contract-ci.yml"],
       "expect": ["Contract CI/CD"]
+    },
+    {
+      "id": "secret-scanner-rules",
+      "changed": [".github/secret-scanning.rules.yaml"],
+      "expect": ["Secret Scanning"]
+    },
+    {
+      "id": "secret-scanner-allowlist",
+      "changed": [".github/secret-scanning-allowlist.yml"],
+      "expect": ["Secret Scanning"]
+    },
+    {
+      "id": "secret-scanner-canary",
+      "changed": [".github/secret-scanning/canary.env"],
+      "expect": ["Secret Scanning"]
+    },
+    {
+      "id": "secret-scanner-workflow",
+      "changed": [".github/workflows/secret-scanning.yml"],
+      "expect": ["Secret Scanning"]
     },
     {
       "id": "mixed-docs-and-boundary",

@@ -1,0 +1,26 @@
+# Secret Scanning Allowlist (False Positive Suppression)
+
+This file defines false-positive suppressions for the secret scanner.
+
+Important rules:
+- Never paste a real secret value here. Suppressions are matched by
+  fingerprint hash, file path, or rule id - not by the secret itself.
+- Each entry MUST include a justification and an owner.
+- Entries expire and must be reviewed at least every 90 days.
+- Any entry without a valid justification is rejected by CI.
+
+Format (TST, one entry per block):
+
+  [[ignore]]
+  rule_id = <scanner rule id>
+  path = <repo-relative path or glob>
+  fingerprint = <sha256 of the matched token, NOT the token itself>
+  justification = <why this is a false positive>
+  owner = <slack handle or team>
+  expires = <YYYY-MM-DD>
+
+------------------------------------------------------------------------------
+Active suppressions
+> No active suppressions. Add entries below using the format above.
+> A failed scan with an unjustified match is the expected behavior - rotate,
+> remove the credential, and only then add a suppression if truly a false positive.
