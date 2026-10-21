@@ -1,0 +1,63 @@
+name: Alert Runbooks
+
+# Every production alert must have an owner, a severity, and a runbook that
+# tells the on-call engineer what users see and what to do. This workflow
+# rejects any rule that does not, and syntax-checks the Prometheus rule files.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/grafana/alerts/**"
+      - "docker/grafana/provisioning/alerting/**"
+      - "docker/loki/rules/**"
+      - "docs/runbooks/**"
+      - ".github/scripts/validate_alert_runbooks.py"
+      - ".github/workflows/alert-runbooks.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/grafana/alerts/**"
+      - "docker/grafana/provisioning/alerting/**"
+      - "docker/loki/rules/**"
+      - "docs/runbooks/**"
+      - ".github/scripts/validate_alert_runbooks.py"
+      - ".github/workflows/alert-runbooks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runbooks:
+    name: Owners and runbooks for every alert
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet pyyaml
+
+      - name: Validate alert ownership and runbook links
+        run: python .github/scripts/validate_alert_runbooks.py
+
+  promtool:
+    name: Prometheus rule syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check rule files with promtool
+        run: |
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/backend/grafana/alerts:/rules:ro" \
+            prom/prometheus:v2.54.1 \
+            check rules /rules/predifi_alerts.yml /rules/predifi_slo_rules.yml

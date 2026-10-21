@@ -1,0 +1,386 @@
+# PrediFi service-level indicators, objectives, and burn-rate alerts.
+#
+# The indicators, targets, windows, and budget policy are defined in
+# docs/observability/slos.md. Keep this file and that document in sync: a target
+# changed here without a doc change (or the reverse) should be rejected in review.
+#
+# SLO summary (28-day rolling window):
+#   api-availability   99.5%  non-5xx responses on user-facing routes
+#   api-latency        99.0%  user-facing responses served in <= 500ms
+#   tx-preparation     99.5%  fee/price/pool reads the wallet flow needs, non-5xx and <= 1s
+#   indexer-freshness  99.0%  minutes in which the indexer backlog is <= 50 jobs
+#
+# Burn-rate alerting follows the multi-window, multi-burn-rate pattern:
+#   fast burn  (page)   14.4x over 1h AND 5m   -> 2% of the 28d budget in 1 hour
+#                        6x  over 6h AND 30m   -> 5% of the 28d budget in 6 hours
+#   slow burn  (ticket)  3x  over 1d AND 2h    -> 10% of the 28d budget in 1 day
+#                        1x  over 3d AND 6h    -> on track to spend the whole budget
+groups:
+  # ── Indicator recording rules ─────────────────────────────────────────────
+  - name: predifi_sli_recording
+    interval: 1m
+    rules:
+      # API availability: share of user-facing requests that returned 5xx.
+      # Health probes and /metrics are excluded so scrapes don't dilute the ratio.
+      - record: slo:api_availability:error_ratio_rate5m
+        expr: |
+          sum(rate(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[5m]))
+          /
+          sum(rate(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[5m]))
+      - record: slo:api_availability:error_ratio_rate30m
+        expr: |
+          sum(rate(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[30m]))
+          /
+          sum(rate(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[30m]))
+      - record: slo:api_availability:error_ratio_rate1h
+        expr: |
+          sum(rate(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1h]))
+          /
+          sum(rate(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1h]))
+      - record: slo:api_availability:error_ratio_rate2h
+        expr: |
+          sum(rate(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[2h]))
+          /
+          sum(rate(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[2h]))
+      - record: slo:api_availability:error_ratio_rate6h
+        expr: |
+          sum(rate(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[6h]))
+          /
+          sum(rate(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[6h]))
+      - record: slo:api_availability:error_ratio_rate1d
+        expr: |
+          sum(rate(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1d]))
+          /
+          sum(rate(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1d]))
+      - record: slo:api_availability:error_ratio_rate3d
+        expr: |
+          sum(rate(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[3d]))
+          /
+          sum(rate(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[3d]))
+
+      # API latency: share of user-facing requests slower than 500ms.
+      - record: slo:api_latency:error_ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[5m]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[5m]))
+          )
+      - record: slo:api_latency:error_ratio_rate30m
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[30m]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[30m]))
+          )
+      - record: slo:api_latency:error_ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1h]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1h]))
+          )
+      - record: slo:api_latency:error_ratio_rate2h
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[2h]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[2h]))
+          )
+      - record: slo:api_latency:error_ratio_rate6h
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[6h]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[6h]))
+          )
+      - record: slo:api_latency:error_ratio_rate1d
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1d]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[1d]))
+          )
+      - record: slo:api_latency:error_ratio_rate3d
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[3d]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[3d]))
+          )
+
+      # Transaction preparation: the reads the wallet flow depends on before a
+      # user signs (fees, prices, the target pool). A request is bad if it
+      # returned 5xx or took longer than 1s.
+      - record: slo:tx_preparation:error_ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[5m]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[5m]))
+          )
+      - record: slo:tx_preparation:error_ratio_rate30m
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[30m]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[30m]))
+          )
+      - record: slo:tx_preparation:error_ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[1h]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[1h]))
+          )
+      - record: slo:tx_preparation:error_ratio_rate2h
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[2h]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[2h]))
+          )
+      - record: slo:tx_preparation:error_ratio_rate6h
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[6h]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[6h]))
+          )
+      - record: slo:tx_preparation:error_ratio_rate1d
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[1d]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[1d]))
+          )
+      - record: slo:tx_preparation:error_ratio_rate3d
+        expr: |
+          1 - (
+            sum(rate(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[3d]))
+            /
+            sum(rate(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[3d]))
+          )
+
+      # Indexer freshness: 1 for every evaluation in which the backlog is above
+      # the freshness threshold, 0 otherwise. Averaging it over a window gives
+      # the share of "stale" minutes. See docs/observability/slos.md for why this
+      # backlog proxy is used until a ledger-lag gauge exists.
+      - record: slo:indexer_freshness:stale
+        expr: max(app_worker_queue_depth) > bool 50
+
+  - name: predifi_sli_windows
+    interval: 1m
+    rules:
+      - record: slo:indexer_freshness:error_ratio_rate5m
+        expr: avg_over_time(slo:indexer_freshness:stale[5m])
+      - record: slo:indexer_freshness:error_ratio_rate30m
+        expr: avg_over_time(slo:indexer_freshness:stale[30m])
+      - record: slo:indexer_freshness:error_ratio_rate1h
+        expr: avg_over_time(slo:indexer_freshness:stale[1h])
+      - record: slo:indexer_freshness:error_ratio_rate2h
+        expr: avg_over_time(slo:indexer_freshness:stale[2h])
+      - record: slo:indexer_freshness:error_ratio_rate6h
+        expr: avg_over_time(slo:indexer_freshness:stale[6h])
+      - record: slo:indexer_freshness:error_ratio_rate1d
+        expr: avg_over_time(slo:indexer_freshness:stale[1d])
+      - record: slo:indexer_freshness:error_ratio_rate3d
+        expr: avg_over_time(slo:indexer_freshness:stale[3d])
+
+      # Remaining error budget over the 28-day SLO window (1 = untouched, 0 = spent,
+      # negative = overspent). Drives the budget policy in docs/observability/slos.md.
+      - record: slo:api_availability:error_budget_remaining
+        expr: |
+          1 - (
+            (
+              sum(increase(app_http_requests_total{status=~"5..", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[28d]))
+              /
+              sum(increase(app_http_requests_total{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[28d]))
+            ) / (1 - 0.995)
+          )
+      - record: slo:api_latency:error_budget_remaining
+        expr: |
+          1 - (
+            (
+              1 - (
+                sum(increase(app_http_request_duration_seconds_bucket{le="0.5", path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[28d]))
+                /
+                sum(increase(app_http_request_duration_seconds_count{path!~"/metrics|/healthz|/readyz|/health|/live.*|/ready.*|.*/v1/health"}[28d]))
+              )
+            ) / (1 - 0.99)
+          )
+      - record: slo:tx_preparation:error_budget_remaining
+        expr: |
+          1 - (
+            (
+              1 - (
+                sum(increase(app_http_request_duration_seconds_bucket{le="1", status!~"5..", path=~".*/v1/(fees|prices|pools/[^/]+)"}[28d]))
+                /
+                sum(increase(app_http_request_duration_seconds_count{path=~".*/v1/(fees|prices|pools/[^/]+)"}[28d]))
+              )
+            ) / (1 - 0.995)
+          )
+      - record: slo:indexer_freshness:error_budget_remaining
+        expr: 1 - (avg_over_time(slo:indexer_freshness:stale[28d]) / (1 - 0.99))
+
+  # ── Burn-rate alerts ──────────────────────────────────────────────────────
+  - name: predifi_slo_burn_alerts
+    rules:
+      # API availability — objective 99.5%, budget 0.005
+      - alert: ApiAvailabilityFastBurn
+        expr: |
+          (slo:api_availability:error_ratio_rate1h > (14.4 * 0.005) and slo:api_availability:error_ratio_rate5m > (14.4 * 0.005))
+          or
+          (slo:api_availability:error_ratio_rate6h > (6 * 0.005) and slo:api_availability:error_ratio_rate30m > (6 * 0.005))
+        for: 2m
+        labels:
+          severity: critical
+          owner: backend-oncall
+          service: api
+          slo: api-availability
+        annotations:
+          summary: "API availability SLO is burning error budget fast"
+          description: "At the current 5xx rate the 28-day availability budget will be spent in under 5 days."
+          impact: "A meaningful share of user requests are failing right now."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#apiavailabilityfastburn"
+          dashboard_url: "/d/predifi-slo"
+      - alert: ApiAvailabilitySlowBurn
+        expr: |
+          (slo:api_availability:error_ratio_rate1d > (3 * 0.005) and slo:api_availability:error_ratio_rate2h > (3 * 0.005))
+          or
+          (slo:api_availability:error_ratio_rate3d > 0.005 and slo:api_availability:error_ratio_rate6h > 0.005)
+        for: 15m
+        labels:
+          severity: warning
+          owner: backend-oncall
+          service: api
+          slo: api-availability
+        annotations:
+          summary: "API availability SLO is on track to miss its 28-day target"
+          description: "A low but steady 5xx rate is consuming the availability error budget faster than it refills."
+          impact: "A small share of users hit errors; no single spike, but the monthly target is at risk."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#apiavailabilityslowburn"
+          dashboard_url: "/d/predifi-slo"
+
+      # API latency — objective 99%, budget 0.01
+      - alert: ApiLatencyFastBurn
+        expr: |
+          (slo:api_latency:error_ratio_rate1h > (14.4 * 0.01) and slo:api_latency:error_ratio_rate5m > (14.4 * 0.01))
+          or
+          (slo:api_latency:error_ratio_rate6h > (6 * 0.01) and slo:api_latency:error_ratio_rate30m > (6 * 0.01))
+        for: 2m
+        labels:
+          severity: critical
+          owner: backend-oncall
+          service: api
+          slo: api-latency
+        annotations:
+          summary: "API latency SLO is burning error budget fast"
+          description: "More than 6% of user-facing requests are slower than 500ms."
+          impact: "The app feels sluggish; odds and pool totals load late."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#apilatencyfastburn"
+          dashboard_url: "/d/predifi-slo"
+      - alert: ApiLatencySlowBurn
+        expr: |
+          (slo:api_latency:error_ratio_rate1d > (3 * 0.01) and slo:api_latency:error_ratio_rate2h > (3 * 0.01))
+          or
+          (slo:api_latency:error_ratio_rate3d > 0.01 and slo:api_latency:error_ratio_rate6h > 0.01)
+        for: 15m
+        labels:
+          severity: warning
+          owner: backend-oncall
+          service: api
+          slo: api-latency
+        annotations:
+          summary: "API latency SLO is on track to miss its 28-day target"
+          description: "Slow requests are consuming the latency error budget faster than it refills."
+          impact: "A steady share of users experience slow page loads."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#apilatencyslowburn"
+          dashboard_url: "/d/predifi-slo"
+
+      # Transaction preparation — objective 99.5%, budget 0.005
+      - alert: TxPreparationFastBurn
+        expr: |
+          (slo:tx_preparation:error_ratio_rate1h > (14.4 * 0.005) and slo:tx_preparation:error_ratio_rate5m > (14.4 * 0.005))
+          or
+          (slo:tx_preparation:error_ratio_rate6h > (6 * 0.005) and slo:tx_preparation:error_ratio_rate30m > (6 * 0.005))
+        for: 2m
+        labels:
+          severity: critical
+          owner: backend-oncall
+          service: tx-preparation
+          slo: tx-preparation
+        annotations:
+          summary: "Transaction-preparation SLO is burning error budget fast"
+          description: "Fee, price, or pool reads used to build a transaction are failing or slower than 1s."
+          impact: "Users cannot reliably start a stake or claim; the wallet prompt fails or shows stale amounts."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#txpreparationfastburn"
+          dashboard_url: "/d/predifi-slo"
+      - alert: TxPreparationSlowBurn
+        expr: |
+          (slo:tx_preparation:error_ratio_rate1d > (3 * 0.005) and slo:tx_preparation:error_ratio_rate2h > (3 * 0.005))
+          or
+          (slo:tx_preparation:error_ratio_rate3d > 0.005 and slo:tx_preparation:error_ratio_rate6h > 0.005)
+        for: 15m
+        labels:
+          severity: warning
+          owner: backend-oncall
+          service: tx-preparation
+          slo: tx-preparation
+        annotations:
+          summary: "Transaction-preparation SLO is on track to miss its 28-day target"
+          description: "A steady share of fee/price/pool reads are failing or slower than 1s."
+          impact: "Some stake and claim attempts fail before the wallet prompt."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#txpreparationslowburn"
+          dashboard_url: "/d/predifi-slo"
+
+      # Indexer freshness — objective 99%, budget 0.01
+      - alert: IndexerFreshnessFastBurn
+        expr: |
+          (slo:indexer_freshness:error_ratio_rate1h > (14.4 * 0.01) and slo:indexer_freshness:error_ratio_rate5m > (14.4 * 0.01))
+          or
+          (slo:indexer_freshness:error_ratio_rate6h > (6 * 0.01) and slo:indexer_freshness:error_ratio_rate30m > (6 * 0.01))
+        for: 2m
+        labels:
+          severity: critical
+          owner: backend-oncall
+          service: indexer
+          slo: indexer-freshness
+        annotations:
+          summary: "Indexer freshness SLO is burning error budget fast"
+          description: "The indexer backlog has been above 50 jobs for a large share of the last hour."
+          impact: "On-chain stakes, new pools, and resolutions show up late or not at all in the app."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#indexerfreshnessfastburn"
+          dashboard_url: "/d/predifi-slo"
+      - alert: IndexerFreshnessSlowBurn
+        expr: |
+          (slo:indexer_freshness:error_ratio_rate1d > (3 * 0.01) and slo:indexer_freshness:error_ratio_rate2h > (3 * 0.01))
+          or
+          (slo:indexer_freshness:error_ratio_rate3d > 0.01 and slo:indexer_freshness:error_ratio_rate6h > 0.01)
+        for: 15m
+        labels:
+          severity: warning
+          owner: backend-oncall
+          service: indexer
+          slo: indexer-freshness
+        annotations:
+          summary: "Indexer freshness SLO is on track to miss its 28-day target"
+          description: "The indexer is falling behind often enough to spend the monthly freshness budget."
+          impact: "Users intermittently see stale pool totals and late resolutions."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#indexerfreshnessslowburn"
+          dashboard_url: "/d/predifi-slo"
+
+      # Guard: an SLO with no data reads as "100% healthy". Page someone instead.
+      - alert: SloIndicatorDataMissing
+        expr: absent(app_http_requests_total) or absent(app_worker_queue_depth)
+        for: 10m
+        labels:
+          severity: warning
+          owner: infra-oncall
+          service: monitoring
+        annotations:
+          summary: "SLO input metrics are missing"
+          description: "Prometheus is not receiving one or more metrics the SLOs are computed from."
+          impact: "No direct user impact, but SLO dashboards and burn alerts are blind until fixed."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/slo.md#sloindicatordatamissing"
+          dashboard_url: "/d/predifi-slo"
