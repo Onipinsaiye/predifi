@@ -16,8 +16,7 @@
  * Configurable per environment via `NEXT_PUBLIC_API_BASE_URL`; falls back to
  * the local backend default so the dashboard works out of the box in dev.
  */
-export const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
+export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3000";
 
 /** WebSocket base derived from the HTTP API base. */
 export function wsBaseUrl(): string {
@@ -44,6 +43,8 @@ export interface Pool {
   token: string;
   /** Settled outcome, or `null` while the pool is still open. */
   result: string | null;
+  /** Optional market description. */
+  description?: string;
 }
 
 /** Per-outcome stake and implied odds from `GET /api/v1/pools/:id`. */

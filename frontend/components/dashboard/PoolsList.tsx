@@ -18,16 +18,14 @@ import { SearchResultHighlighter } from "@/components/search/SearchResultHighlig
 import { usePools } from "@/lib/hooks/usePools";
 import { useTags } from "@/lib/hooks/useTags";
 import type { Pool } from "@/lib/api/pools";
+import { searchMarketItems } from "@/lib/search/marketSearch";
 
 interface PoolsListProps {
   isLoading?: boolean;
   forceLoading?: boolean;
 }
 
-export function PoolsList({
-  isLoading = false,
-  forceLoading = false,
-}: PoolsListProps) {
+export function PoolsList({ isLoading = false, forceLoading = false }: PoolsListProps) {
   const [query, setQuery] = useState("");
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const { tags: availableTags } = useTags();
@@ -52,22 +50,12 @@ export function PoolsList({
     );
   }, []);
   const filteredPools = useMemo(() => {
-    const normalizedQuery = query.toLowerCase();
-    if (!normalizedQuery) return pools;
-
-    return pools.filter(
-      (pool) =>
-        pool.name.toLowerCase().includes(normalizedQuery) ||
-        pool.category.toLowerCase().includes(normalizedQuery),
-    );
+    return searchMarketItems(pools, query);
   }, [pools, query]);
   const skeletonItems = useMemo(
     () =>
       Array.from({ length: 4 }).map((_, i) => (
-        <div
-          key={i}
-          className="flex items-center justify-between p-3 rounded-lg bg-zinc-900/50"
-        >
+        <div key={i} className="flex items-center justify-between p-3 rounded-lg bg-zinc-900/50">
           <div className="space-y-2">
             <Skeleton className="h-4 w-40" />
             <Skeleton className="h-3 w-24" />
@@ -102,11 +90,7 @@ export function PoolsList({
             {total.toLocaleString()} active
           </span>
         </div>
-        <SearchBar
-          placeholder="Search pools…"
-          onSearch={handleSearch}
-          aria-label="Search pools"
-        />
+        <SearchBar placeholder="Search pools…" onSearch={handleSearch} aria-label="Search pools" />
         {availableTags.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {availableTags.map((tag) => {

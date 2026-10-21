@@ -1,18 +1,12 @@
 "use client";
 
 import { useCallback, useMemo } from "react";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-  Skeleton,
-  SearchBar,
-} from "@/components/ui";
+import { Card, CardContent, CardHeader, CardTitle, Skeleton, SearchBar } from "@/components/ui";
 import { SearchResultHighlighter } from "@/components/search/SearchResultHighlighter";
 import { usePools } from "@/lib/hooks/usePools";
 import { usePoolsQuery, type SortBy, type PoolStatus } from "@/lib/hooks/usePoolsQuery";
 import type { Pool } from "@/lib/api/pools";
+import { searchMarkets, type SearchExplanation } from "@/lib/search/marketSearch";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -79,16 +73,8 @@ export function SearchablePools({
   defaultStatus = "active",
 }: SearchablePoolsProps) {
   // ── Query state ─────────────────────────────────────────────────────────
-  const {
-    search,
-    debouncedSearch,
-    sortBy,
-    status,
-    poolsQuery,
-    setSearch,
-    setSortBy,
-    setStatus,
-  } = usePoolsQuery({ defaultSortBy, defaultStatus });
+  const { search, debouncedSearch, sortBy, status, poolsQuery, setSearch, setSortBy, setStatus } =
+    usePoolsQuery({ defaultSortBy, defaultStatus });
 
   // ── Data fetching ────────────────────────────────────────────────────────
   const {
@@ -100,35 +86,21 @@ export function SearchablePools({
     refresh,
   } = usePools(poolsQuery);
 
-  // ── Client-side text filter ──────────────────────────────────────────────
-  // We apply an in-memory text filter on top of the server's response.
-  // This covers name, category, and token matching. Once the backend adds
-  // full-text search, this memo can be removed and `pools` used directly.
-  const filteredPools = useMemo(() => {
-    const q = debouncedSearch.toLowerCase().trim();
-    if (!q) return pools;
-    return pools.filter(
-      (pool) =>
-        pool.name.toLowerCase().includes(q) ||
-        pool.category.toLowerCase().includes(q) ||
-        pool.token.toLowerCase().includes(q),
-    );
+  // ── Deterministic & Explainable Client-side Search ────────────────────────
+  // Matches across title, description, tags, creator, and market state with
+  // stable ranking and deterministic tie-breaking rather than incidental client ordering.
+  const searchResults = useMemo(() => {
+    return searchMarkets(pools, debouncedSearch);
   }, [pools, debouncedSearch]);
 
   // ── Search handler ───────────────────────────────────────────────────────
-  const handleSearch = useCallback(
-    (value: string) => setSearch(value),
-    [setSearch],
-  );
+  const handleSearch = useCallback((value: string) => setSearch(value), [setSearch]);
 
   // ── Skeleton items (memoised to prevent re-allocation) ───────────────────
   const skeletonItems = useMemo(
     () =>
       Array.from({ length: 4 }).map((_, i) => (
-        <div
-          key={i}
-          className="flex items-center justify-between p-3 rounded-lg bg-zinc-900/50"
-        >
+        <div key={i} className="flex items-center justify-between p-3 rounded-lg bg-zinc-900/50">
           <div className="space-y-2">
             <Skeleton className="h-4 w-40" />
             <Skeleton className="h-3 w-24" />
@@ -202,12 +174,17 @@ export function SearchablePools({
         )}
         {isError && !isStale ? (
           <ErrorState onRetry={refresh} />
-        ) : filteredPools.length === 0 ? (
+        ) : searchResults.length === 0 ? (
           <EmptyState query={debouncedSearch} />
         ) : (
           <div className="space-y-3">
-            {filteredPools.map((pool) => (
-              <PoolRow key={pool.pool_id} pool={pool} query={debouncedSearch} />
+            {searchResults.map(({ item: pool, explanation }) => (
+              <PoolRow
+                key={pool.pool_id}
+                pool={pool}
+                query={debouncedSearch}
+                explanation={explanation}
+              />
             ))}
           </div>
         )}
@@ -229,11 +206,7 @@ interface FilterBarProps {
 
 function FilterBar({ sortBy, status, onSortChange, onStatusChange }: FilterBarProps) {
   return (
-    <div
-      className="flex flex-wrap gap-2"
-      role="group"
-      aria-label="Pool filters"
-    >
+    <div className="flex flex-wrap gap-2" role="group" aria-label="Pool filters">
       {/* Sort buttons */}
       <div
         className="flex items-center gap-1 rounded-lg bg-zinc-900 p-1"
@@ -289,7 +262,15 @@ function FilterBar({ sortBy, status, onSortChange, onStatusChange }: FilterBarPr
 // PoolRow
 // ---------------------------------------------------------------------------
 
-function PoolRow({ pool, query }: { pool: Pool; query: string }) {
+function PoolRow({
+  pool,
+  query,
+  explanation,
+}: {
+  pool: Pool;
+  query: string;
+  explanation?: SearchExplanation;
+}) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-lg bg-zinc-900/50 p-3 transition-colors hover:bg-zinc-900/80">
       <div className="min-w-0 space-y-1">
@@ -300,6 +281,11 @@ function PoolRow({ pool, query }: { pool: Pool; query: string }) {
           <SearchResultHighlighter text={pool.category} searchQuery={query} />
           {" · "}
           {pool.total_stake.toLocaleString()} {pool.token}
+          {explanation && explanation.totalScore > 0 && (
+            <span className="ml-2 text-[11px] text-[#7DE3EC]/80" title={explanation.summary}>
+              · {explanation.summary}
+            </span>
+          )}
         </p>
       </div>
       <PoolStateChip state={pool.state} />
@@ -320,9 +306,7 @@ const STATE_STYLES: Record<string, string> = {
 function PoolStateChip({ state }: { state: string }) {
   const cls = STATE_STYLES[state] ?? "bg-zinc-400/10 text-zinc-400";
   return (
-    <span
-      className={`shrink-0 rounded-full px-3 py-1 text-xs font-medium capitalize ${cls}`}
-    >
+    <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-medium capitalize ${cls}`}>
       {state}
     </span>
   );
@@ -335,11 +319,7 @@ function PoolStateChip({ state }: { state: string }) {
 function EmptyState({ query }: { query: string }) {
   return (
     <div className="flex items-center justify-center h-[300px] text-zinc-600">
-      <p>
-        {query
-          ? `No pools match "${query}".`
-          : "No pools are available right now."}
-      </p>
+      <p>{query ? `No pools match "${query}".` : "No pools are available right now."}</p>
     </div>
   );
 }

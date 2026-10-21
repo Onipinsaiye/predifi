@@ -17,6 +17,7 @@ import { OddsCalculator } from "@/components/ui/odds-calculator";
 import { usePools } from "@/lib/hooks/usePools";
 import { useTags } from "@/lib/hooks/useTags";
 import type { Pool } from "@/lib/api/pools";
+import { searchMarketItems } from "@/lib/search/marketSearch";
 
 const CATEGORIES = [
   "All",
@@ -104,13 +105,7 @@ export function PoolMarketClient() {
   }, []);
 
   const filteredPools = useMemo(() => {
-    const normalizedQuery = search.toLowerCase();
-    if (!normalizedQuery) return pools;
-    return pools.filter(
-      (pool) =>
-        pool.name.toLowerCase().includes(normalizedQuery) ||
-        pool.category.toLowerCase().includes(normalizedQuery),
-    );
+    return searchMarketItems(pools, search);
   }, [pools, search]);
 
   const totalPages = Math.ceil(total / 20);
@@ -158,7 +153,9 @@ export function PoolMarketClient() {
 
           {/* Categories */}
           <div className="space-y-2">
-            <p className="text-[10px] text-zinc-500 uppercase tracking-wider font-medium">Category</p>
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider font-medium">
+              Category
+            </p>
             <div className="flex flex-wrap gap-2">
               {CATEGORIES.map((cat) => (
                 <button
@@ -274,7 +271,10 @@ export function PoolMarketClient() {
         {isPoolsLoading ? (
           <SkeletonScreen label="Loading prediction pools" className="space-y-3">
             {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="flex items-center justify-between p-4 rounded-xl bg-zinc-900/50">
+              <div
+                key={i}
+                className="flex items-center justify-between p-4 rounded-xl bg-zinc-900/50"
+              >
                 <div className="space-y-2">
                   <Skeleton className="h-4 w-48" />
                   <Skeleton className="h-3 w-32" />
@@ -291,11 +291,7 @@ export function PoolMarketClient() {
           />
         ) : filteredPools.length === 0 ? (
           <EmptyState
-            heading={
-              search
-                ? "No pools match your search"
-                : "No pools found for these filters"
-            }
+            heading={search ? "No pools match your search" : "No pools found for these filters"}
             description={
               search
                 ? `Nothing matched "${search}". Try a different name or category.`
@@ -303,9 +299,7 @@ export function PoolMarketClient() {
             }
           />
         ) : (
-          filteredPools.map((pool) => (
-            <PoolRow key={pool.pool_id} pool={pool} query={search} />
-          ))
+          filteredPools.map((pool) => <PoolRow key={pool.pool_id} pool={pool} query={search} />)
         )}
       </div>
 
@@ -364,7 +358,9 @@ function PoolRow({ pool, query }: { pool: Pool; query: string }) {
           <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-medium text-zinc-400">
             {pool.category}
           </span>
-          <span>{pool.total_stake.toLocaleString()} {pool.token}</span>
+          <span>
+            {pool.total_stake.toLocaleString()} {pool.token}
+          </span>
         </div>
         {pool.tags.length > 0 && (
           <p className="text-[10px] text-zinc-600 truncate">
