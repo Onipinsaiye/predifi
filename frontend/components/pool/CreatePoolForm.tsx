@@ -51,7 +51,7 @@ function FormSection({
           <p className="text-xs text-zinc-500">{description}</p>
         )}
       </div>
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-5">
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-3 sm:p-5 space-y-4 sm:space-y-5 min-w-0">
         {children}
       </div>
     </div>
@@ -478,7 +478,7 @@ export function CreatePoolForm() {
       onSubmit={handleSubmit}
       noValidate
       aria-label="Create prediction pool"
-      className="space-y-8"
+      className="space-y-8 w-full max-w-full min-w-0 overflow-x-hidden"
     >
       {/* ── 1. Pool Details ── */}
       <FormSection
@@ -544,8 +544,8 @@ export function CreatePoolForm() {
       >
         <div className="space-y-3">
           {values.outcomes.map((outcome, index) => (
-            <div key={index} className="flex items-start gap-2">
-              <div className="flex-1">
+            <div key={index} className="flex items-start gap-2 min-w-0">
+              <div className="min-w-0 flex-1">
                 <Input
                   id={`outcome-${index}`}
                   label={`Outcome ${index + 1}`}
@@ -565,8 +565,8 @@ export function CreatePoolForm() {
                   onClick={() => removeOutcome(index)}
                   disabled={isSubmitting}
                   aria-label={`Remove outcome ${index + 1}`}
-                  className="mt-7 flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-zinc-700 text-zinc-400 hover:border-red-800 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
-                >
+                  className="mt-7 flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-zinc-700 text-zinc-400 hover:border-red-800 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  >
                   <X className="h-4 w-4" aria-hidden="true" />
                 </button>
               )}
@@ -601,13 +601,20 @@ export function CreatePoolForm() {
         description="Set the token and stake limits for pool participants."
       >
         {/* Token picker row */}
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-zinc-700/50 bg-zinc-800/40 px-4 py-3">
-          <div className="space-y-0.5">
+       <div className="flex flex-col gap-3 rounded-lg border border-zinc-700/50 bg-zinc-800/40 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4 min-w-0">
+          <div className="space-y-0.5 min-w-0">
             <p className="text-sm font-medium text-zinc-200">Staking Token</p>
-            <p className="text-xs text-zinc-500">
-              Participants will stake in this token.
-            </p>
+            <p className="text-xs text-zinc-500">Participants will stake in this token.</p>
           </div>
+          <div className="w-full sm:w-auto shrink-0">
+            <SupportedTokensPicker
+              value={values.token}
+              onChange={handleTokenChange}
+              disabled={isSubmitting}
+              className="w-full sm:w-auto"
+            />
+          </div>
+        </div>
           <SupportedTokensPicker
             value={values.token}
             onChange={handleTokenChange}
@@ -669,7 +676,7 @@ export function CreatePoolForm() {
       </FormSection>
 
       {/* ── 5. Terms ── */}
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5">
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-3 sm:p-5 min-w-0">
         <div className="flex items-start gap-3">
           <Checkbox
             id="termsAccepted"
@@ -711,6 +718,52 @@ export function CreatePoolForm() {
           <p className="text-sm text-red-400 text-center">{submitError}</p>
         </div>
       )}
+
+      {/* ── Review summary (before wallet / submit) ── */}
+      <section
+        aria-label="Review pool before creating"
+        className="rounded-xl border border-zinc-700 bg-zinc-900/80 p-3 sm:p-5 space-y-3 min-w-0"
+      >
+        <h2 className="text-sm font-semibold text-white tracking-wide uppercase">
+          Review before create
+        </h2>
+        <dl className="grid grid-cols-1 gap-2 text-sm">
+          <div className="flex flex-col gap-0.5 min-w-0 sm:flex-row sm:justify-between sm:gap-4">
+            <dt className="text-zinc-500 shrink-0">Name</dt>
+            <dd className="text-zinc-200 break-words text-left sm:text-right min-w-0">
+              {values.name.trim() || "—"}
+            </dd>
+          </div>
+          <div className="flex flex-col gap-0.5 min-w-0 sm:flex-row sm:justify-between sm:gap-4">
+            <dt className="text-zinc-500 shrink-0">Category</dt>
+            <dd className="text-zinc-200 break-words sm:text-right">
+              {values.category || "—"}
+            </dd>
+          </div>
+          <div className="flex flex-col gap-0.5 min-w-0 sm:flex-row sm:justify-between sm:gap-4">
+            <dt className="text-zinc-500 shrink-0">Outcomes</dt>
+            <dd className="text-zinc-200 break-words sm:text-right">
+              {values.outcomes.filter((o) => o.trim()).join(" · ") || "—"}
+            </dd>
+          </div>
+          <div className="flex flex-col gap-0.5 min-w-0 sm:flex-row sm:justify-between sm:gap-4">
+            <dt className="text-zinc-500 shrink-0">Stake range</dt>
+            <dd className="text-zinc-200 tabular-nums sm:text-right">
+              {values.minStake || "—"} – {values.maxStake || "—"} {values.token}
+            </dd>
+          </div>
+          <div className="flex flex-col gap-0.5 min-w-0 sm:flex-row sm:justify-between sm:gap-4">
+            <dt className="text-zinc-500 shrink-0">Closes</dt>
+            <dd className="text-zinc-200 break-all sm:text-right">
+              {values.closeTime || "—"}
+            </dd>
+          </div>
+        </dl>
+        <p className="text-xs text-zinc-500 leading-relaxed">
+          Confirm these details before submitting. Your wallet will be asked to
+          sign the create transaction.
+        </p>
+      </section>
 
       {/* ── Actions ── */}
       <div className="flex flex-col sm:flex-row items-center justify-end gap-3 pt-2">
