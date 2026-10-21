@@ -225,17 +225,34 @@ pub struct HealthResponse {
 
 // ── Envelopes ─────────────────────────────────────────────────────────────────
 
-/// Error detail inside the standard error envelope.
+/// One rejected field inside a validation error.
 #[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
-pub struct ErrorDetailDoc {
-    /// Machine-readable error code, e.g. `DATABASE_UNAVAILABLE`.
-    pub code: String,
-    pub message: String,
-    /// Unique id for correlating the failure in logs.
-    pub request_id: String,
+pub struct FieldViolationDoc {
+    /// Field name, query parameter or JSON pointer.
+    pub field: String,
+    /// Why the value was rejected.
+    pub reason: String,
 }
 
-/// Standard error envelope returned by every handler (`ApiResponse::error`).
+/// Error detail inside the standard error envelope (version 1).
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct ErrorDetailDoc {
+    /// Envelope version; currently `1`.
+    pub version: u32,
+    /// Stable machine-readable error code, e.g. `DATABASE_UNAVAILABLE`.
+    pub code: String,
+    /// Safe human-readable message. Never contains internal error details.
+    pub message: String,
+    /// Request id; also returned in the `x-request-id` response header.
+    pub request_id: String,
+    /// Whether the same request may succeed if retried later.
+    pub retryable: bool,
+    /// Field-level validation failures; present only for validation errors.
+    #[serde(default)]
+    pub details: Vec<FieldViolationDoc>,
+}
+
+/// Standard error envelope returned by every failing request.
 #[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct ErrorResponse {
     /// Always `"error"`.
@@ -243,13 +260,14 @@ pub struct ErrorResponse {
     pub error: ErrorDetailDoc,
 }
 
-/// Body of `429` responses, and of `503` responses when the distributed rate
-/// limiter itself is unavailable.
+/// Body of `429` responses (`RATE_LIMIT_EXCEEDED`), and of `503` responses
+/// when the distributed rate limiter itself is unavailable
+/// (`RATE_LIMITER_UNAVAILABLE`). Same shape as [`ErrorResponse`].
 #[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct RateLimitErrorResponse {
     /// Always `"error"`.
     pub status: String,
-    pub error: String,
+    pub error: ErrorDetailDoc,
 }
 
 /// `503` body: a handler error envelope, or the rate limiter's own body when
@@ -368,11 +386,56 @@ pub struct AssetPriceDoc {
     pub price_usd: f64,
 }
 
+/// Lifecycle status of one API version.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct ApiVersionDoc {
+    pub version: String,
+    /// `active`, `deprecated` or `sunset`.
+    pub status: String,
+    /// RFC 3339 time deprecation was announced.
+    pub deprecated_at: Option<String>,
+    /// RFC 3339 time after which the version answers `410 Gone`.
+    pub sunset_at: Option<String>,
+    /// Version clients should migrate to.
+    pub successor: Option<String>,
+}
+
+/// A deprecated operation inside a supported API version.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct DeprecatedRouteDoc {
+    pub method: String,
+    pub path: String,
+    /// `deprecated` or `sunset`.
+    pub status: String,
+    pub deprecated_at: Option<String>,
+    pub sunset_at: Option<String>,
+    /// Path of the replacement operation.
+    pub replacement: Option<String>,
+}
+
 /// OpenAPI schema for the v1 API index document.
 #[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct ApiIndexDoc {
     pub name: String,
     pub version: String,
+    /// Lifecycle status of this version: `active`, `deprecated` or `sunset`.
+    pub status: String,
+    /// Every public API version and its lifecycle dates.
+    pub versions: Vec<ApiVersionDoc>,
+    /// Deprecated operations and their sunset dates.
+    pub deprecated_routes: Vec<DeprecatedRouteDoc>,
+    /// URL of the API versioning and deprecation policy.
+    pub deprecation_policy: String,
+}
+
+/// OpenAPI schema for `POST /api/v1/auth/logout`.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct LogoutRequestDoc {
+    /// Refresh token of the same session to revoke as well.
+    pub refresh_token: Option<String>,
+    /// Revoke every token issued to the user so far.
+    #[serde(default)]
+    pub all_sessions: bool,
 }
 
 /// OpenAPI schema for `POST /api/v1/auth/refresh`.
@@ -410,7 +473,7 @@ pub struct SetInterestsRequestDoc {
     info(
         title = "PrediFi API",
         version = "1.0.0",
-        description = "REST API for the PrediFi prediction-market platform built on Stellar/Soroban.",
+        description = "REST API for the PrediFi prediction-market platform built on Stellar/Soroban.\n\nVersioning: `/api/v1` is active. Every `/api/<version>` response carries an `API-Version` header; deprecated versions and operations add `Deprecation`, `Sunset` and `Link` headers and are listed by `GET /api/v1`. See docs/API_VERSIONING_POLICY.md.\n\nErrors: every failure uses the versioned error envelope (`ErrorResponse`) with a stable `code`, a safe `message`, `request_id` (also in the `x-request-id` header) and `retryable`.",
         contact(name = "PrediFi Team", url = "https://github.com/Web3Novalabs/predifi"),
         license(name = "MIT")
     ),
@@ -440,6 +503,7 @@ pub struct SetInterestsRequestDoc {
         api_get_user_referral_earnings,
         api_get_creator_stats,
         api_refresh_tokens,
+        api_logout,
         api_ingest_pool_created,
         api_ingest_prediction_placed,
         api_ingest_claim,
@@ -465,6 +529,7 @@ pub struct SetInterestsRequestDoc {
         DependencyStatus,
         HealthErrors,
         HealthResponse,
+        FieldViolationDoc,
         ErrorDetailDoc,
         ErrorResponse,
         RateLimitErrorResponse,
@@ -479,12 +544,15 @@ pub struct SetInterestsRequestDoc {
         IndexerOkEnvelope,
         PricesEnvelope,
         AssetPriceDoc,
+        ApiVersionDoc,
+        DeprecatedRouteDoc,
         ApiIndexDoc,
         PoolCreatedPayloadDoc,
         PredictionPlacedPayloadDoc,
         ClaimPayloadDoc,
         IndexerOkResponse,
         RefreshTokenRequestDoc,
+        LogoutRequestDoc,
         UpdatePoolTagsRequestDoc,
         MarkNotificationsReadRequestDoc,
         SetInterestsRequestDoc,
@@ -536,9 +604,8 @@ pub const UNDOCUMENTED_ROUTES: &[(&str, &str, &str)] = &[
 // ── Path stubs ────────────────────────────────────────────────────────────────
 //
 // Response conventions (enforced by tests/openapi_drift.rs):
-// * path/query extraction failures are `400` with a `text/plain` body;
-// * JSON body failures are `400`/`415`/`422` with a `text/plain` body;
-// * handler errors use the `ErrorResponse` envelope;
+// * every failure, including path/query/JSON extraction failures, unknown
+//   routes and body limits, uses the `ErrorResponse` envelope (#51);
 // * rate-limited routes may answer `429`, and `503` from either a handler or
 //   the rate limiter (`ServiceUnavailableResponse`).
 
@@ -554,7 +621,7 @@ async fn api_health() {}
 #[allow(dead_code)]
 #[utoipa::path(get, path = "/api/v1", tag = "health",
     responses(
-        (status = 200, description = "API name and version", body = ApiIndexDoc),
+        (status = 200, description = "API name, version and version lifecycle status", body = ApiIndexDoc),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
     )
 )]
@@ -586,10 +653,7 @@ async fn api_v1_health() {}
     ),
     responses(
         (status = 200, description = "Paginated pool list", body = PoolListResponse),
-        (status = 400, description = "Invalid query parameter", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 400, description = "Invalid query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -602,7 +666,7 @@ async fn api_get_pools() {}
     params(("pool_id" = i64, Path, description = "On-chain pool identifier")),
     responses(
         (status = 200, description = "Pool details with live odds", body = PoolWithOddsEnvelope),
-        (status = 400, description = "Malformed pool id", body = String, content_type = "text/plain"),
+        (status = 400, description = "Malformed pool id", body = ErrorResponse),
         (status = 404, description = "Pool not found", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
@@ -621,7 +685,7 @@ async fn api_get_pool_by_id() {}
     ),
     responses(
         (status = 200, description = "Per-pool leaderboard", body = DataEnvelope),
-        (status = 400, description = "Malformed path or query parameter", body = String, content_type = "text/plain"),
+        (status = 400, description = "Malformed path or query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -635,15 +699,12 @@ async fn api_get_pool_leaderboard() {}
     request_body = UpdatePoolTagsRequestDoc,
     responses(
         (status = 200, description = "Tags replaced", body = DataEnvelope),
-        (status = 400, description = "Malformed path or body", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 400, description = "Malformed path or body", body = ErrorResponse),
         (status = 403, description = "Caller is not the pool creator", body = ErrorResponse),
         (status = 404, description = "Pool not found", body = ErrorResponse),
-        (status = 413, description = "Request body too large", body = String, content_type = "text/plain"),
-        (status = 415, description = "Missing JSON content type", body = String, content_type = "text/plain"),
-        (status = 422, description = "Body does not match the schema", body = String, content_type = "text/plain"),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database or rate limiter not available", body = ServiceUnavailableResponse),
@@ -659,7 +720,7 @@ async fn api_update_pool_tags() {}
     ),
     responses(
         (status = 200, description = "Protocol-wide aggregate statistics", body = ProtocolStatsEnvelope),
-        (status = 400, description = "Invalid query parameter", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -695,10 +756,7 @@ async fn api_get_prices() {}
     ),
     responses(
         (status = 200, description = "User leaderboard", body = LeaderboardEnvelope),
-        (status = 400, description = "Invalid query parameter", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 400, description = "Invalid query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -726,7 +784,7 @@ async fn api_list_tags() {}
     ),
     responses(
         (status = 200, description = "Paginated prediction history", body = PredictionHistoryEnvelope),
-        (status = 400, description = "Invalid address or query parameter", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address or query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -743,7 +801,7 @@ async fn api_get_user_history() {}
     ),
     responses(
         (status = 200, description = "Enhanced predictions with pool status", body = UserPredictionsEnvelope),
-        (status = 400, description = "Invalid address or query parameter", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address or query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -756,7 +814,7 @@ async fn api_get_user_predictions() {}
     params(("address" = String, Path, description = "Stellar account address (G...)")),
     responses(
         (status = 200, description = "User profile and statistics", body = DataEnvelope),
-        (status = 400, description = "Invalid address", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -769,7 +827,7 @@ async fn api_get_user_profile() {}
     params(("address" = String, Path, description = "Stellar account address (G...)")),
     responses(
         (status = 200, description = "Notification interests", body = DataEnvelope),
-        (status = 400, description = "Invalid address", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -783,13 +841,10 @@ async fn api_get_user_interests() {}
     request_body = SetInterestsRequestDoc,
     responses(
         (status = 200, description = "Interests replaced", body = DataEnvelope),
-        (status = 400, description = "Invalid address or body", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
-        (status = 413, description = "Request body too large", body = String, content_type = "text/plain"),
-        (status = 415, description = "Missing JSON content type", body = String, content_type = "text/plain"),
-        (status = 422, description = "Body does not match the schema", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address or body", body = ErrorResponse),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -807,7 +862,7 @@ async fn api_set_user_interests() {}
     ),
     responses(
         (status = 200, description = "Notifications, newest first", body = DataEnvelope),
-        (status = 400, description = "Invalid address or query parameter", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address or query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -821,10 +876,10 @@ async fn api_list_notifications() {}
     request_body = MarkNotificationsReadRequestDoc,
     responses(
         (status = 200, description = "Number of notifications marked read", body = DataEnvelope),
-        (status = 400, description = "Invalid address or body", body = String, content_type = "text/plain"),
-        (status = 413, description = "Request body too large", body = String, content_type = "text/plain"),
-        (status = 415, description = "Missing JSON content type", body = String, content_type = "text/plain"),
-        (status = 422, description = "Body does not match the schema", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address or body", body = ErrorResponse),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
@@ -841,7 +896,7 @@ async fn api_mark_notifications_read() {}
     ),
     responses(
         (status = 200, description = "Cursor-paginated predictions for the market", body = MarketPredictionsEnvelope),
-        (status = 400, description = "Malformed market id or query parameter", body = String, content_type = "text/plain"),
+        (status = 400, description = "Malformed market id or query parameter", body = ErrorResponse),
         (status = 404, description = "Market not found", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
@@ -855,7 +910,7 @@ async fn api_get_market_predictions() {}
     params(("address" = String, Path, description = "Stellar referrer address (G...)")),
     responses(
         (status = 200, description = "Referral summary", body = ReferralEarningsResponse),
-        (status = 400, description = "Invalid address", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not configured", body = ServiceUnavailableResponse),
@@ -868,7 +923,7 @@ async fn api_get_referrals() {}
     params(("address" = String, Path, description = "Stellar referrer address (G...)")),
     responses(
         (status = 200, description = "Estimated referral reward", body = DataEnvelope),
-        (status = 400, description = "Invalid address", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not configured", body = ServiceUnavailableResponse),
@@ -881,7 +936,7 @@ async fn api_get_referral_estimate() {}
     params(("address" = String, Path, description = "Stellar referrer address (G...)")),
     responses(
         (status = 200, description = "Per-pool referral earnings", body = ReferralEarningsResponse),
-        (status = 400, description = "Invalid address", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not configured", body = ServiceUnavailableResponse),
@@ -894,7 +949,7 @@ async fn api_get_user_referral_earnings() {}
     params(("address" = String, Path, description = "Creator Stellar address (G...)")),
     responses(
         (status = 200, description = "Creator statistics", body = DataEnvelope),
-        (status = 400, description = "Invalid address", body = String, content_type = "text/plain"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
         (status = 404, description = "Creator has no pools", body = ErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database not available", body = ErrorResponse),
@@ -907,16 +962,30 @@ async fn api_get_creator_stats() {}
     request_body = RefreshTokenRequestDoc,
     responses(
         (status = 200, description = "New access/refresh token pair", body = DataEnvelope),
-        (status = 400, description = "Malformed body", body = String, content_type = "text/plain"),
+        (status = 400, description = "Malformed body", body = ErrorResponse),
         (status = 401, description = "Invalid, expired, or already-rotated refresh token", body = ErrorResponse),
-        (status = 413, description = "Request body too large", body = String, content_type = "text/plain"),
-        (status = 415, description = "Missing JSON content type", body = String, content_type = "text/plain"),
-        (status = 422, description = "Body does not match the schema", body = String, content_type = "text/plain"),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 503, description = "Revocation store or rate limiter unavailable (fails closed)", body = ServiceUnavailableResponse),
     )
 )]
 async fn api_refresh_tokens() {}
+
+#[allow(dead_code)]
+#[utoipa::path(post, path = "/api/v1/auth/logout", tag = "auth",
+    request_body = LogoutRequestDoc,
+    responses(
+        (status = 200, description = "Session (or all sessions) revoked", body = DataEnvelope),
+        (status = 401, description = "Missing, invalid, expired or revoked access token", body = ErrorResponse),
+        (status = 403, description = "Refresh token belongs to a different user", body = ErrorResponse),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 503, description = "Revocation store or rate limiter unavailable (fails closed)", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_logout() {}
 
 #[allow(dead_code)]
 #[utoipa::path(post, path = "/api/v1/indexer/pool-created", tag = "indexer",
@@ -926,21 +995,12 @@ async fn api_refresh_tokens() {}
     request_body = PoolCreatedPayloadDoc,
     responses(
         (status = 200, description = "Pool indexed successfully", body = IndexerOkEnvelope),
-        (status = 400, description = "Malformed body or Idempotency-Key", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 400, description = "Malformed body or Idempotency-Key", body = ErrorResponse),
         (status = 401, description = "Idempotency-Key sent without a valid bearer access token", body = ErrorResponse),
         (status = 409, description = "A request with this Idempotency-Key is still in progress (retry after `Retry-After`)", body = ErrorResponse),
-        (status = 413, description = "Request body too large", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
-        (status = 415, description = "Missing JSON content type", body = String, content_type = "text/plain"),
-        (status = 422, description = "Body does not match the schema, or Idempotency-Key reused with a different request", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema, or Idempotency-Key reused with a different request", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database, idempotency store, or rate limiter unavailable", body = ServiceUnavailableResponse),
@@ -956,21 +1016,12 @@ async fn api_ingest_pool_created() {}
     request_body = PredictionPlacedPayloadDoc,
     responses(
         (status = 200, description = "Prediction indexed successfully", body = IndexerOkEnvelope),
-        (status = 400, description = "Malformed body or Idempotency-Key", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 400, description = "Malformed body or Idempotency-Key", body = ErrorResponse),
         (status = 401, description = "Idempotency-Key sent without a valid bearer access token", body = ErrorResponse),
         (status = 409, description = "A request with this Idempotency-Key is still in progress (retry after `Retry-After`)", body = ErrorResponse),
-        (status = 413, description = "Request body too large", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
-        (status = 415, description = "Missing JSON content type", body = String, content_type = "text/plain"),
-        (status = 422, description = "Body does not match the schema, or Idempotency-Key reused with a different request", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema, or Idempotency-Key reused with a different request", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database, idempotency store, or rate limiter unavailable", body = ServiceUnavailableResponse),
@@ -986,21 +1037,12 @@ async fn api_ingest_prediction_placed() {}
     request_body = ClaimPayloadDoc,
     responses(
         (status = 200, description = "Claim recorded; `data.rows_updated` predictions marked claimed", body = DataEnvelope),
-        (status = 400, description = "Malformed body or Idempotency-Key", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 400, description = "Malformed body or Idempotency-Key", body = ErrorResponse),
         (status = 401, description = "Idempotency-Key sent without a valid bearer access token", body = ErrorResponse),
         (status = 409, description = "A request with this Idempotency-Key is still in progress (retry after `Retry-After`)", body = ErrorResponse),
-        (status = 413, description = "Request body too large", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
-        (status = 415, description = "Missing JSON content type", body = String, content_type = "text/plain"),
-        (status = 422, description = "Body does not match the schema, or Idempotency-Key reused with a different request", content(
-            (ErrorResponse = "application/json"),
-            (String = "text/plain"),
-        )),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema, or Idempotency-Key reused with a different request", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
         (status = 503, description = "Database, idempotency store, or rate limiter unavailable", body = ServiceUnavailableResponse),

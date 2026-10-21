@@ -6,7 +6,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration as TokioDuration};
 
 use crate::cache_coalesce::{CoalesceError, CoalescingCache};
 use crate::config::Config;
@@ -32,16 +31,14 @@ pub struct FeeInfo {
 pub async fn health(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use std::time::Duration;
 
     let mut all_healthy = true;
     let mut db_status = "ok";
-    let mut db_error = String::new();
 
     if let Some(db) = &state.db {
         if let Err(e) = sqlx::query("SELECT 1").execute(db).await {
+            tracing::warn!(error = %e, "database health probe failed");
             db_status = "unreachable";
-            db_error = e.to_string();
             all_healthy = false;
         }
     } else {
@@ -49,50 +46,10 @@ pub async fn health(State(state): State<AppState>) -> axum::response::Response {
     }
 
     let mut rpc_status = "ok";
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(state.config.rpc_health_timeout_secs))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    // Try RPC health check with retry logic
-    let mut rpc_attempts = 0;
-    let max_attempts = state.config.rpc_health_retry_count as usize;
-    let mut last_error = String::new();
-
-    while rpc_attempts < max_attempts {
-        rpc_attempts += 1;
-
-        let rpc_req = client
-            .post(&state.config.stellar_rpc_url)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getHealth"
-            }))
-            .send()
-            .await;
-
-        match rpc_req {
-            Ok(res) if res.status().is_success() => {
-                // Success - break out of retry loop
-                break;
-            }
-            Ok(res) => {
-                last_error = format!("HTTP {} response", res.status());
-            }
-            Err(e) => {
-                last_error = e.to_string();
-            }
-        }
-
-        // Exponential backoff: 2^(attempt-1) seconds, capped at 5 seconds
-        if rpc_attempts < max_attempts {
-            let backoff_duration = std::cmp::min(2u64.pow((rpc_attempts - 1) as u32), 5);
-            sleep(TokioDuration::from_secs(backoff_duration)).await;
-        }
-    }
-
-    if rpc_attempts >= max_attempts {
+    // Bounded probe with a short deadline and the shared circuit breaker
+    // (#58). Error details are logged, never returned (#51).
+    if let Err(error) = crate::rpc_resilience::probe_health(&state.config).await {
+        tracing::warn!(error = %error, "rpc health probe failed");
         rpc_status = "unreachable";
         all_healthy = false;
     }
@@ -141,8 +98,8 @@ pub async fn health(State(state): State<AppState>) -> axum::response::Response {
             "disk": disk_status
         },
         "errors": {
-            "db": if db_status == "unreachable" { Some(db_error.clone()) } else { None },
-            "rpc": if rpc_status == "unreachable" { Some(last_error.clone()) } else { None },
+            "db": if db_status == "unreachable" { Some("database unreachable".to_string()) } else { None },
+            "rpc": if rpc_status == "unreachable" { Some("rpc unreachable".to_string()) } else { None },
             "redis": if redis_status == "unreachable" { Some(redis_error.clone()) } else { None },
             "price_cache": if price_cache_status == "not_ready" { Some("price cache is empty".to_string()) } else { None },
             "disk": if disk_status != "ok" { Some(disk_error) } else { None }
@@ -157,10 +114,24 @@ pub async fn health(State(state): State<AppState>) -> axum::response::Response {
 }
 
 /// `GET /api/v1` version discovery endpoint.
+///
+/// Also reports the lifecycle status of every API version and any
+/// deprecated routes (#53), so clients can detect upcoming removals.
 async fn index() -> Json<serde_json::Value> {
+    let lifecycle = crate::api_versioning::versions_document();
+    let status = lifecycle
+        .versions
+        .iter()
+        .find(|v| v.version == "v1")
+        .map(|v| v.status)
+        .unwrap_or(crate::api_versioning::LifecycleStatus::Active);
     Json(json!({
         "name": "predifi-backend",
-        "version": "v1"
+        "version": "v1",
+        "status": status,
+        "versions": lifecycle.versions,
+        "deprecated_routes": lifecycle.deprecated_routes,
+        "deprecation_policy": lifecycle.policy,
     }))
 }
 
@@ -207,6 +178,12 @@ impl axum::extract::FromRef<AppState> for SharedMetrics {
 impl axum::extract::FromRef<AppState> for Option<sqlx::PgPool> {
     fn from_ref(state: &AppState) -> Self {
         state.db.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for RedisCache {
+    fn from_ref(state: &AppState) -> Self {
+        state.redis.clone()
     }
 }
 
@@ -2003,6 +1980,11 @@ pub fn router(
                 post(refresh_tokens_handler)
                     .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TOKEN_REFRESH)),
             )
+            .route(
+                "/auth/logout",
+                post(logout_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TOKEN_REFRESH)),
+            )
             .route("/ws", get(crate::ws::ws_handler))
             .with_state(state.clone()),
         RateLimitTier::Token,
@@ -2155,15 +2137,33 @@ async fn refresh_tokens_handler(
         .unwrap_or_default()
         .as_secs();
 
-    match crate::jwt_security::rotate_refresh_token(
-        &state.redis,
-        &state.config.secret_key,
-        &body.refresh_token,
-        state.config.jwt_key_version,
-        now,
-    )
-    .await
-    {
+    // With a database, rotation uses the durable cross-replica revocation
+    // store (#55); without one it falls back to the Redis-only path.
+    let result = if state.db.is_some() {
+        let store = crate::token_revocation::RevocationStore::new(
+            state.db.clone(),
+            state.redis.clone(),
+        );
+        crate::jwt_security::rotate_refresh_token_durable(
+            &store,
+            &state.config.secret_key,
+            &body.refresh_token,
+            state.config.jwt_key_version,
+            now,
+        )
+        .await
+    } else {
+        crate::jwt_security::rotate_refresh_token(
+            &state.redis,
+            &state.config.secret_key,
+            &body.refresh_token,
+            state.config.jwt_key_version,
+            now,
+        )
+        .await
+    };
+
+    match result {
         Ok(pair) => {
             let response = RefreshTokenResponse {
                 access_token: pair.access_token,
@@ -2173,19 +2173,100 @@ async fn refresh_tokens_handler(
             };
             ApiResponse::success(response).into_response()
         }
-        Err(crate::jwt::JwtVerifyError::TokenStoreUnavailable) => ApiResponse::<()>::error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_codes::INTERNAL_ERROR,
-            "token store unavailable",
-        )
-        .into_response(),
-        Err(error) => ApiResponse::<()>::error(
-            StatusCode::UNAUTHORIZED,
-            error_codes::UNAUTHORIZED,
-            error.to_string(),
-        )
-        .into_response(),
+        Err(error) => crate::errors::AppError::from(error).into_response(),
     }
+}
+
+/// `POST /api/v1/auth/logout` — revoke the presented access token (#55).
+///
+/// Requires `Authorization: Bearer <access token>`. The optional body can
+/// also revoke the session's refresh token, or revoke every session of the
+/// user (`all_sessions: true`, which bumps the per-user token version).
+/// Revocation is stored in Postgres, so the tokens fail on every replica.
+async fn logout_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<LogoutRequest>>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use crate::errors::AppError;
+    use crate::token_revocation::{RevocationReason, RevocationStore};
+    use axum::response::IntoResponse;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+        .ok_or_else(|| AppError::Unauthorized("missing bearer token".to_string()))?;
+    let claims = crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    )?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let store = RevocationStore::new(state.db.clone(), state.redis.clone());
+    store.ensure_not_revoked(&claims, now).await?;
+
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let map_store = |e: crate::token_revocation::RevocationError| {
+        AppError::from(crate::jwt::JwtVerifyError::from(e))
+    };
+
+    if body.all_sessions {
+        store
+            .revoke_all(&claims.sub, RevocationReason::Logout, now)
+            .await
+            .map_err(map_store)?;
+        return Ok(ApiResponse::success(LogoutResponse {
+            revoked: "all_sessions",
+        })
+        .into_response());
+    }
+
+    if let Some(refresh) = body.refresh_token.as_deref().filter(|t| !t.is_empty()) {
+        let refresh_claims = crate::jwt::verify_jwt_token_strict(
+            refresh,
+            &state.config.secret_key,
+            "refresh",
+            state.config.jwt_key_version,
+        )?;
+        if refresh_claims.sub != claims.sub {
+            return Err(AppError::Forbidden(
+                "refresh token belongs to a different user".to_string(),
+            ));
+        }
+        store
+            .revoke(&refresh_claims, RevocationReason::Logout, now)
+            .await
+            .map_err(map_store)?;
+    }
+    store
+        .revoke(&claims, RevocationReason::Logout, now)
+        .await
+        .map_err(map_store)?;
+
+    Ok(ApiResponse::success(LogoutResponse { revoked: "session" }).into_response())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LogoutRequest {
+    /// Refresh token of the same session to revoke as well.
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// Revoke every token issued to the user so far.
+    #[serde(default)]
+    all_sessions: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LogoutResponse {
+    /// `"session"` or `"all_sessions"`.
+    revoked: &'static str,
 }
 
 #[derive(Debug, Deserialize)]

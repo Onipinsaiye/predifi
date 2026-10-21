@@ -2,7 +2,8 @@
 
 import { useEffect } from "react";
 import Link from "next/link";
-import { ArrowLeft, RefreshCw, AlertTriangle } from "lucide-react";
+import { usePathname } from "next/navigation";
+import { ArrowLeft, RefreshCw, AlertTriangle, SearchX } from "lucide-react";
 
 export default function Error({
   error,
@@ -11,15 +12,26 @@ export default function Error({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const pathname = usePathname();
+
   useEffect(() => {
-    // Log the error to an error reporting service
-    console.error("Application error:", error);
-  }, [error]);
+    // Log redacted diagnostics to an error reporting service. Never log raw
+    // error messages or stack traces, which may contain sensitive data.
+    console.error("Application error:", {
+      digest: error.digest,
+      pathname,
+    });
+  }, [error.digest, pathname]);
 
   const isNetworkError =
     error.message?.includes("fetch") ||
     error.message?.includes("network") ||
     error.message?.includes("Failed to fetch");
+
+  const isNotFoundError =
+    error.digest === "NEXT_NOT_FOUND" ||
+    error.message?.includes("NEXT_NOT_FOUND") ||
+    error.message?.includes("not found");
 
   return (
     <main
@@ -39,7 +51,7 @@ export default function Error({
       {/* Grid overlay */}
       <svg
         aria-hidden="true"
-        className="pointer-events-none absolute inset-0 h-full w-full opacity-[0.03]"
+        className="pointer-events-none absolute inset-0 h-hide w-full opacity-[0.03]"
         xmlns="http://www.w3.org/2000/svg"
       >
         <defs>
@@ -71,18 +83,26 @@ export default function Error({
         <div className="mx-auto mb-6 h-px w-24 bg-gradient-to-r from-transparent via-red-400/60 to-transparent" />
 
         <h2 className="text-2xl md:text-3xl font-semibold text-white mb-3">
-          {isNetworkError ? "Connection Error" : "Something Went Wrong"}
+          {isNotFoundError
+            ? "Not Found"
+            : isNetworkError
+              ? "Connection Error"
+              : "Something Went Wrong"}
         </h2>
         <p className="text-sm text-zinc-400 max-w-sm mx-auto mb-6 leading-relaxed">
-          {isNetworkError
-            ? "We couldn't connect to the server. Please check your internet connection and try again."
-            : "An unexpected error occurred. Please try again or return to the homepage."}
+          {isNotFoundError
+            ? "The page or market you're looking for doesn't exist or may have been removed."
+            : isNetworkError
+              ? "We couldn't connect to the server. Please check your internet connection and try again."
+              : "An unexpected error occurred. Please try again or return to the homepage."}
         </p>
 
-        {/* Error message for development */}
-        {process.env.NODE_ENV === "development" && error.message && (
+        {/* Redacted diagnostics for development */}
+        {process.env.NODE_ENV === "development" && (
           <div className="mb-6 p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-left">
-            <p className="text-xs text-red-400 font-mono break-all">{error.message}</p>
+            <p className="text-xs text-red-400 font-mono break-all">
+              Route: {pathname}
+            </p>
             {error.digest && (
               <p className="text-xs text-zinc-500 mt-2 font-mono">
                 Digest: {error.digest}
@@ -93,13 +113,24 @@ export default function Error({
 
         {/* CTAs */}
         <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-          <button
-            onClick={reset}
-            className="group inline-flex items-center gap-2 rounded-xl border border-[#37B7C3]/30 bg-[#37B7C3]/10 px-6 py-3 text-sm font-medium text-[#37B7C3] transition-all duration-200 hover:bg-[#37B7C3]/20 hover:border-[#37B7C3]/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#37B7C3]"
-          >
-            <RefreshCw className="w-4 h-4" />
-            Try again
-          </button>
+          {isNotFoundError ? (
+            <Link
+              href="/markets"
+              prefetch
+              className="group inline-flex items-center gap-2 rounded-xl border border-[#37B7C3]/30 bg-[#37B7C3]/10 px-6 py-3 text-sm font-medium text-[#37B7C3] transition-all duration-200 hover:bg-[#37B7C3]/20 hover:border-[#37B7C3]/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#37B7C3]"
+            >
+              <SearchX className="w-4 h-4" />
+              Browse Markets
+            </Link>
+          ) : (
+            <button
+              onClick={reset}
+              className="group inline-flex items-center gap-2 rounded-xl border border-[#37B7C3]/30 bg-[#37B7C3]/10 px-6 py-3 text-sm font-medium text-[#37B7C3] transition-all duration-200 hover:bg-[#37B7C3]/20 hover:border-[#37B7C3]/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#37B7C3]"
+            >
+              <RefreshCw className="w-4 h-4" />
+              Try again
+            </button>
+          )}
           <Link
             href="/"
             prefetch
