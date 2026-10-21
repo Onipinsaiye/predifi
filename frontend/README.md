@@ -44,6 +44,12 @@ and then run `pnpm dev`.
 | --- | --- | --- |
 | `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:3000` | Base URL of the PrediFi backend API used by the data layer in `lib/api`. |
 
+## Security headers
+
+The application enforces a nonce-based Content Security Policy and standard
+response headers. See [the policy and deployment notes](docs/security-headers.md)
+before deploying, changing API endpoints, or adding third-party resources.
+
 ## Data fetching & caching
 
 Server data is fetched through [SWR](https://swr.vercel.app). Global defaults
