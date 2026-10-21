@@ -5,6 +5,9 @@ on:
     - cron: '0 2 * * 0' # Run every Sunday at 2:00 AM
   workflow_dispatch:    # Allow manual triggers from the UI
 
+permissions:
+  contents: read
+
 jobs:
   capacity-test:
     name: Run Capacity Load Test
