@@ -1,3 +1,4 @@
+
 /**
  * Accessibility + keyboard-only flow tests for CreatePoolForm.
  *
@@ -9,7 +10,7 @@
  *   trigger validation, fix errors, and complete a valid submission
  */
 import React from "react";
-import { render, screen, within, act } from "@testing-library/react";
+import { render, screen, within, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import { CreatePoolForm } from "@/components/pool/CreatePoolForm";
@@ -27,6 +28,16 @@ function validCloseTime(): string {
   return d.toISOString().slice(0, 16);
 }
 
+/** Returns the live region used to announce status/validation changes. */
+function getStatusRegion(): HTMLElement {
+  return screen.getByRole("status");
+}
+
+/** Returns the alert region used to announce validation errors. */
+function getAlertRegion(): HTMLElement {
+  return screen.getByRole("alert");
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe("CreatePoolForm accessibility", () => {
@@ -34,6 +45,13 @@ describe("CreatePoolForm accessibility", () => {
     const { container } = render(<CreatePoolForm />);
     const results = await axe(container);
     expect(results).toHaveNoViolations();
+  });
+
+  it("exposes a polite live region for status updates", () => {
+    render(<CreatePoolForm />);
+    const status = getStatusRegion();
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveAttribute("aria-atomic", "true");
   });
 
   it("has no axe violations after validation errors appear", async () => {
@@ -46,6 +64,10 @@ describe("CreatePoolForm accessibility", () => {
     const outcome1 = screen.getByLabelText("Outcome 1");
     expect(outcome1).toHaveAttribute("aria-invalid", "true");
     expect(outcome1).toHaveAccessibleDescription("Outcome label is required.");
+
+    // Validation errors must be announced via an assertive alert region.
+    const alert = getAlertRegion();
+    expect(alert).toHaveTextContent(/outcome label is required/i);
 
     const results = await axe(container);
     expect(results).toHaveNoViolations();
@@ -101,6 +123,11 @@ describe("CreatePoolForm accessibility", () => {
       { timeout: 3000 },
     );
     expect(successHeading).toBeInTheDocument();
+
+    // Success must be announced through the status live region.
+    await waitFor(() => {
+      expect(getStatusRegion()).toHaveTextContent(/pool created successfully/i);
+    });
 
     const results = await axe(container);
     expect(results).toHaveNoViolations();
@@ -240,11 +267,20 @@ describe("CreatePoolForm keyboard-only flow", () => {
     expect(outcome2).toHaveAttribute("aria-invalid", "true");
     expect(outcome2).toHaveAccessibleDescription("Outcome labels must be unique.");
 
+    // The error must be associated and announced.
+    expect(getAlertRegion()).toHaveTextContent(/outcome labels must be unique/i);
+    expect(outcome2).toHaveAttribute("aria-describedby");
+
     await user.clear(screen.getByLabelText("Outcome 1"));
     await user.type(screen.getByLabelText("Outcome 1"), "No");
 
     expect(outcome2).toHaveAttribute("aria-invalid", "false");
     expect(screen.queryByText("Outcome labels must be unique.")).not.toBeInTheDocument();
+
+    // The alert region should be cleared once the error is resolved.
+    await waitFor(() => {
+      expect(getAlertRegion()).toBeEmptyDOMElement();
+    });
   });
 
   it("focuses the first error field when submitting an invalid form", async () => {
@@ -260,6 +296,10 @@ describe("CreatePoolForm keyboard-only flow", () => {
     const nameInput = screen.getByLabelText(/pool name/i);
     expect(nameInput).toHaveFocus();
     expect(nameInput).toHaveAttribute("aria-invalid", "true");
+
+    // Focus must be preserved on the first error field after the announcement.
+    expect(getAlertRegion()).toHaveTextContent(/pool name is required/i);
+    expect(nameInput).toHaveFocus();
   });
 
   it("completes a full valid submission using only keyboard", async () => {
@@ -338,6 +378,11 @@ describe("CreatePoolForm keyboard-only flow", () => {
       { timeout: 3000 },
     );
     expect(successHeading).toBeInTheDocument();
+
+    // Status announcement is present for screen-reader users.
+    await waitFor(() => {
+      expect(getStatusRegion()).toHaveTextContent(/pool created successfully/i);
+    });
   });
 
   it("shows validation errors and allows correcting them via keyboard", async () => {
@@ -362,6 +407,10 @@ describe("CreatePoolForm keyboard-only flow", () => {
     // Focus should now be on Description (next error)
     expect(screen.getByLabelText(/description/i)).toHaveFocus();
     expect(screen.getByLabelText(/description/i)).toHaveAttribute("aria-invalid", "true");
+
+    // The new error must be announced without moving focus away.
+    expect(getAlertRegion()).toHaveTextContent(/description is required/i);
+    expect(screen.getByLabelText(/description/i)).toHaveFocus();
 
     // Fix the description
     await user.keyboard("Prediction market pool for BTC price action in 2026.");
