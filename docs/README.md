@@ -126,6 +126,10 @@ These documents are point-in-time reports and are maintained for historical refe
 2. **System Architecture**: [Architecture Overview](./ARCHITECTURE_OVERVIEW.md)
 3. **Treasury Withdrawals**: [Treasury Authority & Limits](./treasury.md)
 4. **Error Handling**: [Error Reference](./ERROR_HANDLING_REFERENCE.md)
+5. **Alert Runbooks**: [Runbooks & alert ownership](./runbooks/README.md)
+6. **SLOs & Error Budgets**: [Service-level objectives](./observability/slos.md)
+7. **Schema Changes**: [Expand–migrate–contract policy](./migrations/expand-migrate-contract.md)
+8. **Infrastructure Drift**: [Terraform drift review](../terraform/DRIFT.md)
 
 ### For Integrators
 

@@ -49,12 +49,10 @@ use std::net::SocketAddr;
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{header::HeaderValue, Extensions, HeaderMap, StatusCode},
+    http::{header::HeaderValue, Extensions, HeaderMap},
     middleware::Next,
-    response::{IntoResponse, Response},
-    Json,
+    response::Response,
 };
-use serde_json::json;
 use tower_governor::key_extractor::SmartIpKeyExtractor;
 
 use crate::redis_cache::RedisCache;
@@ -229,14 +227,7 @@ fn rate_limited_response(limit: u32, remaining: u32, reset_after_secs: u64) -> R
 }
 
 fn limiter_unavailable_response() -> Response {
-    let mut response = (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "status": "error",
-            "error": "Rate limiter unavailable",
-        })),
-    )
-        .into_response();
+    let mut response = crate::response::rate_limiter_unavailable_response();
     response
         .headers_mut()
         .insert("retry-after", HeaderValue::from_static("1"));
@@ -330,7 +321,7 @@ pub fn with_rate_limit(router: axum::Router, _tier: RateLimitTier) -> axum::Rout
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, StatusCode};
 
     #[test]
     fn tier_burst_and_period_values() {

@@ -43,6 +43,102 @@ env:
   WASM_SIZE_THRESHOLD_KB: 200
 
 jobs:
+  contract-checks:
+    name: Contract Checks (WASM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: ./contract
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-opt (binaryen)
+        run: |
+          BINARYEN_VERSION="120"
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | tar -xz -C /tmp
+          sudo mv "/tmp/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt
+          wasm-opt --version
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contract/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contract/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint with clippy
+        run: cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Build contract
+        run: cargo build --workspace --target wasm32-unknown-unknown --release
+
+      - name: Run wasm-opt -O3
+        run: |
+          WASM_DIR="target/wasm32-unknown-unknown/release"
+          echo "| Contract | Raw (bytes) | After wasm-opt -O3 (bytes) | Reduction |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for CONTRACT in predifi_contract access_control; do
+            RAW="${WASM_DIR}/${CONTRACT}.wasm"
+            OPT="${WASM_DIR}/${CONTRACT}.wasm-opt.wasm"
+            [[ -f "$RAW" ]] || continue
+            RAW_BYTES=$(wc -c < "$RAW")
+            wasm-opt -O3 --strip-debug --enable-bulk-memory --enable-sign-ext -o "$OPT" "$RAW"
+            OPT_BYTES=$(wc -c < "$OPT")
+            REDUCTION=$(( RAW_BYTES - OPT_BYTES ))
+            echo "| ${CONTRACT} | ${RAW_BYTES} | ${OPT_BYTES} | -${REDUCTION} bytes |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Test wasm-opt integration
+        run: bash scripts/tests/test_wasm_opt.sh
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
+      - name: Check WASM size
+        run: bash scripts/wasm_size_check.sh
+
+      - name: Print WASM size summary
+        if: always()
+        run: |
+          WASM="target/wasm32-unknown-unknown/release/predifi_contract.wasm"
+          if [[ -f "$WASM" ]]; then
+            BYTES=$(wc -c < "$WASM")
+            KB=$(( BYTES / 1024 ))
+            echo "### WASM Size: ${KB} KB (${BYTES} bytes)" >> "$GITHUB_STEP_SUMMARY"
+            echo "Threshold: ${WASM_SIZE_THRESHOLD_KB} KB" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload WASM artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: predifi-wasm-${{ github.sha }}
+          path: |
+            contract/target/wasm32-unknown-unknown/release/predifi_contract.wasm
+            contract/target/wasm32-unknown-unknown/release/predifi_contract.wasm-opt.wasm
+            contract/target/wasm32-unknown-unknown/release/access_control.wasm
+            contract/target/wasm32-unknown-unknown/release/access_control.wasm-opt.wasm
+          if-no-files-found: ignore
+          retention-days: 90
+
   backend-checks:
     name: Backend Checks & Integration Tests
     runs-on: ubuntu-latest
@@ -79,15 +175,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -129,21 +225,47 @@ jobs:
         run: cargo test --workspace
 
   docker-build:
-    name: Backend Docker Image Build
+    name: Backend Docker Image Build & Vulnerability Scan
     runs-on: ubuntu-latest
     needs: backend-checks
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build Docker Image
         run: |
           docker build -t predifi-backend:latest ./backend
+
+      - name: Pull Supporting Images
+        run: |
+          docker pull postgres:15-alpine
+          docker pull redis:7-alpine
+
+      - name: Install Trivy vulnerability scanner
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.58.2
+
+      - name: Scan Built Backend and Supporting Images
+        run: |
+          mkdir -p .scan-reports
+          trivy image --format json --output .scan-reports/backend.json predifi-backend:latest || true
+          trivy image --format json --output .scan-reports/postgres.json postgres:15-alpine || true
+          trivy image --format json --output .scan-reports/redis.json redis:7-alpine || true
+
+      - name: Evaluate Vulnerability Policy & Report Package Paths
+        run: |
+          node scripts/evaluate-container-vulnerabilities.mjs \
+            --policy deploy/security/vulnerability-policy.json \
+            --reports .scan-reports
+
+      - name: Run Seeded Vulnerability and Policy Test Suite
+        run: |
+          node --test tests/container-vulnerability-policy.test.mjs
 
   deploy-staging:
     name: Deploy Backend to Staging
@@ -162,7 +284,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Authenticate to AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4

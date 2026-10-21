@@ -45,6 +45,20 @@ As an alternative to email, you can open a [private security advisory](https://g
 
 We will keep you informed at each stage. If you have not received an acknowledgement within 48 hours, please follow up by replying to your original email.
 
+## Container & Package Vulnerability Management
+
+Container base images and operating system packages undergo automated vulnerability scanning prior to deployment.
+See [Container Vulnerability Management](docs/deploy/container-vulnerabilities.md) and the operational policy at [vulnerability-policy.json](deploy/security/vulnerability-policy.json).
+
+| Severity   | Remediation SLA | Deployment Gate Action |
+| ---------- | --------------- | ---------------------- |
+| `CRITICAL` | 7 days          | Block deployment       |
+| `HIGH`     | 14 days         | Block deployment       |
+| `MEDIUM`   | 30 days         | Block on SLA expiry    |
+| `LOW`      | 90 days         | Advisory / audit trail |
+
+Time-limited exceptions require explicit approval and expiration tracking. Expired exceptions automatically re-engage blocking gates.
+
 ## Disclosure Policy
 
 We follow a **coordinated disclosure** model:
@@ -56,6 +70,37 @@ We follow a **coordinated disclosure** model:
 5. Credit is given to the reporter unless they prefer to remain anonymous.
 
 We ask that you do not publicly disclose the vulnerability until a patch has been released or the agreed disclosure date has passed.
+## Secret Scanning and Credential Leak Prevention
+
+We run automated secret scanning to detect committed credentials and private keys before they reach the `main` branch.
+
+### CI Scanner
+
+- Every pull request and push to `main` is scanned by the CI secret scanner (see `.github/workflows/secret-scan.yml`).
+- The scanner fails the build when it detects a high-confidence credential or private key.
+- Findings are reported by rule ID and file path only. **Secret values are never written to CI logs or artifacts.**
+
+### False-Positive Suppression
+
+- Suppressions live in `.github/secret-scanning-allowlist.yml` and must reference the rule ID, file path, and a short justification.
+- Suppressions require review from a maintainer and must not contain the matched value itself.
+- Prefer inline suppression comments (e.g. `# secret-scan: allow <rule-id> <reason>`) over global allowlists.
+
+### Rotation Procedure for Confirmed Leaks
+
+If a credential is confirmed leaked:
+
+1. **Contain** — revoke or rotate the credential immediately in the issuing system. Do not wait for the PR to be merged or reverted.
+2. **Purge** — remove the secret from the branch history using `git filter-repo` (or the GitHub UI for simple cases) and force-push the cleaned history.
+3. **Invalidate** — confirm the old credential no longer authenticates against any service.
+4. **Audit** — review provider logs for use of the leaked credential during the exposure window.
+5. **Document** — record the incident in a private security advisory, including scope, timeline, and remediation.
+6. **Prevent** — add a regression test or scanner rule if the leak pattern was not already covered.
+
+### Canary Verification
+
+CI includes a synthetic canary secret test that asserts the scanner fails on a known-bad fixture. If the canary test passes (i.e. the scanner does not fail), the secret scanning job is considered broken and must be fixed before merging.
+
 
 ## Scope
 
@@ -65,6 +110,7 @@ The following are in scope for vulnerability reports:
 - Backend API in the `backend/` directory
 - Frontend application in the `frontend/` directory
 - Infrastructure-as-code in the `terraform/` directory
+- CI/CD workflows and secret scanning configuration in the `.github/` directory
 
 The following are out of scope:
 

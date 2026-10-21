@@ -7,12 +7,18 @@ on:
       - "terraform/**"
       - ".github/workflows/terraform-safety.yml"
       - ".github/scripts/summarize_terraform_plan.py"
+      - ".github/workflows/terraform-drift.yml"
+      - ".github/scripts/classify_terraform_drift.py"
+      - "backend/grafana/alerts/**"
   push:
     branches: [main]
     paths:
       - "terraform/**"
       - ".github/workflows/terraform-safety.yml"
       - ".github/scripts/summarize_terraform_plan.py"
+      - ".github/workflows/terraform-drift.yml"
+      - ".github/scripts/classify_terraform_drift.py"
+      - "backend/grafana/alerts/**"
 
 permissions:
   contents: read
@@ -36,6 +42,20 @@ jobs:
 
       - name: Check formatting
         run: terraform fmt -check -recursive terraform
+
+      - name: Drift detection must stay read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The scheduled drift job must never change infrastructure or state.
+          # Remediation goes through a reviewed PR (terraform/DRIFT.md).
+          pattern='terraform[[:space:]]+(-chdir=[^[:space:]]+[[:space:]]+)?(apply|destroy|import|taint|untaint|force-unlock|state[[:space:]]+(rm|mv|push|replace-provider))'
+          if grep -nE "$pattern" .github/workflows/terraform-drift.yml; then
+            printf 'terraform-drift.yml contains a mutating Terraform command.\n' >&2
+            exit 1
+          fi
+          grep -q -- '-refresh-only' .github/workflows/terraform-drift.yml
+          grep -q -- '-lock=false' .github/workflows/terraform-drift.yml
 
       - name: Validate configurations
         shell: bash

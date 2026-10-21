@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::Instrument;
 use tracing::{error, info, warn};
@@ -92,31 +91,10 @@ async fn health(State(state): State<crate::routes::v1::AppState>) -> axum::respo
     }
 
     let mut rpc_status = "ok";
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(state.config.rpc_health_timeout_secs))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let mut rpc_attempts = 0;
-    let max_attempts = state.config.rpc_health_retry_count as usize;
-    while rpc_attempts < max_attempts {
-        rpc_attempts += 1;
-        let ok = client
-            .post(&state.config.stellar_rpc_url)
-            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getHealth"}))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if ok {
-            break;
-        }
-        if rpc_attempts < max_attempts {
-            let backoff = std::cmp::min(2u64.pow((rpc_attempts - 1) as u32), 5);
-            sleep(Duration::from_secs(backoff)).await;
-        }
-    }
-    if rpc_attempts >= max_attempts {
+    if crate::rpc_resilience::probe_health(&state.config)
+        .await
+        .is_err()
+    {
         rpc_status = "unreachable";
         all_healthy = false;
     }
@@ -400,7 +378,7 @@ pub fn build_router_with_rate_limit(
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(root))
         .route("/live", get(live))
         .route("/liveness", get(liveness))
@@ -420,7 +398,8 @@ pub fn build_router_with_rate_limit(
                 event_bus,
             ),
         )
-        .merge(crate::openapi::swagger_router())
+        .merge(crate::openapi::swagger_router());
+    crate::api_versioning::with_api_policies(router)
         .layer(from_fn_with_state(
             prometheus_metrics.clone(),
             metrics_middleware,
@@ -452,7 +431,7 @@ fn build_router_with_db(
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(root))
         .route("/live", get(live))
         .route("/liveness", get(liveness))
@@ -472,7 +451,8 @@ fn build_router_with_db(
                 event_bus,
             ),
         )
-        .merge(crate::openapi::swagger_router())
+        .merge(crate::openapi::swagger_router());
+    crate::api_versioning::with_api_policies(router)
         .layer(from_fn_with_state(
             prometheus_metrics.clone(),
             metrics_middleware,
@@ -596,6 +576,15 @@ where
                 .await;
         });
 
+    // Purges token revocation records whose tokens have expired (#55).
+    let revocation_store =
+        crate::token_revocation::RevocationStore::new(Some(pool.clone()), redis.clone());
+    let revocation_purge_handle: JoinHandle<()> =
+        crate::tracing_context::spawn_worker("token_revocation_purge", async move {
+            crate::token_revocation::run_purge_loop(revocation_store, Duration::from_secs(3600))
+                .await;
+        });
+
     if redis.is_available() {
         info!("Redis cache initialized and available");
     } else {
@@ -648,6 +637,7 @@ where
     fetcher_handle.abort();
     listener_handle.abort();
     notifications_handle.abort();
+    revocation_purge_handle.abort();
 
     // Close the pool after aborting workers.
     shutdown::with_shutdown_timeout(drain_timeout, "database pool close", pool.close()).await;

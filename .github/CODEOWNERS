@@ -31,6 +31,11 @@
 # ─── Next.js frontend ────────────────────────────────────────────────────────
 /frontend/                  @Web3Novalabs/frontend-reviewers
 
+# ─── Destructive migration approvals ─────────────────────────────────────────
+# Recovery plans gate contract-phase (destructive) migrations; see
+# docs/migrations/expand-migrate-contract.md.
+/docs/migrations/recovery/  @Web3Novalabs/backend-reviewers @Web3Novalabs/infra-reviewers
+
 # ─── Infrastructure ──────────────────────────────────────────────────────────
 # Terraform and Docker: changes here affect every environment at once.
 /terraform/                 @Web3Novalabs/infra-reviewers

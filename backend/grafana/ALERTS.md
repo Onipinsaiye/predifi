@@ -6,6 +6,17 @@ All alerts are provisioned strictly as code:
 - **Prometheus Alert Rules**: [`backend/grafana/alerts/predifi_alerts.yml`](file:///Users/mac/Documents/OPENSOURCE/Drips/zaps/predifi/backend/grafana/alerts/predifi_alerts.yml) (and Terraform deployment via [`terraform/modules/monitoring/main.tf`](file:///Users/mac/Documents/OPENSOURCE/Drips/zaps/predifi/terraform/modules/monitoring/main.tf)).
 - **Grafana Provisioned Rules**: [`docker/grafana/provisioning/alerting/rules.yaml`](file:///Users/mac/Documents/OPENSOURCE/Drips/zaps/predifi/docker/grafana/provisioning/alerting/rules.yaml).
 
+- **SLO recording rules and burn-rate alerts**: [`backend/grafana/alerts/predifi_slo_rules.yml`](alerts/predifi_slo_rules.yml), defined in [`docs/observability/slos.md`](../../docs/observability/slos.md).
+
+## Ownership and runbooks
+
+Every alert carries an `owner` label and `impact`, `runbook_url`, and
+`dashboard_url` annotations. The operator-facing steps (diagnosis, safe
+mitigation, verification, rollback, escalation) live in
+[`docs/runbooks/`](../../docs/runbooks/README.md); this file explains *why* each
+threshold was chosen. CI (`.github/workflows/alert-runbooks.yml`) rejects a
+rule without an owner or a working runbook link.
+
 ---
 
 ## Core Golden Signal Alerts

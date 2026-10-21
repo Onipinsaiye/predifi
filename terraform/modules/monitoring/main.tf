@@ -49,6 +49,14 @@ resource "random_password" "grafana_admin" {
 
 locals {
   scrape_list = join(", ", [for t in var.prometheus_scrape_targets : "\"${t}:8080\""])
+
+  # Single source of truth for alerting: backend/grafana/alerts/*.yml.
+  alert_rules = trimspace(file("${path.module}/../../../backend/grafana/alerts/predifi_alerts.yml"))
+  slo_rules   = trimspace(file("${path.module}/../../../backend/grafana/alerts/predifi_slo_rules.yml"))
+
+  # Every literal line below is indented by at least four spaces so <<-EOT
+  # strips exactly that prefix: the shebang and heredoc delimiters must land
+  # in column 0 or cloud-init will not run the script.
   user_data = <<-EOT
     #!/bin/bash
     set -euo pipefail
@@ -58,93 +66,29 @@ locals {
     fi
 
     mkdir -p /opt/predifi-monitoring/prometheus/alerts
-    cat >/opt/predifi-monitoring/prometheus/alerts/predifi_alerts.yml <<EOF
-groups:
-  - name: predifi_production_alerts
-    rules:
-      - alert: HighApiErrorRate
-        expr: (sum(rate(app_http_requests_total{status=~"5.."}[5m])) / sum(rate(app_http_requests_total[5m]))) * 100 > 1
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "API HTTP 5xx error rate exceeded 1%"
-      - alert: HighP99Latency
-        expr: histogram_quantile(0.99, sum(rate(app_http_request_duration_seconds_bucket[5m])) by (le)) > 0.5
-        for: 3m
-        labels:
-          severity: warning
-        annotations:
-          summary: "API p99 latency is greater than 500ms"
-      - alert: WorkerQueueBacklog
-        expr: app_worker_queue_depth > 50
-        for: 3m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Worker queue depth exceeded 50 jobs"
-      - alert: WorkerDLQBacklog
-        expr: app_worker_dlq_depth > 10
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Worker dead-letter queue (DLQ) backlog exceeded 10 jobs"
-      - alert: DatabaseConnectionPoolSaturated
-        expr: db_pool_utilization_ratio > 0.8
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Database connection pool utilization exceeded 80%"
-      - alert: DatabaseConnectionPoolCritical
-        expr: db_pool_utilization_ratio > 0.95
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Database connection pool utilization exceeded 95%"
-      - alert: DatabaseQueryFailures
-        expr: sum(rate(app_db_queries_total{result="error"}[5m])) > 5
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Database query error spike detected"
-      - alert: HighRedisErrors
-        expr: sum(rate(app_redis_operations_total{result="error"}[5m])) > 10
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High Redis operation error rate"
-      - alert: ContractInteractionFailures
-        expr: sum(rate(app_db_queries_total{query_type=~".*contract.*",result="error"}[5m])) > 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Smart contract interaction failure detected"
-      - alert: BackendMemoryHigh
-        expr: (app_memory_used_bytes / app_memory_total_bytes) * 100 > 90
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Backend memory usage exceeded 90% threshold"
-EOF
+
+    # Rule files are read from the repository so the deployed alerts, owners,
+    # and runbook links can never drift from the reviewed source. The quoted
+    # heredoc delimiter stops bash from expanding {{ $value }} templates.
+    cat >/opt/predifi-monitoring/prometheus/alerts/predifi_alerts.yml <<'PREDIFI_ALERTS'
+    ${local.alert_rules}
+    PREDIFI_ALERTS
+
+    cat >/opt/predifi-monitoring/prometheus/alerts/predifi_slo_rules.yml <<'PREDIFI_SLO_RULES'
+    ${local.slo_rules}
+    PREDIFI_SLO_RULES
 
     cat >/opt/predifi-monitoring/prometheus/prometheus.yml <<EOF
-global:
-  scrape_interval: 15s
-rule_files:
-  - /etc/prometheus/alerts/*.yml
-scrape_configs:
-  - job_name: predifi
-    metrics_path: /metrics
-    static_configs:
-      - targets: [${local.scrape_list}]
-EOF
+    global:
+      scrape_interval: 15s
+    rule_files:
+      - /etc/prometheus/alerts/*.yml
+    scrape_configs:
+      - job_name: predifi
+        metrics_path: /metrics
+        static_configs:
+          - targets: [${local.scrape_list}]
+    EOF
 
     docker rm -f prometheus grafana 2>/dev/null || true
 
@@ -211,7 +155,10 @@ resource "aws_instance" "monitoring" {
   subnet_id              = var.private_subnet_ids[0]
   vpc_security_group_ids = [aws_security_group.monitoring.id]
   key_name               = var.key_name
-  user_data              = local.user_data
+
+  # Gzipped so the rule files fit inside EC2's 16 KB user-data limit; cloud-init
+  # decompresses it transparently.
+  user_data_base64 = base64gzip(local.user_data)
 
   root_block_device {
     volume_size = 40

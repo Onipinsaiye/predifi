@@ -28,7 +28,28 @@ When adding a new migration, use the **next unused integer**, run
 `sqlx migrate add <description>` (or create the file by hand) inside this
 directory, and never reuse or renumber a prefix that already exists — see
 [Duplicate prefixes](#duplicate-004-and-009-prefixes-do-not-rename) below.
-The next available prefix is **`012_`**.
+The next available prefix is **`015_`**.
+
+## Rollback-safe sequencing (required for new migrations)
+
+Every migration after `013` must follow the
+[expand–migrate–contract policy](../../docs/migrations/expand-migrate-contract.md)
+so the previous application release keeps working after the migration runs.
+Start each new file with:
+
+```sql
+-- migration-phase: expand
+-- compatible-app-versions: previous and current release; <why>
+```
+
+(`migration-phase` is one of `expand`, `migrate`, or `contract`.)
+
+Drops, renames, type changes, `SET NOT NULL`, and data deletion are only
+allowed in a `contract` migration that names its expand
+(`-- contracts: <file>.sql`, already merged) and an approved recovery plan
+(`-- recovery-plan: docs/migrations/recovery/<file>.md`). CI
+(`.github/workflows/migration-safety.yml`) enforces this and tests that the
+previous release's SQL still prepares against the new schema.
 
 ## Applying migrations locally
 
@@ -139,7 +160,7 @@ databases that already ran it — hence this issue being documentation-only.
 **Convention going forward:** always use the next unused integer prefix, and
 double-check this table (or `ls backend/migrations/`) before naming a new
 migration file so prefixes are never reused again. The next migration should
-be named `012_<description>.sql`.
+be named `014_<description>.sql`.
 
 ## Upgrade compatibility matrix
 

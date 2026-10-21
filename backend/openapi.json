@@ -4,16 +4,80 @@
       "ApiIndexDoc": {
         "description": "OpenAPI schema for the v1 API index document.",
         "properties": {
+          "deprecated_routes": {
+            "description": "Deprecated operations and their sunset dates.",
+            "items": {
+              "$ref": "#/components/schemas/DeprecatedRouteDoc"
+            },
+            "type": "array"
+          },
+          "deprecation_policy": {
+            "description": "URL of the API versioning and deprecation policy.",
+            "type": "string"
+          },
           "name": {
             "type": "string"
+          },
+          "status": {
+            "description": "Lifecycle status of this version: `active`, `deprecated` or `sunset`.",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "versions": {
+            "description": "Every public API version and its lifecycle dates.",
+            "items": {
+              "$ref": "#/components/schemas/ApiVersionDoc"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "status",
+          "versions",
+          "deprecated_routes",
+          "deprecation_policy"
+        ],
+        "type": "object"
+      },
+      "ApiVersionDoc": {
+        "description": "Lifecycle status of one API version.",
+        "properties": {
+          "deprecated_at": {
+            "description": "RFC 3339 time deprecation was announced.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`active`, `deprecated` or `sunset`.",
+            "type": "string"
+          },
+          "successor": {
+            "description": "Version clients should migrate to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sunset_at": {
+            "description": "RFC 3339 time after which the version answers `410 Gone`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "version": {
             "type": "string"
           }
         },
         "required": [
-          "name",
-          "version"
+          "version",
+          "status"
         ],
         "type": "object"
       },
@@ -99,30 +163,90 @@
         ],
         "type": "object"
       },
-      "ErrorDetailDoc": {
-        "description": "Error detail inside the standard error envelope.",
+      "DeprecatedRouteDoc": {
+        "description": "A deprecated operation inside a supported API version.",
         "properties": {
-          "code": {
-            "description": "Machine-readable error code, e.g. `DATABASE_UNAVAILABLE`.",
+          "deprecated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
             "type": "string"
           },
-          "message": {
+          "path": {
             "type": "string"
           },
-          "request_id": {
-            "description": "Unique id for correlating the failure in logs.",
+          "replacement": {
+            "description": "Path of the replacement operation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`deprecated` or `sunset`.",
             "type": "string"
+          },
+          "sunset_at": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
+          "method",
+          "path",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ErrorDetailDoc": {
+        "description": "Error detail inside the standard error envelope (version 1).",
+        "properties": {
+          "code": {
+            "description": "Stable machine-readable error code, e.g. `DATABASE_UNAVAILABLE`.",
+            "type": "string"
+          },
+          "details": {
+            "description": "Field-level validation failures; present only for validation errors.",
+            "items": {
+              "$ref": "#/components/schemas/FieldViolationDoc"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "Safe human-readable message. Never contains internal error details.",
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Request id; also returned in the `x-request-id` response header.",
+            "type": "string"
+          },
+          "retryable": {
+            "description": "Whether the same request may succeed if retried later.",
+            "type": "boolean"
+          },
+          "version": {
+            "description": "Envelope version; currently `1`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
           "code",
           "message",
-          "request_id"
+          "request_id",
+          "retryable"
         ],
         "type": "object"
       },
       "ErrorResponse": {
-        "description": "Standard error envelope returned by every handler (`ApiResponse::error`).",
+        "description": "Standard error envelope returned by every failing request.",
         "properties": {
           "error": {
             "$ref": "#/components/schemas/ErrorDetailDoc"
@@ -157,6 +281,24 @@
         "required": [
           "treasury_fee_bps",
           "referral_fee_bps"
+        ],
+        "type": "object"
+      },
+      "FieldViolationDoc": {
+        "description": "One rejected field inside a validation error.",
+        "properties": {
+          "field": {
+            "description": "Field name, query parameter or JSON pointer.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the value was rejected.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "reason"
         ],
         "type": "object"
       },
@@ -361,6 +503,23 @@
           "limit",
           "offset"
         ],
+        "type": "object"
+      },
+      "LogoutRequestDoc": {
+        "description": "OpenAPI schema for `POST /api/v1/auth/logout`.",
+        "properties": {
+          "all_sessions": {
+            "description": "Revoke every token issued to the user so far.",
+            "type": "boolean"
+          },
+          "refresh_token": {
+            "description": "Refresh token of the same session to revoke as well.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "MarkNotificationsReadRequestDoc": {
@@ -839,10 +998,10 @@
         "type": "object"
       },
       "RateLimitErrorResponse": {
-        "description": "Body of `429` responses, and of `503` responses when the distributed rate\nlimiter itself is unavailable.",
+        "description": "Body of `429` responses (`RATE_LIMIT_EXCEEDED`), and of `503` responses\nwhen the distributed rate limiter itself is unavailable\n(`RATE_LIMITER_UNAVAILABLE`). Same shape as [`ErrorResponse`].",
         "properties": {
           "error": {
-            "type": "string"
+            "$ref": "#/components/schemas/ErrorDetailDoc"
           },
           "status": {
             "description": "Always `\"error\"`.",
@@ -1079,7 +1238,7 @@
       "name": "PrediFi Team",
       "url": "https://github.com/Web3Novalabs/predifi"
     },
-    "description": "REST API for the PrediFi prediction-market platform built on Stellar/Soroban.",
+    "description": "REST API for the PrediFi prediction-market platform built on Stellar/Soroban.\n\nVersioning: `/api/v1` is active. Every `/api/<version>` response carries an `API-Version` header; deprecated versions and operations add `Deprecation`, `Sunset` and `Link` headers and are listed by `GET /api/v1`. See docs/API_VERSIONING_POLICY.md.\n\nErrors: every failure uses the versioned error envelope (`ErrorResponse`) with a stable `code`, a safe `message`, `request_id` (also in the `x-request-id` header) and `retryable`.",
     "license": {
       "name": "MIT"
     },
@@ -1100,7 +1259,7 @@
                 }
               }
             },
-            "description": "API name and version"
+            "description": "API name, version and version lifecycle status"
           },
           "429": {
             "content": {
@@ -1115,6 +1274,86 @@
         },
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "operationId": "api_logout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LogoutRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Session (or all sessions) revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked access token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Refresh token belongs to a different user"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Revocation store or rate limiter unavailable (fails closed)"
+          }
+        },
+        "tags": [
+          "auth"
         ]
       }
     },
@@ -1144,9 +1383,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1164,9 +1403,9 @@
           },
           "413": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1174,9 +1413,9 @@
           },
           "415": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1184,9 +1423,9 @@
           },
           "422": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1245,9 +1484,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1403,11 +1642,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Malformed body or Idempotency-Key"
@@ -1438,20 +1672,15 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Request body too large"
           },
           "415": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1462,11 +1691,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
                 }
               }
             },
@@ -1552,11 +1776,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Malformed body or Idempotency-Key"
@@ -1587,20 +1806,15 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Request body too large"
           },
           "415": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1611,11 +1825,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
                 }
               }
             },
@@ -1701,11 +1910,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Malformed body or Idempotency-Key"
@@ -1736,20 +1940,15 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Request body too large"
           },
           "415": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -1760,11 +1959,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
-                }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
                 }
               }
             },
@@ -1857,11 +2051,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Invalid query parameter"
@@ -1950,9 +2139,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2060,9 +2249,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2141,9 +2330,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2151,9 +2340,9 @@
           },
           "413": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2161,9 +2350,9 @@
           },
           "415": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2171,9 +2360,9 @@
           },
           "422": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2329,11 +2518,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Invalid query parameter"
@@ -2402,9 +2586,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2513,9 +2697,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2599,11 +2783,6 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Malformed path or body"
@@ -2630,9 +2809,9 @@
           },
           "413": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2640,9 +2819,9 @@
           },
           "415": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2650,9 +2829,9 @@
           },
           "422": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2761,9 +2940,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2832,9 +3011,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -2912,9 +3091,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3053,9 +3232,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3124,9 +3303,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3207,20 +3386,15 @@
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
-              },
-              "text/plain": {
-                "schema": {
-                  "type": "string"
-                }
               }
             },
             "description": "Invalid address or body"
           },
           "413": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3228,9 +3402,9 @@
           },
           "415": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3238,9 +3412,9 @@
           },
           "422": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3329,9 +3503,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3400,9 +3574,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
@@ -3471,9 +3645,9 @@
           },
           "400": {
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },

@@ -128,25 +128,67 @@ The `predifi-errors` crate defines 33 error variants used across all PrediFi sma
 
 ## Backend API Errors (errors.rs)
 
-The backend defines 5 high-level error types that map database and system errors to standardized API responses.
+All backend failures use one versioned error envelope (see
+[API_REFERENCE.md](API_REFERENCE.md#error-responses) for the client view):
+
+```json
+{
+  "status": "error",
+  "error": {
+    "version": 1,
+    "code": "DATABASE_UNAVAILABLE",
+    "message": "database not available",
+    "request_id": "…",
+    "retryable": true,
+    "details": [ { "field": "…", "reason": "…" } ]
+  }
+}
+```
+
+How it is enforced:
+
+- `ApiResponse::error` (`response.rs`) builds every envelope. For any 5xx
+  status it logs the caller's message with `request_id` and replaces it
+  with the catalog message for the code, so database, RPC and internal
+  error strings never reach clients.
+- `error_envelope_layer` wraps the whole router. It assigns the request id
+  (from `x-request-id` / `x-correlation-id`, else a UUID), echoes it in the
+  `x-request-id` header, and rewrites any non-JSON error (axum extractor
+  rejections, unknown routes, `405`, `413`, `415`) into the envelope.
+- Unknown routes hit an enveloped `404` fallback.
+- `AppError` (`errors.rs`) maps lower-level errors to codes, as below.
 
 ### Error Variants
 
-| Variant | HTTP Status | Error Code | Database Mapping | Cause | Resolution |
-|---------|-------------|------------|------------------|-------|------------|
-| `NotFound` | 404 Not Found | `NOT_FOUND` | `sqlx::Error::RowNotFound` | Requested resource not found in database | Verify resource ID exists |
-| `Conflict` | 409 Conflict | `CONFLICT` | PostgreSQL 23505 (unique_violation), 23503 (foreign_key_violation) | Constraint violation (duplicate, foreign key) | Ensure data uniqueness and referential integrity |
-| `InvalidInput` | 400 Bad Request | `INVALID_INPUT` | PostgreSQL 23502 (not_null_violation) | Input validation failed or required field missing | Provide valid input data with all required fields |
-| `ServiceUnavailable` | 503 Service Unavailable | `SERVICE_UNAVAILABLE` | - | Service temporarily unavailable (e.g., database connection failed) | Retry request after delay |
-| `Internal` | 500 Internal Server Error | `INTERNAL_ERROR` | All other database errors | Unexpected server error | Contact support with request ID |
+| Variant | HTTP Status | Error Code | Mapped from |
+|---------|-------------|------------|-------------|
+| `NotFound` | 404 | `NOT_FOUND` | `sqlx::Error::RowNotFound` |
+| `Conflict` | 409 | `CONFLICT` | PostgreSQL 23505, 23503 |
+| `InvalidInput` | 400 | `INVALID_INPUT` | PostgreSQL 23502, 23514 |
+| `Validation` | 400 | `INVALID_INPUT` (+ `details`) | Field validation |
+| `Unauthorized` | 401 | `UNAUTHORIZED` | JWT invalid / expired / wrong type / key version |
+| `TokenRevoked` | 401 | `TOKEN_REVOKED` | `JwtVerifyError::Revoked` |
+| `Forbidden` | 403 | `FORBIDDEN` | — |
+| `RateLimited` | 429 | `RATE_LIMIT_EXCEEDED` | — |
+| `UpstreamUnavailable` | 502 | `UPSTREAM_UNAVAILABLE` | `RpcError` (connect, HTTP, JSON-RPC, circuit open) |
+| `UpstreamTimeout` | 504 | `UPSTREAM_TIMEOUT` | `RpcError::Timeout`, `RpcError::DeadlineExceeded` |
+| `DatabaseUnavailable` | 503 | `DATABASE_UNAVAILABLE` | `sqlx` pool timeout / closed, I/O, TLS |
+| `TokenStoreUnavailable` | 503 | `TOKEN_STORE_UNAVAILABLE` | `JwtVerifyError::TokenStoreUnavailable` |
+| `ServiceUnavailable` | 503 | `SERVICE_UNAVAILABLE` | — |
+| `Internal` | 500 | `INTERNAL_ERROR` | Any other database error, bad JWT secret |
+
+Messages for 4xx mappings are fixed strings ("resource already exists",
+"invalid token", …). Constraint names, SQL text and token internals are
+never copied into them.
 
 ### PostgreSQL Error Code Mappings
 
-| SQLSTATE | Error Name | Mapped To | Description |
-|----------|------------|------------|-------------|
-| 23502 | not_null_violation | `InvalidInput` | Required field is NULL |
-| 23503 | foreign_key_violation | `Conflict` | Referenced key doesn't exist |
-| 23505 | unique_violation | `Conflict` | Duplicate value in unique column |
+| SQLSTATE | Error Name | Mapped To | Client message |
+|----------|------------|-----------|----------------|
+| 23502 | not_null_violation | `InvalidInput` | a required field is missing |
+| 23503 | foreign_key_violation | `Conflict` | referenced resource does not exist |
+| 23505 | unique_violation | `Conflict` | resource already exists |
+| 23514 | check_violation | `InvalidInput` | a field value is out of range |
 
 ---
 
@@ -154,17 +196,28 @@ The backend defines 5 high-level error types that map database and system errors
 
 ### Backend Error Codes (response.rs)
 
-| Error Code | String Constant | HTTP Status | Usage |
-|------------|-----------------|-------------|-------|
-| NOT_FOUND | `"NOT_FOUND"` | 404 | Resource not found |
-| CONFLICT | `"CONFLICT"` | 409 | Constraint violation |
-| INVALID_INPUT | `"INVALID_INPUT"` | 400 | Invalid request data |
-| SERVICE_UNAVAILABLE | `"SERVICE_UNAVAILABLE"` | 503 | Service temporarily unavailable |
-| INTERNAL_ERROR | `"INTERNAL_ERROR"` | 500 | Unexpected server error |
-| DATABASE_UNAVAILABLE | `"DATABASE_UNAVAILABLE"` | 503 | Database connection failed |
-| RATE_LIMIT_EXCEEDED | `"RATE_LIMIT_EXCEEDED"` | 429 | Too many requests |
-| UNAUTHORIZED | `"UNAUTHORIZED"` | 401 | Authentication required |
-| FORBIDDEN | `"FORBIDDEN"` | 403 | Insufficient permissions |
+| Error Code | HTTP Status | Retryable | Usage |
+|------------|-------------|-----------|-------|
+| `NOT_FOUND` | 404 | No | Resource or route not found |
+| `CONFLICT` | 409 | No | Constraint violation |
+| `INVALID_INPUT` | 400 / 422 | No | Invalid request data |
+| `METHOD_NOT_ALLOWED` | 405 | No | Wrong method for route |
+| `PAYLOAD_TOO_LARGE` | 413 | No | Body over route limit |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | No | Wrong content type |
+| `API_VERSION_SUNSET` | 410 | No | Version or route retired |
+| `UNAUTHORIZED` | 401 | No | Authentication required |
+| `TOKEN_REVOKED` | 401 | No | Token revoked |
+| `FORBIDDEN` | 403 | No | Insufficient permissions |
+| `RATE_LIMIT_EXCEEDED` | 429 | Yes | Too many requests |
+| `INTERNAL_ERROR` | 500 | No | Unexpected server error |
+| `UPSTREAM_UNAVAILABLE` | 502 | Yes | Soroban RPC failure / circuit open |
+| `UPSTREAM_TIMEOUT` | 504 | Yes | Soroban RPC timeout |
+| `SERVICE_UNAVAILABLE` | 503 | Yes | Service temporarily unavailable |
+| `DATABASE_UNAVAILABLE` | 503 | Yes | Database connection failed |
+| `TOKEN_STORE_UNAVAILABLE` | 503 | Yes | Revocation store unreachable |
+| `RATE_LIMITER_UNAVAILABLE` | 503 | Yes | Distributed rate limiter unreachable |
+| `NOTIFICATION_NOT_FOUND` | 404 | No | Notification replay: unknown id |
+| `NOTIFICATION_DEAD` | 409 | No | Notification replay: dead-lettered |
 
 ### Contract to Backend Mapping
 
