@@ -379,6 +379,26 @@ pub async fn run_notification_sweep(pool: &PgPool) -> Result<SweepSummary, sqlx:
 /// Errors are logged and skipped rather than aborting the loop — a single
 /// failed sweep shouldn't take the background worker down.
 pub async fn run_sweep_loop(pool: PgPool, interval: std::time::Duration) {
+    // Crash recovery (#63): before the first tick, re-load any outbound
+    // deliveries that were `pending` when the process last exited and whose
+    // `next_attempt_at` has since elapsed. Errors are logged and skipped so a
+    // broken DB does not block the sweep forever — the next tick will retry.
+    match crate::sinks::recover_pending_deliveries(&pool).await {
+        Ok(pending) if !pending.is_empty() => {
+            info!(
+                count = pending.len(),
+                "recovered pending outbound deliveries on startup"
+            );
+            for d in &pending {
+                crate::sinks::enqueue_delivery(d);
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(error = %error, "outbound delivery recovery failed; will retry on next tick");
+        }
+    }
+
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;

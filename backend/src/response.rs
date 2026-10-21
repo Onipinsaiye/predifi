@@ -67,6 +67,8 @@ pub mod error_codes {
     pub const RATE_LIMIT_EXCEEDED: &str = "RATE_LIMIT_EXCEEDED";
     pub const UNAUTHORIZED: &str = "UNAUTHORIZED";
     pub const FORBIDDEN: &str = "FORBIDDEN";
+    pub const NOTIFICATION_DEAD: &str = "NOTIFICATION_DEAD";
+    pub const NOTIFICATION_NOT_FOUND: &str = "NOTIFICATION_NOT_FOUND";
 }
 
 impl<T: Serialize> ApiResponse<T> {

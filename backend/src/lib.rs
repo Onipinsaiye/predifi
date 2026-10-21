@@ -27,6 +27,7 @@ pub mod routes;
 pub mod seed;
 pub mod server;
 pub mod session;
+pub mod sinks;
 pub mod shutdown;
 pub mod tags;
 pub mod telemetry;

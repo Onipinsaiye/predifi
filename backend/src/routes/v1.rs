@@ -292,6 +292,128 @@ pub async fn set_log_level(
     }
 }
 
+/// `POST /api/v1/admin/notifications/:id/replay` — replay a dead-lettered
+/// outbound delivery (#63).
+///
+/// Restricted to callers with a valid `x-admin-api-key` header. Resets a
+/// delivery that is in `status = 'dead'` back to `status = 'pending'` with
+/// `attempts = 0`, so the next sweep picks it up for another delivery attempt.
+///
+/// Returns 200 with the refreshed delivery row on success, 404 if no
+/// delivery with that id exists, and 409 if the delivery is not currently
+/// dead-lettered (replaying a healthy delivery is a no-op the caller should
+/// be told about rather than silently accepted).
+pub async fn admin_replay_notification(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let admin_key = std::env::var("PREDIFI_ADMIN_API_KEY").ok();
+    let provided = headers
+        .get("x-admin-api-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let authenticated = matches!((&admin_key, provided), (Some(expected), Some(got)) if expected == &got);
+    if !authenticated {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or missing admin credentials" })),
+        )
+            .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    // Confirm the delivery exists and is dead before replaying.
+    let existing = match crate::sinks::get_delivery(db, delivery_id).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOTIFICATION_NOT_FOUND,
+                format!("delivery {delivery_id} not found"),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                e.to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    if existing.status != "dead" {
+        return ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!(
+                "delivery {delivery_id} is in status '{}', not 'dead'; replay would be a no-op",
+                existing.status
+            ),
+        )
+        .into_response();
+    }
+
+    match crate::sinks::replay_dead(db, delivery_id).await {
+        Ok(true) => {
+            // Re-read so the response reflects the reset state.
+            match crate::sinks::get_delivery(db, delivery_id).await {
+                Ok(Some(d)) => {
+                    tracing::info!(
+                        delivery_id,
+                        idempotency_key = %d.idempotency_key,
+                        channel = %d.channel,
+                        "dead-lettered delivery replayed via admin endpoint"
+                    );
+                    ApiResponse::success(json!({
+                        "status": "replayed",
+                        "delivery": d,
+                    }))
+                    .into_response()
+                }
+                Ok(None) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "delivery disappeared between replay and re-read",
+                )
+                .into_response(),
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        Ok(false) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("delivery {delivery_id} was not dead when replay ran"),
+        )
+        .into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
 // ── Task 2: Active Pools API ──────────────────────────────────────────────────
 
 /// Default page size for `GET /api/v1/pools` when `limit` is omitted.
@@ -1540,6 +1662,10 @@ pub fn router(
         .route(
             "/admin/log-level",
             patch(set_log_level),
+        )
+        .route(
+            "/admin/notifications/:id/replay",
+            post(admin_replay_notification),
         )
         .with_state(state.clone());
 
