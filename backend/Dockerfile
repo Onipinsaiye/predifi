@@ -31,12 +31,12 @@ RUN cargo build --release --locked && \
     strip /app/target/release/predifi-backend
 
 # ── Runtime Stage ────────────────────────────────────────────────────────────
-# Minimal runtime image using debian:bookworm-slim to keep size < 100MB.
+# Minimal runtime image using debian:bookworm-slim to keep size minimal.
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 WORKDIR /app
 
-# Install only runtime dependencies
+# Install only runtime dependencies, remove package manager caches and unnecessary packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -44,20 +44,26 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Create non-root user for security
-RUN useradd -m -u 1000 -s /bin/bash predifi && \
-    chown -R predifi:predifi /app
+# Create non-root system user and dedicated writable directory with explicit permissions
+RUN useradd -r -u 10001 -s /usr/sbin/nologin predifi && \
+    mkdir -p /tmp/predifi && \
+    chown -R predifi:predifi /tmp/predifi && \
+    chmod 700 /tmp/predifi
 
 # Copy binary from builder
-COPY --from=builder --chown=predifi:predifi /app/target/release/predifi-backend /usr/local/bin/predifi-backend
+COPY --from=builder /app/target/release/predifi-backend /usr/local/bin/predifi-backend
 
-# Switch to non-root user
-USER predifi
+# Explicit writable volume path for temporary files if needed under read-only root filesystems
+VOLUME ["/tmp/predifi"]
+
+# Switch to non-root user (numeric UID for strict container orchestrator security policies)
+USER 10001:10001
 
 # Environment configuration
 ENV PREDIFI_APP_HOST=0.0.0.0
 ENV PREDIFI_APP_PORT=3000
 ENV RUST_LOG=info
+ENV TMPDIR=/tmp/predifi
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

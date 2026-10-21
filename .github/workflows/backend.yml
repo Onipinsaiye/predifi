@@ -241,6 +241,32 @@ jobs:
         run: |
           docker build -t predifi-backend:latest ./backend
 
+      - name: Inspect Image User and Privileges
+        run: |
+          CONFIG_USER=$(docker inspect -f '{{.Config.User}}' predifi-backend:latest)
+          echo "Configured container user: $CONFIG_USER"
+          if [ "$CONFIG_USER" = "0" ] || [ "$CONFIG_USER" = "root" ] || [ -z "$CONFIG_USER" ]; then
+            echo "Error: Image must not run as root user!"
+            exit 1
+          fi
+
+      - name: Container Smoke Test (Read-only Filesystem & Non-root Execution)
+        run: |
+          docker run --rm \
+            --read-only \
+            --tmpfs /tmp/predifi:rw,noexec,nosuid,size=64m \
+            predifi-backend:latest /usr/local/bin/predifi-backend --version
+
+      - name: Scan Image for Vulnerabilities and Misconfigurations (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'predifi-backend:latest'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL'
+
   deploy-staging:
     name: Deploy Backend to Staging
     runs-on: ubuntu-latest
