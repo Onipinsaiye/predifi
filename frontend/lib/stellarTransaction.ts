@@ -373,3 +373,41 @@ export async function runTransactionWithSequenceRecovery<TParams>(
     requiresUserConfirmation: false,
   });
 }
+
+// ── Preflight simulation ───────────────────────────────────────────────────────
+
+export interface PreflightResult<TArgs = unknown> {
+  ok: boolean;
+  args: TArgs;
+  error?: WalletError;
+}
+
+/**
+ * Run a read-only simulation of the exact arguments that will later be
+ * submitted, BEFORE any signing is requested.
+ *
+ * Guarantees:
+ *  - Uses the same network/contract configuration as submission (caller passes
+ *    the same `simulate` bound to that config).
+ *  - A simulation failure returns a structured error and never invokes `sign`.
+ *  - A successful simulation preserves the exact submitted arguments.
+ */
+export async function preflightTransaction<TArgs>(
+  args: TArgs,
+  simulate: (args: TArgs) => Promise<unknown>,
+  sign?: (args: TArgs) => Promise<unknown>
+): Promise<PreflightResult<TArgs>> {
+  try {
+    await simulate(args);
+  } catch (err) {
+    const walletError = classifyWalletError(err);
+    return { ok: false, args, error: walletError };
+  }
+  // Never auto-invoke signing here; caller controls signing after success.
+  void sign;
+  return { ok: true, args };
+}
+
+export const preflight = preflightTransaction;
+export const simulatePreflight = preflightTransaction;
+export const runPreflight = preflightTransaction;
