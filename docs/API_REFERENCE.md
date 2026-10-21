@@ -326,8 +326,13 @@ List all prediction markets with pagination.
 | `sort_by` | string | `popular`, `ending_soon`, `new` (default: `new`) |
 | `category` | string | Filter by category (e.g., `Sports`, `Crypto`) |
 | `status` | string | `active`, `closed`, `settled` (default: `active`) |
+| `creator` | string | Filter by creator Stellar address (56-character `G...` public key) |
+| `tags` | string | Comma-separated list of tags (max 10 tags, max 50 chars each) |
+| `end_time_min` / `from_time` | string | Inclusive minimum pool `end_time` (RFC3339 timestamp or Unix seconds) |
+| `end_time_max` / `to_time` | string | Inclusive maximum pool `end_time` (RFC3339 timestamp or Unix seconds) |
+| `outcome` | string | Filter by winning outcome (only valid when `status` is `settled`) |
 | `limit` | integer | Max results (default: 20, max: 100) |
-| `offset` | integer | Pagination offset (default: 0) |
+| `offset` | integer | Pagination offset (default: 0, max: 10,000) |
 
 #### Response
 

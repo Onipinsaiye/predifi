@@ -1056,11 +1056,15 @@ mod tests {
 
             #[test]
             fn safe_sub_rejects_underflow(
-                a in i128::MIN..=0,
-                deficit in 1i128..=i128::MAX,
+                b in 1i128..=i128::MAX,
+                offset in any::<u128>(),
             ) {
-                let b = a.saturating_add(deficit);
-                prop_assume!(a.checked_sub(b).is_none());
+                // `a - b` underflows i128 iff `a < i128::MIN + b`, so draw `a`
+                // directly from `[i128::MIN, i128::MIN + b)`. (The previous
+                // generator never produced an underflow, so every case was
+                // rejected by `prop_assume!` and the test aborted.)
+                let a = i128::MIN + (offset % (b as u128)) as i128;
+                prop_assert!(a.checked_sub(b).is_none());
                 prop_assert_eq!(SafeMath::safe_sub(a, b), Err(PrediFiError::ArithmeticError));
             }
 

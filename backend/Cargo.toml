@@ -64,6 +64,23 @@ name = "migration_roundtrip"
 path = "tests/migration_roundtrip.rs"
 required-features = ["integration-tests"]
 
+[[test]]
+name = "indexer_stress"
+path = "tests/indexer_stress.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "shared_fixtures"
+path = "tests/shared_fixtures.rs"
+
+[[test]]
+name = "market_filter_performance"
+path = "tests/market_filter_performance.rs"
+
+[[test]]
+name = "migration_integration_suite"
+path = "tests/migration_integration_suite.rs"
+
 [dev-dependencies]
 http-body-util = "0.1"
 testcontainers = "0.27.3"

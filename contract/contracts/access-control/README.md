@@ -72,22 +72,64 @@ AccessControl::transfer_role(env, admin_caller, from_address, to_address, Role::
 
 ## Admin Transfer
 
-A two-step flow is recommended for transferring admin rights:
+Admin handoff is **always two-step**. The current admin nominates a successor,
+and the successor must accept with a transaction they authenticate. This prevents
+a typo or an address the operator does not control (for example, an exchange or
+contract address that cannot sign) from becoming admin and locking the protocol
+out of administration.
 
-1. Current admin proposes a new admin:
+1. Current admin nominates a successor:
    ```rust
    AccessControl::propose_new_admin(env, current_admin, new_admin)?;
    ```
 
-2. New admin accepts:
+2. The nominee accepts:
    ```rust
    AccessControl::accept_admin_role(env, new_admin)?;
    ```
 
-A legacy one-step transfer is also available:
-```rust
-AccessControl::transfer_admin(env, admin_caller, new_admin)?;
-```
+The handoff is atomic at acceptance: the old admin's `Admin` role is removed and
+the new admin's role is granted in the same call, so there is never a moment
+without an administrator.
+
+### Nomination rules
+
+- Only the current admin can nominate, replace, or cancel a nomination.
+- A new nomination **replaces** the previous one. The previous nominee can no
+  longer accept; only the most recent nominee can.
+- The current admin cannot nominate itself (`InvalidData`). Use cancellation to
+  clear a nomination.
+- The current admin can cancel a pending nomination at any time with
+  `cancel_admin_transfer`. Cancelling with no pending nomination returns
+  `AdminError`.
+- Accepting with no nomination, after cancellation, after replacement, or a
+  second time returns `Unauthorized`.
+- While a nomination is pending, the current admin remains the final admin and
+  cannot be stripped of the `Admin` role.
+
+### Legacy `transfer_admin`
+
+`transfer_admin` is retained for ABI compatibility with deployed clients, but it
+no longer performs a one-step transfer. It behaves exactly like
+`propose_new_admin`; the nominee must call `accept_admin_role` before the handoff
+takes effect.
+
+### Migrating a deployed instance
+
+No storage migration is required:
+
+1. The current admin is already stored under `DataKey::Admin` and its `Admin`
+   role is already in persistent storage; both keep their existing encoding.
+2. `DataKey::ProposedAdmin` is an optional instance entry. On an upgraded
+   deployment it is simply absent and `get_proposed_admin()` returns `None`.
+3. After upgrading the Wasm, the existing admin can call `propose_new_admin`
+   directly. No initialization or `migrate_*` call is needed.
+4. Old clients that still call `transfer_admin` will create a nomination only.
+   They must wait for the nominee to accept; update client code to call
+   `propose_new_admin` + `accept_admin_role` for clarity.
+
+These properties are covered by the `test_migration_compatibility_*` tests in
+`src/test.rs`.
 
 ## Querying State
 
@@ -132,9 +174,10 @@ AccessControl::revoke_all_roles(env, admin_caller, user_address)?;
 
 ### Admin Transfer
 
-- `transfer_admin(env, admin_caller, new_admin) -> Result<(), PrediFiError>` — Legacy one-step admin transfer.
-- `propose_new_admin(env, current_admin, new_admin) -> Result<(), PrediFiError>` — Step 1 of a two-step admin transfer.
-- `accept_admin_role(env, new_admin) -> Result<(), PrediFiError>` — Step 2 of a two-step admin transfer.
+- `propose_new_admin(env, current_admin, new_admin) -> Result<(), PrediFiError>` — Step 1: nominate (or replace) a successor.
+- `accept_admin_role(env, new_admin) -> Result<(), PrediFiError>` — Step 2: accept a pending nomination; the only way to complete a handoff.
+- `cancel_admin_transfer(env, current_admin) -> Result<(), PrediFiError>` — Cancel a pending nomination; the current admin stays in office.
+- `transfer_admin(env, admin_caller, new_admin) -> Result<(), PrediFiError>` — Legacy alias for `propose_new_admin`; no longer transfers in one step.
 
 ### Types
 
@@ -149,6 +192,9 @@ AccessControl::revoke_all_roles(env, admin_caller, user_address)?;
 - `RoleAssignedEvent` — Emitted when a role is assigned.
 - `RoleRevokedEvent` — Emitted when a role is revoked.
 - `RoleTransferredEvent` — Emitted when a role is transferred between users.
-- `AdminTransferredEvent` — Emitted when admin rights are transferred.
-- `AdminTransferProposedEvent` — Emitted when a new admin is proposed.
+- `AdminTransferredEvent` — Emitted when admin rights effectively transfer (on acceptance).
+- `AdminTransferProposedEvent` — Emitted when a new admin is nominated.
+- `AdminTransferReplacedEvent` — Emitted when a nomination replaces an earlier one.
+- `AdminTransferCancelledEvent` — Emitted when the current admin cancels a pending nomination.
+- `AdminTransferAcceptedEvent` — Emitted when the nominee accepts (alongside `AdminTransferredEvent`).
 - `AllRolesRevokedEvent` — Emitted when all roles are revoked from a user.

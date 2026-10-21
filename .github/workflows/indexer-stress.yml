@@ -1,0 +1,42 @@
+name: Indexer Stress
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: indexer-stress-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  indexer-stress:
+    name: Concurrent PostgreSQL and Redis workload
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/target
+          key: ${{ runner.os }}-cargo-indexer-stress-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-indexer-stress-
+            ${{ runner.os }}-cargo-
+
+      - name: Run indexer concurrency stress test
+        working-directory: ./backend
+        run: cargo test --locked --features integration-tests --test indexer_stress -- --ignored --nocapture

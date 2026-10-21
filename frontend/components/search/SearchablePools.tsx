@@ -96,6 +96,7 @@ export function SearchablePools({
     total,
     isLoading: isPoolsLoading,
     isError,
+    isStale,
     refresh,
   } = usePools(poolsQuery);
 
@@ -187,7 +188,19 @@ export function SearchablePools({
       </CardHeader>
 
       <CardContent>
-        {isError ? (
+        {isStale && (
+          <div className="mb-4 flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+            <span>Network outage: displaying cached data in read-only mode.</span>
+            <button
+              type="button"
+              onClick={refresh}
+              className="font-medium underline hover:text-amber-100"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {isError && !isStale ? (
           <ErrorState onRetry={refresh} />
         ) : filteredPools.length === 0 ? (
           <EmptyState query={debouncedSearch} />

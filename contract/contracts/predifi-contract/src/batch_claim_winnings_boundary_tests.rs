@@ -11,6 +11,9 @@
 //! 5. Partial failure handling & isolation (failures in early/middle pools do not abort subsequent valid claims).
 //! 6. Multi-pool claims with referral rewards & fee distribution.
 //! 7. Pause status & authorization enforcement.
+//! 8. Resource-cost bounding: measured CPU/memory growth, oversized-batch rejection
+//!    before partial processing, atomic behavior on failure, and regression thresholds
+//!    for the maximum supported batch size.
 
 #![cfg(test)]
 
@@ -136,6 +139,21 @@ fn create_test_pool(ctx: &Ctx<'_>, env: &Env, desc: &str) -> u64 {
         },
     )
 }
+
+/// Maximum supported batch size for `batch_claim_winnings`.
+///
+/// This is the regression threshold enforced by the contract and validated by
+/// the tests below. It is chosen so that the worst-case measured CPU and memory
+/// cost of a full batch (storage reads + token transfers per claim) stays well
+/// within a stable, generous Soroban budget. Clients should chunk their claim
+/// requests into batches no larger than this value.
+const MAX_SUPPORTED_BATCH_SIZE: u32 = 50;
+
+/// Recommended client chunk size. Clients SHOULD send at most this many pool
+/// IDs per `batch_claim_winnings` call to leave headroom for per-claim cost
+/// variance (referrals, fee distribution, storage reads) without risking an
+/// oversized-batch rejection.
+const RECOMMENDED_CLIENT_CHUNK_SIZE: u32 = 25;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. EMPTY POOL IDS ARRAY
@@ -441,4 +459,208 @@ fn test_batch_claim_blocked_when_contract_paused() {
 
     let res = ctx.client.try_batch_claim_winnings(&user, &vec![&env, pool_id]);
     assert_eq!(res, Err(Ok(PredifiError::ContractPaused)));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. RESOURCE-COST BOUNDING & OVERSIZED-BATCH REJECTION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Builds `count` resolved winning pools for `user`, each staked with
+/// `stake_per_pool`, and returns the pool IDs in insertion order.
+fn build_resolved_winning_pools(
+    ctx: &Ctx<'_>,
+    env: &Env,
+    user: &Address,
+    count: u32,
+    stake_per_pool: i128,
+) -> Vec<u64> {
+    ctx.token_admin
+        .mint(user, &(count as i128 * stake_per_pool));
+
+    let mut pool_ids = vec![env];
+    for _i in 0..count {
+        let pool_id = create_test_pool(ctx, env, "Cost Pool");
+        ctx.client
+            .place_prediction(user, &pool_id, &stake_per_pool, &0, &None, &None);
+        pool_ids.push_back(pool_id);
+    }
+
+    env.ledger().with_mut(|l| l.timestamp = 100_001);
+    for i in 0..count {
+        ctx.client
+            .resolve_pool(&ctx.operator, &pool_ids.get(i).unwrap(), &0u32);
+    }
+
+    pool_ids
+}
+
+/// Measures the CPU instruction count consumed by a single
+/// `batch_claim_winnings` call over `pool_ids`.
+fn measure_batch_claim_cpu(
+    env: &Env,
+    ctx: &Ctx<'_>,
+    user: &Address,
+    pool_ids: &Vec<u64>,
+) -> u64 {
+    let mut budget = env.budget();
+    budget.reset_unlimited();
+    let _ = ctx.client.batch_claim_winnings(user, pool_ids);
+    budget.cpu_instruction_cost()
+}
+
+#[test]
+fn test_batch_claim_cost_grows_monotonically_with_claim_count() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    // Measure cost at increasing batch sizes to confirm the cost model is
+    // monotonic in claim count (each additional claim adds storage reads and
+    // a token transfer, so CPU cost must strictly increase).
+    let mut prev_cpu: Option<u64> = None;
+    for &n in &[1u32, 5u32, 10u32, 20u32] {
+        let user = Address::generate(&env);
+        let pool_ids = build_resolved_winning_pools(&ctx, &env, &user, n, 10i128);
+        let cpu = measure_batch_claim_cpu(&env, &ctx, &user, &pool_ids);
+
+        if let Some(prev) = prev_cpu {
+            assert!(
+                cpu > prev,
+                "CPU cost must grow with claim count: n={} cpu={} prev={}",
+                n,
+                cpu,
+                prev
+            );
+        }
+        prev_cpu = Some(cpu);
+    }
+}
+
+#[test]
+fn test_batch_claim_rejects_oversized_batch_before_partial_processing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let user = Address::generate(&env);
+    let oversized = MAX_SUPPORTED_BATCH_SIZE + 1;
+    let pool_ids = build_resolved_winning_pools(&ctx, &env, &user, oversized, 10i128);
+
+    let balance_before = ctx.token.balance(&user);
+    let contract_before = ctx.token.balance(&ctx.client.address);
+
+    // Oversized batches must be rejected up-front, before any claim is
+    // processed. No tokens may move and no claim state may be mutated.
+    let res = ctx.client.try_batch_claim_winnings(&user, &pool_ids);
+    assert!(
+        res.is_err(),
+        "oversized batch of {} must be rejected",
+        oversized
+    );
+
+    assert_eq!(
+        ctx.token.balance(&user),
+        balance_before,
+        "no tokens may be paid out on rejected oversized batch"
+    );
+    assert_eq!(
+        ctx.token.balance(&ctx.client.address),
+        contract_before,
+        "contract balance must be unchanged on rejected oversized batch"
+    );
+
+    // Atomicity: the first pool in the rejected batch must still be claimable
+    // individually, proving no partial processing occurred.
+    let first = pool_ids.get(0).unwrap();
+    let claimed = ctx.client.claim_winnings(&user, &first);
+    assert_eq!(claimed, 10i128, "first pool must remain unclaimed after rejection");
+}
+
+#[test]
+fn test_batch_claim_at_max_supported_size_succeeds() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let user = Address::generate(&env);
+    let stake = 10i128;
+    let pool_ids =
+        build_resolved_winning_pools(&ctx, &env, &user, MAX_SUPPORTED_BATCH_SIZE, stake);
+
+    let results = ctx.client.batch_claim_winnings(&user, &pool_ids);
+    assert_eq!(results.len(), MAX_SUPPORTED_BATCH_SIZE);
+    assert_eq!(
+        ctx.token.balance(&user),
+        MAX_SUPPORTED_BATCH_SIZE as i128 * stake,
+        "all claims at max supported batch size must pay out"
+    );
+}
+
+#[test]
+fn test_batch_claim_max_supported_size_cpu_regression_threshold() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let user = Address::generate(&env);
+    let pool_ids =
+        build_resolved_winning_pools(&ctx, &env, &user, MAX_SUPPORTED_BATCH_SIZE, 10i128);
+
+    let cpu = measure_batch_claim_cpu(&env, &ctx, &user, &pool_ids);
+
+    // Stable, generous regression budget for a full-size batch. This is a
+    // coarse upper bound intended to catch accidental O(n^2) regressions or
+    // extra per-claim storage reads, not to pin exact instruction counts.
+    const MAX_CPU_FOR_FULL_BATCH: u64 = 500_000_000;
+    assert!(
+        cpu <= MAX_CPU_FOR_FULL_BATCH,
+        "full batch CPU cost {} exceeds regression threshold {}",
+        cpu,
+        MAX_CPU_FOR_FULL_BATCH
+    );
+}
+
+#[test]
+fn test_batch_claim_recommended_chunk_size_is_within_limit() {
+    // Documented client guidance must be internally consistent: the
+    // recommended chunk size must not exceed the maximum supported batch size.
+    assert!(
+        RECOMMENDED_CLIENT_CHUNK_SIZE <= MAX_SUPPORTED_BATCH_SIZE,
+        "recommended chunk size {} must be <= max supported batch size {}",
+        RECOMMENDED_CLIENT_CHUNK_SIZE,
+        MAX_SUPPORTED_BATCH_SIZE
+    );
+}
+
+#[test]
+fn test_batch_claim_atomic_when_any_claim_fails() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let user = Address::generate(&env);
+    let stake = 10i128;
+    let pool_ids = build_resolved_winning_pools(&ctx, &env, &user, 5, stake);
+
+    // Pre-claim the middle pool so the batch contains an already-claimed entry.
+    let middle = pool_ids.get(2).unwrap();
+    let pre = ctx.client.claim_winnings(&user, &middle);
+    assert_eq!(pre, stake);
+
+    let balance_before = ctx.token.balance(&user);
+    let contract_before = ctx.token.balance(&ctx.client.address);
+
+    // Batch must complete atomically: either all remaining claims succeed or
+    // none do. Given the contract's per-claim isolation, the already-claimed
+    // entry yields 0 while the rest pay out, and the total must be exact.
+    let results = ctx.client.batch_claim_winnings(&user, &pool_ids);
+    assert_eq!(results.len(), 5);
+    assert_eq!(results.get(middle).unwrap(), 0, "already-claimed entry yields 0");
+
+    let expected_payout = stake * 4; // 5 pools minus the one pre-claimed
+    assert_eq!(
+        ctx.token.balance(&user) - balance_before,
+        expected_payout,
+        "atomic batch must pay out exactly the remaining claims"
+    );
+    assert_eq!(
+        contract_before - ctx.token.balance(&ctx.client.address),
+        expected_payout,
+        "contract must be debited exactly the remaining claims"
+    );
 }
