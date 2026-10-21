@@ -1,0 +1,63 @@
+name: PostgreSQL Restore Drill
+
+on:
+  schedule:
+    - cron: "0 5 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: postgres-restore-drill
+  cancel-in-progress: false
+
+jobs:
+  restore-drill:
+    name: Restore latest restorable point in isolation
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, restore-drill]
+    timeout-minutes: 360
+    env:
+      AWS_REGION: ${{ vars.DR_REGION }}
+      SOURCE_DB_INSTANCE_IDENTIFIER: ${{ vars.DR_SOURCE_DB_INSTANCE_IDENTIFIER }}
+      DRILL_DB_SUBNET_GROUP: ${{ vars.DR_SUBNET_GROUP }}
+      DRILL_VPC_SECURITY_GROUP_ID: ${{ vars.DR_SECURITY_GROUP_ID }}
+      DRILL_DB_INSTANCE_CLASS: ${{ vars.DR_DB_INSTANCE_CLASS }}
+      DRILL_DB_NAME: ${{ vars.DR_DB_NAME }}
+      RPO_TARGET_SECONDS: "3600"
+      RTO_TARGET_SECONDS: "14400"
+      DRILL_EVIDENCE_PATH: ${{ runner.temp }}/postgres-restore-drill.json
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Confirm configured drill inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in DR_REGION DR_SOURCE_DB_INSTANCE_IDENTIFIER DR_SUBNET_GROUP DR_SECURITY_GROUP_ID DR_DB_INSTANCE_CLASS DR_DB_NAME; do
+            if [[ -z "${!name:-}" ]]; then
+              printf 'Required repository variable is unset: %s\n' "$name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Configure isolated restore role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DR_RESTORE_ROLE_ARN }}
+          aws-region: ${{ vars.DR_REGION }}
+
+      - name: Restore and verify latest automated backup
+        run: bash scripts/postgres_restore_drill.sh
+
+      - name: Upload non-secret drill evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: ignore
+          name: postgres-restore-drill-${{ github.run_id }}
+          path: ${{ runner.temp }}/postgres-restore-drill.json
+          retention-days: 90

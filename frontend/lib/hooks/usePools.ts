@@ -25,6 +25,10 @@ export interface UsePoolsResult {
   isLoading: boolean;
   /** True when the most recent request failed. */
   isError: boolean;
+  /** True when serving cached data despite a failing/outage API response (stale-while-error). */
+  isStale: boolean;
+  /** True when an API outage or request failure is preventing active mutations/writes. */
+  isReadOnly: boolean;
   /** The error from the most recent failed request, if any. */
   error: Error | undefined;
   /** Manually revalidate (e.g. a "retry" button). */
@@ -67,6 +71,10 @@ export function usePools(query: PoolsQuery = {}): UsePoolsResult {
     fetchPools,
   );
 
+  const hasData = Boolean(data);
+  const isStale = Boolean(error && hasData);
+  const isReadOnly = Boolean(error);
+
   return {
     pools: data?.pools ?? [],
     total: data?.total ?? 0,
@@ -75,6 +83,8 @@ export function usePools(query: PoolsQuery = {}): UsePoolsResult {
     data,
     isLoading,
     isError: Boolean(error),
+    isStale,
+    isReadOnly,
     error: error as Error | undefined,
     refresh: () => {
       void mutate();

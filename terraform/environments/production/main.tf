@@ -1,7 +1,7 @@
 # Production environment wrapper — set real VPC/subnet/AMI values in terraform.tfvars.
 
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.10.0"
 
   required_providers {
     aws = {
@@ -14,12 +14,7 @@ terraform {
     }
   }
 
-  # Uncomment and configure for remote state:
-  # backend "s3" {
-  #   bucket = "predifi-terraform-state"
-  #   key    = "production/terraform.tfstate"
-  #   region = "us-east-1"
-  # }
+  backend "s3" {}
 }
 
 provider "aws" {
@@ -52,9 +47,11 @@ module "predifi" {
 
   compute_instance_type    = var.compute_instance_type
   compute_desired_capacity = var.compute_desired_capacity
-  db_instance_class        = var.db_instance_class
-  db_multi_az              = true
-  redis_num_nodes          = 2
+  db_instance_class             = var.db_instance_class
+  db_backup_retention_days      = var.db_backup_retention_days
+  db_multi_az                   = true
+  redis_num_nodes               = 2
+  redis_snapshot_retention_days = 7
 
   monitoring_allowed_cidrs = var.monitoring_allowed_cidrs
 }
@@ -111,6 +108,12 @@ variable "compute_desired_capacity" {
 variable "db_instance_class" {
   type    = string
   default = "db.t4g.medium"
+}
+
+variable "db_backup_retention_days" {
+  type        = number
+  description = "RDS automated backup/PITR retention in days (1-35)."
+  default     = 35
 }
 
 variable "monitoring_allowed_cidrs" {

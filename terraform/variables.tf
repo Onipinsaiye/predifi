@@ -128,6 +128,17 @@ variable "db_multi_az" {
   default = true
 }
 
+variable "db_backup_retention_days" {
+  type        = number
+  description = "Automated PostgreSQL backup and point-in-time recovery retention (1-35 days)."
+  default     = 7
+
+  validation {
+    condition     = var.db_backup_retention_days >= 1 && var.db_backup_retention_days <= 35
+    error_message = "db_backup_retention_days must be between 1 and 35."
+  }
+}
+
 # ── Redis ────────────────────────────────────────────────────────────────────
 
 variable "redis_node_type" {
@@ -143,6 +154,17 @@ variable "redis_num_nodes" {
 variable "redis_engine_version" {
   type    = string
   default = "7.1"
+}
+
+variable "redis_snapshot_retention_days" {
+  type        = number
+  description = "ElastiCache automated snapshot retention in days; use 0 only for disposable environments."
+  default     = 1
+
+  validation {
+    condition     = var.redis_snapshot_retention_days >= 0 && var.redis_snapshot_retention_days <= 35
+    error_message = "redis_snapshot_retention_days must be between 0 and 35."
+  }
 }
 
 # ── Monitoring ───────────────────────────────────────────────────────────────

@@ -2,7 +2,16 @@
 
 import { useMemo, useState, useCallback } from "react";
 import { cn } from "@/lib/utils";
-import { Card, CardContent, SearchBar, Skeleton } from "@/components/ui";
+import {
+  Card,
+  CardContent,
+  EmptyState,
+  ErrorState,
+  PartialDataBanner,
+  SearchBar,
+  Skeleton,
+  SkeletonScreen,
+} from "@/components/ui";
 import { SearchResultHighlighter } from "@/components/search/SearchResultHighlighter";
 import { OddsCalculator } from "@/components/ui/odds-calculator";
 import { usePools } from "@/lib/hooks/usePools";
@@ -56,6 +65,7 @@ export function PoolMarketClient() {
     total,
     isLoading: isPoolsLoading,
     isError,
+    isStale,
     refresh,
   } = usePools({
     sort_by: sortBy,
@@ -243,38 +253,55 @@ export function PoolMarketClient() {
       </Card>
 
       {/* Pool count */}
-      <p className="text-xs text-zinc-500">
-        {total} pool{total !== 1 ? "s" : ""} found
-        {selectedCategory !== "All" && ` in "${selectedCategory}"`}
+      <p className="text-xs text-zinc-500" role="status" aria-live="polite">
+        {isPoolsLoading
+          ? "Loading pools…"
+          : `${total} pool${total !== 1 ? "s" : ""} found${
+              selectedCategory !== "All" ? ` in "${selectedCategory}"` : ""
+            }`}
       </p>
+
+      {/* Partial-data notice: cached results served while the API is failing */}
+      {isStale && (
+        <PartialDataBanner
+          message="Showing cached results — the pool service is unreachable."
+          onRetry={refresh}
+        />
+      )}
 
       {/* Pool list */}
       <div className="space-y-3">
         {isPoolsLoading ? (
-          Array.from({ length: 4 }).map((_, i) => (
-            <div key={i} className="flex items-center justify-between p-4 rounded-xl bg-zinc-900/50">
-              <div className="space-y-2">
-                <Skeleton className="h-4 w-48" />
-                <Skeleton className="h-3 w-32" />
+          <SkeletonScreen label="Loading prediction pools" className="space-y-3">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="flex items-center justify-between p-4 rounded-xl bg-zinc-900/50">
+                <div className="space-y-2">
+                  <Skeleton className="h-4 w-48" />
+                  <Skeleton className="h-3 w-32" />
+                </div>
+                <Skeleton className="h-6 w-16 rounded-full" />
               </div>
-              <Skeleton className="h-6 w-16 rounded-full" />
-            </div>
-          ))
-        ) : isError ? (
-          <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900 py-16 text-zinc-500">
-            <p>Couldn&apos;t load pools.</p>
-            <button
-              type="button"
-              onClick={refresh}
-              className="text-sm font-medium text-[#37B7C3] hover:underline"
-            >
-              Try again
-            </button>
-          </div>
+            ))}
+          </SkeletonScreen>
+        ) : isError && !isStale ? (
+          <ErrorState
+            heading="Couldn't load pools"
+            description="The pool service didn't respond. Check your connection and try again."
+            onRetry={refresh}
+          />
         ) : filteredPools.length === 0 ? (
-          <div className="flex items-center justify-center py-16 rounded-xl border border-zinc-800 bg-zinc-900 text-zinc-600">
-            <p>{search ? "No pools match your search." : "No pools found for the selected filters."}</p>
-          </div>
+          <EmptyState
+            heading={
+              search
+                ? "No pools match your search"
+                : "No pools found for these filters"
+            }
+            description={
+              search
+                ? `Nothing matched "${search}". Try a different name or category.`
+                : "Adjust the category, tag, or status filters to see more pools."
+            }
+          />
         ) : (
           filteredPools.map((pool) => (
             <PoolRow key={pool.pool_id} pool={pool} query={search} />

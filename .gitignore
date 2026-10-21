@@ -2,11 +2,18 @@
 COMMIT_MESSAGE*.txt
 PR_DESCRIPTION.md
 PULL_REQUEST.md
-**/PULL_REQUEST.md
+**/PULL_REQUESX.md
 PULL_REQUEST_DB_REFACTOR.md
 PULL_REQUEST_AUDIT_1408.md
 PULL_REQUEST_STATE_MANAGEMENT_1406.md
 pr-description.md
+
+# Terraform local state, plans, and environment-specific backend configuration
+**/.terraform/
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/*.tfplan
+j**/backend.hcl
 
 # Local documentation generated during implementation — not part of the repository history
 **/VALIDATION_ENHANCEMENTS.md
@@ -16,3 +23,30 @@ security-audit-report.md
 
 # Kiro IDE workspace metadata
 .kiro/
+
+# Local wallet E2E dependencies
+2e2/wallet/node_modules/
+
+# Secret scanning and credential leak prevention local artifacts
+# Never commit real secrets or scanner reports that may contain matched values.
+.env
+.env.*
+!.env.example
+.env.local
+*.pem
+*.key
+*.p12*
+*.pfx
+*.jks
+*.keystore
+*.credentials**/id_rsa**/id_ed25519**/*.ppk
+secrets/**
+!*secrets/*.example
+*/secrets/**
+!*/secrets/*.example
+.secretscan-cache/
+# Scanner reports and false-positive suppression files (no secret values stored)
+secretscan-report.json
+secretscan-report.sarif
+secrets-baseline.json
+secrets-audit.log

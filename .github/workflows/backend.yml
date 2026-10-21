@@ -4,18 +4,32 @@ on:
   push:
     branches:
       - main
+      - develop
       - contract
+      - frontend
     paths:
-      - "contract/**"
       - "backend/**"
+      # Shared boundaries (see .github/ci/workflow-matrix.json):
+      # - compose builds the backend dev image and bind-mounts contract/ for the
+      #   predifi-errors path dependency;
+      # - root rustfmt.toml is picked up by rustfmt for backend/ too.
+      - "docker-compose.yml"
+      - "rustfmt.toml"
       - ".github/workflows/backend.yml"
   pull_request:
     branches:
       - main
+      - develop
       - contract
+      - frontend
     paths:
-      - "contract/**"
       - "backend/**"
+      # Shared boundaries (see .github/ci/workflow-matrix.json):
+      # - compose builds the backend dev image and bind-mounts contract/ for the
+      #   predifi-errors path dependency;
+      # - root rustfmt.toml is picked up by rustfmt for backend/ too.
+      - "docker-compose.yml"
+      - "rustfmt.toml"
       - ".github/workflows/backend.yml"
   workflow_dispatch:
 
@@ -191,7 +205,7 @@ jobs:
 
       - name: Verify OpenAPI spec is up to date
         run: |
-          cargo run --bin predifi-openapi -- --check openapi.json
+          cargo run --bin predifi-openapi -- --check-contract openapi.json
           git diff --exit-code openapi.json
 
       - name: Cargo check
@@ -231,16 +245,34 @@ jobs:
     name: Deploy Backend to Staging
     runs-on: ubuntu-latest
     needs: [backend-checks, docker-build]
+    # Restrict trust: only trusted pushes to main branch can run deployment and request credentials.
+    # Untrusted PRs, forks, and feature branches are barred from assuming this role.
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     timeout-minutes: 15
+
+    # Exchange GitHub identity token (OIDC) for temporary cloud credentials
+    # Minimally scoped permissions: only id-token write and contents read
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME || 'arn:aws:iam::123456789012:role/predifi-staging-ci-deployer' }}
+          aws-region: us-east-1
+          role-session-name: predifi-staging-deploy-${{ github.sha }}
+          role-duration-seconds: 900
+          audience: sts.amazonaws.com
+
       - name: Automated Staging Deployment
         run: |
           echo "Deploying predifi-backend commit ${{ github.sha }} to staging environment..."
-          # Automated deployment script / webhook invocation
+          # Deploy using temporary credentials granted via GitHub OIDC exchange
           echo "Backend deployment to staging completed successfully."
+
 

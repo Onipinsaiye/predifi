@@ -69,6 +69,9 @@ const DEFAULT_SORT_BY: SortBy = "new";
 const DEFAULT_STATUS: PoolStatus = "active";
 const DEFAULT_PAGE_SIZE = 20;
 
+const VALID_SORT_OPTIONS: readonly SortBy[] = ["new", "popular", "ending_soon"];
+const VALID_STATUS_OPTIONS: readonly PoolStatus[] = ["active", "closed", "settled"];
+
 /**
  * usePoolsQuery — centralised SWR query-parameter state for pool lists.
  *
@@ -98,12 +101,22 @@ export function usePoolsQuery(options: UsePoolsQueryOptions = {}): PoolsQuerySta
   // ---------------------------------------------------------------------------
   // Read current state from URL (or fall back to defaults)
   // ---------------------------------------------------------------------------
-  const search = syncUrl ? (searchParams.get("q") ?? "") : "";
-  const sortBy = (syncUrl ? (searchParams.get("sort") as SortBy | null) : null) ?? defaultSortBy;
-  const status = (syncUrl ? (searchParams.get("status") as PoolStatus | null) : null) ?? defaultStatus;
+  const rawSearch = syncUrl ? (searchParams.get("q") ?? "") : "";
+  const search = rawSearch.trim();
+
+  const rawSort = syncUrl ? (searchParams.get("sort") as SortBy | null) : null;
+  const sortBy = rawSort && VALID_SORT_OPTIONS.includes(rawSort) ? rawSort : defaultSortBy;
+
+  const rawStatus = syncUrl ? (searchParams.get("status") as PoolStatus | null) : null;
+  const status = rawStatus && VALID_STATUS_OPTIONS.includes(rawStatus) ? rawStatus : defaultStatus;
+
   const category = syncUrl ? (searchParams.get("category") ?? defaultCategory) : defaultCategory;
-  const page = syncUrl ? Number(searchParams.get("page") ?? 0) : 0;
-  const pageSize = syncUrl ? Number(searchParams.get("limit") ?? defaultPageSize) : defaultPageSize;
+
+  const rawPage = syncUrl ? Number(searchParams.get("page")) : 0;
+  const page = !Number.isNaN(rawPage) && rawPage > 0 ? Math.floor(rawPage) : 0;
+
+  const rawPageSize = syncUrl ? Number(searchParams.get("limit")) : defaultPageSize;
+  const pageSize = !Number.isNaN(rawPageSize) && rawPageSize > 0 ? Math.floor(rawPageSize) : defaultPageSize;
 
   // Debounce the raw search value so we don't fire a new SWR request on every
   // keystroke — only after the user pauses for `searchDebounceMs`.

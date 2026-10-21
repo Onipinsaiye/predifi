@@ -51,6 +51,7 @@ utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 sysinfo = "0.37"
 uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
 predifi-errors = { path = "../contract/contracts/predifi-errors", features = ["std"] }
 jsonwebtoken = "9"
 governor = "0.8"
@@ -63,6 +64,23 @@ integration-tests = []
 name = "migration_roundtrip"
 path = "tests/migration_roundtrip.rs"
 required-features = ["integration-tests"]
+
+[[test]]
+name = "indexer_stress"
+path = "tests/indexer_stress.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "shared_fixtures"
+path = "tests/shared_fixtures.rs"
+
+[[test]]
+name = "market_filter_performance"
+path = "tests/market_filter_performance.rs"
+
+[[test]]
+name = "migration_integration_suite"
+path = "tests/migration_integration_suite.rs"
 
 [dev-dependencies]
 http-body-util = "0.1"

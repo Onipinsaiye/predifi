@@ -29,8 +29,9 @@ terraform/
 ```bash
 cd terraform/environments/staging
 cp terraform.tfvars.example terraform.tfvars
+cp backend.hcl.example backend.hcl
 # edit terraform.tfvars with real staging VPC / subnet / AMI / domain values
-terraform init
+terraform init -backend-config=backend.hcl
 terraform plan
 terraform apply
 ```
@@ -40,8 +41,9 @@ terraform apply
 ```bash
 cd terraform/environments/production
 cp terraform.tfvars.example terraform.tfvars
+cp backend.hcl.example backend.hcl
 # edit terraform.tfvars with real production VPC / subnet / AMI / domain values
-terraform init
+terraform init -backend-config=backend.hcl
 terraform plan
 terraform apply
 ```
@@ -72,4 +74,5 @@ terraform apply
 
 - App instances listen on `:8080` and are only reachable from the VPC / ALB path.
 - Grafana admin password is generated and exposed as a sensitive output.
-- Configure an S3 backend in `environments/staging/main.tf` or `environments/production/main.tf` before team use.
+- Copy the environment's `backend.hcl.example` to `backend.hcl` and configure the private, versioned S3 backend before team use. See [`STATE_AND_POLICY.md`](STATE_AND_POLICY.md) for bucket, KMS, locking, access, recovery, and CI policy requirements.
+- Drift (changes made outside Terraform) is detected by a scheduled read-only workflow and reviewed before any remediation. See [`DRIFT.md`](DRIFT.md).

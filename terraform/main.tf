@@ -28,7 +28,7 @@ locals {
 }
 
 module "compute" {
-  source = "../../modules/compute"
+  source = "modules/compute"
 
   name_prefix        = local.name_prefix
   vpc_id             = var.vpc_id
@@ -44,7 +44,7 @@ module "compute" {
 }
 
 module "postgres" {
-  source = "../../modules/postgres"
+  source = "modules/postgres"
 
   name_prefix            = local.name_prefix
   vpc_id                 = var.vpc_id
@@ -54,24 +54,26 @@ module "postgres" {
   engine_version         = var.db_engine_version
   instance_class         = var.db_instance_class
   allocated_storage      = var.db_allocated_storage
+  backup_retention_days  = var.db_backup_retention_days
   multi_az               = var.db_multi_az
   allowed_security_group = module.compute.security_group_id
 }
 
 module "redis" {
-  source = "../../modules/redis"
+  source = "modules/redis"
 
-  name_prefix            = local.name_prefix
-  vpc_id                 = var.vpc_id
-  private_subnet_ids     = var.private_subnet_ids
-  node_type              = var.redis_node_type
-  num_cache_clusters     = var.redis_num_nodes
-  engine_version         = var.redis_engine_version
-  allowed_security_group = module.compute.security_group_id
+  name_prefix             = local.name_prefix
+  vpc_id                  = var.vpc_id
+  private_subnet_ids      = var.private_subnet_ids
+  node_type               = var.redis_node_type
+  num_cache_clusters      = var.redis_num_nodes
+  engine_version          = var.redis_engine_version
+  snapshot_retention_days = var.redis_snapshot_retention_days
+  allowed_security_group  = module.compute.security_group_id
 }
 
 module "ssl" {
-  source = "../../modules/ssl"
+  source = "modules/ssl"
 
   domain_name     = var.domain_name
   route53_zone_id = var.route53_zone_id
@@ -79,7 +81,7 @@ module "ssl" {
 }
 
 module "loadbalancer" {
-  source = "../../modules/loadbalancer"
+  source = "modules/loadbalancer"
 
   name_prefix        = local.name_prefix
   vpc_id             = var.vpc_id
@@ -89,7 +91,7 @@ module "loadbalancer" {
 }
 
 module "dns" {
-  source = "../../modules/dns"
+  source = "modules/dns"
 
   route53_zone_id   = var.route53_zone_id
   domain_name       = var.domain_name
@@ -99,7 +101,7 @@ module "dns" {
 }
 
 module "monitoring" {
-  source = "../../modules/monitoring"
+  source = "modules/monitoring"
 
   name_prefix        = local.name_prefix
   vpc_id             = var.vpc_id

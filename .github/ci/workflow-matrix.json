@@ -1,0 +1,195 @@
+{
+  "$comment": "Single source of truth for cross-component CI dependencies. Validated by .github/scripts/validate_workflow_matrix.py and documented in docs/ci/workflow-validation-matrix.md. Update this file whenever a new shared boundary appears or a workflow's trigger filters change.",
+  "branches": ["main", "develop", "contract", "frontend"],
+  "workflows": {
+    "Backend CI": {
+      "file": ".github/workflows/backend.yml"
+    },
+    "Contract CI/CD": {
+      "file": ".github/workflows/contract-ci.yml"
+    },
+    "Frontend CI/CD": {
+      "file": ".github/workflows/frontend-ci.yml"
+    },
+    "Secret Scanning": {
+      "file": ".github/workflows/secret-scanning.yml"
+    }
+  },
+  "boundaries": [
+    {
+      "id": "shared-errors",
+      "description": "predifi-errors is a path dependency of the backend (backend/Cargo.toml) and of every contract crate. A change to an error code or message must rebuild both consumers so a mismatch cannot land.",
+      "samples": [
+        "contract/contracts/predifi-errors/src/lib.rs",
+        "contract/contracts/predifi-errors/src/errors.rs",
+        "contract/contracts/predifi-errors/src/native_errors.rs"
+      ],
+      "dependents": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "contract-interfaces",
+      "description": "Contract types, entry points, wasm-size scripts and deploy scripts under contract/ define the interface the backend talks to. Backend CI deliberately includes contract/** for this reason.",
+      "samples": [
+        "contract/contracts/predifi-contract/src/lib.rs",
+        "contract/contracts/access-control/src/lib.rs",
+        "contract/Cargo.toml",
+        "contract/scripts/deploy.sh",
+        "contract/scripts/wasm_size_check.sh"
+      ],
+      "dependents": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "generated-api-schema",
+      "description": "The frontend API layer is generated from the committed backend OpenAPI schema. A schema or generator change must schedule the frontend checks so stale generated types surface as build/type errors instead of shipping.",
+      "samples": [
+        "backend/openapi.json",
+        "backend/src/openapi.rs",
+        "backend/src/bin/openapi_export.rs"
+      ],
+      "dependents": ["Backend CI", "Frontend CI/CD"]
+    },
+    {
+      "id": "build-scripts",
+      "description": "docker-compose.yml builds both the backend dev image (backend/Dockerfile.dev) and the frontend dev image (frontend/Dockerfile.dev), and bind-mounts contract/ for the backend's path dependency.",
+      "samples": [
+        "docker-compose.yml"
+      ],
+      "dependents": ["Backend CI", "Frontend CI/CD"]
+    },
+    {
+      "id": "shared-rust-tooling",
+      "description": "The repository-level rustfmt.toml is discovered by rustfmt for both the backend and the contract workspace, so formatting drift in either component can originate here.",
+      "samples": [
+        "rustfmt.toml"
+      ],
+      "dependents": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "secret-scanning-config",
+      "description": "Secret scanning rules, allow-list and canary fixtures define the credential-leak gate. A change to the scanner configuration or to the canary must run the Secret Scanning workflow so the controlled failure path stays verified.",
+      "samples": [
+        ".github/secret-scanning.rules.yaml",
+        ".github/secret-scanning-allowlist.yml",
+        ".github/secret-scanning/canary.env",
+        ".github/workflows/secret-scanning.yml"
+      ],
+      "dependents": ["Secret Scanning"]
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "shared-error-code",
+      "changed": ["contract/contracts/predifi-errors/src/errors.rs"],
+      "expect": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "contract-entry-point",
+      "changed": ["contract/contracts/predifi-contract/src/lib.rs"],
+      "expect": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "contract-deploy-script",
+      "changed": ["contract/scripts/deploy.sh"],
+      "expect": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "openapi-spec",
+      "changed": ["backend/openapi.json"],
+      "expect": ["Backend CI", "Frontend CI/CD"]
+    },
+    {
+      "id": "openapi-generator",
+      "changed": ["backend/src/bin/openapi_export.rs"],
+      "expect": ["Backend CI", "Frontend CI/CD"]
+    },
+    {
+      "id": "compose-build",
+      "changed": ["docker-compose.yml"],
+      "expect": ["Backend CI", "Frontend CI/CD"]
+    },
+    {
+      "id": "rustfmt-config",
+      "changed": ["rustfmt.toml"],
+      "expect": ["Backend CI", "Contract CI/CD"]
+    },
+    {
+      "id": "frontend-only",
+      "changed": ["frontend/lib/api.ts"],
+      "expect": ["Frontend CI/CD"]
+    },
+    {
+      "id": "backend-only",
+      "changed": ["backend/src/routes/v1.rs"],
+      "expect": ["Backend CI"]
+    },
+    {
+      "id": "backend-dockerfile",
+      "changed": ["backend/Dockerfile.dev"],
+      "expect": ["Backend CI"]
+    },
+    {
+      "id": "frontend-dockerfile",
+      "changed": ["frontend/Dockerfile.dev"],
+      "expect": ["Frontend CI/CD"]
+    },
+    {
+      "id": "workflow-self",
+      "changed": [".github/workflows/contract-ci.yml"],
+      "expect": ["Contract CI/CD"]
+    },
+    {
+      "id": "secret-scanner-rules",
+      "changed": [".github/secret-scanning.rules.yaml"],
+      "expect": ["Secret Scanning"]
+    },
+    {
+      "id": "secret-scanner-allowlist",
+      "changed": [".github/secret-scanning-allowlist.yml"],
+      "expect": ["Secret Scanning"]
+    },
+    {
+      "id": "secret-scanner-canary",
+      "changed": [".github/secret-scanning/canary.env"],
+      "expect": ["Secret Scanning"]
+    },
+    {
+      "id": "secret-scanner-workflow",
+      "changed": [".github/workflows/secret-scanning.yml"],
+      "expect": ["Secret Scanning"]
+    },
+    {
+      "id": "mixed-docs-and-boundary",
+      "changed": ["docs/ci/workflow-validation-matrix.md", "backend/openapi.json"],
+      "expect": ["Backend CI", "Frontend CI/CD"]
+    },
+    {
+      "id": "docs-only",
+      "changed": ["docs/faq.md", "README.md"],
+      "expect": []
+    },
+    {
+      "id": "logging-config-only",
+      "changed": ["docker/loki/loki-config.yml"],
+      "expect": []
+    },
+    {
+      "id": "editorconfig-only",
+      "changed": [".editorconfig"],
+      "expect": []
+    }
+  ],
+  "deploy_gates": [
+    {
+      "workflow": "Backend CI",
+      "job": "deploy-staging",
+      "event": "push",
+      "branch": "main"
+    },
+    {
+      "workflow": "Contract CI/CD",
+      "job": "deploy-testnet",
+      "event": "push",
+      "branch": "develop"
+    }
+  ]
+}

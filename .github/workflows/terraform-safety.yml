@@ -1,0 +1,177 @@
+name: Terraform Safety
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-safety.yml"
+      - ".github/scripts/summarize_terraform_plan.py"
+      - ".github/workflows/terraform-drift.yml"
+      - ".github/scripts/classify_terraform_drift.py"
+      - "backend/grafana/alerts/**"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-safety.yml"
+      - ".github/scripts/summarize_terraform_plan.py"
+      - ".github/workflows/terraform-drift.yml"
+      - ".github/scripts/classify_terraform_drift.py"
+      - "backend/grafana/alerts/**"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-scan:
+    name: Format, validate, and scan Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive terraform
+
+      - name: Drift detection must stay read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The scheduled drift job must never change infrastructure or state.
+          # Remediation goes through a reviewed PR (terraform/DRIFT.md).
+          pattern='terraform[[:space:]]+(-chdir=[^[:space:]]+[[:space:]]+)?(apply|destroy|import|taint|untaint|force-unlock|state[[:space:]]+(rm|mv|push|replace-provider))'
+          if grep -nE "$pattern" .github/workflows/terraform-drift.yml; then
+            printf 'terraform-drift.yml contains a mutating Terraform command.\n' >&2
+            exit 1
+          fi
+          grep -q -- '-refresh-only' .github/workflows/terraform-drift.yml
+          grep -q -- '-lock=false' .github/workflows/terraform-drift.yml
+
+      - name: Validate configurations
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in terraform terraform/environments/staging terraform/environments/production; do
+            terraform -chdir="$directory" init -backend=false -input=false
+            terraform -chdir="$directory" validate -no-color
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Checkov
+        run: python -m pip install --quiet checkov
+
+      - name: Confirm unsafe Terraform fixture is rejected
+        run: |
+          if checkov --framework terraform --file .github/fixtures/terraform/unsafe-public-rds.tf --check CKV_AWS_17 --quiet --compact; then
+            printf 'Checkov accepted the intentionally public RDS fixture.\n' >&2
+            exit 1
+          fi
+
+      - name: Scan changed Terraform files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            mapfile -t changed_files < <(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- 'terraform/**/*.tf')
+          elif [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            mapfile -t changed_files < <(git ls-files 'terraform/**/*.tf')
+          else
+            mapfile -t changed_files < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- 'terraform/**/*.tf')
+          fi
+
+          if [[ "${#changed_files[@]}" -eq 0 ]]; then
+            printf 'No Terraform source files changed.\n'
+            exit 0
+          fi
+
+          for file in "${changed_files[@]}"; do
+            printf 'Checkov: %s\n' "$file"
+            checkov --framework terraform --file "$file" --quiet --compact
+          done
+
+  staging-plan:
+    name: Staging plan summary
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      vars.TERRAFORM_PLAN_ROLE_ARN != '' &&
+      vars.TERRAFORM_STATE_BUCKET != '' &&
+      vars.TERRAFORM_STATE_REGION != '' &&
+      vars.TERRAFORM_STATE_KMS_KEY_ID != '' &&
+      vars.TERRAFORM_PLAN_AWS_REGION != '' &&
+      vars.TERRAFORM_PLAN_VPC_ID != '' &&
+      vars.TERRAFORM_PLAN_PUBLIC_SUBNET_IDS != '' &&
+      vars.TERRAFORM_PLAN_PRIVATE_SUBNET_IDS != '' &&
+      vars.TERRAFORM_PLAN_AMI_ID != '' &&
+      vars.TERRAFORM_PLAN_DOMAIN_NAME != '' &&
+      vars.TERRAFORM_PLAN_ROUTE53_ZONE_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: terraform-staging-plan
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.TERRAFORM_PLAN_AWS_REGION }}
+      TF_VAR_vpc_id: ${{ vars.TERRAFORM_PLAN_VPC_ID }}
+      TF_VAR_public_subnet_ids: ${{ vars.TERRAFORM_PLAN_PUBLIC_SUBNET_IDS }}
+      TF_VAR_private_subnet_ids: ${{ vars.TERRAFORM_PLAN_PRIVATE_SUBNET_IDS }}
+      TF_VAR_ami_id: ${{ vars.TERRAFORM_PLAN_AMI_ID }}
+      TF_VAR_domain_name: ${{ vars.TERRAFORM_PLAN_DOMAIN_NAME }}
+      TF_VAR_route53_zone_id: ${{ vars.TERRAFORM_PLAN_ROUTE53_ZONE_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Configure staging plan role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.TERRAFORM_PLAN_AWS_REGION }}
+
+      - name: Plan and publish resource/action summary
+        shell: bash
+        env:
+          STATE_BUCKET: ${{ vars.TERRAFORM_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TERRAFORM_STATE_REGION }}
+          STATE_KMS_KEY_ID: ${{ vars.TERRAFORM_STATE_KMS_KEY_ID }}
+        run: |
+          set -euo pipefail
+          plan_file="$(mktemp)"
+          trap 'rm -f "$plan_file"' EXIT
+          terraform -chdir=terraform/environments/staging init -input=false \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="key=staging/terraform.tfstate" \
+            -backend-config="region=$STATE_REGION" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true" \
+            -backend-config="kms_key_id=$STATE_KMS_KEY_ID"
+          terraform -chdir=terraform/environments/staging plan -input=false -no-color -out="$plan_file"
+          terraform -chdir=terraform/environments/staging show -json "$plan_file" \
+            | python3 .github/scripts/summarize_terraform_plan.py >> "$GITHUB_STEP_SUMMARY"

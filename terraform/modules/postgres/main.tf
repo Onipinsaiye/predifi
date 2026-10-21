@@ -36,6 +36,11 @@ variable "multi_az" {
   type = bool
 }
 
+variable "backup_retention_days" {
+  type        = number
+  description = "Automated backup and point-in-time recovery retention in days."
+}
+
 variable "allowed_security_group" {
   type        = string
   description = "Security group of app compute allowed to connect on 5432."
@@ -98,14 +103,17 @@ resource "aws_db_instance" "this" {
   allocated_storage     = var.allocated_storage
   max_allocated_storage = var.allocated_storage * 3
   storage_encrypted     = true
+  publicly_accessible     = false
   multi_az              = var.multi_az
 
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [aws_security_group.postgres.id]
 
-  backup_retention_period = 7
-  deletion_protection     = true
-  skip_final_snapshot     = false
+  backup_retention_period   = var.backup_retention_days
+  backup_window             = "03:00-04:00"
+  copy_tags_to_snapshot     = true
+  deletion_protection       = true
+  skip_final_snapshot       = false
   final_snapshot_identifier = "${var.name_prefix}-pg-final"
 
   performance_insights_enabled = true

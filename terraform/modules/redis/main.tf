@@ -24,6 +24,11 @@ variable "engine_version" {
   type = string
 }
 
+variable "snapshot_retention_days" {
+  type        = number
+  description = "Automated snapshot retention in days."
+}
+
 variable "allowed_security_group" {
   type = string
 }
@@ -31,6 +36,16 @@ variable "allowed_security_group" {
 resource "aws_elasticache_subnet_group" "this" {
   name       = "${var.name_prefix}-redis"
   subnet_ids = var.private_subnet_ids
+}
+
+resource "aws_elasticache_parameter_group" "this" {
+  name   = "${var.name_prefix}-redis7"
+  family = "redis7"
+
+  parameter {
+    name  = "maxmemory-policy"
+    value = "volatile-lru"
+  }
 }
 
 resource "aws_security_group" "redis" {
@@ -71,13 +86,16 @@ resource "aws_elasticache_replication_group" "this" {
   num_cache_clusters   = var.num_cache_clusters
   port                 = 6379
 
-  subnet_group_name  = aws_elasticache_subnet_group.this.name
-  security_group_ids = [aws_security_group.redis.id]
+  subnet_group_name    = aws_elasticache_subnet_group.this.name
+  parameter_group_name = aws_elasticache_parameter_group.this.name
+  security_group_ids   = [aws_security_group.redis.id]
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
   automatic_failover_enabled = var.num_cache_clusters > 1
   multi_az_enabled           = var.num_cache_clusters > 1
+  snapshot_retention_limit   = var.snapshot_retention_days
+  snapshot_window            = "04:00-05:00"
 
   tags = {
     Name = "${var.name_prefix}-redis"

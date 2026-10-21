@@ -1,11 +1,51 @@
 //! Pool repository — all queries that read or write the `pools`,
 //! `pool_templates`, and `creator_stats` tables.
 
+use std::time::Instant;
+
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres};
 use tracing::instrument;
 
 // ── Row / DTO types ───────────────────────────────────────────────────────────
+
+// ── Latency / query-count budgets ────────────────────────────────────────────
+//
+// Documented reference load (see `backend/benches/README.md`):
+//   * seeded Postgres: 10_000 pools, 500_000 predictions, 2_000 creators
+//   * seeded Redis with warm caches
+//   * 50 concurrent clients, 60s steady state
+//
+// Budgets are p95 latency and DB round-trips per request. They are emitted as
+// structured `tracing` events with a fixed, low-cardinality `query_group`
+// label so CI can scrape and compare them without exploding label sets.
+
+/// Budget for a single read group: p95 latency (ms) and max DB round-trips.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadBudget {
+    pub query_group: &'static str,
+    pub p95_latency_ms: u64,
+    pub max_round_trips: u32,
+}
+
+/// Budgets for the core read paths covered by this issue.
+pub const READ_BUDGETS: &[ReadBudget] = &[
+    ReadBudget { query_group: "pools.list", p95_latency_ms: 120, max_round_trips: 2 },
+    ReadBudget { query_group: "pools.detail", p95_latency_ms: 80, max_round_trips: 2 },
+    ReadBudget { query_group: "predictions.history", p95_latency_ms: 150, max_round_trips: 1 },
+];
+
+/// Emit a budget observation for a read group. `round_trips` is the number of
+/// DB queries executed for this request; `elapsed_ms` is wall-clock latency.
+fn observe_read_budget(query_group: &'static str, round_trips: u32, elapsed_ms: u64) {
+    tracing::info!(
+        target: "perf.budget",
+        query_group,
+        round_trips,
+        elapsed_ms,
+        "read budget observation"
+    );
+}
 
 /// Summary row returned by list-pools queries.
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
@@ -140,6 +180,7 @@ pub async fn get_pools_with_filters(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PoolRow>, sqlx::Error> {
+    let started = Instant::now();
     let order_clause = match sort_by {
         "popular"     => "total_stake DESC",
         "ending_soon" => "end_time ASC",
@@ -169,6 +210,10 @@ pub async fn get_pools_with_filters(
         .bind(offset)
         .fetch_all(pool)
         .await
+        .map(|rows| {
+            observe_read_budget("pools.list", 1, started.elapsed().as_millis() as u64);
+            rows
+        })
 }
 
 /// Count pools matching optional category and status filters.
@@ -244,6 +289,7 @@ pub async fn get_pool_with_odds(
     pool: &PgPool,
     pool_id: i64,
 ) -> Result<Option<PoolWithOdds>, sqlx::Error> {
+    let started = Instant::now();
     let details = match get_pool_by_id(pool, pool_id).await? {
         Some(d) => d,
         None => return Ok(None),
@@ -254,6 +300,7 @@ pub async fn get_pool_with_odds(
     let total_stake = std::cmp::max(details.total_stake, calculated_total);
     let odds = calculate_odds(&outcome_stakes, total_stake);
 
+    observe_read_budget("pools.detail", 2, started.elapsed().as_millis() as u64);
     Ok(Some(PoolWithOdds {
         pool_id: details.pool_id,
         name: details.name,
@@ -275,13 +322,14 @@ pub async fn get_pool_with_odds(
 ///
 /// Idempotent: a second insert for the same `pool_id` is silently ignored
 /// via `ON CONFLICT (pool_id) DO NOTHING`.
-#[instrument(skip(pool), name = "db.insert_pool_from_event",
+/// Insert a pool record decoded from a `pool_created` contract event inside an existing transaction.
+#[instrument(skip(tx), name = "db.insert_pool_from_event_tx",
     fields(pool_id = event.pool_id, creator = %event.creator))]
-pub async fn insert_pool_from_event(
-    pool: &PgPool,
+pub async fn insert_pool_from_event_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
     event: &PoolCreatedEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO pools
             (pool_id, name, category, total_stake, end_time, state, creator, token, created_at)
@@ -295,11 +343,29 @@ pub async fn insert_pool_from_event(
     .bind(event.end_time as f64)
     .bind(&event.creator)
     .bind(&event.token)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
-    record_pool_created_for_creator(pool, &event.creator).await?;
+    if inserted.rows_affected() > 0 {
+        record_pool_created_for_creator(&mut **tx, &event.creator).await?;
+    }
 
+    Ok(())
+}
+
+/// Insert a pool record decoded from a `pool_created` contract event.
+///
+/// Idempotent: a second insert for the same `pool_id` is silently ignored
+/// via `ON CONFLICT (pool_id) DO NOTHING`.
+#[instrument(skip(pool), name = "db.insert_pool_from_event",
+    fields(pool_id = event.pool_id, creator = %event.creator))]
+pub async fn insert_pool_from_event(
+    pool: &PgPool,
+    event: &PoolCreatedEvent,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    insert_pool_from_event_tx(&mut tx, event).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -381,10 +447,23 @@ pub fn calculate_odds(outcome_stakes: &[(i32, i64)], total_stake: i64) -> Vec<Ou
 ///
 /// Called automatically by [`insert_pool_from_event`] — should not need to be
 /// called directly.
-pub async fn record_pool_created_for_creator(
-    pool: &PgPool,
+pub async fn record_pool_created_for_creator<'e, E>(
+    executor: E,
     creator: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    record_pool_created_for_creator_in_executor(executor, creator).await
+}
+
+async fn record_pool_created_for_creator_in_executor<'e, E>(
+    executor: E,
+    creator: &str,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query(
         r#"
         INSERT INTO creator_stats
@@ -396,7 +475,7 @@ pub async fn record_pool_created_for_creator(
         "#,
     )
     .bind(creator)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -555,7 +634,8 @@ pub async fn create_pool_template(
         .await
 }
 
-/// List all templates owned by `creator`, newest first.
+/// List a creator's templates, newest first (at most
+/// [`crate::constants::MAX_TEMPLATES_PER_LIST`]).
 pub async fn list_pool_templates(
     pool: &PgPool,
     creator: &str,
@@ -566,11 +646,13 @@ pub async fn list_pool_templates(
         FROM pool_templates
         WHERE creator = $1
         ORDER BY created_at DESC
+        LIMIT $2
         "#
     );
 
     sqlx::query_as::<_, PoolTemplate>(&sql)
         .bind(creator)
+        .bind(crate::constants::MAX_TEMPLATES_PER_LIST)
         .fetch_all(pool)
         .await
 }
@@ -705,5 +787,23 @@ mod tests {
         let total = sql.matches("CREATE INDEX").count();
         let idempotent = sql.matches("CREATE INDEX IF NOT EXISTS").count();
         assert_eq!(total, idempotent, "every CREATE INDEX must use IF NOT EXISTS");
+    }
+
+    // ── Read budgets ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_budgets_cover_core_read_paths() {
+        let groups: Vec<_> = READ_BUDGETS.iter().map(|b| b.query_group).collect();
+        for expected in &["pools.list", "pools.detail", "predictions.history"] {
+            assert!(groups.contains(expected), "missing budget for '{expected}'");
+        }
+    }
+
+    #[test]
+    fn read_budgets_are_positive() {
+        for b in READ_BUDGETS {
+            assert!(b.p95_latency_ms > 0, "{} p95 must be > 0", b.query_group);
+            assert!(b.max_round_trips > 0, "{} round-trips must be > 0", b.query_group);
+        }
     }
 }

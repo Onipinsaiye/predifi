@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{symbol, testutils::Address as TestAddress, testutils::BytesN as TestBytesN};
+    use crate::oracle_vectors::{self, ExpectedOutcome};
     use crate::test_utils::{create_test_contract, create_test_pool, MockAccessControl};
+    use soroban_sdk::{symbol, testutils::Address as TestAddress, testutils::BytesN as TestBytesN};
 
     #[test]
     fn test_oracle_initialization() {
@@ -913,5 +914,115 @@ mod tests {
         let result = PredifiContract::resolve_pool_from_price(env.clone(), pool_id);
         assert!(result.is_err());
         assert_eq!(result.err(), Some(PredifiError::OracleNotInitialized));
+    }
+
+    // ── archived oracle vector regression tests ──────────────────────────────
+    //
+    // These tests consume the reviewed fixture corpus in `oracle_vectors`.
+    // They run fully offline and pin the normalized interpretation of each
+    // vector so provider/schema drift fails loudly. When updating fixtures,
+    // follow the review requirements documented in `oracle_vectors`.
+
+    /// Every archived vector must round-trip through the normalization helper
+    /// without panicking and must produce the recorded expected outcome.
+    #[test]
+    fn test_archived_vectors_match_expected_outcome() {
+        let env = Env::default();
+        for vector in oracle_vectors::all() {
+            let normalized = oracle_vectors::normalize(&env, vector);
+            assert_eq!(
+                normalized.outcome,
+                vector.expected,
+                "vector `{}` drifted: expected {:?}, got {:?}",
+                vector.name,
+                vector.expected,
+                normalized.outcome,
+            );
+        }
+    }
+
+    /// Valid vectors must normalize to a usable price with the recorded value.
+    #[test]
+    fn test_archived_valid_vectors_normalize_price() {
+        let env = Env::default();
+        for vector in oracle_vectors::all() {
+            if vector.expected == ExpectedOutcome::Valid {
+                let normalized = oracle_vectors::normalize(&env, vector);
+                assert_eq!(
+                    normalized.price,
+                    vector.expected_price,
+                    "valid vector `{}` price drifted",
+                    vector.name,
+                );
+            }
+        }
+    }
+
+    /// Stale vectors must be rejected as stale, never silently accepted.
+    #[test]
+    fn test_archived_stale_vectors_rejected() {
+        let env = Env::default();
+        for vector in oracle_vectors::all() {
+            if vector.expected == ExpectedOutcome::Stale {
+                let normalized = oracle_vectors::normalize(&env, vector);
+                assert_eq!(
+                    normalized.outcome,
+                    ExpectedOutcome::Stale,
+                    "stale vector `{}` was not rejected",
+                    vector.name,
+                );
+            }
+        }
+    }
+
+    /// Malformed vectors must be rejected without panicking.
+    #[test]
+    fn test_archived_malformed_vectors_rejected() {
+        let env = Env::default();
+        for vector in oracle_vectors::all() {
+            if vector.expected == ExpectedOutcome::Malformed {
+                let normalized = oracle_vectors::normalize(&env, vector);
+                assert_eq!(
+                    normalized.outcome,
+                    ExpectedOutcome::Malformed,
+                    "malformed vector `{}` was not rejected",
+                    vector.name,
+                );
+            }
+        }
+    }
+
+    /// Boundary vectors must normalize to their recorded outcome exactly.
+    #[test]
+    fn test_archived_boundary_vectors() {
+        let env = Env::default();
+        for vector in oracle_vectors::all() {
+            if vector.expected == ExpectedOutcome::Boundary {
+                let normalized = oracle_vectors::normalize(&env, vector);
+                assert_eq!(
+                    normalized.outcome,
+                    ExpectedOutcome::Boundary,
+                    "boundary vector `{}` drifted",
+                    vector.name,
+                );
+            }
+        }
+    }
+
+    /// Fixture provenance must be present and redacted for every vector.
+    #[test]
+    fn test_archived_vectors_have_provenance() {
+        for vector in oracle_vectors::all() {
+            assert!(
+                !vector.provenance.is_empty(),
+                "vector `{}` is missing provenance",
+                vector.name,
+            );
+            assert!(
+                !vector.provenance.contains("http"),
+                "vector `{}` provenance must be redacted (no URLs)",
+                vector.name,
+            );
+        }
     }
 }

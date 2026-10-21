@@ -13,6 +13,8 @@
 //! | `SERVICE_NAME` | `"predifi-backend"` | Reported service name |
 //! | `OTEL_EXPORTER_OTLP_ENDPOINT` | `"http://localhost:4317"` | OTLP gRPC collector |
 //! | `APP_ENV` | `"development"` | Deployment environment tag |
+//! | `OTEL_TRACES_SAMPLER_ARG` | `"1.0"` | Trace sampling ratio (0.0–1.0) |
+//! | `OTEL_PROPAGATORS` | `"tracecontext,baggage"` | W3C propagators for in/outbound context |
 //!
 //! Telemetry is **opt-in** (`TELEMETRY_ENABLED` defaults to `"false"`) so the
 //! server starts cleanly in environments without a collector configured.
@@ -20,6 +22,10 @@
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry::trace::TraceContextExt;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use opentelemetry_sdk::{
     resource::Resource,
     trace::{self, Tracer},
@@ -28,6 +34,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tracing::Level;
+use std::collections::HashMap;
+use opentelemetry::Context as OtelContext;
 
 // ── Global dynamic log-level state ─────────────────────────────────────────────
 
@@ -126,6 +134,126 @@ fn build_resource(service_name: &'static str) -> Resource {
     ])
 }
 
+// ── Sampling & redaction ───────────────────────────────────────────────────────
+
+/// Attribute keys that must never be exported to the collector.
+///
+/// These cover wallet secrets, signing material, and raw unbounded identifiers
+/// (full addresses, tx hashes) that would otherwise leak into traces.
+const SENSITIVE_ATTRIBUTE_KEYS: &[&str] = &[
+    "wallet.secret",
+    "wallet.private_key",
+    "wallet.seed",
+    "wallet.mnemonic",
+    "signature",
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "password",
+];
+
+/// Attribute keys whose values are unbounded identifiers and must be truncated.
+const UNBOUNDED_IDENTIFIER_KEYS: &[&str] = &[
+    "wallet.address",
+    "wallet.public_key",
+    "tx.hash",
+    "request.id",
+    "user.id",
+];
+
+/// Maximum length retained for unbounded identifier attributes.
+const MAX_IDENTIFIER_LEN: usize = 16;
+
+/// Return `true` if the attribute key is considered sensitive and must be dropped.
+pub fn is_sensitive_attribute(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SENSITIVE_ATTRIBUTE_KEYS
+        .iter()
+        .any(|k| lower == *k || lower.contains(k))
+}
+
+/// Redact a single attribute value: drop sensitive keys entirely, truncate
+/// unbounded identifiers, and pass everything else through unchanged.
+pub fn redact_attribute(key: &str, value: &str) -> Option<String> {
+    if is_sensitive_attribute(key) {
+        return None;
+    }
+    let lower = key.to_ascii_lowercase();
+    if UNBOUNDED_IDENTIFIER_KEYS.iter().any(|k| lower == *k) {
+        let truncated: String = value.chars().take(MAX_IDENTIFIER_LEN).collect();
+        return Some(truncated);
+    }
+    Some(value.to_string())
+}
+
+/// Build a sampler from the `OTEL_TRACES_SAMPLER_ARG` env var (ratio 0.0–1.0).
+///
+/// Defaults to `1.0` (always sample) so local development captures every trace.
+fn build_sampler() -> opentelemetry_sdk::trace::Sampler {
+    let ratio = std::env::var("OTEL_TRACES_SAMPLER_ARG")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|r| r.clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(ratio)
+}
+
+// ── Trace context propagation ──────────────────────────────────────────────────
+
+/// Global propagator used for both inbound extraction and outbound injection.
+static PROPAGATOR: OnceLock<TraceContextPropagator> = OnceLock::new();
+
+/// Return the process-wide W3C `traceparent`/`tracestate` propagator.
+pub fn propagator() -> &'static TraceContextPropagator {
+    PROPAGATOR.get_or_init(TraceContextPropagator::new)
+}
+
+/// Inject the current span's trace context into a header map (outbound RPC/HTTP).
+pub fn inject_trace_context(headers: &mut HashMap<String, String>) {
+    let cx = tracing::Span::current().context();
+    propagator().inject_context(&cx, &mut HeaderInjector(headers));
+}
+
+/// Extract trace context from inbound headers and return an OTel [`Context`].
+pub fn extract_trace_context(headers: &HashMap<String, String>) -> OtelContext {
+    propagator().extract(&HeaderExtractor(headers))
+}
+
+/// Serialise the current trace context into a queue payload field.
+pub fn trace_context_to_payload() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    inject_trace_context(&mut map);
+    map
+}
+
+/// Restore a span from a queue payload's trace context map.
+pub fn span_from_payload(payload: &HashMap<String, String>) -> tracing::Span {
+    let parent = extract_trace_context(payload);
+    let span = tracing::info_span!("queue.consume");
+    span.set_parent(parent);
+    span
+}
+
+struct HeaderInjector<'a>(&'a mut HashMap<String, String>);
+
+impl<'a> opentelemetry::propagation::Injector for HeaderInjector<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
+    }
+}
+
+struct HeaderExtractor<'a>(&'a HashMap<String, String>);
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderExtractor<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
+    }
+}
+
 // ── Provider initialisation ────────────────────────────────────────────────────
 
 /// Initialise an OpenTelemetry tracer provider with an **OTLP gRPC** exporter.
@@ -159,6 +287,7 @@ pub fn init_telemetry(service_name: &'static str, otlp_endpoint: &'static str) -
 
     let provider = trace::TracerProvider::builder()
         .with_config(trace::Config::default().with_resource(resource))
+        .with_sampler(build_sampler())
         .with_batch_exporter(otlp_exporter, opentelemetry_sdk::runtime::Tokio)
         .build();
 
@@ -393,5 +522,24 @@ mod tests {
     #[test]
     fn shutdown_tracer_provider_is_safe_with_no_provider() {
         shutdown_tracer_provider();
+    }
+
+    /// Sensitive attributes are dropped and unbounded identifiers truncated.
+    #[test]
+    fn redaction_drops_secrets_and_truncates_identifiers() {
+        assert!(redact_attribute("wallet.secret", "abc").is_none());
+        assert!(redact_attribute("authorization", "Bearer x").is_none());
+        let truncated = redact_attribute("wallet.address", "GABCDEFGHIJKLMNOPQRSTUVWXYZ").unwrap();
+        assert_eq!(truncated.len(), MAX_IDENTIFIER_LEN);
+        assert_eq!(redact_attribute("http.method", "GET").unwrap(), "GET");
+    }
+
+    /// Trace context round-trips through a queue payload map.
+    #[test]
+    fn trace_context_round_trips_through_payload() {
+        let payload = trace_context_to_payload();
+        // No active span → no traceparent, but extraction must not panic.
+        let _ = span_from_payload(&payload);
+        let _ = extract_trace_context(&payload);
     }
 }

@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import { DM_Mono } from "next/font/google";
 import "./globals.css";
 import { SWRProvider } from "@/components/providers/SWRProvider";
@@ -62,11 +63,15 @@ export const metadata: Metadata = {
   },
 };
 
-export default function RootLayout({
+// Nonces are generated per request; a statically cached shell cannot use them.
+export const dynamic = "force-dynamic";
+
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
   return (
     <html lang="en">
       <head>
@@ -75,7 +80,7 @@ export default function RootLayout({
         <link rel="preload" as="image" href="/gradient.webp" />
 
         {/* Inline minimal critical CSS for hero to paint immediately */}
-        <style>{`.hero-critical{min-height:calc(100vh - 40px);display:flex;flex-direction:column;align-items:center;text-align:center}`}</style>
+        <style nonce={nonce}>{`.hero-critical{min-height:calc(100vh - 40px);display:flex;flex-direction:column;align-items:center;text-align:center}`}</style>
       </head>
       <body className={`antialiased text-sm ${dmMono.variable}`}>
         {/* First tab stop: lets keyboard users bypass the nav (WCAG 2.4.1) */}

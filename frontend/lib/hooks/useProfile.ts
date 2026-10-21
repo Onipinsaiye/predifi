@@ -7,6 +7,8 @@ export interface UseProfileResult {
   profile: UserProfile | undefined;
   isLoading: boolean;
   isError: boolean;
+  /** True when serving cached profile data despite a failing request. */
+  isStale: boolean;
   error: Error | undefined;
   refresh: () => void;
 }
@@ -24,6 +26,7 @@ export function useProfile(address: string | undefined): UseProfileResult {
     profile: data,
     isLoading,
     isError: Boolean(error),
+    isStale: Boolean(error && data),
     error: error as Error | undefined,
     refresh: () => {
       void mutate();

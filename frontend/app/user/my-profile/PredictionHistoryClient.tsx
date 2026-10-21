@@ -8,7 +8,13 @@ import { useCurrentUserAddress } from "@/lib/hooks/useCurrentUserAddress";
 import { useProfile } from "@/lib/hooks/useProfile";
 import { NotificationBell } from "@/components/notifications/NotificationBell";
 import { PerformanceCharts } from "@/components/profile/PerformanceCharts";
-import { Skeleton } from "@/components/ui";
+import {
+  EmptyState,
+  ErrorState,
+  PartialDataBanner,
+  Skeleton,
+  SkeletonScreen,
+} from "@/components/ui";
 import type { ClaimStatus } from "@/lib/api/profile";
 
 type PredictionStatus = "Active" | "Won" | "Lost" | "Pending";
@@ -56,7 +62,7 @@ function truncateAddress(address: string): string {
 
 export function PredictionHistoryClient() {
   const address = useCurrentUserAddress();
-  const { profile, isLoading, isError, refresh } = useProfile(address);
+  const { profile, isLoading, isError, isStale, refresh } = useProfile(address);
   const [activeTab, setActiveTab] = useState<Tab>("All");
 
   const filtered = useMemo(() => {
@@ -66,6 +72,7 @@ export function PredictionHistoryClient() {
   }, [profile?.claims, activeTab]);
 
   const stats = profile?.stats;
+  const hasClaims = (profile?.claims?.length ?? 0) > 0;
 
   return (
     <div className="min-h-screen bg-[#0A0A0A] p-6 lg:p-8 space-y-8">
@@ -83,41 +90,49 @@ export function PredictionHistoryClient() {
         <NotificationBell />
       </div>
 
-      {isError ? (
-        <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900 py-12 text-zinc-500">
-          <p>Couldn&apos;t load your profile.</p>
-          <button
-            type="button"
-            onClick={refresh}
-            className="text-sm font-medium text-[#37B7C3] hover:underline"
-          >
-            Try again
-          </button>
-        </div>
+      {isError && !isStale ? (
+        <ErrorState
+          heading="Couldn't load your history"
+          description={
+            address
+              ? "Your profile service didn't respond. Check your connection and try again."
+              : "Connect your wallet to load your prediction history."
+          }
+          onRetry={refresh}
+        />
       ) : (
         <>
+          {isStale && (
+            <PartialDataBanner
+              message="Showing cached history — your profile service is unreachable."
+              onRetry={refresh}
+            />
+          )}
+
           {/* Stats row */}
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
-            {isLoading || !stats
-              ? Array.from({ length: 5 }).map((_, i) => (
-                  <div key={i} className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 space-y-2">
-                    <Skeleton className="h-3 w-20" />
-                    <Skeleton className="h-5 w-16" />
-                  </div>
-                ))
-              : [
-                  { label: "Total Predictions", value: stats.total_predictions },
-                  { label: "Win Rate", value: `${stats.win_rate.toFixed(0)}%` },
-                  { label: "Total Staked", value: formatChartValue(stats.total_staked) },
-                  { label: "Total Earned", value: formatChartValue(stats.total_earnings) },
-                  { label: "Active Positions", value: stats.active_positions },
-                ].map(({ label, value }) => (
-                  <div key={label} className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 space-y-1">
-                    <p className="text-[10px] text-zinc-500 uppercase tracking-wider">{label}</p>
-                    <p className="text-lg font-bold text-white font-mono">{value}</p>
-                  </div>
-                ))}
-          </div>
+          <SkeletonScreen label="Loading your statistics">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+              {isLoading || !stats
+                ? Array.from({ length: 5 }).map((_, i) => (
+                    <div key={i} className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 space-y-2">
+                      <Skeleton className="h-3 w-20" />
+                      <Skeleton className="h-5 w-16" />
+                    </div>
+                  ))
+                : [
+                    { label: "Total Predictions", value: stats.total_predictions },
+                    { label: "Win Rate", value: `${stats.win_rate.toFixed(0)}%` },
+                    { label: "Total Staked", value: formatChartValue(stats.total_staked) },
+                    { label: "Total Earned", value: formatChartValue(stats.total_earnings) },
+                    { label: "Active Positions", value: stats.active_positions },
+                  ].map(({ label, value }) => (
+                    <div key={label} className="rounded-xl border border-zinc-800 bg-zinc-900 p-4 space-y-1">
+                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider">{label}</p>
+                      <p className="text-lg font-bold text-white font-mono">{value}</p>
+                    </div>
+                  ))}
+            </div>
+          </SkeletonScreen>
 
           {/* Performance charts */}
           {!isLoading && stats && (
@@ -129,14 +144,20 @@ export function PredictionHistoryClient() {
             <h2 className="text-base font-semibold text-white">Prediction History</h2>
 
             {/* Tabs */}
-            <div className="flex items-center gap-1 border-b border-zinc-800 overflow-x-auto">
+            <div
+              className="flex items-center gap-1 border-b border-zinc-800 overflow-x-auto"
+              role="tablist"
+              aria-label="Filter predictions by status"
+            >
               {TABS.map((tab) => (
                 <button
                   key={tab}
                   type="button"
+                  role="tab"
+                  aria-selected={activeTab === tab}
                   onClick={() => setActiveTab(tab)}
                   className={cn(
-                    "px-4 py-2.5 text-sm font-medium transition-colors relative whitespace-nowrap",
+                    "px-4 py-2.5 text-sm font-medium transition-colors relative whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#37B7C3] rounded",
                     activeTab === tab ? "text-[#37B7C3]" : "text-zinc-500 hover:text-zinc-300",
                   )}
                 >
@@ -150,13 +171,23 @@ export function PredictionHistoryClient() {
 
             {/* Table */}
             {isLoading ? (
-              <div className="space-y-2">
+              <SkeletonScreen label="Loading prediction history" className="space-y-2">
                 {Array.from({ length: 4 }).map((_, i) => (
                   <Skeleton key={i} className="h-14 w-full rounded-lg" />
                 ))}
-              </div>
+              </SkeletonScreen>
+            ) : !hasClaims ? (
+              <EmptyState
+                heading="No predictions yet"
+                description="Place your first prediction on an active pool and it will show up here."
+                headingAs="h3"
+              />
             ) : filtered.length === 0 ? (
-              <p className="text-center py-10 text-zinc-500 text-sm">No predictions found.</p>
+              <EmptyState
+                heading={`No ${activeTab.toLowerCase()} predictions`}
+                description="Try another tab to see the rest of your history."
+                headingAs="h3"
+              />
             ) : (
               <div className="rounded-xl border border-zinc-800 overflow-hidden">
                 {/* Header */}

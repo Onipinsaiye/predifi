@@ -3,6 +3,11 @@
 //! This module encapsulates everything needed to build and run the Axum
 //! server — middleware, routes, and the `run` entry point that wires
 //! together all dependencies (DB pool, price cache, Redis, event bus).
+//!
+//! Trace context propagation: inbound HTTP requests are wrapped in a
+//! `tracing` span that extracts W3C `traceparent`/`tracestate` headers via
+//! [`crate::tracing_context`], so downstream queue payloads and RPC calls
+//! inherit the same trace id.
 
 use crate::config::Config;
 use crate::metrics::{Metrics, SharedMetrics};
@@ -21,9 +26,10 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::Instrument;
 use tracing::{error, info, warn};
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
@@ -48,12 +54,41 @@ fn build_cors(config: &Config) -> CorsLayer {
             http::header::CONTENT_TYPE,
             http::header::AUTHORIZATION,
             http::header::ACCEPT,
+            http::header::HeaderName::from_static("traceparent"),
+            http::header::HeaderName::from_static("tracestate"),
+            http::header::HeaderName::from_static(crate::idempotency::IDEMPOTENCY_KEY_HEADER),
         ])
 }
+
+// ── Health contracts ─────────────────────────────────────────────────────────
+
+/// Maximum time the readiness probe will spend probing a single dependency.
+/// Keeps `/ready` latency bounded even when a dependency is hanging.
+const READINESS_DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Startup grace period: for this long after process start, readiness probes
+/// report `starting` (503) without probing dependencies, so orchestrators do
+/// not restart the instance while it is still warming up.
+const STARTUP_GRACE: Duration = Duration::from_secs(10);
+
+/// Process start time, used to enforce the startup grace period.
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn live() -> axum::response::Response {
+    use axum::http::StatusCode;
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "alive", "service": "predifi-backend" })),
+    )
+        .into_response()
+}
+
+/// Liveness probe: reports only process health. Never touches dependencies,
+/// so a Postgres/Redis/RPC outage cannot cause the orchestrator to restart a
+/// healthy process.
+async fn liveness() -> axum::response::Response {
     use axum::http::StatusCode;
     (
         StatusCode::OK,
@@ -78,31 +113,10 @@ async fn health(State(state): State<crate::routes::v1::AppState>) -> axum::respo
     }
 
     let mut rpc_status = "ok";
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(state.config.rpc_health_timeout_secs))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let mut rpc_attempts = 0;
-    let max_attempts = state.config.rpc_health_retry_count as usize;
-    while rpc_attempts < max_attempts {
-        rpc_attempts += 1;
-        let ok = client
-            .post(&state.config.stellar_rpc_url)
-            .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getHealth"}))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if ok {
-            break;
-        }
-        if rpc_attempts < max_attempts {
-            let backoff = std::cmp::min(2u64.pow((rpc_attempts - 1) as u32), 5);
-            sleep(Duration::from_secs(backoff)).await;
-        }
-    }
-    if rpc_attempts >= max_attempts {
+    if crate::rpc_resilience::probe_health(&state.config)
+        .await
+        .is_err()
+    {
         rpc_status = "unreachable";
         all_healthy = false;
     }
@@ -197,6 +211,81 @@ async fn ready(State(state): State<crate::routes::v1::AppState>) -> axum::respon
     }
 }
 
+/// Readiness probe: reports whether this instance can currently serve traffic.
+///
+/// Each dependency is probed independently under a bounded timeout budget so
+/// that a single hanging dependency cannot blow up the overall response
+/// latency. Unhealthy dependencies make the endpoint return 503, which
+/// removes the instance from service without triggering a restart.
+async fn readiness(State(state): State<crate::routes::v1::AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let started = PROCESS_START.get_or_init(Instant::now);
+    if started.elapsed() < STARTUP_GRACE {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "starting",
+                "service": "predifi-backend",
+                "grace_remaining_secs": STARTUP_GRACE
+                    .saturating_sub(started.elapsed())
+                    .as_secs(),
+            })),
+        )
+            .into_response();
+    }
+
+    let (db_status, db_error) = match &state.db {
+        Some(db) => match tokio::time::timeout(
+            READINESS_DEPENDENCY_TIMEOUT,
+            sqlx::query("SELECT 1").execute(db),
+        )
+        .await
+        {
+            Ok(Ok(_)) => ("ok", None),
+            Ok(Err(_)) => ("unreachable", Some("database ping failed".to_string())),
+            Err(_) => ("timeout", Some("database ping timed out".to_string())),
+        },
+        None => (
+            "not_configured",
+            Some("database pool is not configured".to_string()),
+        ),
+    };
+
+    let (redis_status, redis_error) = if !state.redis.is_available() {
+        (
+            "not_configured",
+            Some("Redis is not configured".to_string()),
+        )
+    } else {
+        match tokio::time::timeout(READINESS_DEPENDENCY_TIMEOUT, state.redis.ping()).await {
+            Ok(true) => ("ok", None),
+            Ok(false) => ("unreachable", Some("Redis ping failed".to_string())),
+            Err(_) => ("timeout", Some("Redis ping timed out".to_string())),
+        }
+    };
+
+    let (price_cache_status, price_cache_error) = if state.cache.snapshot().is_empty() {
+        ("not_ready", Some("price cache is empty".to_string()))
+    } else {
+        ("ok", None)
+    };
+
+    let ready = db_status == "ok" && redis_status == "ok" && price_cache_status == "ok";
+
+    let body = json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "dependencies": { "db": db_status, "redis": redis_status, "price_cache": price_cache_status },
+        "errors":       { "db": db_error, "redis": redis_error,   "price_cache": price_cache_error  }
+    });
+
+    if ready {
+        (StatusCode::OK, Json(body)).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
+}
+
 async fn root() -> Json<serde_json::Value> {
     Json(json!({ "message": "Welcome to the PrediFi backend", "api": "/api/v1" }))
 }
@@ -230,6 +319,36 @@ async fn metrics_middleware(
         .with_label_values(&[&method, &path, &status])
         .inc();
     response
+}
+
+/// Inbound trace-context middleware.
+///
+/// Extracts the W3C `traceparent`/`tracestate` headers (if present) and
+/// opens a `http.request` span that becomes the parent for every downstream
+/// span — including queue payloads and Soroban RPC calls. Sensitive
+/// attributes (authorization headers, wallet addresses, request bodies) are
+/// deliberately excluded from the span to keep traces free of secrets and
+/// unbounded identifiers.
+async fn trace_context_middleware(
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let method = request.method().as_str().to_owned();
+    let route = request.uri().path().to_owned();
+
+    // Extract the parent context from inbound headers so the span joins the
+    // caller's trace rather than starting a new one.
+    let parent = crate::tracing_context::extract_trace_context(request.headers());
+
+    let span = tracing::info_span!(
+        "http.request",
+        http.method = %method,
+        http.route = %route,
+        // Never record authorization, cookies, bodies, or wallet addresses.
+        http.sensitive = tracing::field::Empty,
+    );
+
+    next.run(request).instrument(span).await
 }
 
 // ── Router builders ───────────────────────────────────────────────────────────
@@ -274,17 +393,20 @@ pub fn build_router_with_rate_limit(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(Duration::from_secs(
             config.pool_negative_cache_ttl_secs,
         )),
+        market_reads: crate::routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: None,
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(root))
         .route("/live", get(live))
+        .route("/liveness", get(liveness))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/readiness", get(readiness))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
         .nest(
@@ -298,11 +420,13 @@ pub fn build_router_with_rate_limit(
                 event_bus,
             ),
         )
-        .merge(crate::openapi::swagger_router())
+        .merge(crate::openapi::swagger_router());
+    crate::api_versioning::with_api_policies(router)
         .layer(from_fn_with_state(
             prometheus_metrics.clone(),
             metrics_middleware,
         ))
+        .layer(from_fn(trace_context_middleware))
         .layer(build_cors(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
@@ -322,17 +446,20 @@ fn build_router_with_db(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(Duration::from_secs(
             config.pool_negative_cache_ttl_secs,
         )),
+        market_reads: crate::routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: Some(pool.clone()),
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(root))
         .route("/live", get(live))
+        .route("/liveness", get(liveness))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/readiness", get(readiness))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
         .nest(
@@ -346,11 +473,13 @@ fn build_router_with_db(
                 event_bus,
             ),
         )
-        .merge(crate::openapi::swagger_router())
+        .merge(crate::openapi::swagger_router());
+    crate::api_versioning::with_api_policies(router)
         .layer(from_fn_with_state(
             prometheus_metrics.clone(),
             metrics_middleware,
         ))
+        .layer(from_fn(trace_context_middleware))
         .layer(build_cors(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
@@ -410,6 +539,9 @@ pub async fn run_with_signal<F>(config: Config, signal: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Record process start so readiness probes honour the startup grace period.
+    PROCESS_START.get_or_init(Instant::now);
+
     let pool = crate::db::create_pool(&config)
         .await
         .unwrap_or_else(|error| {
@@ -466,6 +598,15 @@ where
                 .await;
         });
 
+    // Purges token revocation records whose tokens have expired (#55).
+    let revocation_store =
+        crate::token_revocation::RevocationStore::new(Some(pool.clone()), redis.clone());
+    let revocation_purge_handle: JoinHandle<()> =
+        crate::tracing_context::spawn_worker("token_revocation_purge", async move {
+            crate::token_revocation::run_purge_loop(revocation_store, Duration::from_secs(3600))
+                .await;
+        });
+
     if redis.is_available() {
         info!("Redis cache initialized and available");
     } else {
@@ -518,6 +659,7 @@ where
     fetcher_handle.abort();
     listener_handle.abort();
     notifications_handle.abort();
+    revocation_purge_handle.abort();
 
     // Close the pool after aborting workers.
     shutdown::with_shutdown_timeout(drain_timeout, "database pool close", pool.close()).await;

@@ -26,15 +26,32 @@ role with `assign_role`, and each of those can also call `upgrade_contract` on
 `predifi-contract`. Keep the number of `Admin` role holders minimal, and prefer a
 multisig account as the admin.
 
-Changing who the authority is:
+Changing who the authority is (always two-step):
 
-1. `propose_new_admin(current_admin, new_admin)`
-2. `accept_admin_role(new_admin)` (two-step, recommended) — or the legacy
-   one-step `transfer_admin`.
+1. `propose_new_admin(current_admin, new_admin)` — nominates (or replaces a
+   previous nomination).
+2. `accept_admin_role(new_admin)` — the nominee proves control of the new address
+   and completes the handoff.
+
+The handoff can be withdrawn before acceptance with
+`cancel_admin_transfer(current_admin)`. A nomination is replaced atomically by a
+new `propose_new_admin` call; the previous nominee can no longer accept. The
+legacy `transfer_admin` entry point now only nominates and also requires
+acceptance.
 
 The current admin's `Admin` role can **not** be removed with `revoke_role` /
 `revoke_all_roles` (both return `AdminError`); hand over first, then revoke the
 former admin.
+
+### Migrating a deployed instance
+
+The access-control contract needs no storage migration when this handoff model
+is deployed: `DataKey::Admin` and the Admin role keep their existing encoding,
+and the pending nomination is stored in the optional `DataKey::ProposedAdmin`
+entry (absent means `None`). After upgrading the Wasm, the existing admin can call
+`propose_new_admin` directly. Wallets or scripts still calling the legacy
+`transfer_admin` will create a nomination; the nominee must call
+`accept_admin_role` before authority moves.
 
 ## 2. Delay and attestation
 

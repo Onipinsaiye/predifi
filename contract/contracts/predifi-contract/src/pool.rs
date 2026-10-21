@@ -1,18 +1,24 @@
 //! Pool domain: prediction pool lifecycle — creation, configuration,
 //! resolution, cancellation and pool queries.
+//!
+//! Storage retention: see `RETENTION_*` constants and `bump_ttl` /
+//! `extend_persistent` / `extend_temporary` helpers in `lib.rs`.
 
 use soroban_sdk::{contractimpl, log, token, Address, Env, String, Symbol, Vec};
 
 use crate::gas_opt;
+// NB: a merge conflict once duplicated this whole `use` block (upstream #167/#163)
+// which made `cargo test` fail with E0252 name-collision errors; keep it merged.
 use crate::{
     Config, DataKey, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
-    MarketState, MaxTotalStakeIncreasedEvent, Pool, PoolCanceledEvent, PoolConfig,
-    PoolCreatedEvent, PoolDescriptionUpdatedEvent, PoolDisputedEvent, PoolReadyForResolutionEvent,
-    PoolResolvedDiagEvent, PoolResolvedEvent, PoolStats, PredifiContract, PredifiContractArgs,
-    PredifiContractClient, PredifiError, ResolutionConflictEvent, ResolutionVoteCastEvent,
-    StakeLimitsUpdatedEvent, StakingClosedEvent, CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION,
-    EMERGENCY_CANCEL_MULTISIG_THRESHOLD, INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS,
-    MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
+    MarketOracleConfig, MarketOracleConfiguredEvent, MarketState, MaxTotalStakeIncreasedEvent,
+    Pool, PoolCanceledEvent, PoolConfig, PoolCreatedEvent, PoolDescriptionUpdatedEvent,
+    PoolDisputedEvent, PoolReadyForResolutionEvent, PoolResolvedDiagEvent, PoolResolvedEvent,
+    PoolStats, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
+    ResolutionConflictEvent, ResolutionVoteCastEvent, StakeLimitsUpdatedEvent, StakingClosedEvent,
+    CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION, EMERGENCY_CANCEL_MULTISIG_THRESHOLD,
+    INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY,
+    MAX_OPTIONS_COUNT, MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
 };
 
 #[contractimpl]
@@ -36,7 +42,7 @@ impl PredifiContract {
     ///   pool duration, and no later than `MAX_POOL_DURATION` from the current ledger time.
     /// - `token` - The Stellar token contract address used for staking. It must be whitelisted;
     ///   the token contract itself is called only when a stake or initial liquidity is transferred.
-    /// - `options_count` - Number of possible outcomes (must be >= 2 and <= MAX_OPTIONS_COUNT = 100)
+    /// - `options_count` - Number of possible outcomes (must be >= 2 and <= MAX_OUTCOMES_PER_POOL = 100)
     /// - `category` - Market category symbol (e.g., `CATEGORY_SPORTS`, `CATEGORY_FINANCE`)
     /// - `config` - Pool configuration parameters via `PoolConfig` struct:
     ///   - `start_time` - Unix timestamp when the pool opens for predictions (0 = open immediately)
@@ -95,7 +101,8 @@ impl PredifiContract {
     /// The function returns or raises the following typed protocol errors:
     ///
     /// - `ContractPaused` - The contract is currently paused; all state-mutating operations are blocked
-    /// - `InvalidData` - `options_count` is less than 2 or greater than `MAX_OPTIONS_COUNT`.
+    /// - `InvalidData` - `options_count` is less than 2.
+    /// - `MaxOutcomesExceeded` - `options_count` is greater than `MAX_OUTCOMES_PER_POOL`.
     /// - `TokenNotWhitelisted` - The specified token is not on the allowed betting whitelist
     /// - `InvalidTimestamp` - `end_time` is not in the future, exceeds MAX_POOL_DURATION, or `end_time <= start_time`
     /// - `DeadlineInPast` - `end_time` or `start_time` is in the past (issue #1130)
@@ -130,7 +137,7 @@ impl PredifiContract {
     ///
     /// **Outcome Validation:**
     /// - `options_count` must be >= 2 (binary or multi-outcome)
-    /// - `options_count` must be <= MAX_OPTIONS_COUNT (100)
+    /// - `options_count` must be <= MAX_OUTCOMES_PER_POOL (100)
     /// - `outcome_descriptions` length must equal `options_count`
     /// - Each outcome description must be between 1 and 128 bytes
     ///
@@ -280,10 +287,102 @@ impl PredifiContract {
         Self::require_not_paused(&env)?;
         creator.require_auth();
 
+        Self::create_pool_internal(
+            &env,
+            creator,
+            end_time,
+            token,
+            options_count,
+            category,
+            config,
+        )
+    }
+
+    /// Create a new prediction pool with explicit, governed oracle configuration.
+    ///
+    /// Validates supported feed identifiers, oracle identity whitelist, and freshness bounds
+    /// before persisting the configuration at creation. The configuration is immutable thereafter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_oracle_pool(
+        env: Env,
+        creator: Address,
+        end_time: u64,
+        token: Address,
+        options_count: u32,
+        category: Symbol,
+        config: PoolConfig,
+        oracle_config: MarketOracleConfig,
+    ) -> Result<u64, PredifiError> {
+        Self::require_not_paused(&env)?;
+        creator.require_auth();
+
+        // Validate the oracle configuration bounds and supported identifiers before pool creation
+        Self::validate_market_oracle_config(&env, &oracle_config)?;
+
+        let pool_id = Self::create_pool_internal(
+            &env,
+            creator,
+            end_time,
+            token,
+            options_count,
+            category,
+            config,
+        )?;
+
+        // Persist the selected feed configuration at creation (immutable)
+        let oracle_key = DataKey::MarketOracleConfig(pool_id);
+        env.storage().persistent().set(&oracle_key, &oracle_config);
+        Self::extend_persistent(&env, &oracle_key);
+
+        // Expose configuration in contract event
+        MarketOracleConfiguredEvent {
+            pool_id,
+            oracle: oracle_config.oracle,
+            feed_id: oracle_config.feed_id,
+            max_staleness_seconds: oracle_config.max_staleness_seconds,
+        }
+        .publish(&env);
+
+        Ok(pool_id)
+    }
+
+    /// Alias for `create_oracle_pool`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_pool_with_oracle(
+        env: Env,
+        creator: Address,
+        end_time: u64,
+        token: Address,
+        options_count: u32,
+        category: Symbol,
+        config: PoolConfig,
+        oracle_config: MarketOracleConfig,
+    ) -> Result<u64, PredifiError> {
+        Self::create_oracle_pool(
+            env,
+            creator,
+            end_time,
+            token,
+            options_count,
+            category,
+            config,
+            oracle_config,
+        )
+    }
+
+    fn create_pool_internal(
+        env: &Env,
+        creator: Address,
+        end_time: u64,
+        token: Address,
+        options_count: u32,
+        category: Symbol,
+        config: PoolConfig,
+    ) -> Result<u64, PredifiError> {
         // Validate: category must be in the allowed list, return error if invalid
-        let normalized_category = match Self::validate_category(&env, &category) {
+        let normalized_category = match Self::validate_category(env, &category) {
             Ok(cat) => cat,
-            Err(e) => soroban_sdk::panic_with_error!(&env, e),
+            Err(e) => soroban_sdk::panic_with_error!(env, e),
         };
 
         // Validate: token must be on the allowed betting whitelist
@@ -343,9 +442,10 @@ impl PredifiContract {
             return Err(PredifiError::InvalidData);
         }
 
-        // Validate: options_count must not exceed maximum limit
-        if options_count > MAX_OPTIONS_COUNT {
-            return Err(PredifiError::InvalidData);
+        // Validate: options_count must not exceed the contract-level outcome ceiling.
+        // This is enforced before the pool id is read or any storage is written.
+        if options_count > MAX_OUTCOMES_PER_POOL {
+            return Err(PredifiError::MaxOutcomesExceeded);
         }
 
         // Validate: initial_liquidity must be non-negative if provided
@@ -359,6 +459,12 @@ impl PredifiContract {
             config.initial_liquidity <= MAX_INITIAL_LIQUIDITY,
             "initial_liquidity exceeds maximum allowed value"
         );
+
+        // Validate: initial liquidity must fit under the contract-level
+        // aggregate stake ceiling so the pool cannot start over-cap.
+        if config.initial_liquidity > MAX_AGGREGATE_STAKE_PER_POOL {
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
+        }
 
         // Issue #1131 — initial-liquidity safety margin. When the creator
         // caps the pool at `max_total_stake > 0`, the seeded liquidity must
@@ -438,6 +544,13 @@ impl PredifiContract {
             "min_total_stake must be greater than zero"
         );
         assert!(config.max_total_stake >= 0, "max_total_stake must be >= 0");
+
+        // Validate: a per-pool cap cannot exceed the contract-level ceiling.
+        // Zero remains the "no per-pool cap" sentinel; the global ceiling still
+        // applies to every prediction.
+        if config.max_total_stake > MAX_AGGREGATE_STAKE_PER_POOL {
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
+        }
 
         if let Some(ref whitelist_key) = config.whitelist_key {
             if let Err(e) = Self::validate_referral_code(&env, whitelist_key) {
@@ -619,6 +732,11 @@ impl PredifiContract {
             new_max_total_stake == 0 || new_max_total_stake >= pool.total_stake,
             "new_max_total_stake must be zero (unlimited) or >= total_stake"
         );
+
+        // A per-pool cap may not exceed the contract-level aggregate ceiling.
+        if new_max_total_stake > MAX_AGGREGATE_STAKE_PER_POOL {
+            return Err(PredifiError::MaxAggregateStakeExceeded);
+        }
 
         // Only allow increasing the cap (or setting unlimited)
         if pool.max_total_stake > 0 && new_max_total_stake > 0 {
@@ -1415,6 +1533,35 @@ impl PredifiContract {
             .expect("Pool not found");
         Self::extend_persistent(&env, &pool_key);
         pool
+    }
+
+    /// Returns the ledger timestamp at which the pool's persistent storage
+    /// entries may be safely archived, or `None` if the pool is still
+    /// unresolved and therefore must be retained indefinitely.
+    ///
+    /// Retention policy:
+    /// - Active / Locked / Disputed pools: `None` (retained until resolution).
+    /// - Resolved / Canceled pools: `resolution_timestamp + RETENTION_CLAIM_WINDOW`
+    ///   so that users can still claim winnings or refunds during the promised
+    ///   claim window. After this point, off-chain indexers are expected to
+    ///   have archived the pool and its stakes; on-chain entries may be
+    ///   evicted by TTL expiry.
+    pub fn get_pool_retention_deadline(env: Env, pool_id: u64) -> Option<u64> {
+        let pool_key = DataKey::Pool(pool_id);
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .expect("Pool not found");
+        Self::extend_persistent(&env, &pool_key);
+
+        match pool.state {
+            MarketState::Active | MarketState::Locked | MarketState::Disputed => None,
+            MarketState::Resolved | MarketState::Canceled => {
+                let base = pool.resolution_timestamp.unwrap_or(pool.end_time);
+                Some(base.saturating_add(crate::RETENTION_CLAIM_WINDOW))
+            }
+        }
     }
 
     /// Returns the fee schedule snapshotted when the pool was created.

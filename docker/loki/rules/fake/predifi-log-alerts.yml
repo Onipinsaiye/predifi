@@ -1,5 +1,7 @@
 # Log-based alert rules evaluated by the Loki ruler.
 # `fake` is the tenant directory Loki uses when auth_enabled is false.
+# Every rule needs owner/severity labels and a runbook_url annotation; see
+# docs/runbooks/README.md and .github/scripts/validate_alert_runbooks.py.
 groups:
   - name: predifi-backend-logs
     interval: 1m
@@ -9,33 +11,53 @@ groups:
         for: 2m
         labels:
           severity: critical
+          owner: backend-oncall
+          service: api
         annotations:
           summary: "Backend error log rate elevated"
           description: "The backend is logging errors at {{ $value | printf \"%.2f\" }} per second over the last 5 minutes."
+          impact: "Users are likely seeing failed requests; check the API error-rate panel."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/logs.md#backenderrorlogspike"
+          dashboard_url: "/d/predifi-logs"
 
       - alert: BackendPanic
         expr: 'sum(count_over_time({job="predifi", service="backend"} |~ "(?i)panicked at" [5m])) > 0'
         for: 0m
         labels:
           severity: critical
+          owner: backend-oncall
+          service: api
         annotations:
           summary: "Backend panic detected in logs"
           description: "A Rust panic was logged by the backend within the last 5 minutes."
+          impact: "A request or background task crashed; the affected user action failed."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/logs.md#backendpanic"
+          dashboard_url: "/d/predifi-logs"
 
       - alert: DatabaseErrorLogs
         expr: 'sum(count_over_time({job="predifi", service="backend", level="ERROR"} |~ "(?i)(database|connection pool|sqlx)" [10m])) > 5'
         for: 5m
         labels:
           severity: warning
+          owner: backend-oncall
+          service: database
         annotations:
           summary: "Repeated database errors in backend logs"
           description: "More than 5 database-related error lines were logged in the last 10 minutes."
+          impact: "Some reads or indexer writes are failing intermittently."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/logs.md#databaseerrorlogs"
+          dashboard_url: "/d/predifi-logs"
 
       - alert: NoBackendLogs
         expr: 'sum(count_over_time({job="predifi", service="backend"}[10m])) == 0'
         for: 10m
         labels:
           severity: warning
+          owner: infra-oncall
+          service: monitoring
         annotations:
           summary: "No backend logs received"
           description: "Loki has not received any backend log lines for 10 minutes — the service or the log shipper may be down."
+          impact: "Either the backend is down (users affected) or log shipping is broken (operators blind)."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/logs.md#nobackendlogs"
+          dashboard_url: "/d/predifi-logs"

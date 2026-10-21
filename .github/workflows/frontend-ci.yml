@@ -2,14 +2,32 @@ name: Frontend CI/CD
 
 on:
   push:
-    branches: ["main", "frontend"]
+    branches: ["main", "develop", "contract", "frontend"]
     paths:
       - "frontend/**"
+      # Shared boundary: the frontend API layer is generated from the backend
+      # OpenAPI schema, so schema or generator changes must schedule frontend
+      # checks (stale generated types surface as build/type errors).
+      - "backend/openapi.json"
+      - "backend/src/openapi.rs"
+      - "backend/src/bin/openapi_export.rs"
+      # Shared build script: compose builds frontend/Dockerfile.dev, so a
+      # compose change can break the frontend dev image.
+      - "docker-compose.yml"
       - ".github/workflows/frontend-ci.yml"
   pull_request:
-    branches: ["main", "frontend"]
+    branches: ["main", "develop", "contract", "frontend"]
     paths:
       - "frontend/**"
+      # Shared boundary: the frontend API layer is generated from the backend
+      # OpenAPI schema, so schema or generator changes must schedule frontend
+      # checks (stale generated types surface as build/type errors).
+      - "backend/openapi.json"
+      - "backend/src/openapi.rs"
+      - "backend/src/bin/openapi_export.rs"
+      # Shared build script: compose builds frontend/Dockerfile.dev, so a
+      # compose change can break the frontend dev image.
+      - "docker-compose.yml"
       - ".github/workflows/frontend-ci.yml"
   workflow_dispatch:
 

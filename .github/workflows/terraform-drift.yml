@@ -1,0 +1,212 @@
+name: Terraform Drift
+
+# Read-only drift detection. Runs a refresh-only plan against each environment,
+# classifies anything changed outside Terraform, and opens or updates an issue
+# for the owners. It never changes infrastructure or state: the AWS role it
+# assumes is read-only, the plan runs with -lock=false, and the plan file is
+# discarded. Remediation goes through the reviewed process in terraform/DRIFT.md.
+on:
+  schedule:
+    - cron: "23 6 * * 1-5" # 06:23 UTC on weekdays, so a person can triage the same day
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to check"
+        type: choice
+        options: [staging, production, all]
+        default: staging
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-drift
+  cancel-in-progress: false
+
+jobs:
+  select:
+    name: Select environments
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      environments: ${{ steps.pick.outputs.environments }}
+    steps:
+      - name: Pick environments to check
+        id: pick
+        env:
+          REQUESTED: ${{ inputs.environment || 'all' }}
+        run: |
+          case "$REQUESTED" in
+            staging)    echo 'environments=["staging"]' >> "$GITHUB_OUTPUT" ;;
+            production) echo 'environments=["production"]' >> "$GITHUB_OUTPUT" ;;
+            *)          echo 'environments=["staging","production"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  detect:
+    name: Drift (${{ matrix.environment }})
+    needs: select
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.select.outputs.environments) }}
+    # Environment-scoped variables hold the read-only role and state location.
+    # These environments must not have deployment secrets or apply roles.
+    environment: terraform-drift-${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    env:
+      ENVIRONMENT: ${{ matrix.environment }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.TERRAFORM_DRIFT_AWS_REGION }}
+      TF_VAR_vpc_id: ${{ vars.TERRAFORM_DRIFT_VPC_ID }}
+      TF_VAR_public_subnet_ids: ${{ vars.TERRAFORM_DRIFT_PUBLIC_SUBNET_IDS }}
+      TF_VAR_private_subnet_ids: ${{ vars.TERRAFORM_DRIFT_PRIVATE_SUBNET_IDS }}
+      TF_VAR_ami_id: ${{ vars.TERRAFORM_DRIFT_AMI_ID }}
+      TF_VAR_domain_name: ${{ vars.TERRAFORM_DRIFT_DOMAIN_NAME }}
+      TF_VAR_route53_zone_id: ${{ vars.TERRAFORM_DRIFT_ROUTE53_ZONE_ID }}
+    steps:
+      - name: Check configuration
+        id: config
+        env:
+          ROLE_ARN: ${{ vars.TERRAFORM_DRIFT_ROLE_ARN }}
+          STATE_BUCKET: ${{ vars.TERRAFORM_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TERRAFORM_STATE_REGION }}
+          STATE_KMS_KEY_ID: ${{ vars.TERRAFORM_STATE_KMS_KEY_ID }}
+        run: |
+          missing=()
+          for name in ROLE_ARN STATE_BUCKET STATE_REGION STATE_KMS_KEY_ID TF_VAR_aws_region TF_VAR_vpc_id \
+                      TF_VAR_public_subnet_ids TF_VAR_private_subnet_ids TF_VAR_ami_id TF_VAR_domain_name TF_VAR_route53_zone_id; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            printf 'Drift detection for %s is not configured (missing: %s). See terraform/DRIFT.md.\n' \
+              "$ENVIRONMENT" "${missing[*]}" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        if: steps.config.outputs.enabled == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      - name: Assume read-only drift role
+        if: steps.config.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_DRIFT_ROLE_ARN }}
+          role-session-name: predifi-drift-${{ matrix.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.TERRAFORM_DRIFT_AWS_REGION }}
+
+      - name: Refresh-only plan
+        if: steps.config.outputs.enabled == 'true'
+        id: plan
+        env:
+          STATE_BUCKET: ${{ vars.TERRAFORM_STATE_BUCKET }}
+          STATE_REGION: ${{ vars.TERRAFORM_STATE_REGION }}
+          STATE_KMS_KEY_ID: ${{ vars.TERRAFORM_STATE_KMS_KEY_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="terraform/environments/$ENVIRONMENT"
+          work="$(mktemp -d)"
+          echo "work=$work" >> "$GITHUB_OUTPUT"
+          terraform -chdir="$dir" init -input=false \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="key=$ENVIRONMENT/terraform.tfstate" \
+            -backend-config="region=$STATE_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="kms_key_id=$STATE_KMS_KEY_ID"
+
+          # -refresh-only compares real infrastructure with state and proposes
+          # no configuration changes. -lock=false because the role cannot write
+          # the lockfile and nothing is ever written back.
+          set +e
+          terraform -chdir="$dir" plan -refresh-only -lock=false -input=false -no-color \
+            -detailed-exitcode -out="$work/drift.tfplan" >"$work/plan.log" 2>&1
+          code=$?
+          set -e
+          if [[ $code -eq 1 ]]; then
+            # Show only Terraform's error lines; the full log can contain values.
+            grep -E '^(Error|│ Error)' "$work/plan.log" | head -20 >&2 || true
+            echo "::error::Refresh-only plan failed for $ENVIRONMENT"
+            exit 1
+          fi
+          terraform -chdir="$dir" show -json "$work/drift.tfplan" > "$work/drift.json"
+          rm -f "$work/drift.tfplan" "$work/plan.log"
+
+      - name: Classify drift
+        if: steps.config.outputs.enabled == 'true'
+        id: classify
+        env:
+          WORK: ${{ steps.plan.outputs.work }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DOC_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/terraform/DRIFT.md
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/classify_terraform_drift.py \
+            --environment "$ENVIRONMENT" \
+            --report "$WORK/report.md" \
+            --summary "$WORK/summary.json" \
+            --run-url "$RUN_URL" \
+            --doc-url "$DOC_URL" < "$WORK/drift.json"
+          # Plan JSON contains attribute values; remove it as soon as it is classified.
+          rm -f "$WORK/drift.json"
+          cat "$WORK/report.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "drifted=$(jq -r .drifted "$WORK/summary.json")" >> "$GITHUB_OUTPUT"
+          echo "sensitive=$(jq -r .sensitive "$WORK/summary.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Notify owners
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK: ${{ steps.plan.outputs.work }}
+          DRIFTED: ${{ steps.classify.outputs.drifted }}
+          SENSITIVE: ${{ steps.classify.outputs.sensitive }}
+        run: |
+          set -euo pipefail
+          title="Terraform drift: $ENVIRONMENT"
+          gh label create terraform-drift --color B60205 \
+            --description "Infrastructure changed outside Terraform" --force >/dev/null
+          number="$(gh issue list --state open --label terraform-drift --limit 50 \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+
+          if [[ "$DRIFTED" == "0" ]]; then
+            if [[ -n "$number" ]]; then
+              gh issue comment "$number" --body "No drift detected in \`$ENVIRONMENT\` on $(date -u +%FT%TZ). Close this issue once the remediation PR (if any) is merged."
+            fi
+            exit 0
+          fi
+
+          body="$WORK/body.md"
+          {
+            echo "@Web3Novalabs/infra-reviewers — drift detected in \`$ENVIRONMENT\` ($SENSITIVE sensitive)."
+            echo
+            echo "Sensitive drift must be triaged within one business day. Do not run an apply to \"fix\" this until the change has been reviewed — it may be an emergency fix that must be kept."
+            echo
+            cat "$WORK/report.md"
+          } > "$body"
+
+          if [[ -n "$number" ]]; then
+            gh issue comment "$number" --body-file "$body"
+          else
+            gh issue create --title "$title" --label terraform-drift --body-file "$body"
+          fi
+
+      - name: Flag sensitive drift
+        if: steps.config.outputs.enabled == 'true' && steps.classify.outputs.sensitive != '0'
+        run: |
+          echo "::error::${{ steps.classify.outputs.sensitive }} sensitive drift finding(s) in $ENVIRONMENT. See the drift issue."
+          exit 1

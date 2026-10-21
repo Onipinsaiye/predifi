@@ -64,6 +64,24 @@ a deployment step from a diff, and finding out after merge is the expensive way.
 
 ---
 
+## 🧭 Architecture Decision Records
+
+Read the [Architecture Decision Records](docs/adr/README.md) before making a
+cross-component change. Add or update an ADR when a change affects contract
+compatibility (calls, events, errors, storage, settlement, or upgrades), oracle
+trust or resolution authority, consistency between on-chain state and backend
+or frontend projections, or deployment, migration, rollback, or operational
+boundaries. The ADR must explain the context, decision, alternatives,
+consequences, and linked implementation issues. Keep the ADR after the work is
+merged; supersede it with a new ADR if the decision changes.
+
+An ADR is not needed for an isolated implementation detail, a documentation
+correction, or a change that follows an existing decision without changing its
+tradeoffs. When uncertain, open a proposed ADR and ask the affected area owners
+to review it.
+
+---
+
 ## 👥 Code Review and Ownership
 
 Reviewers are assigned automatically from [`.github/CODEOWNERS`](.github/CODEOWNERS),
@@ -96,5 +114,5 @@ Two things worth knowing if you are editing that file:
 
 For specific setup, building, testing, and linting instructions for individual sub-projects, please refer to:
 
-- ⚙️ **Backend Guide**: [CONTRIBUTING_BACKEND.md](CONTRIBUTING_BACKEND.md)
+- ⚙️ **Backend Guide**: [backend/README.md](backend/README.md)
 - 📜 **Smart Contracts Guide**: [contract/CONTRIBUTING.md](contract/CONTRIBUTING.md)

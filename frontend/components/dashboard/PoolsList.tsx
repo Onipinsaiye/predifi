@@ -1,7 +1,18 @@
 "use client";
 
 import { useMemo, useState, useCallback } from "react";
-import { Card, CardContent, CardHeader, CardTitle, Skeleton, SearchBar } from "@/components/ui";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  EmptyState,
+  ErrorState,
+  PartialDataBanner,
+  Skeleton,
+  SkeletonScreen,
+  SearchBar,
+} from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { SearchResultHighlighter } from "@/components/search/SearchResultHighlighter";
 import { usePools } from "@/lib/hooks/usePools";
@@ -25,6 +36,7 @@ export function PoolsList({
     total,
     isLoading: isPoolsLoading,
     isError,
+    isStale,
     refresh,
   } = usePools({
     status: "active",
@@ -72,7 +84,11 @@ export function PoolsList({
         <CardHeader>
           <Skeleton className="h-5 w-32" />
         </CardHeader>
-        <CardContent className="space-y-3">{skeletonItems}</CardContent>
+        <CardContent>
+          <SkeletonScreen label="Loading active pools" className="space-y-3">
+            {skeletonItems}
+          </SkeletonScreen>
+        </CardContent>
       </Card>
     );
   }
@@ -115,22 +131,30 @@ export function PoolsList({
           </div>
         )}
       </CardHeader>
-      <CardContent>
-        {isError ? (
-          <div className="flex flex-col items-center justify-center h-[300px] gap-3 text-zinc-500">
-            <p>Couldn&apos;t load pools.</p>
-            <button
-              type="button"
-              onClick={refresh}
-              className="text-sm font-medium text-[#37B7C3] hover:underline"
-            >
-              Try again
-            </button>
-          </div>
+      <CardContent className="space-y-3">
+        {isStale && (
+          <PartialDataBanner
+            message="Showing cached pools — the pool service is unreachable."
+            onRetry={refresh}
+          />
+        )}
+        {isError && !isStale ? (
+          <ErrorState
+            heading="Couldn't load active pools"
+            description="The pool service didn't respond. Check your connection and try again."
+            onRetry={refresh}
+            className="h-[300px] border-none bg-transparent py-0"
+          />
         ) : filteredPools.length === 0 ? (
-          <div className="flex items-center justify-center h-[300px] text-zinc-600">
-            <p>{query ? "No pools match your search." : "No active pools yet."}</p>
-          </div>
+          <EmptyState
+            heading={query ? "No pools match your search" : "No active pools yet"}
+            description={
+              query
+                ? `Nothing matched "${query}". Try a different name or category.`
+                : "New pools will appear here as soon as they open."
+            }
+            className="h-[300px] border-none bg-transparent py-0"
+          />
         ) : (
           <div className="space-y-3">
             {filteredPools.map((pool) => (

@@ -793,20 +793,22 @@ stellar contract read \
 
 ### Transfer Admin Role (Two-Step Process)
 
-For security, use the two-step admin transfer:
+Admin handoff is always two-step: a nomination followed by acceptance from the
+new address. This prevents a typo or an address that cannot sign from taking over
+administration.
 
 ```bash
-# Step 1: Current admin proposes new admin
+# Step 1: Current admin nominates the new admin
 stellar contract invoke \
   --id <ACCESS_CONTROL_ID> \
   --source deployer \
   --network testnet \
   -- \
   propose_new_admin \
-  --admin_caller $(stellar keys address deployer --network testnet) \
-  --proposed_admin <NEW_ADMIN_ADDRESS>
+  --current_admin $(stellar keys address deployer --network testnet) \
+  --new_admin <NEW_ADMIN_ADDRESS>
 
-# Step 2: New admin accepts the role
+# Step 2: The nominee accepts with its own key
 stellar contract invoke \
   --id <ACCESS_CONTROL_ID> \
   --source new_admin \
@@ -815,6 +817,22 @@ stellar contract invoke \
   accept_admin_role \
   --new_admin <NEW_ADMIN_ADDRESS>
 ```
+
+To withdraw a pending nomination before it is accepted:
+
+```bash
+stellar contract invoke \
+  --id <ACCESS_CONTROL_ID> \
+  --source deployer \
+  --network testnet \
+  -- \
+  cancel_admin_transfer \
+  --current_admin $(stellar keys address deployer --network testnet)
+```
+
+A new `propose_new_admin` call replaces any existing nomination; only the latest
+nominee can accept. The legacy `transfer_admin` function now nominates only and
+also requires the nominee to accept.
 
 ---
 

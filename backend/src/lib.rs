@@ -5,16 +5,21 @@
 //! handlers live here so both binaries (and the test suite) share a single
 //! source of truth.
 
+pub mod api_versioning;
+pub mod cache_coalesce;
 pub mod config;
 pub mod constants;
 pub mod db;
 pub mod errors;
+pub mod idempotency;
 pub mod jwt;
 pub mod jwt_security;
 pub mod metrics;
 pub mod migration_checks;
 pub mod notifications;
+// pub mod outbox;
 pub mod openapi;
+pub mod openapi_drift;
 pub mod pool_cache;
 pub mod price_cache;
 pub mod profile;
@@ -24,12 +29,16 @@ pub mod referrals;
 pub mod request_logger;
 pub mod response;
 pub mod routes;
+pub mod rpc_resilience;
 pub mod seed;
 pub mod server;
 pub mod session;
+pub mod sinks;
 pub mod shutdown;
 pub mod tags;
 pub mod telemetry;
+pub mod token_revocation;
+pub mod trace_propagation;
 pub mod tracing_context;
 pub mod validated_types;
 pub mod worker;
@@ -46,8 +55,6 @@ use axum::Router;
 use http::HeaderValue;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration as TokioDuration;
-use tokio::time::sleep;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use tracing_subscriber::prelude::*;
@@ -73,6 +80,7 @@ pub fn build_cors(config: &Config) -> CorsLayer {
             http::header::CONTENT_TYPE,
             http::header::AUTHORIZATION,
             http::header::ACCEPT,
+            http::header::HeaderName::from_static(crate::idempotency::IDEMPOTENCY_KEY_HEADER),
         ])
 }
 
@@ -81,53 +89,24 @@ async fn check_db_health(db: &Option<sqlx::PgPool>) -> (String, String) {
     if let Some(pool) = db {
         match sqlx::query("SELECT 1").execute(pool).await {
             Ok(_) => ("ok".to_string(), String::new()),
-            Err(e) => ("unreachable".to_string(), e.to_string()),
+            Err(e) => {
+                // Driver errors stay in the logs (#51).
+                tracing::warn!(error = %e, "database health probe failed");
+                ("unreachable".to_string(), "database unreachable".to_string())
+            }
         }
     } else {
         ("not_configured".to_string(), String::new())
     }
 }
 
-/// Check RPC health with retry logic and exponential backoff.
-async fn check_rpc_health(rpc_url: &str, timeout_secs: u64, retry_count: u8) -> (String, String) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
-    let max_attempts = retry_count as usize;
-    let mut last_error = String::new();
-
-    for attempt in 0..max_attempts {
-        let rpc_req = client
-            .post(rpc_url)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getHealth"
-            }))
-            .send()
-            .await;
-
-        match rpc_req {
-            Ok(res) if res.status().is_success() => {
-                return ("ok".to_string(), String::new());
-            }
-            Ok(res) => {
-                last_error = format!("HTTP {} response", res.status());
-            }
-            Err(e) => {
-                last_error = e.to_string();
-            }
-        }
-
-        if attempt < max_attempts - 1 {
-            let backoff = std::cmp::min(2u64.pow(attempt as u32), 5);
-            sleep(TokioDuration::from_secs(backoff)).await;
-        }
+/// Check RPC health through the resilient client: bounded retries, a short
+/// overall deadline, and the shared circuit breaker (#58).
+async fn check_rpc_health(config: &Config) -> (String, String) {
+    match rpc_resilience::probe_health(config).await {
+        Ok(()) => ("ok".to_string(), String::new()),
+        Err(error) => ("unreachable".to_string(), error.to_string()),
     }
-
-    ("unreachable".to_string(), last_error)
 }
 
 /// Health-check handler.
@@ -140,12 +119,7 @@ async fn health(State(state): State<routes::v1::AppState>) -> axum::response::Re
         all_healthy = false;
     }
 
-    let (rpc_status, _rpc_error) = check_rpc_health(
-        &state.config.stellar_rpc_url,
-        state.config.rpc_health_timeout_secs,
-        state.config.rpc_health_retry_count,
-    )
-    .await;
+    let (rpc_status, _rpc_error) = check_rpc_health(&state.config).await;
     if rpc_status == "unreachable" {
         all_healthy = false;
     }
@@ -244,13 +218,14 @@ pub fn build_router(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(
             std::time::Duration::from_secs(config.pool_negative_cache_ttl_secs),
         ),
+        market_reads: routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: None,
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -266,7 +241,8 @@ pub fn build_router(
                 event_bus,
             ),
         )
-        .merge(openapi::swagger_router())
+        .merge(openapi::swagger_router());
+    api_versioning::with_api_policies(router)
         .layer(build_cors(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
@@ -290,13 +266,14 @@ pub fn build_router_with_db(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(
             std::time::Duration::from_secs(config.pool_negative_cache_ttl_secs),
         ),
+        market_reads: routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: Some(pool.clone()),
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -312,7 +289,8 @@ pub fn build_router_with_db(
                 event_bus,
             ),
         )
-        .merge(openapi::swagger_router())
+        .merge(openapi::swagger_router());
+    api_versioning::with_api_policies(router)
         .layer(build_cors(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }

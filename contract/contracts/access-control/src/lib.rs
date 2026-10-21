@@ -33,6 +33,21 @@
 // - Role 1 (Operator): resolve_pool, cancel_pool, set_stake_limits
 // - Role 3 (Oracle): oracle_resolve (OracleCallback trait)
 //
+// EXPIRING ROLES
+// ──────────────
+// The contract supports time-limited role grants through `assign_expiring_role`.
+// These grants automatically expire at a specified ledger timestamp and are
+// rejected by `has_role` after expiry. The admin can revoke expiring grants at
+// any time using `revoke_expiring_role`.
+//
+// Key features:
+// - Expiry validation: Grants with past or current timestamps are rejected
+// - Automatic expiry: `has_role` returns false for expired grants
+// - Admin revocation: The admin can revoke expiring grants before expiry
+// - Audit trail: Grant details persist even after expiry via `get_expiring_role`
+// - Independent capabilities: Expiring roles coexist with permanent roles
+// - No escalation: Users with expiring roles cannot grant roles to others
+//
 // HOW TO BOOTSTRAP THE ADMIN ROLE
 // ─────────────────────────────────
 // The access-control contract must be initialised exactly once before any
@@ -60,6 +75,14 @@
 //          --user <OPERATOR_ADDRESS> \
 //          --role '{"Operator": null}'
 //
+//   For time-limited grants, use `assign_expiring_role`:
+//     stellar contract invoke --id <ACCESS_CONTROL_ID> \
+//       -- assign_expiring_role \
+//          --admin_caller <ADMIN_ADDRESS> \
+//          --user <OPERATOR_ADDRESS> \
+//          --role '{"Operator": null}' \
+//          --expires_at <TIMESTAMP>
+//
 //   Repeat for Oracle (role 3) and any other roles needed.
 //
 // Step 4 — Pass the access-control address to predifi-contract.
@@ -74,23 +97,52 @@
 //    initial administrator. The admin role (0) is automatically assigned.
 // 2. The admin calls `assign_role(admin_caller, user, Role::Operator)` (or any
 //    other role) to grant a role to any address.
-// 3. Roles can be managed via:
+// 3. For time-limited grants, use `assign_expiring_role(admin_caller, user, role, expires_at)`.
+// 4. Roles can be managed via:
 //    - `revoke_role`: Remove a specific role from a user
+//    - `revoke_expiring_role`: Remove an expiring role grant before expiry
 //    - `transfer_role`: Move a role from one user to another
 //    - `revoke_all_roles`: Remove all roles from a user
 //    - The current (final) admin can never lose the Admin role via `revoke_role` /
-//      `revoke_all_roles` (they return `AdminError`); transfer admin first.
-//    - `propose_new_admin` + `accept_admin_role`: Two-step admin transfer (recommended)
-//    - `transfer_admin`: Legacy one-step admin transfer
-// 4. Any contract can check if a user has a role by calling `has_role(user, role)`.
-// 5. The `has_any_role` function allows checking if a user has any of a set of roles.
+//      `revoke_all_roles` (they return `AdminError`); hand over first.
+// 4. Admin handoff is always two-step:
+//    - `propose_new_admin(admin, nominee)` nominates a successor. This replaces
+//      any previous nomination; only the latest nominee can accept.
+//    - `accept_admin_role(nominee)` is the only way to complete the handoff.
+//      The nominee must authenticate, proving it controls a usable address.
+//    - `cancel_admin_transfer(admin)` withdraws a pending nomination. The
+//      current admin remains in office and the nominee can no longer accept.
+//    - `transfer_admin` is a legacy alias for `propose_new_admin`; it no longer
+//      transfers admin rights in one step. Deployed clients must follow the
+//      call with `accept_admin_role`.
+// 5. Any contract can check if a user has a role by calling `has_role(user, role)`.
+//    This function automatically validates expiry for expiring role grants.
+// 6. The `has_any_role` function allows checking if a user has any of a set of roles.
+// 7. The `get_expiring_role` function allows querying expiring grant details for auditing.
 //
 // SECURITY CONSIDERATIONS
 // ───────────────────────
 // - Only the admin can assign or revoke roles
 // - All admin operations require authentication (`require_auth`)
-// - Admin transfer supports a two-step propose/accept flow for safety
+// - Admin handoff can never complete without acceptance by the nominee, so an
+//   accidental or unavailable address cannot become admin
+// - The previous admin keeps the Admin role until acceptance, and the transfer
+//   then happens atomically; the contract is never left without an admin
 // - Role checks are performed via storage lookups in persistent storage
+// - Expiring roles automatically expire and are rejected by `has_role`
+// - Users with expiring roles cannot escalate or grant roles to others
+// - The root admin can always revoke expiring grants
+//
+// MIGRATION FOR DEPLOYED INSTANCES
+// ────────────────────────────────
+// No storage migration is required. Deployed instances already store the admin
+// under `DataKey::Admin`; the pending nomination is a new, optional
+// `DataKey::ProposedAdmin` entry that reads as `None` until the first proposal.
+// After upgrading the Wasm, existing admins can immediately use
+// `propose_new_admin` / `accept_admin_role`. Any `transfer_admin` transaction
+// sent by an old client now only nominates; the nominee must accept before the
+// handoff completes. See `README.md` ("Migrating a deployed instance") for the
+// operational steps.
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -179,12 +231,63 @@ pub struct AdminTransferProposedEvent {
     pub proposed_admin: Address,
 }
 
+/// Emitted when a pending nomination is replaced by a newer one. The previous
+/// nominee loses the ability to accept the handoff.
+#[contractevent(topics = ["admin_transfer_replaced"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferReplacedEvent {
+    pub admin: Address,
+    pub previous_proposed_admin: Address,
+    pub proposed_admin: Address,
+}
+
+/// Emitted when the current admin cancels a pending nomination. The cancelled
+/// nominee can no longer accept, and the current admin remains in place.
+#[contractevent(topics = ["admin_transfer_cancelled"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelledEvent {
+    pub admin: Address,
+    pub cancelled_admin: Address,
+}
+
+/// Emitted when the nominee accepts the handoff (step 2). This is emitted in
+/// addition to [`AdminTransferredEvent`], which remains the canonical event for
+/// the effective transfer and is also understood by older indexers.
+#[contractevent(topics = ["admin_transfer_accepted"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferAcceptedEvent {
+    pub admin: Address,
+    pub new_admin: Address,
+}
+
 #[contractevent(topics = ["all_roles_revoked"])]
 #[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllRolesRevokedEvent {
     pub admin: Address,
     pub user: Address,
+}
+
+#[contractevent(topics = ["expiring_role_assigned"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiringRoleAssignedEvent {
+    pub admin: Address,
+    pub user: Address,
+    pub role: Role,
+    pub expires_at: u64,
+}
+
+#[contractevent(topics = ["expiring_role_revoked"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiringRoleRevokedEvent {
+    pub admin: Address,
+    pub user: Address,
+    pub role: Role,
 }
 
 /// Status of a prediction pool in the access control system.
@@ -240,6 +343,26 @@ pub enum DataKey {
     PoolCount,
     /// Count of addresses currently holding the Operator role: `OperatorCount` -> u32
     OperatorCount,
+    /// Expiring role grant: `ExpiringRole(user_address, role)` -> ExpiringRoleGrant
+    ExpiringRole(Address, Role),
+}
+
+/// Represents a time-limited role grant with an expiry timestamp.
+///
+/// This structure stores information about a role grant that automatically
+/// expires at a specific ledger timestamp. After expiry, the role is no longer
+/// valid even if the grant record remains in storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiringRoleGrant {
+    /// The address that received the role grant.
+    pub user: Address,
+    /// The role that was granted.
+    pub role: Role,
+    /// The ledger timestamp at which this grant expires (in seconds since epoch).
+    pub expires_at: u64,
+    /// The admin address that granted this role.
+    pub granted_by: Address,
 }
 
 #[contract]
@@ -376,6 +499,12 @@ impl AccessControl {
             .persistent()
             .remove(&DataKey::Role(user.clone(), role.clone()));
 
+        // Also remove expiring role grant if it exists
+        let expiring_key = DataKey::ExpiringRole(user.clone(), role.clone());
+        if env.storage().persistent().has(&expiring_key) {
+            env.storage().persistent().remove(&expiring_key);
+        }
+
         if matches!(role, Role::Operator) {
             let count: u32 = env
                 .storage()
@@ -399,9 +528,182 @@ impl AccessControl {
     }
 
     /// Checks if a user has a specific role.
+    ///
+    /// This function first checks if the user has the role in storage. If an expiring
+    /// role grant exists, it validates that the grant has not expired. Expired grants
+    /// are treated as if the role is not held.
     #[must_use]
     pub fn has_role(env: &Env, user: Address, role: Role) -> bool {
-        env.storage().persistent().has(&DataKey::Role(user, role))
+        // Check if role exists in storage
+        if !env.storage().persistent().has(&DataKey::Role(user.clone(), role.clone())) {
+            return false;
+        }
+
+        // Check if there's an expiring grant for this role
+        if let Some(grant) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ExpiringRoleGrant>(&DataKey::ExpiringRole(user.clone(), role.clone()))
+        {
+            // Validate expiry - role is valid until and including the expiry timestamp
+            let current_time = env.ledger().timestamp();
+            current_time <= grant.expires_at
+        } else {
+            // No expiring grant, so it's a permanent role
+            true
+        }
+    }
+
+    /// Assigns a role to a user with an expiry timestamp.
+    ///
+    /// This function grants a temporary role that automatically expires at the specified
+    /// ledger timestamp. The admin can revoke the grant before expiry if needed.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InvalidTimestamp` if the expiry timestamp is in the past.
+    ///
+    /// # Arguments
+    /// * `env` - The environment
+    /// * `admin_caller` - The admin address assigning the role
+    /// * `user` - The user address receiving the role
+    /// * `role` - The role to grant
+    /// * `expires_at` - The ledger timestamp when the grant expires (seconds since epoch)
+    pub fn assign_expiring_role(
+        env: &Env,
+        admin_caller: Address,
+        user: Address,
+        role: Role,
+        expires_at: u64,
+    ) -> Result<(), PrediFiError> {
+        admin_caller.require_auth();
+
+        let current_admin = Self::get_admin(env);
+        if admin_caller != current_admin {
+            return Err(PrediFiError::Unauthorized);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if expires_at <= current_time {
+            return Err(PrediFiError::InvalidTimestamp);
+        }
+
+        // Store the expiring role grant
+        let grant = ExpiringRoleGrant {
+            user: user.clone(),
+            role: role.clone(),
+            expires_at,
+            granted_by: admin_caller.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExpiringRole(user.clone(), role.clone()), &grant);
+
+        // Also assign the regular role for backwards compatibility
+        // The has_role check will validate expiry
+        env.storage().persistent().set(&DataKey::Role(user.clone(), role.clone()), &());
+
+        // Increment operator count if applicable
+        if matches!(role, Role::Operator) {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OperatorCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::OperatorCount, &(count + 1));
+        }
+
+        ExpiringRoleAssignedEvent {
+            admin: admin_caller,
+            user,
+            role,
+            expires_at,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    /// Revokes an expiring role grant from a user.
+    ///
+    /// This function removes an expiring role grant before its natural expiry.
+    /// The admin can revoke any expiring grant at any time.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InsufficientPermissions` if the user does not have the specified expiring role.
+    ///
+    /// # Arguments
+    /// * `env` - The environment
+    /// * `admin_caller` - The admin address revoking the role
+    /// * `user` - The user address whose role is being revoked
+    /// * `role` - The role to revoke
+    pub fn revoke_expiring_role(
+        env: &Env,
+        admin_caller: Address,
+        user: Address,
+        role: Role,
+    ) -> Result<(), PrediFiError> {
+        admin_caller.require_auth();
+
+        let current_admin = Self::get_admin(env);
+        if admin_caller != current_admin {
+            return Err(PrediFiError::Unauthorized);
+        }
+
+        // Check if the expiring role grant exists
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::ExpiringRole(user.clone(), role.clone()))
+        {
+            return Err(PrediFiError::InsufficientPermissions);
+        }
+
+        // Remove the expiring role grant
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ExpiringRole(user.clone(), role.clone()));
+
+        // Also remove the regular role entry
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Role(user.clone(), role.clone()));
+
+        // Decrement operator count if applicable
+        if matches!(role, Role::Operator) {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OperatorCount)
+                .unwrap_or(0);
+            if count > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::OperatorCount, &(count - 1));
+            }
+        }
+
+        ExpiringRoleRevokedEvent {
+            admin: admin_caller,
+            user,
+            role,
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    /// Gets the expiring role grant details for a user and role.
+    ///
+    /// Returns `None` if the user does not have an expiring grant for the specified role.
+    /// Note: This returns the grant record even if it has expired; use `has_role` to check
+    /// if the role is currently valid.
+    #[must_use]
+    pub fn get_expiring_role(env: &Env, user: Address, role: Role) -> Option<ExpiringRoleGrant> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExpiringRole(user, role))
     }
 
     /// Transfers a role from one user to another.
@@ -434,6 +736,12 @@ impl AccessControl {
         env.storage()
             .persistent()
             .remove(&DataKey::Role(from.clone(), role.clone()));
+
+        // Remove expiring role grant if it exists (transfers are permanent)
+        let expiring_key = DataKey::ExpiringRole(from.clone(), role.clone());
+        if env.storage().persistent().has(&expiring_key) {
+            env.storage().persistent().remove(&expiring_key);
+        }
 
         // Only increment if `to` doesn't already hold the role
         let to_key = DataKey::Role(to.clone(), role.clone());
@@ -469,37 +777,35 @@ impl AccessControl {
         Ok(())
     }
 
-    /// Transfers admin role to a new admin (legacy one-step transfer).
+    /// Legacy admin transfer entry point, retained for ABI compatibility.
+    ///
+    /// Since the two-step handoff is mandatory, this function **no longer
+    /// transfers admin rights immediately**. It behaves exactly like
+    /// [`Self::propose_new_admin`]: the current admin nominates `new_admin` and
+    /// the nominee must then call [`Self::accept_admin_role`]. This keeps
+    /// deployed clients working while ensuring a handoff can never complete
+    /// without the new administrator proving control of their address.
     ///
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InvalidData` if `new_admin` is the current admin.
     pub fn transfer_admin(
         env: &Env,
         admin_caller: &Address,
         new_admin: Address,
     ) -> Result<(), PrediFiError> {
-        admin_caller.require_auth();
-
-        let current_admin = Self::get_admin(env);
-        if admin_caller != &current_admin {
-            return Err(PrediFiError::Unauthorized);
-        }
-
-        Self::apply_admin_transfer(env, current_admin.clone(), &new_admin);
-
-        AdminTransferredEvent {
-            admin: current_admin,
-            new_admin,
-        }
-        .publish(env);
-
-        Ok(())
+        Self::propose_new_admin(env, admin_caller.clone(), new_admin)
     }
 
     /// Proposes a new admin (two-step transfer, step 1).
     ///
+    /// Replaces any existing nomination. Replacing a nomination invalidates the
+    /// previous nominee: only the most recently proposed address can accept.
+    ///
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `InvalidData` if `new_admin` is the current admin; use
+    /// [`Self::cancel_admin_transfer`] to withdraw a nomination instead.
     pub fn propose_new_admin(
         env: &Env,
         current_admin: Address,
@@ -512,13 +818,67 @@ impl AccessControl {
             return Err(PrediFiError::Unauthorized);
         }
 
+        // Nominating the current admin would leave a confusing pending handoff
+        // that can be "accepted" as a no-op. Treat it as invalid input; a
+        // cancellation is the explicit way to clear a nomination.
+        if new_admin == current_admin {
+            return Err(PrediFiError::InvalidData);
+        }
+
+        let previous: Option<Address> = env.storage().instance().get(&DataKey::ProposedAdmin);
+
         env.storage()
             .instance()
-            .set(&DataKey::ProposedAdmin, &new_admin);
+            .set(&DataKey::ProposedAdmin, &new_admin.clone());
 
         AdminTransferProposedEvent {
+            admin: current_admin.clone(),
+            proposed_admin: new_admin.clone(),
+        }
+        .publish(env);
+
+        if let Some(previous) = previous {
+            if previous != new_admin {
+                AdminTransferReplacedEvent {
+                    admin: current_admin,
+                    previous_proposed_admin: previous,
+                    proposed_admin: new_admin,
+                }
+                .publish(env);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cancels a pending admin nomination (current admin only).
+    ///
+    /// The current admin stays in office and the cancelled nominee can no longer
+    /// accept. Calling this without a pending nomination returns `AdminError`,
+    /// so callers can distinguish "nothing to cancel" from a successful cancel.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    /// Returns `AdminError` if there is no pending nomination.
+    pub fn cancel_admin_transfer(env: &Env, current_admin: Address) -> Result<(), PrediFiError> {
+        current_admin.require_auth();
+
+        let stored_admin = Self::get_admin(env);
+        if current_admin != stored_admin {
+            return Err(PrediFiError::Unauthorized);
+        }
+
+        let cancelled_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposedAdmin)
+            .ok_or(PrediFiError::AdminError)?;
+
+        env.storage().instance().remove(&DataKey::ProposedAdmin);
+
+        AdminTransferCancelledEvent {
             admin: current_admin,
-            proposed_admin: new_admin,
+            cancelled_admin,
         }
         .publish(env);
 
@@ -527,8 +887,15 @@ impl AccessControl {
 
     /// Accepts the admin role (two-step transfer, step 2).
     ///
+    /// The caller must authenticate and must be exactly the address named in the
+    /// most recent nomination. Accepting clears the pending nomination and
+    /// atomically moves the admin role, so there is never a moment where the
+    /// contract has no administrator.
+    ///
     /// # Errors
-    /// Returns `Unauthorized` if the caller is not the proposed admin.
+    /// Returns `Unauthorized` if the caller is not the proposed admin (including
+    /// when no nomination exists, or when the nomination was replaced or
+    /// cancelled).
     pub fn accept_admin_role(env: &Env, new_admin: Address) -> Result<(), PrediFiError> {
         new_admin.require_auth();
 
@@ -539,6 +906,12 @@ impl AccessControl {
 
         let current_admin = Self::get_admin(env);
         Self::apply_admin_transfer(env, current_admin.clone(), &new_admin);
+
+        AdminTransferAcceptedEvent {
+            admin: current_admin.clone(),
+            new_admin: new_admin.clone(),
+        }
+        .publish(env);
 
         AdminTransferredEvent {
             admin: current_admin,
@@ -591,6 +964,11 @@ impl AccessControl {
             let key = DataKey::Role(user.clone(), role.clone());
             if env.storage().persistent().has(&key) {
                 env.storage().persistent().remove(&key);
+                // Also remove expiring role grant if it exists
+                let expiring_key = DataKey::ExpiringRole(user.clone(), role.clone());
+                if env.storage().persistent().has(&expiring_key) {
+                    env.storage().persistent().remove(&expiring_key);
+                }
                 // Decrement operator count if the Operator role is being removed
                 if matches!(role, Role::Operator) {
                     let count: u32 = env
@@ -617,14 +995,13 @@ impl AccessControl {
     }
 
     /// Checks if a user has any of the specified roles.
+    ///
+    /// This function uses `has_role` internally, so it also validates expiry
+    /// for expiring role grants.
     #[must_use]
     pub fn has_any_role(env: &Env, user: &Address, roles: &soroban_sdk::Vec<Role>) -> bool {
         for role in roles.iter() {
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Role(user.clone(), role))
-            {
+            if Self::has_role(env, user.clone(), role.clone()) {
                 return true;
             }
         }

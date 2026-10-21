@@ -1,0 +1,89 @@
+name: Migration Safety
+
+# Prevents a release from shipping a schema change that the previous release
+# cannot run against, so an application rollback never fails because of a
+# migration. Policy: docs/migrations/expand-migrate-contract.md
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/migrations/**"
+      - "backend/src/**"
+      - "backend/.sqlx/**"
+      - "docs/migrations/recovery/**"
+      - ".github/scripts/check_migration_safety.py"
+      - ".github/scripts/migration_rollback_compat.py"
+      - ".github/workflows/migration-safety.yml"
+  workflow_dispatch:
+    inputs:
+      previous_ref:
+        description: "Previous release to test rollback against (tag or commit)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migration-safety-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sequencing:
+    name: Expand-migrate-contract sequencing
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Block destructive or out-of-order migrations without a recovery plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python .github/scripts/check_migration_safety.py --base "$BASE_SHA"
+
+  rollback-compatibility:
+    name: Previous release runs on the new schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: predifi_compat
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply new migrations and prepare both releases' queries
+        env:
+          OLD_REF: ${{ github.event.pull_request.base.sha || inputs.previous_ref }}
+          DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/predifi_compat
+        run: >-
+          python .github/scripts/migration_rollback_compat.py
+          --old-ref "$OLD_REF"
+          --new-ref HEAD
+          --database-url "$DATABASE_URL"

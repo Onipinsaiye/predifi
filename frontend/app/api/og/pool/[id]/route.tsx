@@ -56,7 +56,7 @@ export async function GET(
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div style={{ fontSize: 28, color: "#7DE3EC", textTransform: "uppercase" }}>
+          <div style={{ display: "flex", fontSize: 28, color: "#7DE3EC", textTransform: "uppercase" }}>
             {pool.category} · PrediFi
           </div>
           <div style={{ fontSize: 56, fontWeight: 700, lineHeight: 1.15 }}>

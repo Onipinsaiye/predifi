@@ -1,0 +1,64 @@
+name: Market Reconciliation CI
+
+on:
+  pull_request:
+    paths:
+      - "backend/reconciliation/**"
+      - "backend/migrations/002_create_pools.sql"
+      - "contract/contracts/predifi-contract/src/lib.rs"
+      - "contract/contracts/predifi-contract/src/pool.rs"
+      - ".github/workflows/reconciliation.yml"
+  push:
+    paths:
+      - "backend/reconciliation/**"
+      - ".github/workflows/reconciliation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reconciliation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reconciliation:
+    name: Reconciliation checks and PostgreSQL integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: predifi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend/reconciliation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/reconciliation/target
+          key: ${{ runner.os }}-reconciliation-${{ hashFiles('backend/reconciliation/Cargo.lock') }}
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Mocked RPC and PostgreSQL discrepancy tests
+        env:
+          RECONCILE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/predifi_test
+        run: cargo test --locked -- --include-ignored

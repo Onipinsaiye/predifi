@@ -5,6 +5,10 @@ apiVersion: 1
 # 2. Request latency (p99 > 500ms)
 # 3. Worker queue depth (> 50 jobs) and DLQ depth (> 10 jobs)
 # 4. Database connection pool saturation (> 80% warning, > 95% critical)
+#
+# Each rule carries owner/severity labels and impact/runbook_url/dashboard_url
+# annotations, mirroring backend/grafana/alerts/predifi_alerts.yml. CI checks
+# both files with .github/scripts/validate_alert_runbooks.py.
 groups:
   - orgId: 1
     name: predifi_production_alerts
@@ -18,8 +22,13 @@ groups:
         annotations:
           summary: "API HTTP 5xx error rate exceeded 1%"
           description: "API HTTP 5xx error rate is currently above 1% over the last 5 minutes."
+          impact: "Users see failed page loads, missing pool data, and cannot view or claim payouts."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/api.md#highapierrorrate"
+          dashboard_url: "/d/predifi-backend-prod"
         labels:
           severity: critical
+          owner: backend-oncall
+          service: api
         data:
           - refId: A
             queryType: ""
@@ -65,8 +74,13 @@ groups:
         annotations:
           summary: "API p99 latency is greater than 500ms"
           description: "The 99th percentile HTTP request latency is > 0.5s over the last 5 minutes."
+          impact: "Pages and odds load slowly; users may act on stale pool totals."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/api.md#highp99latency"
+          dashboard_url: "/d/predifi-backend-prod"
         labels:
           severity: warning
+          owner: backend-oncall
+          service: api
         data:
           - refId: A
             queryType: ""
@@ -112,8 +126,13 @@ groups:
         annotations:
           summary: "Worker queue depth exceeded 50 jobs"
           description: "Worker queue depth has exceeded 50 jobs, indicating backlog or worker starvation."
+          impact: "New on-chain pools, stakes, and resolutions appear late in the app."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/worker.md#workerqueuebacklog"
+          dashboard_url: "/d/predifi-backend-prod"
         labels:
           severity: warning
+          owner: backend-oncall
+          service: indexer
         data:
           - refId: A
             queryType: ""
@@ -159,8 +178,13 @@ groups:
         annotations:
           summary: "Worker dead-letter queue (DLQ) backlog exceeded 10 jobs"
           description: "Worker DLQ contains more than 10 unrecoverable failed jobs."
+          impact: "Some on-chain events were not indexed; affected pools or predictions show wrong or missing data until replayed."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/worker.md#workerdlqbacklog"
+          dashboard_url: "/d/predifi-backend-prod"
         labels:
           severity: critical
+          owner: backend-oncall
+          service: indexer
         data:
           - refId: A
             queryType: ""
@@ -206,8 +230,13 @@ groups:
         annotations:
           summary: "Database connection pool utilization exceeded 80%"
           description: "Database connection pool is above 80% capacity (checked out / total slots)."
+          impact: "No user impact yet; latency rises if utilization keeps climbing."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/database.md#databaseconnectionpoolsaturated"
+          dashboard_url: "/d/predifi-backend-prod"
         labels:
           severity: warning
+          owner: backend-oncall
+          service: database
         data:
           - refId: A
             queryType: ""
@@ -253,8 +282,13 @@ groups:
         annotations:
           summary: "Database connection pool near exhaustion (>95%)"
           description: "Database connection pool is above 95% capacity, query queue starvation imminent."
+          impact: "Requests wait for a connection and time out with 5xx errors."
+          runbook_url: "https://github.com/Onipinsaiye/predifi/blob/main/docs/runbooks/database.md#databaseconnectionpoolcritical"
+          dashboard_url: "/d/predifi-backend-prod"
         labels:
           severity: critical
+          owner: backend-oncall
+          service: database
         data:
           - refId: A
             queryType: ""

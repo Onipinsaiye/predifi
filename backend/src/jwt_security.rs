@@ -6,9 +6,7 @@
 //! - Key version tracking to support secret rotation
 
 use crate::constants::JWT_ACCESS_TOKEN_EXPIRY_SECS;
-use crate::jwt::{
-    sign_jwt_with_type, verify_jwt_token_strict, JwtVerifyError,
-};
+use crate::jwt::{sign_jwt_with_token_version, verify_jwt_token_strict, JwtVerifyError};
 use crate::redis_cache::RedisCache;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,8 +35,21 @@ pub fn issue_token_pair(
     now_unix: u64,
     key_version: u64,
 ) -> Result<TokenPair, String> {
-    let access_token = sign_jwt_with_type(sub, secret, now_unix, "access", key_version)?;
-    let refresh_token = sign_jwt_with_type(sub, secret, now_unix, "refresh", key_version)?;
+    issue_token_pair_with_version(sub, secret, now_unix, key_version, 0)
+}
+
+/// Issue a fresh pair carrying the user's per-user token version (`tv`).
+pub fn issue_token_pair_with_version(
+    sub: &str,
+    secret: &str,
+    now_unix: u64,
+    key_version: u64,
+    token_version: u64,
+) -> Result<TokenPair, String> {
+    let access_token =
+        sign_jwt_with_token_version(sub, secret, now_unix, "access", key_version, token_version)?;
+    let refresh_token =
+        sign_jwt_with_token_version(sub, secret, now_unix, "refresh", key_version, token_version)?;
     Ok(TokenPair {
         access_token,
         refresh_token,
@@ -79,6 +90,46 @@ pub async fn rotate_refresh_token(
     }
 
     issue_token_pair(&claims.sub, secret, now_unix, current_key_version)
+        .map_err(JwtVerifyError::Decode)
+}
+
+/// Rotate a refresh token against the durable revocation store (#55).
+///
+/// * The presented token must not be revoked (per-jti or by user version).
+/// * Its jti is revoked in Postgres before a new pair is issued, so the old
+///   token fails on every replica.
+/// * If the jti was already revoked by a concurrent or earlier rotation, the
+///   token is being replayed. That signals theft, so every token of the user
+///   is revoked and the request fails.
+/// * Fails closed with `TokenStoreUnavailable` when the store is unreachable.
+pub async fn rotate_refresh_token_durable(
+    store: &crate::token_revocation::RevocationStore,
+    secret: &str,
+    refresh_token: &str,
+    current_key_version: u64,
+    now_unix: u64,
+) -> Result<TokenPair, JwtVerifyError> {
+    use crate::token_revocation::{RevocationReason, RevokeOutcome};
+
+    let claims = verify_jwt_token_strict(refresh_token, secret, "refresh", current_key_version)?;
+    let snapshot = store.ensure_not_revoked(&claims, now_unix).await?;
+
+    let token_version = match store
+        .revoke(&claims, RevocationReason::RefreshRotated, now_unix)
+        .await?
+    {
+        RevokeOutcome::Revoked => snapshot.token_version,
+        RevokeOutcome::EscalatedToUserWide { token_version } => token_version,
+        RevokeOutcome::AlreadyRevoked => {
+            tracing::warn!(user = %claims.sub, "refresh token reuse detected; revoking all sessions");
+            store
+                .revoke_all(&claims.sub, RevocationReason::RefreshReuseDetected, now_unix)
+                .await?;
+            return Err(JwtVerifyError::Revoked);
+        }
+    };
+
+    issue_token_pair_with_version(&claims.sub, secret, now_unix, current_key_version, token_version)
         .map_err(JwtVerifyError::Decode)
 }
 
