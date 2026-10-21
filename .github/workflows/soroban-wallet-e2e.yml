@@ -3,14 +3,15 @@ name: Soroban Wallet E2E
 on:
   push:
     branches:
-      - 'issue-127-*'
+      - main
+      - develop
     paths:
       - '.github/workflows/soroban-wallet-e2e.yml'
       - 'contract/**'
       - 'docker-compose.yml'
       - 'e2e/wallet/**'
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - '.github/workflows/soroban-wallet-e2e.yml'
       - 'contract/**'

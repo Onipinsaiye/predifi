@@ -1,8 +1,20 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::testutils::{Address as _, Events, Ledger};
+use soroban_sdk::{Address, Env, Symbol, TryFromVal};
+
+/// Returns true if an event with the given first topic was emitted in this test.
+fn event_emitted(env: &Env, topic: &str) -> bool {
+    let expected = Symbol::new(env, topic);
+    env.events().all().iter().any(|event| {
+        event
+            .1
+            .get(0)
+            .map(|value| Symbol::try_from_val(env, &value).is_ok_and(|symbol| symbol == expected))
+            .unwrap_or(false)
+    })
+}
 
 #[test]
 fn test_initialization() {
@@ -101,7 +113,15 @@ fn test_admin_transfer() {
     client.init(&admin1);
     assert_eq!(client.get_admin(), admin1);
 
+    // The legacy entry point now only nominates; the handoff is not complete
+    // until the nominee accepts.
     client.transfer_admin(&admin1, &admin2);
+    assert_eq!(client.get_admin(), admin1);
+    assert_eq!(client.get_proposed_admin(), Some(admin2.clone()));
+    assert!(client.has_role(&admin1, &Role::Admin));
+    assert!(!client.has_role(&admin2, &Role::Admin));
+
+    client.accept_admin_role(&admin2);
     assert_eq!(client.get_admin(), admin2);
     assert!(client.has_role(&admin2, &Role::Admin));
     assert!(!client.has_role(&admin1, &Role::Admin));
@@ -475,8 +495,8 @@ fn test_has_any_role_operator_oracle() {
     assert!(client.has_any_role(&oracle, &roles));
 }
 
-/// After `transfer_admin`, the new admin holds Admin role (0) and the old
-/// admin loses it — verifying the documented admin-transfer behaviour.
+/// After the legacy `transfer_admin` nomination is accepted, the new admin
+/// holds Admin role (0) and the old admin loses it.
 #[test]
 fn test_admin_transfer_updates_role_storage() {
     let env = Env::default();
@@ -490,6 +510,10 @@ fn test_admin_transfer_updates_role_storage() {
     client.init(&admin1);
 
     client.transfer_admin(&admin1, &admin2);
+    assert!(client.has_role(&admin1, &Role::Admin));
+    assert!(!client.has_role(&admin2, &Role::Admin));
+
+    client.accept_admin_role(&admin2);
 
     assert!(client.has_role(&admin2, &Role::Admin));
     assert!(client.is_admin(&admin2));
@@ -669,6 +693,58 @@ fn test_get_operator_count_decrements_on_revoke_all() {
     assert_eq!(client.get_operator_count(), 0);
 }
 
+/// Simulate an out-of-sync operator counter (e.g. roles granted before the
+/// counter existed): the Operator role is stored but `OperatorCount` is 0.
+fn desync_operator_count(env: &Env, contract_id: &Address) {
+    env.as_contract(contract_id, || {
+        env.storage().instance().set(&DataKey::OperatorCount, &0u32);
+    });
+}
+
+/// revoke_role must saturate at 0 rather than underflow when the counter is
+/// already 0 (kills the `count > 0` → `count >= 0` mutant, issue #128).
+#[test]
+fn test_revoke_role_operator_count_saturates_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let op = Address::generate(&env);
+    client.init(&admin);
+
+    client.assign_role(&admin, &op, &Role::Operator);
+    desync_operator_count(&env, &contract_id);
+
+    client.revoke_role(&admin, &op, &Role::Operator);
+    assert!(!client.has_role(&op, &Role::Operator));
+    assert_eq!(client.get_operator_count(), 0);
+}
+
+/// revoke_all_roles must saturate at 0 rather than underflow when the counter
+/// is already 0 (kills the `count > 0` → `count >= 0` mutant, issue #128).
+#[test]
+fn test_revoke_all_roles_operator_count_saturates_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let op = Address::generate(&env);
+    client.init(&admin);
+
+    client.assign_role(&admin, &op, &Role::Operator);
+    desync_operator_count(&env, &contract_id);
+
+    client.revoke_all_roles(&admin, &op);
+    assert!(!client.has_role(&op, &Role::Operator));
+    assert_eq!(client.get_operator_count(), 0);
+}
+
 /// Assigning the Operator role to the same address twice does not double-count.
 #[test]
 fn test_get_operator_count_no_double_count_on_reassign() {
@@ -804,11 +880,8 @@ fn test_revoke_all_roles_removes_admin_role() {
     );
 }
 
-/// After `transfer_admin`, the old admin's Admin role is removed from
-/// persistent storage and `is_admin` returns false for them.
-///
-/// This is the primary "admin removal" path: transferring admin rights
-/// atomically removes the role from the previous holder.
+/// After the legacy `transfer_admin` nomination is accepted, the old admin's
+/// Admin role is removed and `is_admin` returns false for them.
 #[test]
 fn test_transfer_admin_removes_admin_role_from_old_admin() {
     let env = Env::default();
@@ -827,6 +900,10 @@ fn test_transfer_admin_removes_admin_role_from_old_admin() {
     assert!(!client.has_role(&new_admin, &Role::Admin));
 
     client.transfer_admin(&old_admin, &new_admin);
+    // Nomination alone must not move the role.
+    assert!(client.is_admin(&old_admin));
+    assert!(!client.is_admin(&new_admin));
+    client.accept_admin_role(&new_admin);
 
     // Old admin must have lost the Admin role entirely.
     assert!(
@@ -1075,4 +1152,815 @@ fn test_self_revocation_behaviour() {
     assert!(!client.has_role(&admin, &Role::Operator));
     assert_eq!(client.get_operator_count(), 1);
     assert!(client.has_role(&admin, &Role::Admin));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Two-step administrator handoff (issue #33)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Only the current admin can nominate a successor.
+#[test]
+fn test_non_admin_cannot_propose_new_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let nominee = Address::generate(&env);
+    client.init(&admin);
+
+    let result = client.try_propose_new_admin(&attacker, &nominee);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_proposed_admin(), None);
+}
+
+// Expiring Role Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Assign an expiring role and verify it's valid before expiry.
+#[test]
+fn test_assign_expiring_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400; // 1 day from now
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // Verify the grant details
+    let grant = client.get_expiring_role(&user, &Role::Operator);
+    assert!(grant.is_some());
+    let grant = grant.unwrap();
+    assert_eq!(grant.user, user);
+    assert_eq!(grant.role, Role::Operator);
+    assert_eq!(grant.expires_at, expires_at);
+    assert_eq!(grant.granted_by, admin);
+}
+
+/// Assigning an expiring role with a past timestamp should fail.
+#[test]
+fn test_assign_expiring_role_past_timestamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let nominee = Address::generate(&env);
+    client.init(&admin);
+    client.propose_new_admin(&admin, &nominee);
+
+    let result = client.try_cancel_admin_transfer(&attacker);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_proposed_admin(), Some(nominee));
+    assert_eq!(client.get_admin(), admin);
+}
+
+/// Cancelling when there is nothing pending is an explicit error rather than a
+/// silent success.
+#[test]
+fn test_cancel_without_nomination_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time - 1; // In the past
+
+    let result = client.try_assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert_eq!(result, Err(Ok(PrediFiError::InvalidTimestamp)));
+}
+
+/// Assigning an expiring role with the current timestamp should fail.
+#[test]
+fn test_assign_expiring_role_current_timestamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time; // Exactly now
+
+    let result = client.try_assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert_eq!(result, Err(Ok(PrediFiError::InvalidTimestamp)));
+}
+
+/// Non-admin cannot assign expiring roles.
+#[test]
+fn test_assign_expiring_role_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    let result = client.try_assign_expiring_role(&non_admin, &user, &Role::Operator, &expires_at);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+}
+
+/// Expiring role should be rejected after expiry time passes.
+#[test]
+fn test_expiring_role_expired() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100; // 100 seconds from now
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // Advance time past expiry
+    env.ledger().set_timestamp(expires_at + 1);
+
+    // Role should no longer be valid
+    assert!(!client.has_role(&user, &Role::Operator));
+}
+
+/// Expiring role should be valid exactly at the expiry boundary (still not expired).
+#[test]
+fn test_expiring_role_valid_at_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.init(&admin);
+
+    client.propose_new_admin(&admin, &new_admin);
+    client.accept_admin_role(&new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+
+    let result = client.try_accept_admin_role(&new_admin);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert_eq!(client.get_admin(), new_admin);
+}
+
+/// A pending nomination does not alter the admin: the current admin remains the
+/// final admin, cannot be stripped, and can cancel at any point.
+#[test]
+fn test_pending_handoff_cannot_lock_out_current_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // Set time exactly to expiry
+    env.ledger().set_timestamp(expires_at);
+
+    // Role should still be valid (not expired yet)
+    assert!(client.has_role(&user, &Role::Operator));
+}
+
+/// Expiring role becomes invalid 1 second after expiry.
+#[test]
+fn test_expiring_role_invalid_one_second_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // Set time to exactly expiry
+    env.ledger().set_timestamp(expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // Advance 1 second past expiry
+    env.ledger().set_timestamp(expires_at + 1);
+    assert!(!client.has_role(&user, &Role::Operator));
+}
+
+/// Admin can revoke an expiring role before it expires.
+#[test]
+fn test_revoke_expiring_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    client.revoke_expiring_role(&admin, &user, &Role::Operator);
+    assert!(!client.has_role(&user, &Role::Operator));
+
+    // Grant should be removed
+    let grant = client.get_expiring_role(&user, &Role::Operator);
+    assert!(grant.is_none());
+}
+
+/// Non-admin cannot revoke an expiring role.
+#[test]
+fn test_revoke_expiring_role_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+
+    let result = client.try_revoke_expiring_role(&non_admin, &user, &Role::Operator);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+    assert!(client.has_role(&user, &Role::Operator));
+}
+
+/// Revoking an expiring role that doesn't exist should fail.
+#[test]
+fn test_revoke_expiring_role_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let nominee = Address::generate(&env);
+    client.init(&admin);
+    client.propose_new_admin(&admin, &nominee);
+
+    // The current admin is still the sole admin while the nomination is pending.
+    assert_eq!(client.get_admin(), admin);
+    assert!(client.is_admin(&admin));
+    assert!(!client.is_admin(&nominee));
+    assert!(!client.has_role(&nominee, &Role::Admin));
+
+    // Loss-of-admin guards still apply.
+    assert_eq!(
+        client.try_revoke_role(&admin, &admin, &Role::Admin),
+        Err(Ok(PrediFiError::AdminError))
+    );
+    assert_eq!(
+        client.try_revoke_all_roles(&admin, &admin),
+        Err(Ok(PrediFiError::AdminError))
+    );
+
+    // The admin can still perform privileged operations and cancel.
+    client.assign_role(&admin, &nominee, &Role::Operator);
+    client.cancel_admin_transfer(&admin);
+    assert_eq!(client.get_admin(), admin);
+    assert!(client.has_role(&admin, &Role::Admin));
+}
+
+/// Emits a distinct event for each stage of the handoff so indexers and
+/// monitoring can follow proposals, replacements, cancellations and acceptance.
+#[test]
+fn test_admin_handoff_emits_clear_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let first_nominee = Address::generate(&env);
+    let second_nominee = Address::generate(&env);
+    client.init(&admin);
+
+    client.propose_new_admin(&admin, &first_nominee);
+    assert!(event_emitted(&env, "admin_transfer_proposed"));
+    assert!(!event_emitted(&env, "admin_transfer_replaced"));
+
+    client.propose_new_admin(&admin, &second_nominee);
+    assert!(event_emitted(&env, "admin_transfer_replaced"));
+
+    client.cancel_admin_transfer(&admin);
+    assert!(event_emitted(&env, "admin_transfer_cancelled"));
+
+    client.propose_new_admin(&admin, &second_nominee);
+    client.accept_admin_role(&second_nominee);
+    assert!(event_emitted(&env, "admin_transfer_accepted"));
+    assert!(event_emitted(&env, "admin_transferred"));
+}
+
+/// Deployed instances that predate the handoff feature only have `Admin` and
+/// the Admin role in storage. They must remain readable after the upgrade, and
+/// the two-step flow must work without a destructive state migration.
+#[test]
+fn test_migration_compatibility_with_legacy_deployment_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+
+    let legacy_admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    // Simulate state written by an older deployment: only Admin + Admin role.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &legacy_admin.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(legacy_admin.clone(), Role::Admin), &());
+    });
+
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    // Existing state is preserved; the new pending key is simply absent.
+    assert_eq!(client.get_admin(), legacy_admin);
+    assert_eq!(client.get_proposed_admin(), None);
+    assert!(client.has_role(&legacy_admin, &Role::Admin));
+    assert_eq!(client.get_operator_count(), 0);
+
+    // No migration call is required: the upgraded two-step flow works directly.
+    client.propose_new_admin(&legacy_admin, &new_admin);
+    assert_eq!(client.get_proposed_admin(), Some(new_admin.clone()));
+    client.accept_admin_role(&new_admin);
+
+    assert_eq!(client.get_admin(), new_admin);
+    assert_eq!(client.get_proposed_admin(), None);
+    assert!(client.has_role(&new_admin, &Role::Admin));
+    assert!(!client.has_role(&legacy_admin, &Role::Admin));
+}
+
+/// A deployed instance that had already nominated an admin under the old code
+/// can still complete (or cancel) that nomination after the upgrade.
+#[test]
+fn test_migration_compatibility_with_pre_existing_nomination() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(AccessControl, ());
+
+    let legacy_admin = Address::generate(&env);
+    let nominee = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &legacy_admin.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposedAdmin, &nominee.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(legacy_admin.clone(), Role::Admin), &());
+    });
+
+    let client = AccessControlClient::new(&env, &contract_id);
+    assert_eq!(client.get_proposed_admin(), Some(nominee.clone()));
+
+    client.accept_admin_role(&nominee);
+    assert_eq!(client.get_admin(), nominee);
+    assert!(!client.has_role(&legacy_admin, &Role::Admin));
+}
+
+/// Expiring role increments operator count.
+#[test]
+fn test_expiring_role_increments_operator_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    assert_eq!(client.get_operator_count(), 0);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert_eq!(client.get_operator_count(), 1);
+}
+
+/// Revoking expiring role decrements operator count.
+#[test]
+fn test_revoke_expiring_role_decrements_operator_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert_eq!(client.get_operator_count(), 1);
+
+    client.revoke_expiring_role(&admin, &user, &Role::Operator);
+    assert_eq!(client.get_operator_count(), 0);
+}
+
+/// Expired role still decrements operator count when revoked.
+#[test]
+fn test_expired_role_still_counts_until_revoked() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert_eq!(client.get_operator_count(), 1);
+
+    // Advance past expiry
+    env.ledger().set_timestamp(expires_at + 1);
+    assert!(!client.has_role(&user, &Role::Operator));
+
+    // Operator count is still 1 until explicitly revoked
+    assert_eq!(client.get_operator_count(), 1);
+
+    // Now revoke it
+    client.revoke_expiring_role(&admin, &user, &Role::Operator);
+    assert_eq!(client.get_operator_count(), 0);
+}
+
+/// User with expiring Operator role cannot escalate to Admin.
+#[test]
+fn test_expiring_role_cannot_escalate_to_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    // Grant expiring Operator role
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // User tries to assign themselves Admin role (should fail)
+    let result = client.try_assign_role(&user, &user, &Role::Admin);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+
+    // User should not have Admin role
+    assert!(!client.has_role(&user, &Role::Admin));
+}
+
+/// User with expiring role cannot grant roles to others.
+#[test]
+fn test_expiring_role_cannot_grant_roles() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    // Grant expiring Operator role
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // User tries to grant Operator role to another (should fail)
+    let result = client.try_assign_role(&user, &other, &Role::Operator);
+    assert_eq!(result, Err(Ok(PrediFiError::Unauthorized)));
+
+    // Other should not have Operator role
+    assert!(!client.has_role(&other, &Role::Operator));
+}
+
+/// Expiring role can coexist with permanent roles (independent capabilities).
+#[test]
+fn test_expiring_role_independent_from_permanent_roles() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Grant permanent Oracle role
+    client.assign_role(&admin, &user, &Role::Oracle);
+    assert!(client.has_role(&user, &Role::Oracle));
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    assert!(client.has_role(&user, &Role::Operator));
+
+    // Advance past Operator expiry
+    env.ledger().set_timestamp(expires_at + 1);
+
+    // Operator should be expired, but Oracle should still be valid
+    assert!(!client.has_role(&user, &Role::Operator));
+    assert!(client.has_role(&user, &Role::Oracle));
+}
+
+/// Multiple expiring roles can be assigned to the same user.
+#[test]
+fn test_multiple_expiring_roles() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at_1 = current_time + 100;
+    let expires_at_2 = current_time + 200;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at_1);
+    client.assign_expiring_role(&admin, &user, &Role::Oracle, &expires_at_2);
+
+    assert!(client.has_role(&user, &Role::Operator));
+    assert!(client.has_role(&user, &Role::Oracle));
+
+    // Advance past first expiry
+    env.ledger().set_timestamp(expires_at_1 + 1);
+
+    // Operator should be expired, Oracle should still be valid
+    assert!(!client.has_role(&user, &Role::Operator));
+    assert!(client.has_role(&user, &Role::Oracle));
+
+    // Advance past second expiry
+    env.ledger().set_timestamp(expires_at_2 + 1);
+
+    // Both should be expired
+    assert!(!client.has_role(&user, &Role::Operator));
+    assert!(!client.has_role(&user, &Role::Oracle));
+}
+
+/// has_any_role should respect expiry for expiring roles.
+#[test]
+fn test_has_any_role_respects_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+
+    let mut roles = soroban_sdk::Vec::new(&env);
+    roles.push_back(Role::Operator);
+    roles.push_back(Role::Oracle);
+
+    // User should have at least one role (Operator)
+    assert!(client.has_any_role(&user, &roles));
+
+    // Advance past expiry
+    env.ledger().set_timestamp(expires_at + 1);
+
+    // User should no longer have any of the roles
+    assert!(!client.has_any_role(&user, &roles));
+}
+
+/// Expiring role grant details persist even after expiry (for auditing).
+#[test]
+fn test_expiring_role_grant_persists_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 100;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+
+    // Advance past expiry
+    env.ledger().set_timestamp(expires_at + 1);
+
+    // Role should be invalid
+    assert!(!client.has_role(&user, &Role::Operator));
+
+    // But grant details should still be queryable
+    let grant = client.get_expiring_role(&user, &Role::Operator);
+    assert!(grant.is_some());
+    let grant = grant.unwrap();
+    assert_eq!(grant.user, user);
+    assert_eq!(grant.role, Role::Operator);
+    assert_eq!(grant.expires_at, expires_at);
+}
+
+/// revoke_all_roles should also remove expiring role grants.
+#[test]
+fn test_revoke_all_roles_removes_expiring_grants() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    client.assign_expiring_role(&admin, &user, &Role::Operator, &expires_at);
+    client.assign_expiring_role(&admin, &user, &Role::Oracle, &expires_at);
+
+    assert!(client.has_role(&user, &Role::Operator));
+    assert!(client.has_role(&user, &Role::Oracle));
+
+    client.revoke_all_roles(&admin, &user);
+
+    assert!(!client.has_role(&user, &Role::Operator));
+    assert!(!client.has_role(&user, &Role::Oracle));
+
+    // Grants should be removed
+    assert!(client.get_expiring_role(&user, &Role::Operator).is_none());
+    assert!(client.get_expiring_role(&user, &Role::Oracle).is_none());
+}
+
+/// transfer_role should remove expiring grant (transfers are permanent).
+#[test]
+fn test_transfer_role_removes_expiring_grant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(AccessControl, ());
+    let client = AccessControlClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    client.init(&admin);
+
+    // Set the ledger to a known timestamp
+    env.ledger().set_timestamp(100);
+    let current_time = env.ledger().timestamp();
+    let expires_at = current_time + 86400;
+
+    client.assign_expiring_role(&admin, &from, &Role::Operator, &expires_at);
+    assert!(client.has_role(&from, &Role::Operator));
+
+    // Transfer the role
+    client.transfer_role(&admin, &from, &to, &Role::Operator);
+
+    // From should lose the role
+    assert!(!client.has_role(&from, &Role::Operator));
+    // To should have the role (permanent, not expiring)
+    assert!(client.has_role(&to, &Role::Operator));
+
+    // Expiring grant should be removed
+    assert!(client.get_expiring_role(&from, &Role::Operator).is_none());
+    assert!(client.get_expiring_role(&to, &Role::Operator).is_none());
+}
+
 }

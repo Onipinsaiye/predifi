@@ -36,6 +36,7 @@
 use std::future::Future;
 use std::thread::JoinHandle as ThreadJoinHandle;
 
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle as TaskJoinHandle;
 use tracing::{field, info_span, Instrument, Span};
 use uuid::Uuid;
@@ -48,6 +49,38 @@ use uuid::Uuid;
 /// that can be threaded through all downstream spans and log lines.
 pub fn new_correlation_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+// ── Trace context propagation ────────────────────────────────────────────────
+
+/// Standard W3C `traceparent` header value carried across queue payloads and
+/// outbound requests.
+///
+/// The format is `00-<32 hex trace-id>-<16 hex parent-id>-<2 hex flags>`.
+/// Only the trace ID and sampling flag are propagated; span IDs are minted
+/// per hop so no unbounded identifiers leak into logs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceContext {
+    /// 32 lowercase hex characters identifying the whole trace.
+    pub trace_id: String,
+    /// Whether the trace is sampled (`01`) or not (`00`).
+    pub sampled: bool,
+}
+
+impl TraceContext {
+    /// Build a fresh root trace context with a new random trace ID.
+    pub fn new_root() -> Self {
+        Self {
+            trace_id: Uuid::new_v4().simple().to_string(),
+            sampled: true,
+        }
+    }
+
+    /// Render this context as a W3C `traceparent` header value.
+    pub fn to_traceparent(&self) -> String {
+        let flags = if self.sampled { "01" } else { "00" };
+        format!("00-{}-0000000000000000-{}", self.trace_id, flags)
+    }
 }
 
 /// Record a correlation ID on the *current* span.

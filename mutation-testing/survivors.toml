@@ -1,0 +1,80 @@
+# Reviewed surviving mutants (issue #128).
+#
+# A missed mutant is acceptable only with one of these dispositions:
+#   equivalent    - behaves identically to the original for every input
+#   unreachable   - the mutated branch cannot execute in production
+#   accepted-risk - reachable, deliberately untested; risk explained
+#
+# `mutant` is `file: description` exactly as cargo-mutants prints it, minus the
+# `:line:col`, and `line_contains` is a snippet of the original source line.
+# Together they pin one mutation site while surviving unrelated edits.
+# Anything not listed here fails the gate in run.py.
+
+[[survivor]]
+suite = "contract-math"
+mutant = "contracts/predifi-contract/src/payouts.rs: replace || with && in calculate_claim_payout"
+line_contains = "input.fee_bps < 0 || input.fee_bps > 10_000"
+disposition = "equivalent"
+rationale = """
+The `fee_bps < 0 || fee_bps > 10_000` pre-check is defense in depth. With `&&`
+it never fires, but the very next call, `SafeMath::percentage`, validates
+`bps` against the same `0..=10_000` range and returns the same
+`InvalidFeeBps` before any arithmetic (negative `pool_total_stake` is already
+rejected by the line above). Every input therefore produces the same result.
+Both bounds are pinned by `mutation_kill_fee_bps_above_max_is_rejected` and
+`mutation_kill_negative_fee_bps_is_rejected`.
+"""
+
+[[survivor]]
+suite = "contract-math"
+mutant = "contracts/predifi-contract/src/payouts.rs: replace || with && in calculate_claim_payout"
+line_contains = "input.winning_stake == 0 || input.user_stake == 0"
+disposition = "equivalent"
+rationale = """
+The zero-stake short-circuit duplicates the one inside
+`SafeMath::calculate_share`, which returns `Ok(0)` when either `user_stake` or
+`winning_stake` is 0 (negative stakes are already rejected above). With `&&`
+the call falls through to `calculate_winnings`, which yields the same `0`.
+Zero-stake results are pinned by `zero_winning_stake_yields_zero`,
+`mutation_kill_zero_pool_is_accepted` and the `calculate_share` zero tests.
+"""
+
+[[survivor]]
+suite = "contract-math"
+mutant = "contracts/predifi-contract/src/safe_math.rs: replace || with && in SafeMath::percentage"
+line_contains = "if amount == 0 || bps == 0 {"
+disposition = "equivalent"
+rationale = """
+Fast path only. Inputs were already validated as `amount >= 0` and
+`0 <= bps <= MAX_BPS`; if either is 0 the slow path computes
+`0 * x / MAX_BPS = 0` with remainder 0, which every rounding mode returns
+unchanged (Neutral: `0 >= MAX_BPS / 2` is false; UserFavor: `0 > 0` is false).
+"""
+
+[[survivor]]
+suite = "contract-math"
+mutant = "contracts/predifi-contract/src/safe_math.rs: replace || with && in SafeMath::proportion"
+line_contains = "if numerator == 0 || amount == 0 {"
+disposition = "equivalent"
+rationale = """
+Fast path only. At this point `numerator >= 0`, `denominator > 0`,
+`amount >= 0`. If either factor is 0, `numerator <= denominator` holds and
+the slow path computes `0 / denominator = 0` with remainder 0, which every
+rounding mode returns unchanged.
+"""
+
+[[survivor]]
+suite = "contract-math"
+mutant = "contracts/predifi-contract/src/safe_math.rs: replace || with && in SafeMath::calculate_share"
+line_contains = "if winning_stake == 0 || user_stake == 0 || payout_pool == 0 {"
+disposition = "equivalent"
+rationale = """
+Applies to the second `||` (`user_stake == 0 || payout_pool == 0` -> `&&`).
+When `winning_stake > 0` and either `user_stake` or `payout_pool` is 0, the
+slow path computes `0 / winning_stake = 0` (and `0 <= winning_stake` passes
+the guard), the same `Ok(0)`. The first `||` on this line is NOT equivalent
+(winning_stake = 0 would hit `user_stake > winning_stake`) and is killed by
+`mutation_kill_share_zero_winning_stake_is_zero`. Both share this line, so a
+regression of that test would also be masked here; it is additionally
+covered by `test_calculate_share_zero_cases`.
+"""
