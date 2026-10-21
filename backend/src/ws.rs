@@ -39,6 +39,7 @@ use tracing::Instrument;
 use crate::config::Config;
 use crate::constants::{RATE_LIMIT_WS_BURST, RATE_LIMIT_WS_PERIOD_SECS};
 use crate::jwt::{extract_bearer_token, verify_jwt_token_strict};
+use crate::response::error_codes;
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -466,13 +467,12 @@ fn validate_origin(headers: &HeaderMap, config: &Config) -> bool {
 }
 
 fn unauthorized_response(message: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({
-            "error": message,
-        })),
-    )
-        .into_response()
+    ws_error(StatusCode::UNAUTHORIZED, error_codes::UNAUTHORIZED, message)
+}
+
+/// Handshake failures use the standard error envelope (#51).
+fn ws_error(status: StatusCode, code: &'static str, message: &str) -> Response {
+    crate::response::ApiResponse::<()>::error(status, code, message).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -532,36 +532,32 @@ pub async fn ws_handler(
     Query(params): Query<WsConnectParams>,
     State(config): State<Arc<Config>>,
     State(bus): State<EventBus>,
+    State(db): State<Option<sqlx::PgPool>>,
+    State(redis): State<crate::redis_cache::RedisCache>,
 ) -> impl IntoResponse {
     if !validate_origin(&headers, &config) {
-        return (
+        return ws_error(
             StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({
-                "error": "invalid or missing Origin header",
-            })),
-        )
-            .into_response();
+            error_codes::FORBIDDEN,
+            "invalid or missing Origin header",
+        );
     }
 
     let ip = client_ip(&headers);
     if !bus.allow_connect(&ip) {
-        return (
+        return ws_error(
             StatusCode::TOO_MANY_REQUESTS,
-            axum::Json(serde_json::json!({
-                "error": "websocket connection rate limit exceeded",
-            })),
-        )
-            .into_response();
+            error_codes::RATE_LIMIT_EXCEEDED,
+            "websocket connection rate limit exceeded",
+        );
     }
 
     if bus.active_connections() >= MAX_ACTIVE_CONNECTIONS {
-        return (
+        return ws_error(
             StatusCode::TOO_MANY_REQUESTS,
-            axum::Json(serde_json::json!({
-                "error": "maximum active websocket connections reached",
-            })),
-        )
-            .into_response();
+            error_codes::RATE_LIMIT_EXCEEDED,
+            "maximum active websocket connections reached",
+        );
     }
 
     let Some(token) = extract_ws_token(&headers, &params, config.is_production()) else {
@@ -578,15 +574,26 @@ pub async fn ws_handler(
         Err(error) => return unauthorized_response(&error.to_string()),
     };
 
+    // Revoked sessions must not open sockets on any replica (#55). Without a
+    // database (tests, health-only deployments) there is no revocation state.
+    if db.is_some() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let store = crate::token_revocation::RevocationStore::new(db, redis);
+        if let Err(error) = store.ensure_not_revoked(&claims, now).await {
+            return crate::errors::AppError::from(error).into_response();
+        }
+    }
+
     if let Some(ref target_address) = params.address {
         if target_address != &claims.sub {
-            return (
+            return ws_error(
                 StatusCode::FORBIDDEN,
-                axum::Json(serde_json::json!({
-                    "error": "unauthorized wallet subscription",
-                })),
-            )
-                .into_response();
+                error_codes::FORBIDDEN,
+                "unauthorized wallet subscription",
+            );
         }
     }
 

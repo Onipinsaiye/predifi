@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use tracing::{error, info, instrument, warn};
 
 use crate::config::Config;
+use crate::rpc_resilience::{ResilientRpcClient, RpcError};
 
 /// Result of a single pool sync operation.
 #[derive(Debug)]
@@ -29,31 +30,24 @@ pub struct PoolSyncResult {
     pub fixed: bool,
 }
 
-/// Fetch `total_stake` for a pool from the Soroban contract via the backend
-/// RPC helper. Returns `None` if the pool is not found on-chain.
+/// Fetch `total_stake` for a pool from the Soroban contract.
 ///
-/// This calls `get_pool_outcome_stakes` on the predifi contract and sums
-/// all outcome stakes to compute the total.
-#[instrument(skip(config), name = "sync.fetch_contract_total_stake",
+/// This calls `get_pool_outcome_stakes` on the predifi contract (simulated,
+/// so the call is idempotent and safe to retry) and sums all outcome stakes.
+/// Goes through [`ResilientRpcClient`] so transient failures are retried with
+/// backoff and a failing node trips the shared circuit breaker (#58).
+#[instrument(skip(config, rpc), name = "sync.fetch_contract_total_stake",
     fields(pool_id = pool_id))]
-async fn fetch_contract_total_stake(config: &Config, pool_id: i64) -> Option<i64> {
-    // Build the Soroban RPC request — we call `get_pool_outcome_stakes(pool_id)`.
-    // The response is a map of outcome_index → stake_amount; we sum the values.
-    let rpc_url = format!("{}/", config.stellar_rpc_url);
-    let payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "simulateTransaction",
-        "params": {
-            "transaction": build_get_stakes_xdr(config, pool_id)
-        }
+async fn fetch_contract_total_stake(
+    config: &Config,
+    rpc: &ResilientRpcClient,
+    pool_id: i64,
+) -> Result<Option<i64>, RpcError> {
+    let params = serde_json::json!({
+        "transaction": build_get_stakes_xdr(config, pool_id)
     });
-
-    let client = reqwest::Client::new();
-    let response = client.post(&rpc_url).json(&payload).send().await.ok()?;
-
-    let body: serde_json::Value = response.json().await.ok()?;
-    parse_total_stake_from_rpc(&body)
+    let result = rpc.call("simulateTransaction", params).await?;
+    Ok(parse_total_stake_from_rpc(&result))
 }
 
 /// Build a minimal XDR string for simulating `get_pool_outcome_stakes(pool_id)`.
@@ -74,11 +68,11 @@ fn build_get_stakes_xdr(_config: &Config, _pool_id: i64) -> String {
 
 /// Parse the summed total stake from a Soroban RPC simulate response.
 fn parse_total_stake_from_rpc(body: &serde_json::Value) -> Option<i64> {
-    // The result is expected under body["result"]["results"][0]["xdr"] as a
-    // SCVal map of (u32 outcome → i128 stake). We sum all values.
-    // This is a minimal parser for the happy path; production code should use
-    // the stellar-xdr crate for full XDR decoding.
-    let results = body.get("result")?.get("results")?.as_array()?;
+    // `body` is the JSON-RPC `result` object. The value is expected under
+    // `results[0].xdr` as a SCVal map of (u32 outcome → i128 stake). We sum
+    // all values. This is a minimal parser for the happy path; production
+    // code should use the stellar-xdr crate for full XDR decoding.
+    let results = body.get("results")?.as_array()?;
 
     if results.is_empty() {
         return None;
@@ -133,12 +127,14 @@ pub async fn run_full_sync(
     let mut fixed_count = 0u32;
     let mut error_count = 0u32;
 
+    let rpc = ResilientRpcClient::from_config(config);
+
     for row in &rows {
         let pool_id = row.pool_id;
         let db_stake = row.total_stake;
 
-        match fetch_contract_total_stake(config, pool_id).await {
-            Some(contract_stake) => {
+        match fetch_contract_total_stake(config, &rpc, pool_id).await {
+            Ok(Some(contract_stake)) => {
                 let needs_fix = db_stake != contract_stake;
                 if needs_fix {
                     warn!(
@@ -159,8 +155,19 @@ pub async fn run_full_sync(
                     fixed: needs_fix,
                 });
             }
-            None => {
-                warn!(pool_id, "could not fetch on-chain stake — skipping");
+            Ok(None) => {
+                warn!(pool_id, "pool not found on-chain — skipping");
+                error_count += 1;
+            }
+            Err(RpcError::CircuitOpen) => {
+                // The node is unhealthy: stop this pass instead of queueing a
+                // failure per remaining pool. The next pass retries.
+                warn!(pool_id, "rpc circuit open — aborting sync pass early");
+                error_count += 1;
+                break;
+            }
+            Err(e) => {
+                warn!(pool_id, error = %e, "could not fetch on-chain stake — skipping");
                 error_count += 1;
             }
         }

@@ -16,7 +16,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
 /// Clock-skew leeway applied to `exp` (seconds).
-const JWT_EXP_LEEWAY_SECS: u64 = 30;
+pub const JWT_EXP_LEEWAY_SECS: u64 = 30;
 
 /// Errors returned when a token string fails the structural JWT check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +151,11 @@ pub struct PredifiClaims {
     /// invalidates all tokens issued under previous versions (rotation support).
     #[serde(default = "default_key_version")]
     pub key_version: u64,
+    /// Per-user token version at issuance. Bumping the user's version in the
+    /// revocation store (logout-all, compromise) revokes every token carrying
+    /// a lower value. Tokens issued before this claim existed decode as `0`.
+    #[serde(default)]
+    pub tv: u64,
 }
 
 fn default_token_type() -> String {
@@ -314,6 +319,19 @@ pub fn sign_jwt_with_type(
     token_type: &str,
     key_version: u64,
 ) -> Result<String, String> {
+    sign_jwt_with_token_version(sub, secret, now_unix, token_type, key_version, 0)
+}
+
+/// Issue a signed JWT carrying the user's current per-user token version
+/// (`tv` claim). See [`crate::token_revocation`].
+pub fn sign_jwt_with_token_version(
+    sub: &str,
+    secret: &str,
+    now_unix: u64,
+    token_type: &str,
+    key_version: u64,
+    token_version: u64,
+) -> Result<String, String> {
     use jsonwebtoken::{encode, EncodingKey, Header};
 
     let expiry = if token_type == "refresh" {
@@ -329,6 +347,7 @@ pub fn sign_jwt_with_type(
         jti: uuid::Uuid::new_v4().to_string(),
         token_type: token_type.to_string(),
         key_version,
+        tv: token_version,
     };
 
     encode(
@@ -358,6 +377,7 @@ pub fn sign_jwt_for_test(sub: &str, secret: &str) -> String {
             jti: "test-jti".to_string(),
             token_type: "access".to_string(),
             key_version: 0,
+            tv: 0,
         },
         &EncodingKey::from_secret(secret.as_bytes()),
     )
@@ -383,6 +403,7 @@ mod tests {
             jti: "test-jti".to_string(),
             token_type: token_type.to_string(),
             key_version,
+            tv: 0,
         }
     }
 

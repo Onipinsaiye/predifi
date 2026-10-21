@@ -22,6 +22,7 @@
    - [Indexer](#indexer)
 5. [Request/Response Examples](#requestresponse-examples)
 6. [Error Responses](#error-responses)
+7. [Versioning and Deprecation](#versioning-and-deprecation)
 
 ---
 
@@ -43,9 +44,14 @@ Tokens are issued by the authentication service and contain:
   "type": "access",
   "exp": 1234567890,
   "iat": 1234567890,
-  "key_version": 0
+  "jti": "uuid-v4",
+  "key_version": 0,
+  "tv": 0
 }
 ```
+
+`tv` is the user's token version at issuance. Tokens issued before `tv`
+existed are treated as `tv = 0`.
 
 ### Obtaining a Token
 
@@ -58,6 +64,31 @@ Tokens are issued by the authentication service and contain:
 
 - **Access tokens**: 1 hour (3600 seconds)
 - **Refresh tokens**: 7 days (604800 seconds)
+
+### Logout and Revocation
+
+`POST /api/v1/auth/logout` revokes tokens before they expire:
+
+```http
+POST /api/v1/auth/logout
+Authorization: Bearer <jwt_access_token>
+Content-Type: application/json
+
+{ "refresh_token": "<optional refresh token of this session>", "all_sessions": false }
+```
+
+- Without a body, only the presented access token is revoked.
+- With `refresh_token`, that session's refresh token is revoked too (it must belong to the same user).
+- With `all_sessions: true`, the user's token version is bumped and every token issued so far is revoked.
+
+Response: `{ "status": "success", "data": { "revoked": "session" | "all_sessions" } }`.
+
+Revocation semantics:
+
+- Revocation state is stored in Postgres and cached in Redis, so a revoked token fails on every backend instance. If Redis cannot be updated during a revocation, other instances pick it up within 30 seconds.
+- A single-token revocation record is kept until the token's own expiry plus a grace period, so deleting old records can never make a token valid again. Token versions never expire.
+- If the revocation store cannot be read, authenticated requests fail closed with `503 TOKEN_STORE_UNAVAILABLE` (`retryable: true`).
+- Reusing a refresh token that was already rotated revokes all of the user's sessions.
 
 ### WebSocket Authentication
 
@@ -102,12 +133,8 @@ X-RateLimit-Reset: 1672531200
 
 ### Error Response
 
-```json
-{
-  "error": "RATE_LIMIT_EXCEEDED",
-  "message": "Rate limit exceeded. Retry after 30 seconds."
-}
-```
+429 responses use the standard [error envelope](#error-responses) with
+`code: "RATE_LIMIT_EXCEEDED"` and `retryable: true`.
 
 ### WebSocket Rate Limiting
 
@@ -874,70 +901,155 @@ ws.run_forever()
 
 ## Error Responses
 
-### Standard Error Format
+### Standard Error Envelope (version 1)
+
+Every failure uses the same envelope: handler errors, invalid path, query
+or JSON input, unknown routes, wrong methods, body size limits, rate
+limiting and WebSocket handshake failures.
 
 ```json
 {
-  "error": "ERROR_CODE",
-  "message": "Human-readable error message"
+  "status": "error",
+  "error": {
+    "version": 1,
+    "code": "INVALID_INPUT",
+    "message": "Human-readable, safe message",
+    "request_id": "2f0c6d0e-...",
+    "retryable": false,
+    "details": [{ "field": "limit", "reason": "must be between 1 and 100" }]
+  }
 }
 ```
 
+| Field | Meaning |
+|-------|---------|
+| `version` | Envelope version. Changes only through the [deprecation policy](API_VERSIONING_POLICY.md). |
+| `code` | Stable, machine-readable code. Branch on this, never on `message`. |
+| `message` | Safe to display. 5xx responses always use a generic message; internal, database and RPC details are only logged. |
+| `request_id` | Same value as the `x-request-id` response header. Sent back from an inbound `x-request-id` / `x-correlation-id` header when present. Quote it in support requests. |
+| `retryable` | `true` when the same request may succeed later without changes. |
+| `details` | Only present for validation failures. |
+
 ### Error Codes
 
-| Code | HTTP Status | Description |
-|------|-------------|-------------|
-| `INVALID_REQUEST` | 400 | Invalid request parameters |
-| `UNAUTHORIZED` | 401 | Missing or invalid authentication |
-| `FORBIDDEN` | 403 | Insufficient permissions |
-| `NOT_FOUND` | 404 | Resource not found |
-| `RATE_LIMIT_EXCEEDED` | 429 | Rate limit exceeded |
-| `INTERNAL_ERROR` | 500 | Internal server error |
-| `DATABASE_UNAVAILABLE` | 503 | Database unavailable |
+| Code | HTTP Status | Retryable | Description |
+|------|-------------|-----------|-------------|
+| `INVALID_INPUT` | 400 / 422 | No | Invalid path, query or body |
+| `UNAUTHORIZED` | 401 | No | Missing, invalid or expired token |
+| `TOKEN_REVOKED` | 401 | No | Token was revoked (logout, compromise) |
+| `FORBIDDEN` | 403 | No | Authenticated but not allowed |
+| `NOT_FOUND` | 404 | No | Resource or route not found |
+| `METHOD_NOT_ALLOWED` | 405 | No | Route exists, method does not |
+| `CONFLICT` | 409 | No | Constraint violation or in-progress idempotent request |
+| `API_VERSION_SUNSET` | 410 | No | API version or route retired after its sunset date |
+| `PAYLOAD_TOO_LARGE` | 413 | No | Body exceeds the route limit |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | No | Missing or wrong `Content-Type` |
+| `RATE_LIMIT_EXCEEDED` | 429 | Yes | Rate limit exceeded; see `Retry-After` |
+| `INTERNAL_ERROR` | 500 | No | Unexpected server error |
+| `UPSTREAM_UNAVAILABLE` | 502 | Yes | Soroban RPC failed or its circuit breaker is open |
+| `UPSTREAM_TIMEOUT` | 504 | Yes | Soroban RPC did not answer in time |
+| `SERVICE_UNAVAILABLE` | 503 | Yes | Service temporarily unavailable |
+| `DATABASE_UNAVAILABLE` | 503 | Yes | Database unavailable |
+| `TOKEN_STORE_UNAVAILABLE` | 503 | Yes | Revocation store unavailable (auth fails closed) |
+| `RATE_LIMITER_UNAVAILABLE` | 503 | Yes | Distributed rate limiter unavailable (fail-closed tiers) |
+| `NOTIFICATION_NOT_FOUND` | 404 | No | Admin notification replay: unknown id |
+| `NOTIFICATION_DEAD` | 409 | No | Admin notification replay: delivery is dead-lettered |
+
+Adding a code is backward compatible. Clients must treat unknown codes by
+HTTP status class.
 
 ### Example Error Responses
 
 #### Rate Limit Exceeded
 
-```json
-{
-  "error": "RATE_LIMIT_EXCEEDED",
-  "message": "Rate limit exceeded. Retry after 30 seconds."
-}
-```
-
-**Headers**:
 ```http
 HTTP/1.1 429 Too Many Requests
 Retry-After: 30
+x-request-id: 9b1e...
+```
+
+```json
+{
+  "status": "error",
+  "error": {
+    "version": 1,
+    "code": "RATE_LIMIT_EXCEEDED",
+    "message": "Too many requests",
+    "request_id": "9b1e...",
+    "retryable": true
+  }
+}
 ```
 
 #### Not Found
 
 ```json
 {
-  "error": "NOT_FOUND",
-  "message": "Pool with ID 999 not found"
+  "status": "error",
+  "error": {
+    "version": 1,
+    "code": "NOT_FOUND",
+    "message": "pool not found",
+    "request_id": "c0a8...",
+    "retryable": false
+  }
 }
 ```
 
-**Headers**:
-```http
-HTTP/1.1 404 Not Found
-```
+#### Internal Error
 
-#### Unauthorized
+Internal details never appear in the body; use `request_id` to find them
+in the logs.
 
 ```json
 {
-  "error": "UNAUTHORIZED",
-  "message": "Missing or invalid authorization token"
+  "status": "error",
+  "error": {
+    "version": 1,
+    "code": "INTERNAL_ERROR",
+    "message": "internal server error",
+    "request_id": "5d2f...",
+    "retryable": false
+  }
 }
 ```
 
-**Headers**:
-```http
-HTTP/1.1 401 Unauthorized
+---
+
+## Versioning and Deprecation
+
+The full policy, including support windows, compatibility rules and the
+release checklist, is in [API_VERSIONING_POLICY.md](API_VERSIONING_POLICY.md).
+
+| Version | Status | Deprecated | Sunset | Successor |
+|---------|--------|------------|--------|-----------|
+| `v1` | Active | — | — | — |
+
+Headers on `/api/<version>` responses:
+
+| Header | When | Example |
+|--------|------|---------|
+| `API-Version` | Always | `API-Version: v1` |
+| `Deprecation` | Version or route is deprecated (RFC 9745) | `Deprecation: @1767225600` |
+| `Sunset` | A removal date is set (RFC 8594) | `Sunset: Wed, 01 Jul 2026 00:00:00 GMT` |
+| `Link` | Deprecated: policy and successor | `Link: <…/API_VERSIONING_POLICY.md>; rel="deprecation"; type="text/html", </api/v2>; rel="successor-version"` |
+
+After the sunset date, requests get `410 API_VERSION_SUNSET`.
+
+`GET /api/v1` returns the live status of every version and every deprecated
+route:
+
+```json
+{
+  "name": "predifi-backend",
+  "version": "v1",
+  "status": "active",
+  "versions": [
+    { "version": "v1", "status": "active", "deprecated_at": null, "sunset_at": null, "successor": null }
+  ],
+  "deprecated_routes": [],
+  "deprecation_policy": "https://github.com/Onipinsaiye/predifi/blob/main/docs/API_VERSIONING_POLICY.md"
+}
 ```
 
 ---

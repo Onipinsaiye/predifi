@@ -28,7 +28,7 @@ When adding a new migration, use the **next unused integer**, run
 `sqlx migrate add <description>` (or create the file by hand) inside this
 directory, and never reuse or renumber a prefix that already exists — see
 [Duplicate prefixes](#duplicate-004-and-009-prefixes-do-not-rename) below.
-The next available prefix is **`012_`**.
+The next available prefix is **`015_`**.
 
 ## Applying migrations locally
 
