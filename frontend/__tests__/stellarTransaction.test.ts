@@ -55,6 +55,19 @@ describe("classifySubmissionFailure", () => {
     expect(result.isStaleSequence).toBe(false);
   });
 
+    it("treats a network failure after submission as ambiguous", () => {
+    const error = new TransactionSubmitError({
+      stage: "post_submit",
+      hash: "network-error-hash",
+      cause: new Error("Network connection lost"),
+    });
+
+    const result = classifySubmissionFailure(error);
+
+    expect(result.retryClass).toBe("ambiguous");
+    expect(result.hash).toBe("network-error-hash");
+  });
+
   it("treats a stale sequence (`tx_bad_seq`) as retryable regardless of stage", () => {
     const error = new TransactionSubmitError({
       stage: "post_submit",
