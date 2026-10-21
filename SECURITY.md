@@ -45,6 +45,20 @@ As an alternative to email, you can open a [private security advisory](https://g
 
 We will keep you informed at each stage. If you have not received an acknowledgement within 48 hours, please follow up by replying to your original email.
 
+## Container & Package Vulnerability Management
+
+Container base images and operating system packages undergo automated vulnerability scanning prior to deployment.
+See [Container Vulnerability Management](docs/deploy/container-vulnerabilities.md) and the operational policy at [vulnerability-policy.json](deploy/security/vulnerability-policy.json).
+
+| Severity   | Remediation SLA | Deployment Gate Action |
+| ---------- | --------------- | ---------------------- |
+| `CRITICAL` | 7 days          | Block deployment       |
+| `HIGH`     | 14 days         | Block deployment       |
+| `MEDIUM`   | 30 days         | Block on SLA expiry    |
+| `LOW`      | 90 days         | Advisory / audit trail |
+
+Time-limited exceptions require explicit approval and expiration tracking. Expired exceptions automatically re-engage blocking gates.
+
 ## Disclosure Policy
 
 We follow a **coordinated disclosure** model:

@@ -129,10 +129,10 @@ jobs:
         run: cargo test --workspace
 
   docker-build:
-    name: Backend Docker Image Build
+    name: Backend Docker Image Build & Vulnerability Scan
     runs-on: ubuntu-latest
     needs: backend-checks
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -144,6 +144,32 @@ jobs:
       - name: Build Docker Image
         run: |
           docker build -t predifi-backend:latest ./backend
+
+      - name: Pull Supporting Images
+        run: |
+          docker pull postgres:15-alpine
+          docker pull redis:7-alpine
+
+      - name: Install Trivy vulnerability scanner
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.58.2
+
+      - name: Scan Built Backend and Supporting Images
+        run: |
+          mkdir -p .scan-reports
+          trivy image --format json --output .scan-reports/backend.json predifi-backend:latest || true
+          trivy image --format json --output .scan-reports/postgres.json postgres:15-alpine || true
+          trivy image --format json --output .scan-reports/redis.json redis:7-alpine || true
+
+      - name: Evaluate Vulnerability Policy & Report Package Paths
+        run: |
+          node scripts/evaluate-container-vulnerabilities.mjs \
+            --policy deploy/security/vulnerability-policy.json \
+            --reports .scan-reports
+
+      - name: Run Seeded Vulnerability and Policy Test Suite
+        run: |
+          node --test tests/container-vulnerability-policy.test.mjs
 
   deploy-staging:
     name: Deploy Backend to Staging
