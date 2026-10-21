@@ -294,14 +294,17 @@ impl SessionStore {
 
     /// Explicit logout — destroy a single session.
     pub fn logout(&self, session_id: &str) -> bool {
-        if let Some(user) = self
+        // Extract the user address in a scoped binding so the `sessions`
+        // mutex guard is dropped before `destroy_session` re-locks it —
+        // holding the guard across the `if let` would self-deadlock.
+        let user = self
             .inner
             .sessions
             .lock()
             .expect("sessions")
             .get(session_id)
-            .map(|s| s.user_address.clone())
-        {
+            .map(|s| s.user_address.clone());
+        if let Some(user) = user {
             let ok = self.destroy_session(session_id);
             if ok {
                 self.log(

@@ -2,3 +2,4 @@
 // (toBeInTheDocument, toHaveTextContent, toBeVisible, etc.)
 // This file is picked up automatically because `types/` matches **/*.ts in tsconfig.json.
 import "@testing-library/jest-dom";
+import "jest-axe";

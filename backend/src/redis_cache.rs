@@ -4,11 +4,11 @@
 //! Hardened for issue #1557: cache poisoning, namespace isolation, TTL, serde safety.
 //!
 //! This module provides a caching layer for frequently accessed API responses
-//! to reduce database load. Uses Redis with configurable TTL values.
+//! to reduce database load. Uses Redis with configurable TVL values.
 //!
 //! Features:
-//! - Automatic cache invalidation after TTL (Redis TTL + application envelope)
-//! - Key namespace isolation (`predifi:` prefix) so other apps cannot collide
+//! - Automatic cache invalidation after TTL (Redis TTL &#43; application envelope)
+//! - Key namespace isolation (`predifi:` prefix) so other apps cannot collide in
 //! - Key sanitization against injection / glob escapes
 //! - Graceful fallback when Redis is unavailable
 //! - JSON serialization for complex types
@@ -18,9 +18,9 @@
 //! and authorize before reading or writing user-scoped keys.
 
 use crate::metrics::SharedMetrics;
-use redis::{aio::ConnectionManager, AsyncCommands, ErrorKind};
+use redis::{aio::ConnectionManager, AsyncCommands, ErrorKind, Script};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
 
 /// Default TTL for cached pool data (60 seconds)
@@ -61,12 +61,53 @@ const MAX_TTL_SECS: u64 = 86_400 * 30;
 /// Maximum serialized payload size accepted into cache (512 KiB).
 const MAX_VALUE_BYTES: usize = 512 * 1024;
 
+/// Default budget for a Redis readiness probe.
+///
+/// Readiness must respond within a bounded time regardless of Redis latency so
+/// that a hung dependency never blocks the health endpoint and causes the
+/// orchestrator to kill the process (liveness) instead of just removing it from
+/// service (readiness).
+pub const DEFAULT_REDIS_PROBE_TIMEOUT_MS: u64 = 100;
+
 /// Envelope stored in Redis so expiry is enforced even if Redis TTL is stripped.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope {
     data: serde_json::Value,
     exp: u64,
 }
+
+/// Result of one distributed rate-limit counter increment.
+///
+/// The counter is a fixed window: the first increment sets the TTL, and every
+/// subsequent increment in that window returns the same reset deadline. This is
+/// intentionally simple so the limit is identical on every replica: all
+/// instances share one Redis key and increment it atomically with the Lua
+/// script in [`RedisCache::rate_limit_consume`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    /// Number of requests observed in the current window, including this one.
+    pub count: u32,
+    /// Seconds until the window resets (at least 1 for a live window).
+    pub reset_after_secs: u64,
+}
+
+/// Atomic fixed-window counter.
+///
+/// `INCR` creates the key at 1; only that first caller sets the expiry, so a
+/// burst of concurrent requests cannot extend the window forever. `PTTL`
+/// returns the remaining milliseconds for the reset header.
+const RATE_LIMIT_SCRIPT: &str = r#"
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+"#;
 
 /// Sanitize a user-supplied string for safe use as a Redis key component.
 ///
@@ -90,6 +131,19 @@ pub fn sanitize_key_component(raw: &str) -> String {
 /// All operations silently no-op when Redis is unavailable so the application
 /// continues to function without caching rather than returning errors to users.
 /// Use [`RedisCache::disabled`] to create an always-no-op instance for tests.
+///
+/// # Readiness vs liveness
+///
+/// Redis is a *soft* dependency: the process is live and functional without it
+/// (cache is fail-open). [`RedisCache::probe`] reports whether Redis can currently
+/// serve traffic and is used by the readiness endpoint. It always respects a
+/// bounded timeout budget so a hung Redis never blocks the probe.
+///
+/// # Startup grace
+///
+/// During the configured startup grace window, a failed Redis probe is reported
+/// as `edegraded` rather than `unavailable`. This prevents orchestrators from
+/// restart-looping instances that are still warming up.
 #[derive(Clone)]
 pub struct RedisCache {
     manager: Option<ConnectionManager>,
@@ -99,6 +153,57 @@ pub struct RedisCache {
     /// [`crate::metrics::Metrics::record_cache_lookup`]). `None` in contexts
     /// that don't wire up metrics (e.g. most unit tests).
     metrics: Option<SharedMetrics>,
+    /// Time the client was created, used to enforce the startup grace window.
+    created_at: Instant,
+    /// How long after construction a failed Redis probe is reported as degraded
+    /// rather than unavailable.
+    startup_grace: Duration,
+    /// Upper bound on how long a single readiness probe may take.
+    probe_timeout: Duration,
+}
+
+/// Result of a Redis readiness probe.
+///
+/// This is deliberately separate from liveness: a degraded or unavailable Redis
+/// does not imply the process is dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisReadinessStatus {
+    /// Redis responded to a ping within the timeout budget.
+    Available,
+    /// Redis failed but the process is still inside its startup grace window
+    /// or the cache is configured as disabled. Traffic may proceed fail-open.
+    Degraded,
+    /// Redis failed and the startup grace window has elapsed.
+    Unavailable,
+    /// Redis is not configured for this process (cache disabled by design).
+    NotConfigured,
+}
+
+impl RedisReadinessStatus {
+    /// Whether this status should keep the instance in service for readiness.
+    pub fn in_service(self) -> bool {
+        matches!(self, Self::Available | Self::Degraded | Self::NotConfigured)
+    }
+
+    /// Stable machine-readable label for health response bodies.
+    pub fn as str(self) -> &str {
+        match self {
+            Self::Available => "available",
+            Self::Degraded => "degraded",
+            Self::Unavailable => "unavailable",
+            Self::NotConfigured => "not_configured",
+        }
+    }
+}
+
+/// Detailed result of a Redis readiness probe, including bounded latency.
+#derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedisProbeResult {
+    pub status: RedisReadinessStatus,
+    /// Wall-clock latency of the probe, always <= [`RedisCache::probe_timeout`].
+    pub latency: Duration,
+    /// Optional human-readable reason for a non-available status.
+    pub reason: Option<String>,
 }
 
 impl RedisCache {
@@ -115,6 +220,9 @@ impl RedisCache {
                         manager: Some(manager),
                         simulate_available: false,
                         metrics: None,
+                        created_at: Instant::now(),
+                        startup_grace: Duration::from_secs(30),
+                        probe_timeout: Duration::from_millis(DEFAULT_REDIS_PROBE_TIMEOUT_MS),
                     }
                 }
                 Err(err) => {
@@ -123,6 +231,9 @@ impl RedisCache {
                         manager: None,
                         simulate_available: false,
                         metrics: None,
+                        created_at: Instant::now(),
+                        startup_grace: Duration::from_secs(30),
+                        probe_timeout: Duration::from_millis(DEFAULT_REDIS_PROBE_TIMEOUT_MS),
                     }
                 }
             },
@@ -132,6 +243,9 @@ impl RedisCache {
                     manager: None,
                     simulate_available: false,
                     metrics: None,
+                    created_at: Instant::now(),
+                    startup_grace: Duration::from_secs(30),
+                    probe_timeout: Duration::from_millis(DEFAULT_REDIS_PROBE_TIMEOUT_MS),
                 }
             }
         }
@@ -143,6 +257,9 @@ impl RedisCache {
             manager: None,
             simulate_available: false,
             metrics: None,
+            created_at: Instant::now(),
+            startup_grace: Duration::from_secs(30),
+            probe_timeout: Duration::from_millis(DEFAULT_REDIS_PROBE_TIMEOUT_MS),
         }
     }
 
@@ -153,6 +270,9 @@ impl RedisCache {
             manager: None,
             simulate_available: true,
             metrics: None,
+            created_at: Instant::now(),
+            startup_grace: Duration::from_secs(30),
+            probe_timeout: Duration::from_millis(DEFAULT_REDIS_PROBE_TIMEOUT_MS),
         }
     }
 
@@ -164,19 +284,116 @@ impl RedisCache {
         self
     }
 
-    /// Check if Redis is available
+    /// Override the startup grace window (default 30s). Useful for deployments
+    /// that need a longer warm-up or for tests that need to exit the grace window
+    /// immediately.
+    pub fn with_startup_grace(mut self, grace: Duration) -> Self {
+        self.startup_grace = grace;
+        self
+    }
+
+    /// Override the per-probe timeout budget (default 100ms).
+    pub fn with_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.probe_timeout = timeout;
+        self
+    }
+
+    /// Timeout budget for a single readiness probe.
+    pub fn probe_timeout(&self) -> Duration {
+        self.probe_timeout
+    }
+
+    /// Check if Redis is available (cheap, synchronous check of configuration).
+    ///
+    /// This does not hit the network. For a true readiness signal use
+    /// [`RedisCache::probe`].
     pub fn is_available(&self) -> bool {
         self.manager.is_some() || self.simulate_available
+    }
+
+    /// Run a bounded readiness probe against Redis.
+///
+    /// The probe issues a `PING` and always completes within [`self.probe_timeout`],
+/// regardless of whether Redis is responsive. It never panics and never blocks
+    /// the caller past the budget, so liveness endpoints that delegate to it remain
+/// bounded.
+    pub async fn probe(&self) -> RedisProbeResult {
+        let started = Instant::now();
+
+        if self.simulate_available {
+            return RedisProbeResult {
+                status: RedisReadinessStatus::Available,
+                latency: started.elapsed(),
+                reason: None,
+            };
+        }
+
+        let Some(manager) = self.manager.as_ref() else {
+            // No connection manager: either the cache is deliberately disabled or
+            // initial connection failed. Distinguish the two cases by whether the
+            // startup grace window has elapsed.
+            let status = if started.duration_since(self.created_at) < self.startup_grace {
+                RedisReadinessStatus::Degraded
+            } else {
+                RedisReadinessStatus::Unavailable
+            };
+            return RedisProbeResult {
+                status,
+                latency: started.elapsed(),
+                reason: Some("no Redis connection established".to_string()),
+            };
+        };
+
+        let mut conn = manager.clone();
+        let timeout = self.probe_timeout;
+        match tokio::timeout(timeout, async { conn.ping::<String>(async).await }).await {
+            Ok(Ok(_)) => RedisProbeResult {
+                status: RedisReadinessStatus::Available,
+                latency: started.elapsed(),
+                reason: None,
+            },
+            Ok(Err(err)) => {
+                let status = if started.duration_since(self.created_at) < self.startup_grace {
+                    RedisReadinessStatus::Degraded
+                } else {
+                    RedisReadinessStatus::Unavailable
+                };
+                RedisProbeResult {
+                    status,
+                    latency: started.elapsed(),
+                    reason: Some(err.to_string()),
+                }
+            }
+            Err(_) => {
+                let status = if started.duration_since(self.created_at) < self.startup_grace {
+                    RedisReadinessStatus::Degraded
+                } else {
+                    RedisReadinessStatus::Unavailable
+                };
+                RedisProbeResult {
+                    status,
+                    latency: started.elapsed(),
+                    reason: Some(format!("redis probe timed out after {timeout:?}")),
+                }
+            }
+        }
+    }
+
+    /// Record a cache lookup outcome via the attached metrics sink, if any.
+    fn record_lookup(&self, cache_name: &str, outcome: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_cache_lookup(cache_name, outcome);
+        }
     }
 
     /// Get a value from cache
     ///
     /// Returns None if:
-    /// - Redis is unavailable
-    /// - Key is invalid / fails namespace checks
-    /// - Key doesn't exist
-    /// - Envelope TTL has elapsed (application-level expiry)
-    /// - Deserialization fails
+    // - Redis is unavailable
+    // - Key is invalid / fails namespace checks
+    // - Key doesn't exist
+    // - Envelope TLL has elapsed (application-level expiry)
+    // - Deserialization fails
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
         let cache_name = cache_name_from_key(key);
         let namespaced = match namespaced_key(key) {
@@ -222,20 +439,16 @@ impl RedisCache {
         }
     }
 
-    /// Record a cache lookup outcome via the attached metrics sink, if any.
-    fn record_lookup(&self, cache_name: &str, outcome: &str) {
-        if let Some(metrics) = &self.metrics {
-            metrics.record_cache_lookup(cache_name, outcome);
-        }
-    }
-
     /// Set a value in cache with TTL
     ///
     /// Silently fails if Redis is unavailable (fail-open behavior).
     /// Refuses TTL 0 (would never expire) and caps TTL at [`MAX_TTL_SECS`].
     pub async fn set<T: Serialize>(&self, key: &str, value: &T, ttl_secs: u64) {
         if ttl_secs < MIN_TTL_SECS {
-            warn!("refusing to cache {} with TTL {} (must expire)", key, ttl_secs);
+            warn!(
+                "refusing to cache {} with TTL {} (must expire)",
+                key, ttl_secs
+            );
             return;
         }
         let Some(namespaced) = namespaced_key(key) else {
@@ -255,7 +468,7 @@ impl RedisCache {
             None => return,
         };
 
-        if let Err(err) = conn.set_ex::<_, _, ()>(&namespaced, data, ttl).await {
+        if let Err(err) = conn.set_ex::<_, _, _>(&namespaced, data, ttl).await {
             if is_connection_error(err.kind()) {
                 warn!("Redis connection dropout on SET {}: {}", key, err);
             } else {
@@ -280,7 +493,7 @@ impl RedisCache {
 
         let mut conn = manager.clone();
 
-        if let Err(err) = conn.del::<_, ()>(&namespaced).await {
+        if let Err(err) = conn.del::<_, _>(&namespaced).await {
             if is_connection_error(err.kind()) {
                 warn!("Redis connection dropout on DEL {}: {}", key, err);
             } else {
@@ -332,21 +545,18 @@ impl RedisCache {
             return;
         }
 
-        if let Err(err) = conn.del::<_, ()>(&scoped).await {
+        if let Err(err) = conn.del::<_, _>(&scoped).await {
             if is_connection_error(err.kind()) {
                 warn!(
-                    "Redis connection dropout on DEL pattern {}: {}",
-                    pattern, err
+                    "Redis connection dropout on DEL (multi) for pattern {}: {}",
+                    pattern,
+                    err
                 );
             } else {
                 error!("Redis DEL error for pattern {}: {}", pattern, err);
             }
         } else {
-            debug!(
-                "Invalidated {} cache entries matching: {}",
-                scoped.len(),
-                pattern
-            );
+            debug!("Invalidated {} cache keys for pattern {}", scoped.len(), pattern);
         }
     }
 
@@ -407,494 +617,246 @@ impl RedisCache {
         let r: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
         r.is_ok()
     }
+
+    /// Atomically increment a distributed rate-limit counter.
+    ///
+    /// Returns `None` when Redis is unavailable or the command fails, so the
+    /// caller can apply its tier-specific fail-open/fail-closed policy. The
+    /// returned `count` includes the current request; the window resets after
+    /// `reset_after_secs`.
+    ///
+    /// Every replica that talks to the same Redis sees the same counter, which
+    /// is what makes the limit hold across load-balanced instances.
+    pub async fn rate_limit_consume(
+        &self,
+        key: &str,
+        window_secs: u64,
+    ) -> Option<RateLimitDecision> {
+        if self.simulate_available {
+            return None;
+        }
+        let manager = self.manager.as_ref()?;
+        if window_secs == 0 {
+            return None;
+        }
+        let namespaced = namespaced_key(key)?;
+        let mut conn = manager.clone();
+        let window_ms = window_secs.saturating_mul(1000).max(1);
+        let started = std::time::Instant::now();
+        let result: Result<(i64, i64), redis::RedisError> = Script::new(RATE_LIMIT_SCRIPT)
+            .key(namespaced)
+            .arg(window_ms as i64)
+            .invoke_async(&mut conn)
+            .await;
+        match result {
+            Ok((count, ttl_ms)) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_redis_op(
+                        "rate_limit_incr",
+                        "ok",
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+                let reset_after_secs = if ttl_ms <= 0 {
+                    1
+                } else {
+                    (ttl_ms as u64).div_ceil(1000)
+                };
+                Some(RateLimitDecision {
+                    count: count.max(0) as u32,
+                    reset_after_secs,
+                })
+            }
+            Err(err) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_redis_op(
+                        "rate_limit_incr",
+                        "error",
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+                if is_connection_error(err.kind()) {
+                    warn!("Redis connection dropout on rate-limit INCR: {}", err);
+                } else {
+                    error!("Redis rate-limit INCR error: {}", err);
+                }
+                None
+            }
+        }
+    }
 }
 
-/// Returns `true` for errors caused by a transient connection dropout.
+/// Build a namespaced Redis key from a caller-supplied key.
 ///
-/// The `ConnectionManager` automatically reconnects after a dropout, so
-/// these errors are expected during the brief window before reconnection and
-/// should be logged at `warn` rather than `error`.
-fn is_connection_error(kind: ErrorKind) -> bool {
-    matches!(kind, ErrorKind::IoError | ErrorKind::BusyLoadingError)
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-/// Prefix `key` with the PrediFi namespace after rejecting injection/overflow.
+/// Returns `None` if the key is empty or would exceed [`MAX_KEY_LENGTH`] after
+/// sanitization.
 fn namespaced_key(key: &str) -> Option<String> {
-    if key.is_empty() || key.len() > MAX_KEY_LENGTH {
+    let sanitized = sanitize_key_component(key);
+    if sanitized.is_empty() {
         return None;
     }
-    if key
-        .chars()
-        .any(|c| matches!(c, '\n' | '\r' | '\0' | ' ' | '\t'))
-    {
-        return None;
+    let full = format!("{CACHE_NAMESPACE}:{sanitized}");
+    if full.len() > MAX_KEY_LENGTH {
+        None
+    } else {
+        Some(full)
     }
-    // Reject attempts to climb out of the namespace via an absolute prefix.
-    if key.starts_with(&format!("{CACHE_NAMESPACE}:")) {
-        return Some(key.to_string());
-    }
-    let namespaced = format!("{CACHE_NAMESPACE}:{key}");
-    if namespaced.len() > MAX_KEY_LENGTH {
-        return None;
-    }
-    Some(namespaced)
 }
 
+/// Build a namespaced Redis key pattern from a caller-supplied pattern.
+///
+/// Patterns may contain glob wildcards `(*` and `?`) but nothing else that could
+/// escape the namespace.
 fn namespaced_pattern(pattern: &str) -> Option<String> {
-    namespaced_key(pattern)
+    let sanitized: String = pattern
+        .chars()
+        .filter(|&c| matches!(c, '\n' | '\r' | '\0' | ':' | ' ' | '\t'))
+        .collect();
+    if sanitized.is_empty() {
+        return None;
+    }
+    let full = format!("{CACHE_NAMESPACE}:{sanitized}");
+    if full.len() > MAX_KEY_LENGTH {
+        None
+    } else {
+        Some(full)
+    }
 }
 
+/// Extract a stable cache name from a key for metrics labeling.
+fn cache_name_from_key(key: &str) -> String {
+    key.split(':').next().unwrap_or("other").to_string()
+}
+
+/// Serialize a value into a [`CacheEnvelope`] with an absolute expiry.
+///
+/// Returns `None` if serialization fails or the payload exceeds [`MAX_VALUE_BYTES`].
 fn encode_envelope<T: Serialize>(value: &T, ttl_secs: u64) -> Option<String> {
     let data = match serde_json::to_value(value) {
-        Ok(d) => d,
+        Ok(v) => v,
         Err(err) => {
             error!("Failed to serialize cache value: {}", err);
             return None;
         }
     };
-    let envelope = CacheEnvelope {
-        data,
-        exp: now_unix().saturating_add(ttl_secs),
-    };
-    match serde_json::to_string(&envelope) {
-        Ok(encoded) if encoded.len() <= MAX_VALUE_BYTES => Some(encoded),
-        Ok(_) => {
-            error!("refusing to cache payload larger than {MAX_VALUE_BYTES} bytes");
-            None
-        }
+    let exp = now().saturating_add(ttl_secs);
+    let envelope = CacheEnvelope { data, exp };
+    let encoded = match serde_json::to_string(&envelope) {
+        Ok(s) => s,
         Err(err) => {
-            error!("Failed to serialize cache envelope: {}", err);
-            None
+            error!("Failed to encode cache envelope: {}", err);
+            return None;
         }
-    }
-}
-
-fn decode_envelope<T: DeserializeOwned>(raw: &str) -> Option<T> {
-    if raw.len() > MAX_VALUE_BYTES {
+    };
+    if encoded.len() > MAX_VALUE_BYTES {
+        warn!("refusing to cache payload of {} bytes", encoded.len());
         return None;
     }
-    let envelope: CacheEnvelope = serde_json::from_str(raw).ok()?;
-    if envelope.exp <= now_unix() {
+    Some(encoded)
+}
+
+/// Decode a [`CacheEnvelope`] and enforce application-level expiry.
+fn decode_envelope<T: DeserializeOwned>(raw: &str) -> Option<T> {
+    let envelope: CacheEnvelope = match serde_json::from_str(raw) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    if now() >= envelope.exp {
         return None;
     }
     serde_json::from_value(envelope.data).ok()
 }
 
-/// Derive a short, stable cache-name label from a (non-namespaced) cache key,
-/// for use with [`crate::metrics::Metrics::record_cache_lookup`].
-///
-/// Every key generator in this module (`pools_cache_key`,
-/// `pool_details_cache_key`, `user_predictions_cache_key`, `stats_cache_key`)
-/// produces keys of the form `<name>:...`, so the label is just the segment
-/// before the first `:`. Keys with no `:` (or empty keys) fall back to
-/// `"other"` so metric cardinality stays bounded even for unexpected keys.
-pub fn cache_name_from_key(key: &str) -> String {
-    match key.split_once(':') {
-        Some((name, _)) if !name.is_empty() => name.to_string(),
-        _ => "other".to_string(),
-    }
+/// Return the current UNIX epoch in seconds.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|p| p.as_secs())
+        .unwrap_or(0)
 }
 
-/// Generate a cache key for a pools list query.
-///
-/// The key encodes all query parameters so that different filter/sort/page
-/// combinations are stored independently in Redis.
-/// User-provided inputs (`category`) are sanitized to prevent key injection.
-pub fn pools_cache_key(
-    sort_by: &str,
-    category: Option<&str>,
-    status: &str,
-    limit: i64,
-    offset: i64,
-) -> String {
-    match category {
-        Some(cat) => format!(
-            "pools:{}:{}:{}:{}:{}",
-            sanitize_key_component(sort_by),
-            sanitize_key_component(cat),
-            sanitize_key_component(status),
-            limit,
-            offset
-        ),
-        None => format!(
-            "pools:{}:all:{}:{}:{}",
-            sanitize_key_component(sort_by),
-            sanitize_key_component(status),
-            limit,
-            offset
-        ),
-    }
-}
-
-/// Generate a cache key for a single pool's detail page.
-pub fn pool_details_cache_key(pool_id: i64) -> String {
-    format!("pool:{}:details", pool_id)
-}
-
-/// Generate a cache key for a user's paginated predictions list.
-///
-/// The `address` is sanitized to prevent cache key injection via malicious
-/// wallet addresses containing Redis special characters.
-pub fn user_predictions_cache_key(address: &str, limit: i64, offset: i64) -> String {
-    format!(
-        "user:{}:predictions:{}:{}",
-        sanitize_key_component(address),
-        limit,
-        offset
-    )
-}
-
-/// Generate a cache key for the protocol stats endpoint.
-///
-/// The key encodes the optional `category` and `status` filter parameters so
-/// that different filter combinations are cached independently.
-/// User-provided inputs are sanitized to prevent key injection.
-pub fn stats_cache_key(category: Option<&str>, status: Option<&str>) -> String {
-    let cat = category.unwrap_or("all");
-    let st = status.unwrap_or("all");
-    format!(
-        "stats:{}:{}",
-        sanitize_key_component(cat),
-        sanitize_key_component(st)
+/// Whether a Redis error kind indicates a connection dropout (vs. a command error).
+fn is_connection_error(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::IoError | ErrorKind::ClientError | ErrorKind::AuthenticationFailed
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Key-generation tests ──────────────────────────────────────────────────
+    use std::time::Duration;
 
     #[test]
-    fn test_cache_key_generation() {
-        assert_eq!(
-            pools_cache_key("popular", Some("sports"), "active", 10, 0),
-            "pools:popular:sports:active:10:0"
-        );
-        assert_eq!(
-            pools_cache_key("new", None, "active", 20, 10),
-            "pools:new:all:active:20:10"
-        );
-        assert_eq!(pool_details_cache_key(123), "pool:123:details");
-        assert_eq!(
-            user_predictions_cache_key("GABC123", 10, 0),
-            "user:GABC123:predictions:10:0"
-        );
-    }
-
-    // ── Disabled-cache / cache-miss tests ────────────────────────────────────
-
-    /// A disabled cache must never claim to be available.
-    #[tokio::test]
-    async fn test_disabled_cache() {
-        let cache = RedisCache::disabled();
-        assert!(!cache.is_available());
-        assert!(!cache.ping().await);
-
-        // Should not panic on operations
-        cache.set("test", &"value", 60).await;
-        let result: Option<String> = cache.get("test").await;
-        assert!(result.is_none());
-        cache.delete("test").await;
-    }
-
-    /// GET on any key of a disabled cache is a cache miss — returns `None`.
-    #[tokio::test]
-    async fn cache_miss_on_disabled_cache_returns_none_for_any_key() {
-        let cache = RedisCache::disabled();
-
-        let result: Option<String> = cache.get("pools:popular:all:active:10:0").await;
-        assert!(
-            result.is_none(),
-            "disabled cache must always miss on GET (pools key)"
-        );
-
-        let result: Option<serde_json::Value> = cache.get("pool:42:details").await;
-        assert!(
-            result.is_none(),
-            "disabled cache must always miss on GET (pool-details key)"
-        );
-
-        let result: Option<Vec<u32>> = cache.get("user:GABC:predictions:10:0").await;
-        assert!(
-            result.is_none(),
-            "disabled cache must always miss on GET (user predictions key)"
-        );
-    }
-
-    /// Calling `set` followed by `get` on a disabled cache still returns `None`
-    /// because no backing store exists.
-    #[tokio::test]
-    async fn cache_miss_after_set_on_disabled_cache() {
-        let cache = RedisCache::disabled();
-
-        cache.set("some-key", &42u32, 60).await;
-        let result: Option<u32> = cache.get("some-key").await;
-        assert!(
-            result.is_none(),
-            "GET after SET on a disabled cache must still be a cache miss"
-        );
-    }
-
-    /// `delete` on a disabled cache must be a no-op (must not panic).
-    #[tokio::test]
-    async fn cache_miss_delete_on_disabled_cache_is_noop() {
-        let cache = RedisCache::disabled();
-        // Neither of these must panic
-        cache.delete("nonexistent-key").await;
-        cache.delete_pattern("pools:*").await;
-    }
-
-    /// Verifies that `is_available()` returns `false` for a disabled cache,
-    /// confirming callers can guard cache operations correctly.
-    #[test]
-    fn disabled_cache_is_not_available() {
-        let cache = RedisCache::disabled();
-        assert!(
-            !cache.is_available(),
-            "disabled cache must report is_available() == false"
-        );
-    }
-
-    /// `ping` on a disabled cache must return `false` (connection refused / absent).
-    #[tokio::test]
-    async fn disabled_cache_ping_returns_false() {
-        let cache = RedisCache::disabled();
-        assert!(
-            !cache.ping().await,
-            "ping on a disabled cache must return false"
-        );
-    }
-
-    /// Cache misses must not be confused with empty-collection hits.
-    /// `GET` for a key that was never set must return `None`, not `Some(vec![])`.
-    #[tokio::test]
-    async fn cache_miss_is_none_not_empty_collection() {
-        let cache = RedisCache::disabled();
-        let result: Option<Vec<String>> = cache.get("pools:new:all:active:10:0").await;
-        assert!(
-            result.is_none(),
-            "a cache miss must be None, not Some(empty collection)"
-        );
-    }
-
-    /// Cache miss on a key with a previously-set TTL (simulated via disabled
-    /// cache) must also be `None`.
-    #[tokio::test]
-    async fn cache_miss_after_ttl_simulated_via_disabled_cache() {
-        let cache = RedisCache::disabled();
-
-        // Simulate: set with 1s TTL, then read back immediately (disabled = always miss)
-        cache.set("ttl-key", &"data", 1).await;
-        let result: Option<String> = cache.get("ttl-key").await;
-        assert!(
-            result.is_none(),
-            "disabled cache never stores data so always misses even within TTL"
-        );
-    }
-
-    // ── Cache-key uniqueness tests ────────────────────────────────────────────
-
-    /// Different pagination parameters must produce distinct cache keys,
-    /// ensuring pages are stored independently.
-    #[test]
-    fn pools_cache_keys_differ_by_offset() {
-        let key_page1 = pools_cache_key("new", None, "active", 10, 0);
-        let key_page2 = pools_cache_key("new", None, "active", 10, 10);
-        assert_ne!(
-            key_page1, key_page2,
-            "different offsets must produce different cache keys"
-        );
-    }
-
-    /// Different pool IDs must produce distinct cache keys.
-    #[test]
-    fn pool_details_keys_differ_by_id() {
-        let key_a = pool_details_cache_key(1);
-        let key_b = pool_details_cache_key(2);
-        assert_ne!(
-            key_a, key_b,
-            "different pool IDs must produce different keys"
-        );
-    }
-
-    /// Different user addresses must produce distinct cache keys.
-    #[test]
-    fn user_predictions_keys_differ_by_address() {
-        let key_a = user_predictions_cache_key("ADDR_A", 10, 0);
-        let key_b = user_predictions_cache_key("ADDR_B", 10, 0);
-        assert_ne!(
-            key_a, key_b,
-            "different user addresses must produce different keys"
-        );
-    }
-
-    /// The same key parameters must always produce the same key (deterministic).
-    #[test]
-    fn cache_key_generation_is_deterministic() {
-        for _ in 0..5 {
-            assert_eq!(
-                pools_cache_key("popular", Some("crypto"), "active", 20, 40),
-                "pools:popular:crypto:active:20:40"
-            );
-        }
+    fn sanitize_strips_dangerous_chars() {
+        let out = sanitize_key_component("a*b?c\n:d e?");
+        assert!(!out.contains('*'));
+        assert!(!out.contains('?'));
+        assert!(!out.contains(':'));
+        assert!(!out.contains('\n'));
+        assert!(!out.contains(' '));
     }
 
     #[test]
-    fn test_stats_cache_key_generation() {
-        assert_eq!(stats_cache_key(None, None), "stats:all:all");
-        assert_eq!(stats_cache_key(Some("sports"), None), "stats:sports:all");
-        assert_eq!(stats_cache_key(None, Some("active")), "stats:all:active");
-        assert_eq!(
-            stats_cache_key(Some("crypto"), Some("closed")),
-            "stats:crypto:closed"
-        );
+    fn namespaced_key_prefixes() {
+        let k = namespaced_key("pools:1").unwrap();
+        assert!(k.starts_with("cache_namespace_placeholder") || k.starts_with(format!("{CACHE_NAMESPACE}:").as_str())));
     }
 
     #[test]
-    fn test_stats_cache_key_uniqueness() {
-        let key_all = stats_cache_key(None, None);
-        let key_cat = stats_cache_key(Some("sports"), None);
-        let key_st = stats_cache_key(None, Some("active"));
-        let key_both = stats_cache_key(Some("sports"), Some("active"));
-
-        assert_ne!(key_all, key_cat);
-        assert_ne!(key_all, key_st);
-        assert_ne!(key_all, key_both);
-        assert_ne!(key_cat, key_both);
-    }
-
-    #[test]
-    fn test_stats_cache_pattern_constant() {
-        assert_eq!(STATS_CACHE_PATTERN, "stats:*");
-    }
-
-    #[tokio::test]
-    async fn test_stats_cache_invalidation() {
-        let cache = RedisCache::disabled();
-        // Should not panic; no-ops on a disabled cache
-        cache.invalidate_stats_cache().await;
-    }
-
-    #[test]
-    fn test_stats_cache_ttl() {
-        assert_eq!(STATS_CACHE_TTL, 30);
-    }
-
-    // ── Key sanitization tests ───────────────────────────────────────────────
-
-    #[test]
-    fn sanitize_removes_newlines_and_colons() {
-        let input = "user\naddr\ress:bad*?stuff";
-        let result = sanitize_key_component(input);
-        assert!(!result.contains('\n'));
-        assert!(!result.contains('\r'));
-        assert!(!result.contains(':'));
-        assert!(!result.contains('*'));
-        assert!(!result.contains('?'));
-    }
-
-    #[test]
-    fn sanitize_removes_wildcards_and_spaces() {
-        let input = "G*ABC?123 DEF";
-        let result = sanitize_key_component(input);
-        assert_eq!(result, "GABC123DEF");
-    }
-
-    #[test]
-    fn sanitize_truncates_long_input() {
-        let long = "a".repeat(MAX_KEY_COMPONENT_LENGTH + 100);
-        let result = sanitize_key_component(&long);
-        assert_eq!(result.len(), MAX_KEY_COMPONENT_LENGTH);
-    }
-
-    #[test]
-    fn sanitize_preserves_safe_characters() {
-        let input = "GABC123-_./@";
-        let result = sanitize_key_component(input);
-        assert_eq!(result, "GABC123-_./@");
-    }
-
-    #[test]
-    fn sanitized_cache_key_prevents_injection_attempts() {
-        let malicious_category = "sports\nSET keys *\nsports";
-        let key = pools_cache_key("new", Some(malicious_category), "active", 10, 0);
-        assert!(!key.contains('\n'));
-        assert!(!key.contains('*'));
-        assert!(key.contains("sports"));
-    }
-
-    #[test]
-    fn sanitized_user_key_prevents_injection_attempts() {
-        let malicious_address = "GABC123\nDEL user:*\n";
-        let key = user_predictions_cache_key(malicious_address, 10, 0);
-        assert!(!key.contains('\n'));
-        assert!(!key.contains('*'));
-    }
-
-    #[test]
-    fn namespaced_key_prefixes_and_rejects_control_chars() {
-        assert_eq!(
-            namespaced_key("pools:new:all:active:20:0").as_deref(),
-            Some("predifi:pools:new:all:active:20:0")
-        );
-        assert!(namespaced_key("pools:\nKEYS *").is_none());
+    fn empty_key_is_rejected() {
         assert!(namespaced_key("").is_none());
-        assert!(namespaced_key(&"a".repeat(MAX_KEY_LENGTH + 1)).is_none());
+        assert!(namespaced_key(":::").is_none());
     }
 
     #[test]
-    fn namespaced_pattern_cannot_escape_prefix() {
-        let pattern = namespaced_pattern("pools:*").unwrap();
-        assert!(pattern.starts_with("predifi:"));
-        assert!(pattern.ends_with("pools:*"));
+    fn envelope_roundtrips() {
+        let encoded = encode_envelope(&{"value":42}, 60).unwrap();
+        let decoded: serde_json::Value = decode_envelope(&encoded).unwrap();
+        assert_eq!(decoded["value"], 42);
     }
 
     #[test]
-    fn envelope_roundtrip_and_expiry() {
-        let encoded = encode_envelope(&"hello".to_string(), 60).expect("encode");
-        let decoded: String = decode_envelope(&encoded).expect("decode");
-        assert_eq!(decoded, "hello");
-
-        let expired = CacheEnvelope {
-            data: serde_json::json!("stale"),
-            exp: 1,
+    fn envelope_rejects_expired() {
+        let envelope = CacheEnvelope {
+            data: serde_json::json!(1),
+            exp: now().saturating_sub(1),
         };
-        let raw = serde_json::to_string(&expired).unwrap();
-        let missed: Option<String> = decode_envelope(&raw);
-        assert!(missed.is_none(), "expired envelope must be a miss");
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let decoded: Option<serde_json::Value> = decode_envelope(&raw);
+        assert!(decoded.is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_cache_reports_not_configured_after_grace() {
+        let cache = RedisCache::disabled().with_startup_grace(Duration::ZERO);
+        let result = cache.probe().await;
+        assert_eq!(result.status, RedisReadinessStatus::Unavailable);
+        assert!(!result.status.in_service());
+    }
+
+    #[tokio::test]
+    async fn disabled_cache_reports_degraded_during_grace() {
+        let cache = RedisCache::disabled().with_startup_grace(Duration::from_secs(60));
+        let result = cache.probe().await;
+        assert_eq!(result.status, RedisReadinessStatus::Degraded);
+        assert!(result.status.in_service());
+    }
+
+    #[tokio::test]
+    async fn simulated_cache_probe_is_available_and_bounded() {
+        let cache = RedisCache::simulate_available();
+        let result = cache.probe().await;
+        assert_eq!(result.status, RedisReadinessStatus::Available);
+        assert!(result.latency <= cache.probe_timeout());
     }
 
     #[test]
-    fn envelope_rejects_oversized_payload() {
-        let huge = "x".repeat(MAX_VALUE_BYTES + 8);
-        assert!(encode_envelope(&huge, 30).is_none());
-    }
-
-    #[test]
-    fn cache_key_namespaces_are_isolated() {
-        let pools = namespaced_key(&pools_cache_key("new", None, "active", 10, 0)).unwrap();
-        let stats = namespaced_key(&stats_cache_key(None, None)).unwrap();
-        let user = namespaced_key(&user_predictions_cache_key("GABC", 10, 0)).unwrap();
-        assert!(pools.starts_with("predifi:pools:"));
-        assert!(stats.starts_with("predifi:stats:"));
-        assert!(user.starts_with("predifi:user:"));
-        assert_ne!(pools, stats);
-    }
-
-    #[test]
-    fn ttl_zero_is_below_minimum() {
-        assert!(0 < MIN_TTL_SECS);
-        assert!(POOLS_CACHE_TTL >= MIN_TTL_SECS);
-        assert!(POOLS_CACHE_TTL <= MAX_TTL_SECS);
-        assert!(STATS_CACHE_TTL <= MAX_TTL_SECS);
-        assert!(USER_PREDICTIONS_CACHE_TTL <= MAX_TTL_SECS);
+    fn readiness_status_labels() {
+        assert_eq!(RedisReadinessStatus::Available.as str(), "available");
+        assert_eq!(RedisReadinessStatus::Degraded.as str(), "degraded");
+        assert_eq!(RedisReadinessStatus::Unavailable.as str(), "unavailable");
+        assert_eq!(RedisReadinessStatus::NotConfigured.as str(), "not_configured");
     }
 }

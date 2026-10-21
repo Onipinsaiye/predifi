@@ -21,10 +21,34 @@
 //! 6. **Overdue-pool failsafe** — once a pool is past
 //!    `end_time + CANCELATION_DELAY`, any address (not just the creator or a
 //!    privileged role) may cancel it.
+//!
+//! # Emergency pause matrix
+//!
+//! The contract exposes a scoped emergency pause. Each operation is guarded
+//! independently so that pausing mutating entry points does not block safe
+//! exits. The matrix is:
+//!
+//! | Entry point          | Pause scope        | Paused behavior |
+//! |----------------------|--------------------|-----------------|
+//! | `create_pool`        | `PauseScope::Create` | rejected (`Paused`) |
+//! | `place_prediction`   | `PauseScope::Predict` | rejected (`Paused`) |
+//! | `resolve_pool`       | `PauseScope::Resolve` | rejected (`Paused`) |
+//! | `cancel_pool`        | `PauseScope::Cancel`  | rejected (`Paused`) |
+//! | `claim_winnings`     | never paused       | always allowed (safe exit) |
+//! | `refund` / cancel refund path | never paused | always allowed (safe exit) |
+//!
+//! `get_pause_state` exposes the current matrix to clients so they can render
+//! the correct UI before submitting a transaction.
+//!
+//! 7. **No-contest / invalid-oracle settlement** — explicit refund policy for
+//!    unresolved, invalid-oracle, and cancelled markets, including
+//!    retry-safe individual refunds and aggregate accounting conservation.
 
 #![cfg(test)]
 
-use crate::{MarketState, PoolConfig, PredifiContract, PredifiContractClient, PredifiError};
+use crate::{
+    MarketState, PauseScope, PoolConfig, PredifiContract, PredifiContractClient, PredifiError,
+};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
@@ -169,6 +193,184 @@ fn test_privileged_operator_can_cancel_pool_with_active_predictions() {
     ctx.client.cancel_pool(&ctx.operator, &pool_id, &reason);
 
     assert_eq!(ctx.client.get_pool(&pool_id).state, MarketState::Canceled);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. NO-CONTEST / INVALID-ORACLE SETTLEMENT RULES
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// No-contest settlement: the operator declares the market a no-contest via
+/// `cancel_pool`, which is the single explicit refund entrypoint. Fees and
+/// referrals must NOT apply on this path — every participant recovers their
+/// exact stake.
+#[test]
+fn test_no_contest_settlement_refunds_full_stake_without_fees() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let creator = Address::generate(&env);
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &creator,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &base_config(&env),
+    );
+
+    let stakes = [100i128, 250, 400, 50];
+    let mut bettors: alloc::vec::Vec<(Address, i128)> = alloc::vec::Vec::new();
+    for (i, &amount) in stakes.iter().enumerate() {
+        let user = Address::generate(&env);
+        ctx.token_admin.mint(&user, &amount);
+        let outcome = (i % 2) as u32;
+        ctx.client
+            .place_prediction(&user, &pool_id, &amount, &outcome, &None, &None);
+        bettors.push((user, amount));
+    }
+
+    let total_stake: i128 = stakes.iter().sum();
+    assert_eq!(ctx.token.balance(&ctx.client.address), total_stake);
+
+    // Operator declares no-contest.
+    let reason = String::from_str(&env, "no-contest: oracle inconclusive");
+    ctx.client.cancel_pool(&ctx.operator, &pool_id, &reason);
+    assert_eq!(ctx.client.get_pool(&pool_id).state, MarketState::Canceled);
+
+    // No fees/referrals: each participant recovers exactly their stake.
+    let mut refunded: i128 = 0;
+    for (user, amount) in &bettors {
+        let refund = ctx.client.claim_winnings(user, &pool_id);
+        assert_eq!(refund, *amount, "no-contest refund must equal stake exactly");
+        refunded += refund;
+    }
+
+    // Aggregate accounting conservation: refunded == escrowed pool value.
+    assert_eq!(refunded, total_stake);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+}
+
+/// Invalid-oracle settlement: when the oracle cannot produce a valid outcome,
+/// the market settles under the same explicit refund policy as no-contest.
+#[test]
+fn test_invalid_oracle_settlement_refunds_full_stake() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let creator = Address::generate(&env);
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &creator,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Crypto"),
+        &base_config(&env),
+    );
+
+    let bettor = Address::generate(&env);
+    ctx.token_admin.mint(&bettor, &750);
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &750, &1, &None, &None);
+
+    // Oracle fails to produce a valid outcome; operator settles as refund.
+    let reason = String::from_str(&env, "invalid-oracle: no valid outcome");
+    ctx.client.cancel_pool(&ctx.operator, &pool_id, &reason);
+    assert_eq!(ctx.client.get_pool(&pool_id).state, MarketState::Canceled);
+
+    let refund = ctx.client.claim_winnings(&bettor, &pool_id);
+    assert_eq!(refund, 750);
+    assert_eq!(ctx.token.balance(&bettor), 750);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+}
+
+/// Retry-safe individual refunds: repeated `claim_winnings` calls on a
+/// cancelled pool must not pay twice. The second call is rejected with
+/// `AlreadyClaimed`, and the contract balance is unchanged.
+#[test]
+fn test_repeated_refund_claims_cannot_pay_twice() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let creator = Address::generate(&env);
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &creator,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Tech"),
+        &base_config(&env),
+    );
+
+    let bettor = Address::generate(&env);
+    ctx.token_admin.mint(&bettor, &300);
+    ctx.client
+        .place_prediction(&bettor, &pool_id, &300, &0, &None, &None);
+
+    let reason = String::from_str(&env, "no-contest");
+    ctx.client.cancel_pool(&ctx.operator, &pool_id, &reason);
+
+    let first = ctx.client.claim_winnings(&bettor, &pool_id);
+    assert_eq!(first, 300);
+    assert_eq!(ctx.token.balance(&bettor), 300);
+
+    // Retry must be rejected and must not move any funds.
+    let result = ctx.client.try_claim_winnings(&bettor, &pool_id);
+    assert_eq!(result.unwrap_err().unwrap(), PredifiError::AlreadyClaimed);
+    assert_eq!(ctx.token.balance(&bettor), 300);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
+}
+
+/// Property-style assertion: total refundable value never exceeds pool escrow
+/// across all terminal paths (cancel / no-contest / invalid-oracle).
+#[test]
+fn test_total_refundable_never_exceeds_pool_escrow() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    let creator = Address::generate(&env);
+    let end_time = 10_000u64;
+    let pool_id = ctx.client.create_pool(
+        &creator,
+        &end_time,
+        &ctx.token_address,
+        &2u32,
+        &symbol_short!("Finance"),
+        &base_config(&env),
+    );
+
+    let stakes = [10i128, 20, 30, 40, 50];
+    let mut bettors: alloc::vec::Vec<(Address, i128)> = alloc::vec::Vec::new();
+    for (i, &amount) in stakes.iter().enumerate() {
+        let user = Address::generate(&env);
+        ctx.token_admin.mint(&user, &amount);
+        let outcome = (i % 2) as u32;
+        ctx.client
+            .place_prediction(&user, &pool_id, &amount, &outcome, &None, &None);
+        bettors.push((user, amount));
+    }
+
+    let escrow = ctx.token.balance(&ctx.client.address);
+    let total_stake: i128 = stakes.iter().sum();
+    assert_eq!(escrow, total_stake);
+
+    let reason = String::from_str(&env, "no-contest property test");
+    ctx.client.cancel_pool(&ctx.operator, &pool_id, &reason);
+
+    let mut refundable: i128 = 0;
+    for (user, _) in &bettors {
+        // Each participant's refundable amount is bounded by their stake.
+        let refund = ctx.client.claim_winnings(user, &pool_id);
+        refundable += refund;
+        assert!(
+            refundable <= escrow,
+            "total refundable value must never exceed pool escrow"
+        );
+    }
+    assert_eq!(refundable, escrow);
+    assert_eq!(ctx.token.balance(&ctx.client.address), 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -347,6 +549,40 @@ fn test_all_participants_can_refund_their_exact_stake_after_cancellation() {
     let reason = String::from_str(&env, "operator cancels pool with mixed stakes");
     ctx.client.cancel_pool(&ctx.operator, &pool_id, &reason);
     assert_eq!(ctx.client.get_pool(&pool_id).state, MarketState::Canceled);
+
+    // ── Pause matrix: cancel scope paused rejects cancel_pool ──────────────
+    let pause_env = Env::default();
+    let pause_ctx = setup(&pause_env);
+    let pause_creator = Address::generate(&pause_env);
+    let pause_pool = pause_ctx.client.create_pool(
+        &pause_creator,
+        &end_time,
+        &pause_ctx.token_address,
+        &2u32,
+        &symbol_short!("Sports"),
+        &base_config(&pause_env),
+    );
+    pause_ctx
+        .client
+        .set_pause(&pause_ctx.admin, &PauseScope::Cancel, &true);
+    assert!(pause_ctx.client.get_pause_state(&PauseScope::Cancel));
+    let paused_reason = String::from_str(&pause_env, "paused cancel");
+    let paused_result =
+        pause_ctx
+            .client
+            .try_cancel_pool(&pause_ctx.operator, &pause_pool, &paused_reason);
+    assert_eq!(paused_result.unwrap_err().unwrap(), PredifiError::Paused);
+    pause_ctx
+        .client
+        .set_pause(&pause_ctx.admin, &PauseScope::Cancel, &false);
+    assert!(!pause_ctx.client.get_pause_state(&PauseScope::Cancel));
+    pause_ctx
+        .client
+        .cancel_pool(&pause_ctx.operator, &pause_pool, &paused_reason);
+    assert_eq!(
+        pause_ctx.client.get_pool(&pause_pool).state,
+        MarketState::Canceled
+    );
 
     // Every bettor gets back exactly their original stake via claim_winnings
     // (the cancel-state branch pays 100% principal, no fee).

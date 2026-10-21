@@ -1,10 +1,13 @@
 use crate::config::Config;
+use crate::health::{self, DependencyProbes};
 use crate::price_cache::PriceCache;
 use crate::redis_cache::RedisCache;
 use crate::ws::EventBus;
+use axum::routing::get;
 use axum::Router;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub mod v1;
 
@@ -20,10 +23,20 @@ pub fn router(
     metrics: crate::metrics::SharedMetrics,
     event_bus: EventBus,
 ) -> Router {
-    Router::new().nest(
-        "/v1",
-        v1::router(config, cache, redis, pool, metrics, event_bus),
-    )
+    let probes = DependencyProbes::new(pool.clone(), redis.clone());
+    let readiness = health::ReadinessState::new(
+        probes,
+        health::DependencyTimeouts::default(),
+        Duration::from_secs(5),
+    );
+    Router::new()
+        .route("/healthz", get(health::liveness))
+        .route("/readyz", get(health::readiness))
+        .with_state(readiness)
+        .nest(
+            "/v1",
+            v1::router(config, cache, redis, pool, metrics, event_bus),
+        )
 }
 
 /// Build the versioned API router with a live PostgreSQL connection pool.
@@ -37,10 +50,20 @@ pub fn router_with_db(
     metrics: crate::metrics::SharedMetrics,
     event_bus: EventBus,
 ) -> Router {
-    Router::new().nest(
-        "/v1",
-        v1::router(config, cache, redis, Some(db), metrics, event_bus),
-    )
+    let probes = DependencyProbes::new(Some(db.clone()), redis.clone());
+    let readiness = health::ReadinessState::new(
+        probes,
+        health::DependencyTimeouts::default(),
+        Duration::from_secs(5),
+    );
+    Router::new()
+        .route("/healthz", get(health::liveness))
+        .route("/readyz", get(health::readiness))
+        .with_state(readiness)
+        .nest(
+            "/v1",
+            v1::router(config, cache, redis, Some(db), metrics, event_bus),
+        )
 }
 
 #[cfg(test)]
@@ -50,6 +73,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use sqlx::postgres::PgPoolOptions;
+    use std::time::Instant;
     use tower::ServiceExt;
 
     use crate::config::Config;
@@ -218,6 +242,72 @@ mod tests {
         );
     }
 
+    // ── Liveness / readiness separation ──────────────────────────────────────
+
+    /// Liveness must succeed even when dependencies are unavailable, so the
+    /// process is not restarted during a Postgres/Redis/Soroban outage.
+    #[tokio::test]
+    async fn healthz_is_live_without_dependencies() {
+        let response = build_router_without_db()
+            .oneshot(get("/healthz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Readiness must fail (503) when the database pool is missing, removing
+    /// the instance from service without triggering a restart loop.
+    #[tokio::test]
+    async fn readyz_is_not_ready_without_db() {
+        let response = build_router_without_db()
+            .oneshot(get("/readyz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Readiness must fail (503) when the database is unreachable, and the
+    /// response must complete within the dependency timeout budget.
+    #[tokio::test]
+    async fn readyz_is_not_ready_with_unreachable_db_and_bounded_latency() {
+        let started = Instant::now();
+        let response = build_router_with_lazy_db()
+            .oneshot(get("/readyz"))
+            .await
+            .expect("request failed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "readiness probe exceeded dependency timeout budget: {elapsed:?}"
+        );
+    }
+
+    /// Liveness must remain OK while the database is unreachable.
+    #[tokio::test]
+    async fn healthz_is_live_with_unreachable_db() {
+        let response = build_router_with_lazy_db()
+            .oneshot(get("/healthz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Readiness must fail (503) when Redis is disabled/unavailable.
+    #[tokio::test]
+    async fn readyz_is_not_ready_without_redis() {
+        let response = build_router_without_db()
+            .oneshot(get("/readyz"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     // ── Market predictions: no-DB guard ──────────────────────────────────────
 
     /// Without a DB the market predictions endpoint must return a structured
@@ -283,5 +373,169 @@ mod tests {
             body.contains("\"error\""),
             "should return an error envelope; got: {body}"
         );
+    }
+
+    // ── Request body and query limits (#54) ────────────────────────────
+
+    fn post_json(path: &str, body: String) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("failed to build request")
+    }
+
+    /// A valid pool-template body, padded with an ignored field to exactly
+    /// `len` bytes.
+    fn template_body_of_len(len: usize) -> String {
+        let head = r#"{"creator":"G","name":"n","category":"c","description":"d","token":"T","duration_seconds":3600,"recurrence_interval_seconds":3600,"pad":""#;
+        let tail = r#""}"#;
+        let fill = len - head.len() - tail.len();
+        format!("{head}{}{tail}", "x".repeat(fill))
+    }
+
+    fn template_json(name: &str, description: &str, interval: i64) -> String {
+        serde_json::json!({
+            "creator": "G",
+            "name": name,
+            "category": "c",
+            "description": description,
+            "token": "T",
+            "duration_seconds": 3600,
+            "recurrence_interval_seconds": interval,
+        })
+        .to_string()
+    }
+
+    /// POST to `/v1/pool-templates` on a fresh router (so rate limits never
+    /// interfere) and return the status and body text.
+    async fn post_template(body: String) -> (StatusCode, String) {
+        let response = build_router_without_db()
+            .oneshot(post_json("/v1/pool-templates", body))
+            .await
+            .expect("request failed");
+        let status = response.status();
+        (status, body_string(response.into_body()).await)
+    }
+
+    /// Without a database, a request that passes every check answers
+    /// "database not available". Anything rejected earlier never says that,
+    /// so it also never reached persistence.
+    fn reached_db_step(text: &str) -> bool {
+        text.contains("database not available")
+    }
+
+    #[tokio::test]
+    async fn template_body_just_under_and_at_limit_reach_the_handler() {
+        let max = crate::constants::MAX_BODY_BYTES_POOL_TEMPLATE;
+        for len in [max - 1, max] {
+            let body = template_body_of_len(len);
+            assert_eq!(body.len(), len);
+            let (status, text) = post_template(body).await;
+            assert_eq!(status, StatusCode::OK, "len {len}");
+            assert!(reached_db_step(&text), "len {len}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn template_body_over_limit_is_rejected_with_413() {
+        let max = crate::constants::MAX_BODY_BYTES_POOL_TEMPLATE;
+        let (status, text) = post_template(template_body_of_len(max + 1)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!reached_db_step(&text));
+    }
+
+    #[tokio::test]
+    async fn template_field_limits_are_enforced_before_the_db() {
+        use crate::constants::{
+            MAX_TEMPLATE_DESCRIPTION_LEN, MAX_TEMPLATE_SECONDS, MAX_TEMPLATE_TEXT_LEN,
+        };
+
+        let cases = [
+            (
+                "name at limit",
+                template_json(&"n".repeat(MAX_TEMPLATE_TEXT_LEN), "d", 3600),
+                true,
+            ),
+            (
+                "name over limit",
+                template_json(&"n".repeat(MAX_TEMPLATE_TEXT_LEN + 1), "d", 3600),
+                false,
+            ),
+            (
+                "description at limit",
+                template_json("n", &"d".repeat(MAX_TEMPLATE_DESCRIPTION_LEN), 3600),
+                true,
+            ),
+            (
+                "description over limit",
+                template_json("n", &"d".repeat(MAX_TEMPLATE_DESCRIPTION_LEN + 1), 3600),
+                false,
+            ),
+            (
+                "interval at max",
+                template_json("n", "d", MAX_TEMPLATE_SECONDS),
+                true,
+            ),
+            (
+                "interval over max",
+                template_json("n", "d", MAX_TEMPLATE_SECONDS + 1),
+                false,
+            ),
+            (
+                "interval i64::MAX",
+                template_json("n", "d", i64::MAX),
+                false,
+            ),
+            ("interval zero", template_json("n", "d", 0), false),
+        ];
+
+        for (label, body, expect_ok) in cases {
+            let (status, text) = post_template(body).await;
+            if expect_ok {
+                assert_eq!(status, StatusCode::OK, "{label}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            }
+            assert_eq!(reached_db_step(&text), expect_ok, "{label}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn template_list_creator_length_is_bounded() {
+        let max = crate::constants::MAX_ADDRESS_LEN;
+        for (len, expect_ok) in [(max, true), (max + 1, false)] {
+            let uri = format!("/v1/pool-templates?creator={}", "G".repeat(len));
+            let response = build_router_without_db()
+                .oneshot(get(&uri))
+                .await
+                .expect("request failed");
+            let status = response.status();
+            let text = body_string(response.into_body()).await;
+            let expected = if expect_ok {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            assert_eq!(status, expected, "len {len}");
+            assert_eq!(reached_db_step(&text), expect_ok, "len {len}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pools_offset_above_cap_is_rejected() {
+        let max = crate::constants::MAX_PAGE_OFFSET;
+        let ok = build_router_without_db()
+            .oneshot(get(&format!("/v1/pools?offset={max}")))
+            .await
+            .expect("request failed");
+        assert_ne!(ok.status(), StatusCode::BAD_REQUEST, "offset at cap");
+
+        let over = build_router_without_db()
+            .oneshot(get(&format!("/v1/pools?offset={}", max + 1)))
+            .await
+            .expect("request failed");
+        assert_eq!(over.status(), StatusCode::BAD_REQUEST, "offset over cap");
     }
 }

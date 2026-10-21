@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useId } from "react";
+import React, { useState, useId, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { CheckCircle2, Info, Plus, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -36,13 +36,15 @@ function FormSection({
   title,
   description,
   children,
+  sectionId,
 }: {
   title: string;
   description?: string;
   children: React.ReactNode;
+  sectionId?: string;
 }) {
   return (
-    <div className="space-y-4">
+    <section id={sectionId} aria-label={title} className="space-y-4">
       <div className="space-y-0.5">
         <h2 className="text-sm font-semibold text-white tracking-wide uppercase">
           {title}
@@ -54,7 +56,8 @@ function FormSection({
       <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-3 sm:p-5 space-y-4 sm:space-y-5 min-w-0">
         {children}
       </div>
-    </div>
+      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-5">{children}</div>
+    </section>
   );
 }
 
@@ -122,9 +125,7 @@ function SelectField({
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
           "disabled:cursor-not-allowed disabled:opacity-50",
           "text-white [&>option]:bg-zinc-900 [&>option]:text-white",
-          error
-            ? "border-destructive focus-visible:ring-destructive"
-            : "border-input",
+          error ? "border-destructive focus-visible:ring-destructive" : "border-input",
         )}
       >
         <option value="" disabled className="text-zinc-500">
@@ -137,11 +138,7 @@ function SelectField({
         ))}
       </select>
       {error && (
-        <p
-          id={`${id}-error`}
-          className="text-sm font-medium text-destructive"
-          role="alert"
-        >
+        <p id={`${id}-error`} className="text-sm font-medium text-destructive" role="alert">
           {error}
         </p>
       )}
@@ -191,26 +188,18 @@ function DateTimeField({
         onChange={(e) => onChange(e.target.value)}
         disabled={disabled}
         aria-invalid={error ? "true" : "false"}
-        aria-describedby={
-          error ? `${id}-error` : helperText ? `${id}-helper` : undefined
-        }
+        aria-describedby={error ? `${id}-error` : helperText ? `${id}-helper` : undefined}
         className={cn(
           "flex h-10 w-full rounded-md border bg-transparent px-3 py-2 text-sm text-white",
           "ring-offset-background",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
           "disabled:cursor-not-allowed disabled:opacity-50",
           "[color-scheme:dark]",
-          error
-            ? "border-destructive focus-visible:ring-destructive"
-            : "border-input",
+          error ? "border-destructive focus-visible:ring-destructive" : "border-input",
         )}
       />
       {error && (
-        <p
-          id={`${id}-error`}
-          className="text-sm font-medium text-destructive"
-          role="alert"
-        >
+        <p id={`${id}-error`} className="text-sm font-medium text-destructive" role="alert">
           {error}
         </p>
       )}
@@ -269,26 +258,18 @@ function TextareaField({
         placeholder={placeholder}
         disabled={disabled}
         aria-invalid={error ? "true" : "false"}
-        aria-describedby={
-          error ? `${id}-error` : helperText ? `${id}-helper` : undefined
-        }
+        aria-describedby={error ? `${id}-error` : helperText ? `${id}-helper` : undefined}
         className={cn(
           "w-full rounded-md border bg-transparent px-3 py-2 text-sm text-white",
           "placeholder:text-zinc-500 ring-offset-background resize-none",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
           "disabled:cursor-not-allowed disabled:opacity-50",
-          error
-            ? "border-destructive focus-visible:ring-destructive"
-            : "border-input",
+          error ? "border-destructive focus-visible:ring-destructive" : "border-input",
         )}
       />
       <div className="flex items-center justify-between gap-2">
         {error ? (
-          <p
-            id={`${id}-error`}
-            className="text-sm font-medium text-destructive"
-            role="alert"
-          >
+          <p id={`${id}-error`} className="text-sm font-medium text-destructive" role="alert">
             {error}
           </p>
         ) : helperText ? (
@@ -298,9 +279,7 @@ function TextareaField({
         ) : (
           <span />
         )}
-        {maxLength != null && (
-          <CharCount current={value.length} max={maxLength} />
-        )}
+        {maxLength != null && <CharCount current={value.length} max={maxLength} />}
       </div>
     </div>
   );
@@ -316,20 +295,14 @@ function SuccessState({ onCreateAnother }: { onCreateAnother: () => void }) {
         <CheckCircle2 className="h-8 w-8 text-[#37B7C3]" aria-hidden="true" />
       </div>
       <div className="space-y-2">
-        <h2 className="text-xl font-semibold text-white">
-          Pool Created Successfully
-        </h2>
+        <h2 className="text-xl font-semibold text-white">Pool Created Successfully</h2>
         <p className="max-w-sm text-sm text-zinc-400">
-          Your prediction pool has been submitted. It will appear in the market
-          once confirmed on the Stellar network.
+          Your prediction pool has been submitted. It will appear in the market once confirmed on
+          the Stellar network.
         </p>
       </div>
       <div className="flex flex-col sm:flex-row gap-3">
-        <Button
-          variant="primary"
-          size="medium"
-          onClick={() => router.push("/user/pool-market")}
-        >
+        <Button variant="primary" size="medium" onClick={() => router.push("/user/pool-market")}>
           View Pool Market
         </Button>
         <Button variant="tertiary" size="medium" onClick={onCreateAnother}>
@@ -352,13 +325,43 @@ export function CreatePoolForm() {
   const descriptionId = useId();
   const categoryId = useId();
   const closeTimeId = useId();
+  const outcomesSectionId = useId();
+  const outcomesErrorId = useId();
 
   const [values, setValues] = useState<CreatePoolFormValues>(INITIAL_VALUES);
   const [errors, setErrors] = useState<CreatePoolFormErrors>({});
-  const [status, setStatus] = useState<"idle" | "submitting" | "success">(
-    "idle",
-  );
+  const [status, setStatus] = useState<"idle" | "submitting" | "success">("idle");
   const [submitError, setSubmitError] = useState<string | null>(null);
+
+  // ── Focus management for dynamic outcome rows ──────────────────────────────
+  /**
+   * When an outcome is added we move focus to the new input. When removed we
+   * focus the previous outcome input (or the add button if none remain).
+   * `focusAction` records what happened and triggers the useEffect.
+   */
+  const outcomeRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const addButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [focusAction, setFocusAction] = useState<
+    { type: "added"; index: number } | { type: "removed"; index: number } | null
+  >(null);
+
+  useEffect(() => {
+    if (!focusAction) return;
+    if (focusAction.type === "added") {
+      const el = outcomeRefs.current[focusAction.index];
+      el?.focus();
+    } else {
+      // Focus previous outcome, or the add button if we removed the first one
+      const prevIndex = Math.max(0, focusAction.index - 1);
+      const el = outcomeRefs.current[prevIndex];
+      if (el) {
+        el.focus();
+      } else {
+        addButtonRef.current?.focus();
+      }
+    }
+    setFocusAction(null);
+  }, [focusAction, values.outcomes.length]);
 
   const isSubmitting = status === "submitting";
 
@@ -377,41 +380,53 @@ export function CreatePoolForm() {
   }
 
   function setOutcome(index: number, value: string) {
+    const outcomes = [...values.outcomes];
+    outcomes[index] = value;
     setValues((prev) => {
-      const outcomes = [...prev.outcomes];
-      outcomes[index] = value;
       return { ...prev, outcomes };
     });
     setErrors((prev) => {
       if (!prev.outcomeErrors && !prev.outcomes) return prev;
-      const outcomeErrors = prev.outcomeErrors ? [...prev.outcomeErrors] : undefined;
-      if (outcomeErrors) outcomeErrors[index] = undefined;
-      return { ...prev, outcomeErrors, outcomes: undefined };
+      const updatedErrors = validateCreatePool({ ...values, outcomes });
+      return {
+        ...prev,
+        outcomeErrors: updatedErrors.outcomeErrors,
+        outcomes: updatedErrors.outcomes,
+      };
     });
     setSubmitError(null);
   }
 
   function addOutcome() {
-    setValues((prev) =>
-      prev.outcomes.length >= MAX_OUTCOMES
-        ? prev
-        : { ...prev, outcomes: [...prev.outcomes, ""] },
-    );
+    if (values.outcomes.length >= MAX_OUTCOMES) return;
+    const outcomes = [...values.outcomes, ""];
+    setValues((prev) => ({ ...prev, outcomes }));
+    setErrors((prev) => {
+      if (!prev.outcomeErrors && !prev.outcomes) return prev;
+      const updatedErrors = validateCreatePool({ ...values, outcomes });
+      return {
+        ...prev,
+        outcomeErrors: updatedErrors.outcomeErrors,
+        outcomes: updatedErrors.outcomes,
+      };
+    });
+    setFocusAction({ type: "added", index: values.outcomes.length });
   }
 
   function removeOutcome(index: number) {
-    setValues((prev) =>
-      prev.outcomes.length <= MIN_OUTCOMES
-        ? prev
-        : { ...prev, outcomes: prev.outcomes.filter((_, i) => i !== index) },
-    );
+    if (values.outcomes.length <= MIN_OUTCOMES) return;
+    const outcomes = values.outcomes.filter((_, i) => i !== index);
+    setValues((prev) => ({ ...prev, outcomes }));
     setErrors((prev) => {
-      if (!prev.outcomeErrors) return prev;
+      if (!prev.outcomeErrors && !prev.outcomes) return prev;
+      const updatedErrors = validateCreatePool({ ...values, outcomes });
       return {
         ...prev,
-        outcomeErrors: prev.outcomeErrors.filter((_, i) => i !== index),
+        outcomeErrors: updatedErrors.outcomeErrors,
+        outcomes: updatedErrors.outcomes,
       };
     });
+    setFocusAction({ type: "removed", index });
   }
 
   function handleTokenChange(token: Token) {
@@ -432,14 +447,44 @@ export function CreatePoolForm() {
     const validationErrors = validateCreatePool(values);
     if (Object.keys(validationErrors).length > 0) {
       setErrors(validationErrors);
-      // Scroll to the first error field
-      const firstErrorField = Object.keys(validationErrors)[0];
-      const targetId =
-        firstErrorField === "outcomeErrors"
-          ? `outcome-${validationErrors.outcomeErrors?.findIndex((e) => e) ?? 0}`
-          : firstErrorField;
-      const el = document.getElementById(targetId);
-      el?.scrollIntoView({ behavior: "smooth", block: "center" });
+
+      // Determine the first field that has an error and focus it.
+      // The form fields are checked in DOM order so focus lands on the
+      // top-most error the user needs to fix.
+      // Uses getElementById (not querySelector) because React's useId()
+      // generates IDs containing colons (":r0:") which are invalid in
+      // CSS selectors.
+      const fieldIdMap: { key: keyof CreatePoolFormErrors; id: string }[] = [
+        { key: "name", id: "name" },
+        { key: "description", id: descriptionId },
+        { key: "category", id: categoryId },
+        { key: "tags", id: "tags" },
+        {
+          key: "outcomeErrors",
+          id: `outcome-${validationErrors.outcomeErrors?.findIndex((err) => err) ?? 0}`,
+        },
+        { key: "outcomes", id: outcomesErrorId },
+        { key: "minStake", id: "minStake" },
+        { key: "maxStake", id: "maxStake" },
+        { key: "closeTime", id: closeTimeId },
+        { key: "termsAccepted", id: "termsAccepted" },
+      ];
+
+      const firstError = fieldIdMap.find(({ key }) => validationErrors[key]);
+      if (firstError) {
+        const el = document.getElementById(firstError.id);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          // Focus the element so keyboard/screen-reader users land on it.
+          // Inputs/selects/textareas are focusable directly; for the
+          // section-level outcomes error we focus the add button.
+          if (firstError.key === "outcomes") {
+            addButtonRef.current?.focus();
+          } else {
+            el.focus?.();
+          }
+        }
+      }
       return;
     }
 
@@ -452,9 +497,7 @@ export function CreatePoolForm() {
       setStatus("success");
     } catch {
       setStatus("idle");
-      setSubmitError(
-        "Something went wrong submitting your pool. Please try again.",
-      );
+      setSubmitError("Something went wrong submitting your pool. Please try again.");
     }
   }
 
@@ -516,9 +559,7 @@ export function CreatePoolForm() {
           id={categoryId}
           label="Category"
           value={values.category}
-          onChange={(val) =>
-            setField("category", val as CreatePoolFormValues["category"])
-          }
+          onChange={(val) => setField("category", val as CreatePoolFormValues["category"])}
           options={POOL_CATEGORIES}
           placeholder="Select a category"
           error={errors.category}
@@ -541,22 +582,29 @@ export function CreatePoolForm() {
       <FormSection
         title="Prediction Options"
         description={`Define the outcomes participants can stake on (${MIN_OUTCOMES}–${MAX_OUTCOMES}).`}
+        sectionId={outcomesSectionId}
       >
-        <div className="space-y-3">
+        <div
+          className="space-y-3"
+          role="group"
+          aria-label="Outcomes"
+          aria-describedby={errors.outcomes ? outcomesErrorId : undefined}
+        >
           {values.outcomes.map((outcome, index) => (
             <div key={index} className="flex items-start gap-2 min-w-0">
               <div className="min-w-0 flex-1">
                 <Input
                   id={`outcome-${index}`}
                   label={`Outcome ${index + 1}`}
-                  placeholder={
-                    index === 0 ? "e.g. Yes" : index === 1 ? "e.g. No" : "e.g. Draw"
-                  }
+                  placeholder={index === 0 ? "e.g. Yes" : index === 1 ? "e.g. No" : "e.g. Draw"}
                   value={outcome}
                   onChange={(e) => setOutcome(index, e.target.value)}
                   error={errors.outcomeErrors?.[index]}
                   disabled={isSubmitting}
                   autoComplete="off"
+                  ref={(el) => {
+                    outcomeRefs.current[index] = el;
+                  }}
                 />
               </div>
               {values.outcomes.length > MIN_OUTCOMES && (
@@ -574,18 +622,20 @@ export function CreatePoolForm() {
           ))}
 
           {errors.outcomes && (
-            <p className="text-sm font-medium text-destructive" role="alert">
+            <p id={outcomesErrorId} className="text-sm font-medium text-destructive" role="alert">
               {errors.outcomes}
             </p>
           )}
 
           {values.outcomes.length < MAX_OUTCOMES && (
             <Button
+              ref={addButtonRef}
               type="button"
               variant="tertiary"
               size="small"
               onClick={addOutcome}
               disabled={isSubmitting}
+              aria-describedby={errors.outcomes ? outcomesErrorId : undefined}
               className="gap-1.5"
             >
               <Plus className="h-4 w-4" aria-hidden="true" />
@@ -647,10 +697,7 @@ export function CreatePoolForm() {
       </FormSection>
 
       {/* ── 4. Pool Schedule ── */}
-      <FormSection
-        title="Pool Schedule"
-        description="Set when the pool closes to new predictions."
-      >
+      <FormSection title="Pool Schedule" description="Set when the pool closes to new predictions.">
         <DateTimeField
           id={closeTimeId}
           label="Close Time"
@@ -664,13 +711,10 @@ export function CreatePoolForm() {
 
         {/* Informational hint */}
         <div className="flex items-start gap-2 rounded-lg bg-[#37B7C3]/5 border border-[#37B7C3]/15 p-3">
-          <Info
-            className="mt-0.5 h-4 w-4 shrink-0 text-[#7DE3EC]"
-            aria-hidden="true"
-          />
+          <Info className="mt-0.5 h-4 w-4 shrink-0 text-[#7DE3EC]" aria-hidden="true" />
           <p className="text-xs text-zinc-400 leading-relaxed">
-            After the close time, no new stakes are accepted. The pool outcome
-            is settled by a designated validator on the Stellar network.
+            After the close time, no new stakes are accepted. The pool outcome is settled by a
+            designated validator on the Stellar network.
           </p>
         </div>
       </FormSection>
@@ -681,21 +725,17 @@ export function CreatePoolForm() {
           <Checkbox
             id="termsAccepted"
             checked={values.termsAccepted}
-            onCheckedChange={(checked) =>
-              setField("termsAccepted", checked === true)
-            }
+            onCheckedChange={(checked) => setField("termsAccepted", checked === true)}
             disabled={isSubmitting}
-            aria-describedby={
-              errors.termsAccepted ? "termsAccepted-error" : undefined
-            }
+            aria-describedby={errors.termsAccepted ? "termsAccepted-error" : undefined}
             className="mt-0.5"
           />
           <label
             htmlFor="termsAccepted"
             className="text-sm text-zinc-300 leading-relaxed cursor-pointer select-none"
           >
-            I understand that this pool is governed by smart contracts on the
-            Stellar network and that outcomes are final once settled.
+            I understand that this pool is governed by smart contracts on the Stellar network and
+            that outcomes are final once settled.
           </label>
         </div>
         {errors.termsAccepted && (
@@ -711,10 +751,7 @@ export function CreatePoolForm() {
 
       {/* ── Submit error ── */}
       {submitError && (
-        <div
-          className="rounded-lg border border-red-800 bg-red-900/20 p-4"
-          role="alert"
-        >
+        <div className="rounded-lg border border-red-800 bg-red-900/20 p-4" role="alert">
           <p className="text-sm text-red-400 text-center">{submitError}</p>
         </div>
       )}
