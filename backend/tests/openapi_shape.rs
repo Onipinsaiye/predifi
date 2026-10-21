@@ -11,7 +11,7 @@ use predifi_backend::openapi::ApiDoc;
 /// schemas, response codes, and request bodies) and that every path
 /// declares at least one response so runtime responses can be compared
 /// against the published schema.
-# [test]
+#[test]
 fn openapi_document_has_required_shape() {
     let spec: Value =
         serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI spec must serialize to JSON");
@@ -41,7 +41,7 @@ fn openapi_document_has_required_shape() {
     // typed request/response models. A missing or empty section would
     // silently produce `unknown` types in the generated client.
     assert!(
-        spec["components"]["components"]
+        spec["components"]["schemas"]
             .as_object()
             .is_some_and(|components| !components.is_empty()),
         "OpenAPI components.schemas must be non-empty, got: {spec:?}"
@@ -55,12 +55,12 @@ fn openapi_document_has_required_shape() {
         let item_obj = item
             .as_object()
             .unwrap_or_else(|| panic!("path {path} must be an object, got: {item:?}"));
-        let operations: Vec< (&String, &Value) > = item_obj
+        let operations: Vec<(&String, &Value)> = item_obj
             .iter()
             .filter(|(method, _)| {
                 matches!(
                     method.as_str(),
-                    Some("get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace")
+                    "get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace"
                 )
             })
             .collect();

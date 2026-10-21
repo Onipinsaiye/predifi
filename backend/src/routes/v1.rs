@@ -8,6 +8,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration as TokioDuration};
 
+use crate::cache_coalesce::{CoalesceError, CoalescingCache};
 use crate::config::Config;
 use crate::db::PoolCreatedEvent;
 use crate::db::PredictionPlacedEvent;
@@ -172,6 +173,9 @@ pub struct AppState {
     pub cache: PriceCache,
     /// Short-TTL cache for pool-detail lookups (#1369).
     pub pool_cache: PoolCache,
+    /// Stampede-safe, cross-replica cache behind `pool_cache` for hot market
+    /// reads (#60).
+    pub market_reads: CoalescingCache,
     /// Redis cache client for hot-path response caching.
     pub redis: RedisCache,
     /// Optional DB pool — absent in unit tests that don't need a database.
@@ -414,21 +418,48 @@ pub async fn get_pool_by_id_handler(
         .into_response();
     };
 
-    match crate::db::get_pool_with_odds(db, pool_id).await {
-        Ok(Some(pool)) => {
-            state.pool_cache.set(pool_id, pool.clone());
-            ApiResponse::success(pool).into_response()
+    // Concurrent misses for the same pool (across replicas) are coalesced into
+    // one database read; the refresh owner also fills the local `pool_cache`.
+    let loader = {
+        let db = db.clone();
+        let pool_cache = state.pool_cache.clone();
+        move || async move {
+            let pool = crate::db::get_pool_with_odds(&db, pool_id).await?;
+            match &pool {
+                Some(pool) => pool_cache.set(pool_id, pool.clone()),
+                None => pool_cache.set_missing(pool_id),
+            }
+            Ok::<_, sqlx::Error>(pool.and_then(|p| serde_json::to_value(p).ok()))
         }
-        Ok(None) => {
-            state.pool_cache.set_missing(pool_id);
-            ApiResponse::<()>::error(
+    };
+    match state
+        .market_reads
+        .get_or_refresh(&format!("pool:{pool_id}"), loader)
+        .await
+    {
+        Ok(lookup) => match lookup.value {
+            Some(pool) => ApiResponse::success(pool).into_response(),
+            None => ApiResponse::<()>::error(
                 StatusCode::NOT_FOUND,
                 error_codes::NOT_FOUND,
                 "pool not found",
             )
-            .into_response()
+            .into_response(),
+        },
+        Err(CoalesceError::RefreshTimeout | CoalesceError::WaitTimeout) => {
+            let mut response = ApiResponse::<()>::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_codes::SERVICE_UNAVAILABLE,
+                "pool lookup timed out; retry shortly",
+            )
+            .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            response
         }
-        Err(e) => ApiResponse::<()>::error(
+        Err(CoalesceError::Upstream(e)) => ApiResponse::<()>::error(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_codes::INTERNAL_ERROR,
             e.to_string(),
@@ -475,7 +506,8 @@ pub async fn get_stats(
     let cache_key = crate::redis_cache::stats_cache_key(category, status);
 
     if let Some(cached) = state.redis.get::<serde_json::Value>(&cache_key).await {
-        return (StatusCode::OK, Json(cached)).into_response();
+        // Same envelope as a fresh read, so clients see one shape.
+        return ApiResponse::success(cached).into_response();
     }
 
     match crate::db::get_protocol_stats(db, category, status).await {
@@ -1091,6 +1123,10 @@ pub async fn ingest_pool_created(
         Ok(()) => {
             state.redis.invalidate_pools_cache().await;
             state.redis.invalidate_stats_cache().await;
+            state
+                .market_reads
+                .invalidate(&format!("pool:{}", event.pool_id))
+                .await;
             let response = json!({ "status": "ok", "pool_id": event.pool_id });
             ApiResponse::success(response).into_response()
         }
@@ -1146,6 +1182,10 @@ pub async fn ingest_prediction_placed(
                 "amount": event.amount,
             }));
             state.redis.invalidate_stats_cache().await;
+            state
+                .market_reads
+                .invalidate(&format!("pool:{}", event.pool_id))
+                .await;
             let response = json!({ "status": "ok", "pool_id": event.pool_id });
             ApiResponse::success(response).into_response()
         }
@@ -1311,6 +1351,7 @@ pub async fn pay_creator_incentive_handler(
     match crate::db::pay_creator_incentive(db, pool_id, state.config.treasury_fee_bps).await {
         Ok(Some(amount)) => {
             state.pool_cache.invalidate(pool_id);
+            state.market_reads.invalidate(&format!("pool:{pool_id}")).await;
             Json(json!({ "status": "paid", "pool_id": pool_id, "amount": amount }))
         }
         Ok(None) => Json(json!({ "status": "not_eligible", "pool_id": pool_id })),
@@ -1523,6 +1564,7 @@ pub async fn update_pool_tags_handler(
     match crate::tags::update_pool_tags(db, pool_id, body.creator.as_str(), &body.tags).await {
         Ok(true) => {
             state.pool_cache.invalidate(pool_id);
+            state.market_reads.invalidate(&format!("pool:{pool_id}")).await;
             state.redis.invalidate_pools_cache().await;
             ApiResponse::success(json!({ "pool_id": pool_id, "tags": body.tags })).into_response()
         }
@@ -1785,10 +1827,26 @@ pub fn router(
         config,
         cache,
         pool_cache,
+        market_reads: market_reads_cache(&redis),
         redis,
         db: pool,
         metrics,
         event_bus,
+    };
+
+    // Idempotency-Key support for market mutations (#48). Without a database
+    // the handlers answer 503 before doing any work, so nothing to guard.
+    let idempotent = |operation: &'static str, route: axum::routing::MethodRouter<AppState>| {
+        match &state.db {
+            Some(db) => crate::idempotency::Idempotency::new(
+                crate::idempotency::IdempotencyStore::postgres(db.clone()),
+                operation,
+                &state.config.secret_key,
+                state.config.jwt_key_version,
+            )
+            .guard(route),
+            None => route,
+        }
     };
 
     // Admin tier — authenticated administrative operations (no public rate limit).
@@ -1877,18 +1935,27 @@ pub fn router(
         Router::new()
             .route(
                 "/indexer/pool-created",
-                post(ingest_pool_created)
-                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_CREATED)),
+                idempotent(
+                    "pools.create",
+                    post(ingest_pool_created)
+                        .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_CREATED)),
+                ),
             )
             .route(
                 "/indexer/prediction-placed",
-                post(ingest_prediction_placed)
-                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+                idempotent(
+                    "predictions.create",
+                    post(ingest_prediction_placed)
+                        .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+                ),
             )
             .route(
                 "/indexer/claim",
-                post(ingest_claim_handler)
-                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+                idempotent(
+                    "claims.submit",
+                    post(ingest_claim_handler)
+                        .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+                ),
             )
             .route(
                 "/pools/:id/tags",
@@ -1923,6 +1990,16 @@ pub fn router(
         .merge(user)
         .merge(write)
         .merge(admin)
+}
+
+/// Coalescing cache for hot market reads: shared through Redis when it is
+/// connected, process-local otherwise.
+pub fn market_reads_cache(redis: &RedisCache) -> CoalescingCache {
+    CoalescingCache::from_redis_cache(
+        redis,
+        "market",
+        crate::cache_coalesce::CoalesceConfig::default(),
+    )
 }
 
 /// `POST /api/v1/auth/refresh` — rotate a refresh token and issue a new pair.

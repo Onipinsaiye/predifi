@@ -1,748 +1,82 @@
 {
-  "openapi": "3.1.0",
-  "info": {
-    "title": "PrediFi API",
-    "description": "REST API for the PrediFi prediction-market platform built on Stellar/Soroban.",
-    "contact": {
-      "name": "PrediFi Team",
-      "url": "https://github.com/Web3Novalabs/predifi"
-    },
-    "license": {
-      "name": "MIT"
-    },
-    "version": "1.0.0"
-  },
-  "paths": {
-    "/api/v1/fees": {
-      "get": {
-        "tags": [
-          "stats"
-        ],
-        "operationId": "api_get_fees",
-        "responses": {
-          "200": {
-            "description": "Current protocol fee configuration",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FeeInfoDoc"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/indexer/pool-created": {
-      "post": {
-        "tags": [
-          "indexer"
-        ],
-        "operationId": "api_ingest_pool_created",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PoolCreatedPayloadDoc"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Pool indexed successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IndexerOkResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/indexer/prediction-placed": {
-      "post": {
-        "tags": [
-          "indexer"
-        ],
-        "operationId": "api_ingest_prediction_placed",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PredictionPlacedPayloadDoc"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Prediction indexed successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IndexerOkResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/leaderboard": {
-      "get": {
-        "tags": [
-          "leaderboard"
-        ],
-        "operationId": "api_get_leaderboard",
-        "parameters": [
-          {
-            "name": "rank_by",
-            "in": "query",
-            "description": "volume (default) | winnings",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Max results (default 20, max 100)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "description": "Pagination offset (default 0)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "User leaderboard",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LeaderboardResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/markets/{market_id}/predictions": {
-      "get": {
-        "tags": [
-          "predictions"
-        ],
-        "operationId": "api_get_market_predictions",
-        "parameters": [
-          {
-            "name": "market_id",
-            "in": "path",
-            "description": "On-chain pool (market) identifier",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "after",
-            "in": "query",
-            "description": "Cursor from previous page's `next_cursor` field",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Page size (1–100, default 20)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Cursor-paginated predictions for the market",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MarketPredictionsResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid pagination parameters",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Market not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Database not available",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/pools": {
-      "get": {
-        "tags": [
-          "pools"
-        ],
-        "operationId": "api_get_pools",
-        "parameters": [
-          {
-            "name": "sort_by",
-            "in": "query",
-            "description": "popular | ending_soon | new (default)",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "category",
-            "in": "query",
-            "description": "Category filter e.g. Sports, Crypto",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "status",
-            "in": "query",
-            "description": "active | closed | settled (default: active)",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Max results (default 20, max 100)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "description": "Pagination offset (default 0)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Paginated pool list",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PoolListResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/pools/{pool_id}": {
-      "get": {
-        "tags": [
-          "pools"
-        ],
-        "operationId": "api_get_pool_by_id",
-        "parameters": [
-          {
-            "name": "pool_id",
-            "in": "path",
-            "description": "On-chain pool identifier",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Pool details with live odds",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PoolWithOddsDoc"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid pool identifier",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Pool not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/prices": {
-      "get": {
-        "tags": [
-          "stats"
-        ],
-        "operationId": "api_get_prices",
-        "responses": {
-          "200": {
-            "description": "Latest cached asset prices",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PricesResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Price cache unavailable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/referrals/{address}": {
-      "get": {
-        "tags": [
-          "referrals"
-        ],
-        "operationId": "api_get_referrals",
-        "parameters": [
-          {
-            "name": "address",
-            "in": "path",
-            "description": "Stellar referrer address (G...)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Referral summary",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReferralEarningsResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid Stellar address",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Database not configured",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/stats": {
-      "get": {
-        "tags": [
-          "stats"
-        ],
-        "operationId": "api_get_stats",
-        "responses": {
-          "200": {
-            "description": "Protocol-wide aggregate statistics",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolStatsDoc"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/users/{address}/history": {
-      "get": {
-        "tags": [
-          "predictions"
-        ],
-        "operationId": "api_get_user_history",
-        "parameters": [
-          {
-            "name": "address",
-            "in": "path",
-            "description": "Stellar account address (G...)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Max results (default 20, max 100)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "description": "Pagination offset (default 0)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Paginated prediction history",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PredictionHistoryResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid Stellar address",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/users/{address}/predictions": {
-      "get": {
-        "tags": [
-          "predictions"
-        ],
-        "operationId": "api_get_user_predictions",
-        "parameters": [
-          {
-            "name": "address",
-            "in": "path",
-            "description": "Stellar account address (G...)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "description": "Max results (default 20, max 100)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "description": "Pagination offset (default 0)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Enhanced predictions with pool status",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UserPredictionsResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid Stellar address",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Database error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/users/{address}/referrals": {
-      "get": {
-        "tags": [
-          "referrals"
-        ],
-        "operationId": "api_get_user_referral_earnings",
-        "parameters": [
-          {
-            "name": "address",
-            "in": "path",
-            "description": "Stellar referrer address (G...)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Per-pool referral earnings",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReferralEarningsResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid Stellar address",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Database not configured",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/health": {
-      "get": {
-        "tags": [
-          "health"
-        ],
-        "operationId": "api_health",
-        "responses": {
-          "200": {
-            "description": "All dependencies healthy",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "One or more dependencies unreachable",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  },
   "components": {
     "schemas": {
-      "DependencyStatus": {
-        "type": "object",
-        "description": "OpenAPI schema for the dependency status block inside a health response.",
+      "ApiIndexDoc": {
+        "description": "OpenAPI schema for the v1 API index document.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
         "required": [
-          "db",
-          "rpc",
-          "redis",
-          "price_cache"
+          "name",
+          "version"
         ],
+        "type": "object"
+      },
+      "AssetPriceDoc": {
+        "description": "OpenAPI schema for one cached asset price.",
+        "properties": {
+          "price_usd": {
+            "format": "double",
+            "type": "number"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol",
+          "price_usd"
+        ],
+        "type": "object"
+      },
+      "ClaimPayloadDoc": {
+        "description": "OpenAPI schema for the claim event ingestion request body.",
+        "properties": {
+          "amount_paid": {
+            "description": "Amount paid out by `claim_winnings` / `claim_refund` (0 for losers).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "pool_id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "user_address": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pool_id",
+          "user_address",
+          "amount_paid"
+        ],
+        "type": "object"
+      },
+      "DataEnvelope": {
+        "description": "Success envelope with an endpoint-specific `data` object.",
+        "properties": {
+          "data": {
+            "type": "object"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "DependencyStatus": {
+        "description": "OpenAPI schema for the dependency status block inside a health response.",
         "properties": {
           "db": {
             "type": "string"
@@ -756,44 +90,77 @@
           "rpc": {
             "type": "string"
           }
-        }
-      },
-      "ErrorResponse": {
-        "type": "object",
-        "description": "OpenAPI schema for a generic error response body.",
+        },
         "required": [
-          "error"
+          "db",
+          "rpc",
+          "redis",
+          "price_cache"
         ],
+        "type": "object"
+      },
+      "ErrorDetailDoc": {
+        "description": "Error detail inside the standard error envelope.",
         "properties": {
-          "error": {
+          "code": {
+            "description": "Machine-readable error code, e.g. `DATABASE_UNAVAILABLE`.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Unique id for correlating the failure in logs.",
             "type": "string"
           }
-        }
+        },
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "description": "Standard error envelope returned by every handler (`ApiResponse::error`).",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetailDoc"
+          },
+          "status": {
+            "description": "Always `\"error\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "error"
+        ],
+        "type": "object"
       },
       "FeeInfoDoc": {
-        "type": "object",
         "description": "OpenAPI schema for the fee configuration response.",
+        "properties": {
+          "referral_fee_bps": {
+            "description": "Referral share of the protocol fee in basis points.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "treasury_fee_bps": {
+            "description": "Protocol (treasury) fee in basis points.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "required": [
           "treasury_fee_bps",
           "referral_fee_bps"
         ],
-        "properties": {
-          "referral_fee_bps": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Referral share of the protocol fee in basis points.",
-            "minimum": 0
-          },
-          "treasury_fee_bps": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Protocol (treasury) fee in basis points.",
-            "minimum": 0
-          }
-        }
+        "type": "object"
       },
       "HealthErrors": {
-        "type": "object",
         "description": "OpenAPI schema for the per-dependency error details block inside a health response.",
         "properties": {
           "db": {
@@ -820,18 +187,11 @@
               "null"
             ]
           }
-        }
+        },
+        "type": "object"
       },
       "HealthResponse": {
-        "type": "object",
         "description": "OpenAPI schema for the full health check response body.",
-        "required": [
-          "status",
-          "service",
-          "version",
-          "dependencies",
-          "errors"
-        ],
         "properties": {
           "dependencies": {
             "$ref": "#/components/schemas/DependencyStatus"
@@ -848,81 +208,105 @@
           "version": {
             "type": "string"
           }
-        }
-      },
-      "PricesResponse": {
-        "type": "object",
-        "description": "OpenAPI schema for the latest cached asset prices response.",
-        "required": [
-          "prices",
-          "updated_at"
-        ],
-        "properties": {
-          "prices": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "number",
-              "format": "double"
-            },
-            "description": "Map of asset symbol to latest cached price."
-          },
-          "updated_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Timestamp of the most recent cache update; null when no prices are cached."
-          }
-        }
-      },
-      "IndexerOkResponse": {
-        "type": "object",
-        "description": "OpenAPI schema for a successful indexer ingestion response.",
+        },
         "required": [
           "status",
-          "pool_id"
+          "service",
+          "version",
+          "dependencies",
+          "errors"
         ],
+        "type": "object"
+      },
+      "IndexerOkEnvelope": {
+        "description": "Success envelope for indexer ingestion endpoints.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/IndexerOkResponse"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "IndexerOkResponse": {
+        "description": "OpenAPI schema for a successful indexer ingestion response.",
         "properties": {
           "pool_id": {
-            "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 0,
+            "type": "integer"
           },
           "status": {
             "type": "string"
           }
-        }
+        },
+        "required": [
+          "status",
+          "pool_id"
+        ],
+        "type": "object"
       },
       "LeaderboardEntryVolume": {
-        "type": "object",
         "description": "OpenAPI schema for a leaderboard entry ranked by betting volume.",
+        "properties": {
+          "prediction_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "rank": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_volume": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "user_address": {
+            "type": "string"
+          }
+        },
         "required": [
           "user_address",
           "total_volume",
           "prediction_count",
           "rank"
         ],
+        "type": "object"
+      },
+      "LeaderboardEntryWinnings": {
+        "description": "OpenAPI schema for a leaderboard entry ranked by winnings.",
         "properties": {
-          "prediction_count": {
-            "type": "integer",
-            "format": "int64"
-          },
           "rank": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
-          "total_volume": {
-            "type": "integer",
-            "format": "int64"
+          "total_predictions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_winnings": {
+            "format": "int64",
+            "type": "integer"
           },
           "user_address": {
             "type": "string"
+          },
+          "win_rate": {
+            "format": "double",
+            "type": "number"
+          },
+          "winning_predictions": {
+            "format": "int64",
+            "type": "integer"
           }
-        }
-      },
-      "LeaderboardEntryWinnings": {
-        "type": "object",
-        "description": "OpenAPI schema for a leaderboard entry ranked by winnings.",
+        },
         "required": [
           "user_address",
           "total_winnings",
@@ -931,64 +315,95 @@
           "win_rate",
           "rank"
         ],
+        "type": "object"
+      },
+      "LeaderboardEnvelope": {
+        "description": "Success envelope for `GET /api/v1/leaderboard`.",
         "properties": {
-          "rank": {
-            "type": "integer",
-            "format": "int64"
+          "data": {
+            "$ref": "#/components/schemas/LeaderboardResponse"
           },
-          "total_predictions": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "total_winnings": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "user_address": {
+          "status": {
+            "description": "Always `\"success\"`.",
             "type": "string"
-          },
-          "win_rate": {
-            "type": "number",
-            "format": "double"
-          },
-          "winning_predictions": {
-            "type": "integer",
-            "format": "int64"
           }
-        }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
       },
       "LeaderboardResponse": {
-        "type": "object",
         "description": "OpenAPI schema for the leaderboard response.",
+        "properties": {
+          "leaderboard": {
+            "items": {
+              "$ref": "#/components/schemas/LeaderboardEntryVolume"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "offset": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "rank_by": {
+            "type": "string"
+          }
+        },
         "required": [
           "leaderboard",
           "rank_by",
           "limit",
           "offset"
         ],
+        "type": "object"
+      },
+      "MarkNotificationsReadRequestDoc": {
+        "description": "OpenAPI schema for `POST /api/v1/notifications/{address}/read`.",
         "properties": {
-          "leaderboard": {
-            "type": "array",
+          "ids": {
+            "description": "Notification ids to mark read; omit to mark all as read.",
             "items": {
-              "$ref": "#/components/schemas/LeaderboardEntryVolume"
-            }
-          },
-          "limit": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "offset": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "rank_by": {
-            "type": "string"
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": "array"
           }
-        }
+        },
+        "type": "object"
       },
       "MarketPredictionDoc": {
-        "type": "object",
         "description": "OpenAPI schema for a single prediction in the market predictions list.",
+        "properties": {
+          "amount": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "description": "Stable row ID; also used as the pagination cursor value.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "outcome": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pool_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "user_address": {
+            "type": "string"
+          }
+        },
         "required": [
           "id",
           "pool_id",
@@ -997,105 +412,89 @@
           "amount",
           "created_at"
         ],
+        "type": "object"
+      },
+      "MarketPredictionsEnvelope": {
+        "description": "Success envelope for `GET /api/v1/markets/{market_id}/predictions`.",
         "properties": {
-          "amount": {
-            "type": "integer",
-            "format": "int64"
+          "data": {
+            "$ref": "#/components/schemas/MarketPredictionsResponse"
           },
-          "created_at": {
-            "type": "string"
-          },
-          "id": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Stable row ID; also used as the pagination cursor value."
-          },
-          "outcome": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "pool_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "user_address": {
+          "status": {
+            "description": "Always `\"success\"`.",
             "type": "string"
           }
-        }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
       },
       "MarketPredictionsResponse": {
-        "type": "object",
         "description": "OpenAPI schema for the cursor-paginated market predictions response.",
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "market_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Opaque cursor: pass as `?after=<value>` to retrieve the next page.\n`null` when the current page is the last.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "predictions": {
+            "items": {
+              "$ref": "#/components/schemas/MarketPredictionDoc"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "Total number of predictions for this market (across all pages).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
         "required": [
           "market_id",
           "predictions",
           "total",
           "limit"
         ],
-        "properties": {
-          "limit": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "market_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "next_cursor": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Opaque cursor: pass as `?after=<value>` to retrieve the next page.\n`null` when the current page is the last."
-          },
-          "predictions": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MarketPredictionDoc"
-            }
-          },
-          "total": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Total number of predictions for this market (across all pages)."
-          }
-        }
+        "type": "object"
       },
       "OutcomeOddsDoc": {
-        "type": "object",
         "description": "OpenAPI schema for outcome odds within a pool.",
+        "properties": {
+          "odds": {
+            "format": "double",
+            "type": "number"
+          },
+          "outcome": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "stake": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
         "required": [
           "outcome",
           "stake",
           "odds"
         ],
-        "properties": {
-          "odds": {
-            "type": "number",
-            "format": "double"
-          },
-          "outcome": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "stake": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
+        "type": "object"
       },
       "PoolCreatedPayloadDoc": {
-        "type": "object",
         "description": "OpenAPI schema for the `pool_created` event ingestion request body.",
-        "required": [
-          "pool_id",
-          "creator",
-          "end_time",
-          "token",
-          "category",
-          "description"
-        ],
         "properties": {
           "category": {
             "type": "string"
@@ -1107,34 +506,31 @@
             "type": "string"
           },
           "end_time": {
-            "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 0,
+            "type": "integer"
           },
           "pool_id": {
-            "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "minimum": 0,
+            "type": "integer"
           },
           "token": {
             "type": "string"
           }
-        }
-      },
-      "PoolDoc": {
-        "type": "object",
-        "description": "OpenAPI schema for a prediction market pool.",
+        },
         "required": [
           "pool_id",
-          "name",
-          "category",
-          "total_stake",
-          "end_time",
-          "created_at",
-          "state",
           "creator",
-          "token"
+          "end_time",
+          "token",
+          "category",
+          "description"
         ],
+        "type": "object"
+      },
+      "PoolDoc": {
+        "description": "OpenAPI schema for a prediction market pool.",
         "properties": {
           "category": {
             "type": "string"
@@ -1146,15 +542,15 @@
             "type": "string"
           },
           "end_time": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "name": {
             "type": "string"
           },
           "pool_id": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "result": {
             "type": [
@@ -1169,43 +565,67 @@
             "type": "string"
           },
           "total_stake": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           }
-        }
+        },
+        "required": [
+          "pool_id",
+          "name",
+          "category",
+          "total_stake",
+          "end_time",
+          "created_at",
+          "state",
+          "creator",
+          "token"
+        ],
+        "type": "object"
       },
       "PoolListResponse": {
-        "type": "object",
         "description": "OpenAPI schema for the paginated pool list response.",
-        "required": [
-          "pools",
-          "limit",
-          "offset",
-          "status",
-          "sort_by"
-        ],
         "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "limit": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "offset": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "pools": {
-            "type": "array",
             "items": {
               "$ref": "#/components/schemas/PoolDoc"
-            }
+            },
+            "type": "array"
           },
           "sort_by": {
             "type": "string"
           },
           "status": {
             "type": "string"
+          },
+          "total": {
+            "description": "Number of pools matching the filters (across all pages).",
+            "format": "int64",
+            "type": "integer"
           }
-        }
+        },
+        "required": [
+          "pools",
+          "total",
+          "limit",
+          "offset",
+          "status",
+          "sort_by"
+        ],
+        "type": "object"
       },
       "PoolWithOddsDoc": {
         "allOf": [
@@ -1213,47 +633,56 @@
             "$ref": "#/components/schemas/PoolDoc"
           },
           {
-            "type": "object",
+            "properties": {
+              "odds": {
+                "items": {
+                  "$ref": "#/components/schemas/OutcomeOddsDoc"
+                },
+                "type": "array"
+              }
+            },
             "required": [
               "odds"
             ],
-            "properties": {
-              "odds": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/OutcomeOddsDoc"
-                }
-              }
-            }
+            "type": "object"
           }
         ],
         "description": "OpenAPI schema for a pool with real-time odds attached."
       },
-      "PredictionDoc": {
-        "type": "object",
-        "description": "OpenAPI schema for a single prediction record.",
+      "PoolWithOddsEnvelope": {
+        "description": "Success envelope for `GET /api/v1/pools/{pool_id}`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PoolWithOddsDoc"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
         "required": [
-          "pool_id",
-          "pool_name",
-          "outcome",
-          "amount",
-          "created_at"
+          "status",
+          "data"
         ],
+        "type": "object"
+      },
+      "PredictionDoc": {
+        "description": "OpenAPI schema for a single prediction record.",
         "properties": {
           "amount": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "created_at": {
             "type": "string"
           },
           "outcome": {
-            "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "type": "integer"
           },
           "pool_id": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "pool_name": {
             "type": "string"
@@ -1264,153 +693,279 @@
               "null"
             ]
           }
-        }
+        },
+        "required": [
+          "pool_id",
+          "pool_name",
+          "outcome",
+          "amount",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "PredictionHistoryEnvelope": {
+        "description": "Success envelope for `GET /api/v1/users/{address}/history`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PredictionHistoryResponse"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
       },
       "PredictionHistoryResponse": {
-        "type": "object",
         "description": "OpenAPI schema for the paginated prediction history response.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "offset": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "predictions": {
+            "items": {
+              "$ref": "#/components/schemas/PredictionDoc"
+            },
+            "type": "array"
+          }
+        },
         "required": [
           "address",
           "predictions",
           "limit",
           "offset"
         ],
-        "properties": {
-          "address": {
-            "type": "string"
-          },
-          "limit": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "offset": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "predictions": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PredictionDoc"
-            }
-          }
-        }
+        "type": "object"
       },
       "PredictionPlacedPayloadDoc": {
-        "type": "object",
         "description": "OpenAPI schema for the `prediction_placed` event ingestion request body.",
+        "properties": {
+          "amount": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "outcome": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pool_id": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "user_address": {
+            "type": "string"
+          }
+        },
         "required": [
           "pool_id",
           "user_address",
           "outcome",
           "amount"
         ],
+        "type": "object"
+      },
+      "PricesEnvelope": {
+        "description": "Success envelope for `GET /api/v1/prices`.",
         "properties": {
-          "amount": {
-            "type": "integer",
-            "format": "int64"
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AssetPriceDoc"
+            },
+            "type": "array"
           },
-          "outcome": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "pool_id": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "user_address": {
+          "status": {
+            "description": "Always `\"success\"`.",
             "type": "string"
           }
-        }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
       },
       "ProtocolStatsDoc": {
-        "type": "object",
         "description": "OpenAPI schema for protocol-wide aggregate statistics.",
+        "properties": {
+          "total_bets": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_pools": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_value_locked": {
+            "description": "Total value locked across all pools (stroops).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
         "required": [
           "total_value_locked",
           "total_bets",
           "total_pools"
         ],
+        "type": "object"
+      },
+      "ProtocolStatsEnvelope": {
+        "description": "Success envelope for `GET /api/v1/stats`.",
         "properties": {
-          "total_bets": {
-            "type": "integer",
-            "format": "int64"
+          "data": {
+            "$ref": "#/components/schemas/ProtocolStatsDoc"
           },
-          "total_pools": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "total_value_locked": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Total value locked across all pools (stroops)."
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
           }
-        }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "RateLimitErrorResponse": {
+        "description": "Body of `429` responses, and of `503` responses when the distributed rate\nlimiter itself is unavailable.",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "status": {
+            "description": "Always `\"error\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "error"
+        ],
+        "type": "object"
       },
       "ReferralEarningDoc": {
-        "type": "object",
         "description": "OpenAPI schema for a single referral earning row (per pool).",
+        "properties": {
+          "pool_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pool_name": {
+            "type": "string"
+          },
+          "referral_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_earned": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
         "required": [
           "pool_id",
           "pool_name",
           "total_earned",
           "referral_count"
         ],
-        "properties": {
-          "pool_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "pool_name": {
-            "type": "string"
-          },
-          "referral_count": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "total_earned": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
+        "type": "object"
       },
       "ReferralEarningsResponse": {
-        "type": "object",
         "description": "OpenAPI schema for the referral earnings response.",
-        "required": [
-          "referrer",
-          "total_earned",
-          "pools"
-        ],
         "properties": {
           "pools": {
-            "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReferralEarningDoc"
-            }
+            },
+            "type": "array"
           },
           "referrer": {
             "type": "string"
           },
           "total_earned": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           }
-        }
+        },
+        "required": [
+          "referrer",
+          "total_earned",
+          "pools"
+        ],
+        "type": "object"
+      },
+      "RefreshTokenRequestDoc": {
+        "description": "OpenAPI schema for `POST /api/v1/auth/refresh`.",
+        "properties": {
+          "refresh_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "refresh_token"
+        ],
+        "type": "object"
+      },
+      "ServiceUnavailableResponse": {
+        "description": "`503` body: a handler error envelope, or the rate limiter's own body when\nRedis is unavailable for a fail-closed tier.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ErrorResponse"
+          },
+          {
+            "$ref": "#/components/schemas/RateLimitErrorResponse"
+          }
+        ]
+      },
+      "SetInterestsRequestDoc": {
+        "description": "OpenAPI schema for `PUT /api/v1/users/{address}/interests`.",
+        "properties": {
+          "interests": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "interests"
+        ],
+        "type": "object"
+      },
+      "UpdatePoolTagsRequestDoc": {
+        "description": "OpenAPI schema for `PATCH /api/v1/pools/{pool_id}/tags`.",
+        "properties": {
+          "creator": {
+            "description": "Must match the pool's on-chain creator.",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "creator",
+          "tags"
+        ],
+        "type": "object"
       },
       "UserPredictionDoc": {
-        "type": "object",
         "description": "OpenAPI schema for an enhanced user prediction with current pool status.",
-        "required": [
-          "prediction_id",
-          "pool_id",
-          "pool_name",
-          "pool_category",
-          "pool_state",
-          "pool_total_stake",
-          "user_outcome",
-          "user_amount"
-        ],
         "properties": {
           "is_winning_outcome": {
             "type": [
@@ -1422,8 +977,8 @@
             "type": "string"
           },
           "pool_id": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "pool_name": {
             "type": "string"
@@ -1438,26 +993,76 @@
             "type": "string"
           },
           "pool_total_stake": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "prediction_id": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "user_amount": {
-            "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "type": "integer"
           },
           "user_outcome": {
-            "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "type": "integer"
           }
-        }
+        },
+        "required": [
+          "prediction_id",
+          "pool_id",
+          "pool_name",
+          "pool_category",
+          "pool_state",
+          "pool_total_stake",
+          "user_outcome",
+          "user_amount"
+        ],
+        "type": "object"
+      },
+      "UserPredictionsEnvelope": {
+        "description": "Success envelope for `GET /api/v1/users/{address}/predictions`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/UserPredictionsResponse"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
       },
       "UserPredictionsResponse": {
-        "type": "object",
         "description": "OpenAPI schema for the enhanced user predictions response.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "offset": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "predictions": {
+            "items": {
+              "$ref": "#/components/schemas/UserPredictionDoc"
+            },
+            "type": "array"
+          },
+          "total_predictions": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
         "required": [
           "address",
           "predictions",
@@ -1465,60 +1070,2518 @@
           "offset",
           "total_predictions"
         ],
-        "properties": {
-          "address": {
-            "type": "string"
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "contact": {
+      "name": "PrediFi Team",
+      "url": "https://github.com/Web3Novalabs/predifi"
+    },
+    "description": "REST API for the PrediFi prediction-market platform built on Stellar/Soroban.",
+    "license": {
+      "name": "MIT"
+    },
+    "title": "PrediFi API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1": {
+      "get": {
+        "operationId": "api_v1_index",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiIndexDoc"
+                }
+              }
+            },
+            "description": "API name and version"
           },
-          "limit": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "offset": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "predictions": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/UserPredictionDoc"
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          }
+        },
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/v1/auth/refresh": {
+      "post": {
+        "operationId": "api_refresh_tokens",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshTokenRequestDoc"
+              }
             }
           },
-          "total_predictions": {
-            "type": "integer",
-            "minimum": 0
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "New access/refresh token pair"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid, expired, or already-rotated refresh token"
+          },
+          "413": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Body does not match the schema"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Revocation store or rate limiter unavailable (fails closed)"
           }
-        }
+        },
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/creators/{address}/stats": {
+      "get": {
+        "operationId": "api_get_creator_stats",
+        "parameters": [
+          {
+            "description": "Creator Stellar address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Creator statistics"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Creator has no pools"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/fees": {
+      "get": {
+        "operationId": "api_get_fees",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeeInfoDoc"
+                }
+              }
+            },
+            "description": "Current protocol fee configuration"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          }
+        },
+        "tags": [
+          "stats"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "api_v1_health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "All dependencies healthy"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "One or more dependencies unreachable"
+          }
+        },
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/v1/indexer/claim": {
+      "post": {
+        "operationId": "api_ingest_claim",
+        "parameters": [
+          {
+            "description": "Client-chosen key (1-255 visible ASCII chars) making retries safe; requires a bearer access token. Replays carry `Idempotent-Replayed: true`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaimPayloadDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Claim recorded; `data.rows_updated` predictions marked claimed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed body or Idempotency-Key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Idempotency-Key sent without a valid bearer access token"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "A request with this Idempotency-Key is still in progress (retry after `Retry-After`)"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Body does not match the schema, or Idempotency-Key reused with a different request"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database, idempotency store, or rate limiter unavailable"
+          }
+        },
+        "tags": [
+          "indexer"
+        ]
+      }
+    },
+    "/api/v1/indexer/pool-created": {
+      "post": {
+        "operationId": "api_ingest_pool_created",
+        "parameters": [
+          {
+            "description": "Client-chosen key (1-255 visible ASCII chars) making retries safe; requires a bearer access token. Replays carry `Idempotent-Replayed: true`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PoolCreatedPayloadDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexerOkEnvelope"
+                }
+              }
+            },
+            "description": "Pool indexed successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed body or Idempotency-Key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Idempotency-Key sent without a valid bearer access token"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "A request with this Idempotency-Key is still in progress (retry after `Retry-After`)"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Body does not match the schema, or Idempotency-Key reused with a different request"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database, idempotency store, or rate limiter unavailable"
+          }
+        },
+        "tags": [
+          "indexer"
+        ]
+      }
+    },
+    "/api/v1/indexer/prediction-placed": {
+      "post": {
+        "operationId": "api_ingest_prediction_placed",
+        "parameters": [
+          {
+            "description": "Client-chosen key (1-255 visible ASCII chars) making retries safe; requires a bearer access token. Replays carry `Idempotent-Replayed: true`.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PredictionPlacedPayloadDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexerOkEnvelope"
+                }
+              }
+            },
+            "description": "Prediction indexed successfully"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed body or Idempotency-Key"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Idempotency-Key sent without a valid bearer access token"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "A request with this Idempotency-Key is still in progress (retry after `Retry-After`)"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Body does not match the schema, or Idempotency-Key reused with a different request"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database, idempotency store, or rate limiter unavailable"
+          }
+        },
+        "tags": [
+          "indexer"
+        ]
+      }
+    },
+    "/api/v1/leaderboard": {
+      "get": {
+        "operationId": "api_get_leaderboard",
+        "parameters": [
+          {
+            "description": "volume (default) | winnings",
+            "in": "query",
+            "name": "rank_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max results (default 20, max 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pagination offset (default 0)",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaderboardEnvelope"
+                }
+              }
+            },
+            "description": "User leaderboard"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid query parameter"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "leaderboard"
+        ]
+      }
+    },
+    "/api/v1/markets/{market_id}/predictions": {
+      "get": {
+        "operationId": "api_get_market_predictions",
+        "parameters": [
+          {
+            "description": "On-chain pool (market) identifier",
+            "in": "path",
+            "name": "market_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor from previous page's `next_cursor` field",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (1–100, default 20)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarketPredictionsEnvelope"
+                }
+              }
+            },
+            "description": "Cursor-paginated predictions for the market"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed market id or query parameter"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Market not found"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "predictions"
+        ]
+      }
+    },
+    "/api/v1/notifications/{address}": {
+      "get": {
+        "operationId": "api_list_notifications",
+        "parameters": [
+          {
+            "description": "Stellar account address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only unread notifications",
+            "in": "query",
+            "name": "unread_only",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Max results (1-100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pagination offset",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Notifications, newest first"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address or query parameter"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/notifications/{address}/read": {
+      "post": {
+        "operationId": "api_mark_notifications_read",
+        "parameters": [
+          {
+            "description": "Stellar account address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarkNotificationsReadRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Number of notifications marked read"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address or body"
+          },
+          "413": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Body does not match the schema"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/pools": {
+      "get": {
+        "operationId": "api_get_pools",
+        "parameters": [
+          {
+            "description": "popular | ending_soon | new (default)",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Category filter e.g. Sports, Crypto",
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "active | closed | settled (default: active)",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Creator Stellar address filter (G...)",
+            "in": "query",
+            "name": "creator",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated tag filter (e.g. 'crypto,btc')",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter pools ending at or after timestamp (RFC3339 or Unix seconds)",
+            "in": "query",
+            "name": "end_time_min",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter pools ending at or before timestamp (RFC3339 or Unix seconds)",
+            "in": "query",
+            "name": "end_time_max",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Settled outcome filter (only valid when status is settled)",
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max results (default 20, max 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pagination offset (default 0, max 10000)",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PoolListResponse"
+                }
+              }
+            },
+            "description": "Paginated pool list"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid query parameter"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/pools/{pool_id}": {
+      "get": {
+        "operationId": "api_get_pool_by_id",
+        "parameters": [
+          {
+            "description": "On-chain pool identifier",
+            "in": "path",
+            "name": "pool_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PoolWithOddsEnvelope"
+                }
+              }
+            },
+            "description": "Pool details with live odds"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed pool id"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Pool not found"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available, or the coalesced lookup timed out (retry after `Retry-After`)"
+          }
+        },
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/pools/{pool_id}/leaderboard": {
+      "get": {
+        "operationId": "api_get_pool_leaderboard",
+        "parameters": [
+          {
+            "description": "On-chain pool identifier",
+            "in": "path",
+            "name": "pool_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "volume (default) | win_rate | streak",
+            "in": "query",
+            "name": "rank_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max results (default 20, max 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pagination offset (default 0)",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Per-pool leaderboard"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed path or query parameter"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "leaderboard"
+        ]
+      }
+    },
+    "/api/v1/pools/{pool_id}/tags": {
+      "patch": {
+        "operationId": "api_update_pool_tags",
+        "parameters": [
+          {
+            "description": "On-chain pool identifier",
+            "in": "path",
+            "name": "pool_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePoolTagsRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Tags replaced"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Malformed path or body"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Caller is not the pool creator"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Pool not found"
+          },
+          "413": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Body does not match the schema"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database or rate limiter not available"
+          }
+        },
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/prices": {
+      "get": {
+        "operationId": "api_get_prices",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PricesEnvelope"
+                }
+              }
+            },
+            "description": "Latest cached asset prices"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Price cache not ready"
+          }
+        },
+        "tags": [
+          "stats"
+        ]
+      }
+    },
+    "/api/v1/referrals/{address}": {
+      "get": {
+        "operationId": "api_get_referrals",
+        "parameters": [
+          {
+            "description": "Stellar referrer address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferralEarningsResponse"
+                }
+              }
+            },
+            "description": "Referral summary"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not configured"
+          }
+        },
+        "tags": [
+          "referrals"
+        ]
+      }
+    },
+    "/api/v1/referrals/{address}/estimate": {
+      "get": {
+        "operationId": "api_get_referral_estimate",
+        "parameters": [
+          {
+            "description": "Stellar referrer address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Estimated referral reward"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not configured"
+          }
+        },
+        "tags": [
+          "referrals"
+        ]
+      }
+    },
+    "/api/v1/stats": {
+      "get": {
+        "operationId": "api_get_stats",
+        "parameters": [
+          {
+            "description": "Category filter",
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "active | closed | settled",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolStatsEnvelope"
+                }
+              }
+            },
+            "description": "Protocol-wide aggregate statistics"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid query parameter"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "stats"
+        ]
+      }
+    },
+    "/api/v1/tags": {
+      "get": {
+        "operationId": "api_list_tags",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "All tags in use"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "pools"
+        ]
+      }
+    },
+    "/api/v1/users/{address}/history": {
+      "get": {
+        "operationId": "api_get_user_history",
+        "parameters": [
+          {
+            "description": "Stellar account address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max results (default 20, max 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pagination offset (default 0)",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PredictionHistoryEnvelope"
+                }
+              }
+            },
+            "description": "Paginated prediction history"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address or query parameter"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "predictions"
+        ]
+      }
+    },
+    "/api/v1/users/{address}/interests": {
+      "get": {
+        "operationId": "api_get_user_interests",
+        "parameters": [
+          {
+            "description": "Stellar account address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Notification interests"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "users"
+        ]
+      },
+      "put": {
+        "operationId": "api_set_user_interests",
+        "parameters": [
+          {
+            "description": "Stellar account address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetInterestsRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Interests replaced"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address or body"
+          },
+          "413": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Body does not match the schema"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/users/{address}/predictions": {
+      "get": {
+        "operationId": "api_get_user_predictions",
+        "parameters": [
+          {
+            "description": "Stellar account address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max results (default 20, max 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pagination offset (default 0)",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserPredictionsEnvelope"
+                }
+              }
+            },
+            "description": "Enhanced predictions with pool status"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address or query parameter"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "predictions"
+        ]
+      }
+    },
+    "/api/v1/users/{address}/profile": {
+      "get": {
+        "operationId": "api_get_user_profile",
+        "parameters": [
+          {
+            "description": "Stellar account address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "User profile and statistics"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "users"
+        ]
+      }
+    },
+    "/api/v1/users/{address}/referrals": {
+      "get": {
+        "operationId": "api_get_user_referral_earnings",
+        "parameters": [
+          {
+            "description": "Stellar referrer address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferralEarningsResponse"
+                }
+              }
+            },
+            "description": "Per-pool referral earnings"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not configured"
+          }
+        },
+        "tags": [
+          "referrals"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "api_health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "All dependencies healthy"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "One or more dependencies unreachable"
+          }
+        },
+        "tags": [
+          "health"
+        ]
       }
     }
   },
   "tags": [
     {
-      "name": "health",
-      "description": "Service liveness and dependency checks"
+      "description": "Service liveness and dependency checks",
+      "name": "health"
     },
     {
-      "name": "pools",
-      "description": "Prediction market pools"
+      "description": "Prediction market pools",
+      "name": "pools"
     },
     {
-      "name": "stats",
-      "description": "Protocol-wide statistics"
+      "description": "Protocol-wide statistics",
+      "name": "stats"
     },
     {
-      "name": "leaderboard",
-      "description": "User rankings"
+      "description": "User rankings",
+      "name": "leaderboard"
     },
     {
-      "name": "predictions",
-      "description": "User prediction history"
+      "description": "User prediction history",
+      "name": "predictions"
     },
     {
-      "name": "referrals",
-      "description": "Referral earnings"
+      "description": "User profiles, interests and notifications",
+      "name": "users"
     },
     {
-      "name": "indexer",
-      "description": "Internal event ingestion endpoints"
+      "description": "Referral earnings",
+      "name": "referrals"
+    },
+    {
+      "description": "Token rotation",
+      "name": "auth"
+    },
+    {
+      "description": "Internal event ingestion endpoints",
+      "name": "indexer"
     }
   ]
 }

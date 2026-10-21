@@ -57,6 +57,7 @@ fn build_cors(config: &Config) -> CorsLayer {
             http::header::ACCEPT,
             http::header::HeaderName::from_static("traceparent"),
             http::header::HeaderName::from_static("tracestate"),
+            http::header::HeaderName::from_static(crate::idempotency::IDEMPOTENCY_KEY_HEADER),
         ])
 }
 
@@ -414,6 +415,7 @@ pub fn build_router_with_rate_limit(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(Duration::from_secs(
             config.pool_negative_cache_ttl_secs,
         )),
+        market_reads: crate::routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: None,
         metrics: prometheus_metrics.clone(),
@@ -465,6 +467,7 @@ fn build_router_with_db(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(Duration::from_secs(
             config.pool_negative_cache_ttl_secs,
         )),
+        market_reads: crate::routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: Some(pool.clone()),
         metrics: prometheus_metrics.clone(),

@@ -5,10 +5,12 @@
 //! handlers live here so both binaries (and the test suite) share a single
 //! source of truth.
 
+pub mod cache_coalesce;
 pub mod config;
 pub mod constants;
 pub mod db;
 pub mod errors;
+pub mod idempotency;
 pub mod jwt;
 pub mod jwt_security;
 pub mod metrics;
@@ -16,6 +18,7 @@ pub mod migration_checks;
 pub mod notifications;
 // pub mod outbox;
 pub mod openapi;
+pub mod openapi_drift;
 pub mod pool_cache;
 pub mod price_cache;
 pub mod profile;
@@ -75,6 +78,7 @@ pub fn build_cors(config: &Config) -> CorsLayer {
             http::header::CONTENT_TYPE,
             http::header::AUTHORIZATION,
             http::header::ACCEPT,
+            http::header::HeaderName::from_static(crate::idempotency::IDEMPOTENCY_KEY_HEADER),
         ])
 }
 
@@ -246,6 +250,7 @@ pub fn build_router(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(
             std::time::Duration::from_secs(config.pool_negative_cache_ttl_secs),
         ),
+        market_reads: routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: None,
         metrics: prometheus_metrics.clone(),
@@ -292,6 +297,7 @@ pub fn build_router_with_db(
         pool_cache: crate::pool_cache::PoolCache::with_negative_ttl(
             std::time::Duration::from_secs(config.pool_negative_cache_ttl_secs),
         ),
+        market_reads: routes::v1::market_reads_cache(&redis),
         redis: redis.clone(),
         db: Some(pool.clone()),
         metrics: prometheus_metrics.clone(),

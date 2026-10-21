@@ -109,7 +109,7 @@ jobs:
 
       - name: Verify OpenAPI spec is up to date
         run: |
-          cargo run --bin predifi-openapi -- --check openapi.json
+          cargo run --bin predifi-openapi -- --check-contract openapi.json
           git diff --exit-code openapi.json
 
       - name: Cargo check

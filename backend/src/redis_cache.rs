@@ -142,7 +142,7 @@ pub fn sanitize_key_component(raw: &str) -> String {
 /// # Startup grace
 ///
 /// During the configured startup grace window, a failed Redis probe is reported
-/// as `edegraded` rather than `unavailable`. This prevents orchestrators from
+/// as `degraded` rather than `unavailable`. This prevents orchestrators from
 /// restart-looping instances that are still warming up.
 #[derive(Clone)]
 pub struct RedisCache {
@@ -186,7 +186,7 @@ impl RedisReadinessStatus {
     }
 
     /// Stable machine-readable label for health response bodies.
-    pub fn as str(self) -> &str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Available => "available",
             Self::Degraded => "degraded",
@@ -197,7 +197,7 @@ impl RedisReadinessStatus {
 }
 
 /// Detailed result of a Redis readiness probe, including bounded latency.
-#derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedisProbeResult {
     pub status: RedisReadinessStatus,
     /// Wall-clock latency of the probe, always <= [`RedisCache::probe_timeout`].
@@ -311,6 +311,13 @@ impl RedisCache {
         self.manager.is_some() || self.simulate_available
     }
 
+    /// The underlying connection, for components that need raw Redis
+    /// commands (e.g. [`crate::cache_coalesce`] refresh locks). `None` when
+    /// Redis is not connected.
+    pub fn connection_manager(&self) -> Option<ConnectionManager> {
+        self.manager.clone()
+    }
+
     /// Run a bounded readiness probe against Redis.
 ///
     /// The probe issues a `PING` and always completes within [`self.probe_timeout`],
@@ -346,7 +353,11 @@ impl RedisCache {
 
         let mut conn = manager.clone();
         let timeout = self.probe_timeout;
-        match tokio::timeout(timeout, async { conn.ping::<String>(async).await }).await {
+        match tokio::time::timeout(timeout, async {
+            redis::cmd("PING").query_async::<_, String>(&mut conn).await
+        })
+        .await
+        {
             Ok(Ok(_)) => RedisProbeResult {
                 status: RedisReadinessStatus::Available,
                 latency: started.elapsed(),
@@ -801,7 +812,7 @@ mod tests {
     #[test]
     fn namespaced_key_prefixes() {
         let k = namespaced_key("pools:1").unwrap();
-        assert!(k.starts_with("cache_namespace_placeholder") || k.starts_with(format!("{CACHE_NAMESPACE}:").as_str())));
+        assert!(k.starts_with(format!("{CACHE_NAMESPACE}:").as_str()));
     }
 
     #[test]
@@ -812,7 +823,7 @@ mod tests {
 
     #[test]
     fn envelope_roundtrips() {
-        let encoded = encode_envelope(&{"value":42}, 60).unwrap();
+        let encoded = encode_envelope(&serde_json::json!({"value": 42}), 60).unwrap();
         let decoded: serde_json::Value = decode_envelope(&encoded).unwrap();
         assert_eq!(decoded["value"], 42);
     }
@@ -854,9 +865,9 @@ mod tests {
 
     #[test]
     fn readiness_status_labels() {
-        assert_eq!(RedisReadinessStatus::Available.as str(), "available");
-        assert_eq!(RedisReadinessStatus::Degraded.as str(), "degraded");
-        assert_eq!(RedisReadinessStatus::Unavailable.as str(), "unavailable");
-        assert_eq!(RedisReadinessStatus::NotConfigured.as str(), "not_configured");
+        assert_eq!(RedisReadinessStatus::Available.as_str(), "available");
+        assert_eq!(RedisReadinessStatus::Degraded.as_str(), "degraded");
+        assert_eq!(RedisReadinessStatus::Unavailable.as_str(), "unavailable");
+        assert_eq!(RedisReadinessStatus::NotConfigured.as_str(), "not_configured");
     }
 }
