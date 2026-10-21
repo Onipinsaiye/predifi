@@ -9,6 +9,7 @@ pub mod api_versioning;
 pub mod cache_coalesce;
 pub mod config;
 pub mod constants;
+pub mod cors;
 pub mod db;
 pub mod errors;
 pub mod idempotency;
@@ -59,30 +60,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use tracing_subscriber::prelude::*;
 
-/// Build the CORS middleware layer from the validated origin list in `config`.
-pub fn build_cors(config: &Config) -> CorsLayer {
-    let origins: Vec<HeaderValue> = config
-        .cors_allowed_origins
-        .iter()
-        .filter_map(|origin| origin.parse().ok())
-        .collect();
-
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([
-            http::Method::GET,
-            http::Method::POST,
-            http::Method::PUT,
-            http::Method::DELETE,
-            http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            http::header::CONTENT_TYPE,
-            http::header::AUTHORIZATION,
-            http::header::ACCEPT,
-            http::header::HeaderName::from_static(crate::idempotency::IDEMPOTENCY_KEY_HEADER),
-        ])
-}
+pub use cors::{
+    build_cors, build_credentialed_cors, build_public_cors, is_public_read_route, DynamicCorsLayer,
+};
 
 /// Check database health with a simple query.
 async fn check_db_health(db: &Option<sqlx::PgPool>) -> (String, String) {

@@ -425,6 +425,45 @@ impl Config {
             });
         }
 
+        for origin in &self.cors_allowed_origins {
+            validate_cors_origin(origin)?;
+        }
+
+        if self.is_production() {
+            let default_origins: Vec<String> =
+                DEFAULT_CORS_ORIGINS.iter().map(|s| s.to_string()).collect();
+            if self.cors_allowed_origins == default_origins {
+                return Err(ConfigError::InvalidValue {
+                    key: "PREDIFI_CORS_ALLOWED_ORIGINS",
+                    reason: String::from(
+                        "the default development CORS origins must not be used in production; \
+                         set PREDIFI_CORS_ALLOWED_ORIGINS to an explicit list of trusted HTTPS origins",
+                    ),
+                });
+            }
+
+            for origin in &self.cors_allowed_origins {
+                if !origin.starts_with("https://") {
+                    return Err(ConfigError::InvalidValue {
+                        key: "PREDIFI_CORS_ALLOWED_ORIGINS",
+                        reason: format!(
+                            "production CORS origin '{}' must use https://",
+                            origin
+                        ),
+                    });
+                }
+                if origin.contains("localhost") || origin.contains("127.0.0.1") {
+                    return Err(ConfigError::InvalidValue {
+                        key: "PREDIFI_CORS_ALLOWED_ORIGINS",
+                        reason: format!(
+                            "production CORS origin '{}' cannot be localhost or loopback",
+                            origin
+                        ),
+                    });
+                }
+            }
+        }
+
         // ── JWT secret ───────────────────────────────────────────────────────
         if let Err(reason) = crate::jwt::verify_jwt_secret(&self.secret_key) {
             return Err(ConfigError::InvalidValue {
@@ -643,9 +682,9 @@ fn parse_ws_origins(vars: &HashMap<String, String>) -> Result<Vec<String>, Confi
 /// - `scheme` is `http` or `https`
 /// - `host` is non-empty
 /// - There is no path (other than an empty path or bare `/`), no query, and no fragment.
-fn validate_cors_origin(origin: &str) -> Result<(), ConfigError> {
+pub fn validate_cors_origin(origin: &str) -> Result<(), ConfigError> {
     // Reject wildcards and the special `null` origin outright.
-    if origin == "*" || origin.eq_ignore_ascii_case("null") {
+    if origin == "*" || origin.contains('*') || origin.eq_ignore_ascii_case("null") {
         return Err(ConfigError::InvalidValue {
             key: "PREDIFI_CORS_ALLOWED_ORIGINS",
             reason: format!(
@@ -1207,6 +1246,147 @@ mod tests {
                 }
             ),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cors_production_rejects_default_dev_origins() {
+        let vars = HashMap::from([
+            (String::from("PREDIFI_APP_ENV"), String::from("production")),
+            (
+                String::from("PREDIFI_SECRET_KEY"),
+                String::from("custom-prod-secret-key-at-least-32-chars-long"),
+            ),
+            (
+                String::from("PREDIFI_WS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
+        ]);
+        let error = Config::from_map(&vars).expect_err("production must reject default dev CORS origins");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidValue {
+                    key: "PREDIFI_CORS_ALLOWED_ORIGINS",
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("default development CORS origins must not be used in production"),
+            "expected actionable error message, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn cors_production_rejects_localhost_origin() {
+        let vars = HashMap::from([
+            (String::from("PREDIFI_APP_ENV"), String::from("production")),
+            (
+                String::from("PREDIFI_SECRET_KEY"),
+                String::from("custom-prod-secret-key-at-least-32-chars-long"),
+            ),
+            (
+                String::from("PREDIFI_WS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
+            (
+                String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
+                String::from("https://localhost:3000"),
+            ),
+        ]);
+        let error = Config::from_map(&vars).expect_err("production must reject localhost origins");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidValue {
+                    key: "PREDIFI_CORS_ALLOWED_ORIGINS",
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("cannot be localhost or loopback"),
+            "expected localhost rejection, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn cors_production_rejects_http_origin() {
+        let vars = HashMap::from([
+            (String::from("PREDIFI_APP_ENV"), String::from("production")),
+            (
+                String::from("PREDIFI_SECRET_KEY"),
+                String::from("custom-prod-secret-key-at-least-32-chars-long"),
+            ),
+            (
+                String::from("PREDIFI_WS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
+            (
+                String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
+                String::from("http://app.predifi.com"),
+            ),
+        ]);
+        let error = Config::from_map(&vars).expect_err("production must reject http origins");
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidValue {
+                    key: "PREDIFI_CORS_ALLOWED_ORIGINS",
+                    ..
+                }
+            ),
+            "unexpected error: {error}"
+        );
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("must use https://"),
+            "expected https requirement, got: {error_msg}"
+        );
+    }
+
+    #[test]
+    fn cors_production_accepts_valid_https_origins() {
+        let vars = HashMap::from([
+            (String::from("PREDIFI_APP_ENV"), String::from("production")),
+            (
+                String::from("PREDIFI_SECRET_KEY"),
+                String::from("custom-prod-secret-key-at-least-32-chars-long"),
+            ),
+            (
+                String::from("PREDIFI_WS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
+            (
+                String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com,https://predifi.com"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).expect("valid production origins must be accepted");
+        assert_eq!(
+            config.cors_allowed_origins,
+            vec!["https://app.predifi.com", "https://predifi.com"]
+        );
+    }
+
+    #[test]
+    fn cors_development_allows_explicit_localhost_origin() {
+        let vars = HashMap::from([
+            (String::from("PREDIFI_APP_ENV"), String::from("development")),
+            (
+                String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
+                String::from("http://localhost:3000,http://localhost:5173"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).expect("development explicitly allows localhost");
+        assert_eq!(
+            config.cors_allowed_origins,
+            vec!["http://localhost:3000", "http://localhost:5173"]
         );
     }
 

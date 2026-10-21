@@ -35,29 +35,7 @@ use tracing::{error, info, warn};
 // ── CORS ─────────────────────────────────────────────────────────────────────
 
 fn build_cors(config: &Config) -> CorsLayer {
-    let origins: Vec<HeaderValue> = config
-        .cors_allowed_origins
-        .iter()
-        .filter_map(|origin| origin.parse().ok())
-        .collect();
-
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([
-            http::Method::GET,
-            http::Method::POST,
-            http::Method::PUT,
-            http::Method::DELETE,
-            http::Method::OPTIONS,
-        ])
-        .allow_headers([
-            http::header::CONTENT_TYPE,
-            http::header::AUTHORIZATION,
-            http::header::ACCEPT,
-            http::header::HeaderName::from_static("traceparent"),
-            http::header::HeaderName::from_static("tracestate"),
-            http::header::HeaderName::from_static(crate::idempotency::IDEMPOTENCY_KEY_HEADER),
-        ])
+    crate::cors::build_cors(config)
 }
 
 // ── Health contracts ─────────────────────────────────────────────────────────
@@ -427,7 +405,7 @@ pub fn build_router_with_rate_limit(
             metrics_middleware,
         ))
         .layer(from_fn(trace_context_middleware))
-        .layer(build_cors(&config))
+        .layer(crate::cors::DynamicCorsLayer::new(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
 
@@ -480,7 +458,7 @@ fn build_router_with_db(
             metrics_middleware,
         ))
         .layer(from_fn(trace_context_middleware))
-        .layer(build_cors(&config))
+        .layer(crate::cors::DynamicCorsLayer::new(&config))
         .layer(LoggingLayer::with_metrics(prometheus_metrics.clone()))
 }
 
