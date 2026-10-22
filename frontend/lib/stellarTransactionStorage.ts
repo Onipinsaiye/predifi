@@ -42,8 +42,14 @@ export interface RestoredStellarTransaction<TParams = unknown>
   status: RestoredTransactionStatus;
 }
 
-function getStorageKey(address: string): string {
-  return `${STORAGE_PREFIX}${encodeURIComponent(address)}`;
+function getStorageKey(address: string, network?: string): string {
+  const encodedAddress = encodeURIComponent(address);
+
+  if (!network) {
+    return `${STORAGE_PREFIX}${encodedAddress}`;
+  }
+
+  return `${STORAGE_PREFIX}${encodeURIComponent(network)}:${encodedAddress}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -92,6 +98,7 @@ function isPersistedTransaction(
  */
 export function setPersistedStellarTransaction<TParams>(
   transaction: PersistedStellarTransaction<TParams>,
+  network?: string,
 ): boolean {
   try {
     if (typeof window === "undefined") {
@@ -99,7 +106,7 @@ export function setPersistedStellarTransaction<TParams>(
     }
 
     window.localStorage.setItem(
-      getStorageKey(transaction.address),
+      getStorageKey(transaction.address, network),
       JSON.stringify(transaction),
     );
 
@@ -118,13 +125,14 @@ export function setPersistedStellarTransaction<TParams>(
  */
 export function getPersistedStellarTransaction<TParams = unknown>(
   address: string,
+  network?: string,
   now = Date.now(),
 ): RestoredStellarTransaction<TParams> | null {
   if (!address) {
     return null;
   }
 
-  const key = getStorageKey(address);
+  const key = getStorageKey(address, network);
 
   try {
     if (typeof window === "undefined") {
@@ -197,6 +205,7 @@ export function getPersistedStellarTransaction<TParams = unknown>(
 
 export function removePersistedStellarTransaction(
   address: string,
+  network?: string,
 ): void {
   if (!address) {
     return;
@@ -204,7 +213,7 @@ export function removePersistedStellarTransaction(
 
   try {
     if (typeof window !== "undefined") {
-      window.localStorage.removeItem(getStorageKey(address));
+      window.localStorage.removeItem(getStorageKey(address, network));
     }
   } catch {
     // Cleanup should not crash the app if storage is unavailable.

@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import type { PoolsQuery } from "@/lib/api/pools";
 import { useDebounce } from "@/lib/hooks/useDebounce";
+import { useWallet } from "@/lib/hooks/useWallet";
 
 /**
  * Valid sort options exposed in the UI.
@@ -51,6 +52,11 @@ export interface PoolsQueryActions {
    * Uses the debounced search to avoid a request on every keystroke.
    */
   poolsQuery: PoolsQuery;
+  /**
+   * Identity-scoped SWR cache key (`["pools", identityKey, query]`). Pass this
+   * to `usePools` so cached data is never shared across network/account.
+   */
+  poolsQueryKey: readonly ["pools", string, PoolsQuery];
 }
 
 /** Default configuration values for the query state. */
@@ -63,6 +69,12 @@ export interface UsePoolsQueryOptions {
   searchDebounceMs?: number;
   /** Whether to sync query state to the URL as search params. Default: true. */
   syncUrl?: boolean;
+  /**
+   * Identity key (network + address) used to scope the query. When it changes,
+   * pagination and filters are reset so no prior identity's data is reused.
+   * Defaults to the connected wallet's network/address identity.
+   */
+  identityKey?: string;
 }
 
 const DEFAULT_SORT_BY: SortBy = "new";
@@ -92,11 +104,29 @@ export function usePoolsQuery(options: UsePoolsQueryOptions = {}): PoolsQuerySta
     defaultPageSize = DEFAULT_PAGE_SIZE,
     searchDebounceMs = 350,
     syncUrl = true,
+    identityKey: identityKeyOption,
   } = options;
 
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+
+  // ---------------------------------------------------------------------------
+  // Identity scoping — pools data is owned per network+address. When the
+  // identity changes we reset filters/pagination so the previous identity's
+  // query state (and therefore cached SWR data) is never reused.
+  // ---------------------------------------------------------------------------
+  const { network, address } = useWallet();
+  const identityKey = identityKeyOption ?? `${network ?? "none"}:${address ?? "none"}`;
+
+  const previousIdentityRef = useRef(identityKey);
+  useEffect(() => {
+    if (previousIdentityRef.current === identityKey) return;
+    previousIdentityRef.current = identityKey;
+    if (syncUrl) {
+      router.replace(pathname, { scroll: false });
+    }
+  }, [identityKey, syncUrl, router, pathname]);
 
   // ---------------------------------------------------------------------------
   // Read current state from URL (or fall back to defaults)
@@ -205,6 +235,13 @@ export function usePoolsQuery(options: UsePoolsQueryOptions = {}): PoolsQuerySta
     return q;
   }, [sortBy, status, category, page, pageSize]);
 
+  // Cache key scoped by identity so switching network/account never reuses the
+  // previous identity's pool data. Callers should pass this to `usePools`.
+  const poolsQueryKey = useMemo(
+    () => ["pools", identityKey, poolsQuery] as const,
+    [identityKey, poolsQuery],
+  );
+
   return {
     // State
     search,
@@ -223,5 +260,6 @@ export function usePoolsQuery(options: UsePoolsQueryOptions = {}): PoolsQuerySta
     setPageSize,
     reset,
     poolsQuery,
+    poolsQueryKey,
   };
 }

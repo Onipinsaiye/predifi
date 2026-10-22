@@ -14,12 +14,15 @@ import {
 
 export interface WalletConnectionState {
   address: string | null;
+  network: string | null;
+  identityKey: string | null;
   isConnecting: boolean;
   error: WalletError | null;
   requiredNetworkLabel: string;
   connect: () => Promise<string | null>;
   disconnect: () => void;
   clearError: () => void;
+  refreshNetwork: () => Promise<string | null>;
 }
 
 type FreighterLike = {
@@ -45,6 +48,7 @@ function getFreighterApi(): FreighterLike | null {
  */
 export function useWalletConnection(): WalletConnectionState {
   const [address, setAddress] = useState<string | null>(null);
+  const [network, setNetwork] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<WalletError | null>(null);
 
@@ -52,7 +56,31 @@ export function useWalletConnection(): WalletConnectionState {
 
   const disconnect = useCallback(() => {
     setAddress(null);
+    setNetwork(null);
     setError(null);
+  }, []);
+
+  const refreshNetwork = useCallback(async (): Promise<string | null> => {
+    const api = getFreighterApi();
+    if (!api) {
+      setNetwork(null);
+      return null;
+    }
+    try {
+      const current =
+        (await api.getNetworkDetails?.())?.network ??
+        (await api.getNetwork?.()) ??
+        null;
+      setNetwork(current);
+      return current;
+    } catch (netErr) {
+      const classified = classifyWalletError(netErr);
+      if (classified.code !== "UNKNOWN") {
+        setError(classified);
+      }
+      setNetwork(null);
+      return null;
+    }
   }, []);
 
   const connect = useCallback(async (): Promise<string | null> => {
@@ -75,11 +103,12 @@ export function useWalletConnection(): WalletConnectionState {
 
       // Network check before requesting access
       try {
-        const network =
+        const currentNetwork =
           (await api.getNetworkDetails?.())?.network ??
           (await api.getNetwork?.()) ??
           null;
-        const mismatch = checkNetworkMatch(network);
+        setNetwork(currentNetwork);
+        const mismatch = checkNetworkMatch(currentNetwork);
         if (mismatch) {
           setError(mismatch);
           return null;
@@ -133,14 +162,19 @@ export function useWalletConnection(): WalletConnectionState {
     }
   }, []);
 
+  const identityKey = address ? `${network ?? "unknown"}:${address}` : null;
+
   return {
     address,
+    network,
+    identityKey,
     isConnecting,
     error,
     requiredNetworkLabel: STELLAR_NETWORK_LABELS[REQUIRED_STELLAR_NETWORK],
     connect,
     disconnect,
     clearError,
+    refreshNetwork,
   };
 }
 

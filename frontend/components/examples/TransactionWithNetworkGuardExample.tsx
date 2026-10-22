@@ -21,15 +21,35 @@ interface TransactionParams {
 }
 
 export function TransactionWithNetworkGuardExample() {
-  const { checkNetworkBeforeSubmit } = useNetworkGuard();
+  const {
+    checkNetworkBeforeSubmit,
+    recheckNetwork,
+    isMismatch,
+    expectedNetwork,
+    expectedContractEnv,
+  } = useNetworkGuard();
   
   const [txStatus, setTxStatus] = useState<TxStatus>("idle");
   const [txHash, setTxHash] = useState<string>();
   const [txError, setTxError] = useState<string>();
   const [isRetrying, setIsRetrying] = useState(false);
+  const [isRechecking, setIsRechecking] = useState(false);
   
   // Store original transaction parameters for retry
   const [savedTxParams, setSavedTxParams] = useState<TransactionParams | null>(null);
+
+  /**
+   * Re-check the wallet after the user attempts to switch networks.
+   * Submission stays disabled until the mismatch is resolved.
+   */
+  const handleRecheckNetwork = async () => {
+    setIsRechecking(true);
+    try {
+      await recheckNetwork();
+    } finally {
+      setIsRechecking(false);
+    }
+  };
 
   /**
    * Submit a transaction with proper network validation
@@ -122,6 +142,35 @@ export function TransactionWithNetworkGuardExample() {
         </p>
       </div>
 
+      {/* Network mismatch banner with expected network and contract environment */}
+      {isMismatch && (
+        <div
+          role="alert"
+          className="rounded-lg bg-amber-500/10 border border-amber-500/30 p-4 space-y-3"
+        >
+          <div className="space-y-1">
+            <h3 className="text-sm font-semibold text-amber-300">
+              Wrong network
+            </h3>
+            <p className="text-xs text-amber-200/80">
+              Switch your wallet to <span className="font-semibold">{expectedNetwork}</span> to
+              continue. Transactions are disabled until the network matches.
+            </p>
+            <p className="text-xs text-amber-200/60">
+              Contract environment: <span className="font-mono">{expectedContractEnv}</span>
+            </p>
+          </div>
+          <Button
+            type="button"
+            onClick={handleRecheckNetwork}
+            disabled={isRechecking}
+            className="h-9 rounded-lg font-medium bg-amber-500 hover:bg-amber-500/90 text-[#001112] disabled:opacity-50"
+          >
+            {isRechecking ? "Checking..." : "I've switched — re-check network"}
+          </Button>
+        </div>
+      )}
+
       {/* Transaction Form */}
       <form onSubmit={handleSubmit} className="space-y-4">
         <div className="space-y-2">
@@ -154,10 +203,18 @@ export function TransactionWithNetworkGuardExample() {
 
         <Button
           type="submit"
-          disabled={txStatus === "submitted" || txStatus === "processing"}
+          disabled={
+            isMismatch ||
+            txStatus === "submitted" ||
+            txStatus === "processing"
+          }
           className="w-full h-10 rounded-lg font-medium bg-[#37B7C3] hover:bg-[#37B7C3]/90 text-[#001112] disabled:opacity-50"
         >
-          {txStatus === "submitted" || txStatus === "processing" ? "Processing..." : "Send Transaction"}
+          {isMismatch
+            ? `Switch to ${expectedNetwork} to send`
+            : txStatus === "submitted" || txStatus === "processing"
+              ? "Processing..."
+              : "Send Transaction"}
         </Button>
       </form>
 
@@ -177,6 +234,9 @@ export function TransactionWithNetworkGuardExample() {
           <li>Network is checked immediately before each submission</li>
           <li>Submission is blocked on network mismatch with clear error</li>
           <li>Error message includes both current and required network names</li>
+          <li>Expected network and contract environment are always shown on mismatch</li>
+          <li>Submit button stays disabled while the mismatch persists</li>
+          <li>Wallet is re-checked after a switch attempt before re-enabling submission</li>
           <li>Retry button reuses original parameters (no form re-entry)</li>
           <li>Retry performs fresh network check</li>
           <li>Progress component instance is reused (no duplicate entries)</li>

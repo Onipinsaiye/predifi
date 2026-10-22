@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { REQUIRED_CHAIN_NAME } from "@/lib/hooks/useNetworkGuard";
@@ -12,6 +12,10 @@ interface NetworkSwitchModalProps {
   onSwitch: () => Promise<void>;
   switchError: string | null;
   switchRecoveryAction?: string | null;
+  /** True while the wallet is being re-checked after a switch attempt. */
+  isRechecking?: boolean;
+  /** Contract environment (e.g. "testnet", "mainnet") the app targets. */
+  contractEnvironment?: string;
 }
 
 export function NetworkSwitchModal({
@@ -20,6 +24,8 @@ export function NetworkSwitchModal({
   onSwitch,
   switchError,
   switchRecoveryAction,
+  isRechecking = false,
+  contractEnvironment,
 }: NetworkSwitchModalProps) {
   const switchBtnRef = useRef<HTMLButtonElement>(null);
 
@@ -81,8 +87,34 @@ export function NetworkSwitchModal({
           to continue.
         </p>
 
+        {/* Expected network + contract environment */}
+        <dl className="mt-3 space-y-1 rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <dt className="text-zinc-500">Expected network</dt>
+            <dd className="font-medium text-white">{REQUIRED_CHAIN_NAME}</dd>
+          </div>
+          {contractEnvironment && (
+            <div className="flex items-center justify-between gap-2">
+              <dt className="text-zinc-500">Contract environment</dt>
+              <dd className="font-medium text-white">{contractEnvironment}</dd>
+            </div>
+          )}
+        </dl>
+
+        {/* Re-checking state */}
+        {isRechecking && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mt-3 flex items-center gap-2 text-xs text-zinc-400"
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+            Re-checking wallet network…
+          </div>
+        )}
+
         {/* Error feedback */}
-        {switchError && (
+        {switchError && !isRechecking && (
           <div role="alert" className="mt-3 space-y-1">
             <p className="text-xs text-red-400">{switchError}</p>
             {switchRecoveryAction && (
@@ -96,9 +128,11 @@ export function NetworkSwitchModal({
           ref={switchBtnRef}
           onClick={onSwitch}
           size="medium"
+          disabled={isRechecking}
+          aria-busy={isRechecking}
           className="mt-5 w-full"
         >
-          Switch Network
+          {isRechecking ? "Re-checking…" : "Switch Network"}
         </Button>
       </div>
     </div>

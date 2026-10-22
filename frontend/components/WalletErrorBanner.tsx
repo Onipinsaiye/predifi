@@ -19,6 +19,14 @@ interface WalletErrorBannerProps {
   error: WalletError;
   onRetry?: () => void;
   onDismiss?: () => void;
+  /** Expected network name, e.g. "Testnet". Shown for NETWORK_MISMATCH. */
+  expectedNetwork?: string;
+  /** Contract environment label, e.g. "Testnet contract". Shown for NETWORK_MISMATCH. */
+  contractEnvironment?: string;
+  /** Re-checks the wallet network after the user switches. */
+  onRecheckNetwork?: () => void;
+  /** True while a network re-check is in flight. */
+  isRechecking?: boolean;
   className?: string;
 }
 
@@ -32,6 +40,10 @@ export function WalletErrorBanner({
   error,
   onRetry,
   onDismiss,
+  expectedNetwork,
+  contractEnvironment,
+  onRecheckNetwork,
+  isRechecking = false,
   className,
 }: WalletErrorBannerProps) {
   // A deliberate cancellation is not an error — render neutral copy only.
@@ -62,6 +74,10 @@ export function WalletErrorBanner({
   }
 
   const Icon = ICONS[error.code];
+  const isNetworkMismatch = error.code === "NETWORK_MISMATCH";
+  // While the wallet is on the wrong network, retrying would submit against an
+  // unintended contract deployment, so only the re-check action is offered.
+  const showRetry = Boolean(onRetry) && !isNetworkMismatch;
 
   return (
     <div
@@ -79,8 +95,39 @@ export function WalletErrorBanner({
           <p className="text-sm font-semibold text-white">{error.title}</p>
           <p className="mt-1 text-sm text-zinc-400">{error.message}</p>
           <p className="mt-2 text-sm text-zinc-300">{error.recoveryAction}</p>
+          {isNetworkMismatch && (expectedNetwork || contractEnvironment) && (
+            <dl
+              className="mt-3 space-y-1 rounded-lg border border-zinc-800 bg-zinc-950/60 p-3 text-sm"
+              data-testid="network-mismatch-details"
+            >
+              {expectedNetwork && (
+                <div className="flex justify-between gap-3">
+                  <dt className="text-zinc-500">Expected network</dt>
+                  <dd className="font-medium text-zinc-200">{expectedNetwork}</dd>
+                </div>
+              )}
+              {contractEnvironment && (
+                <div className="flex justify-between gap-3">
+                  <dt className="text-zinc-500">Contract environment</dt>
+                  <dd className="font-medium text-zinc-200">{contractEnvironment}</dd>
+                </div>
+              )}
+            </dl>
+          )}
           <div className="mt-3 flex flex-wrap gap-2">
-            {onRetry && (
+            {isNetworkMismatch && onRecheckNetwork && (
+              <Button
+                type="button"
+                size="small"
+                onClick={onRecheckNetwork}
+                disabled={isRechecking}
+                aria-busy={isRechecking}
+                data-testid="recheck-network-button"
+              >
+                {isRechecking ? "Re-checking…" : "Re-check network"}
+              </Button>
+            )}
+            {showRetry && (
               <Button type="button" size="small" onClick={onRetry}>
                 Try again
               </Button>

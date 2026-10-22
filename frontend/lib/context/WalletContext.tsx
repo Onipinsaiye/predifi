@@ -34,6 +34,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   type ReactNode,
 } from "react";
 import { useSWRConfig } from "swr";
@@ -41,14 +42,31 @@ import {
   useWalletConnection,
   type WalletConnectionState,
 } from "@/lib/hooks/useWalletConnection";
+import { removePersistedStellarTransaction } from "@/lib/stellar/pendingTransactions";
 
 // ── Context ───────────────────────────────────────────────────────────────────
+
+/**
+ * Wallet state exposed to consumers.
+ *
+ * `identityKey` is a stable string derived from the active network + address
+ * (or `null` when disconnected). Account-scoped hooks should include it in
+ * their SWR keys so cached data is never reused across identities.
+ *
+ * `generation` is bumped on every identity change. Async work started under a
+ * previous generation can compare against the current value and discard its
+ * result, preventing stale responses from a prior account/network leaking in.
+ */
+export interface WalletContextValue extends WalletConnectionState {
+  identityKey: string | null;
+  generation: number;
+}
 
 /**
  * Exported so useCurrentUserAddress can consume it directly without going
  * through the barrel (avoids a circular import).
  */
-export const WalletContext = createContext<WalletConnectionState | undefined>(
+export const WalletContext = createContext<WalletContextValue | undefined>(
   undefined,
 );
 WalletContext.displayName = "WalletContext";
@@ -59,36 +77,59 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const wallet = useWalletConnection();
   const { mutate } = useSWRConfig();
 
-  // Track the previous address so we can detect a disconnect transition.
+  // Identity = network + address. `null` when no wallet is connected.
+  const identityKey = wallet.identityKey;
+
+  // Bumped on every identity change so in-flight async work can detect that
+  // it belongs to a previous identity and discard its result.
+  const [generation, setGeneration] = useState(0);
+
+  // Track the previous identity/address so we can detect transitions.
+  const prevIdentityRef = useRef<string | null>(identityKey);
   const prevAddressRef = useRef<string | null>(wallet.address);
 
-  // When the user disconnects (address transitions from some value to null),
-  // invalidate all address-scoped SWR cache entries (notifications, profile,
-  // referral earnings). This prevents stale data from a previous session
-  // appearing when a different wallet connects.
+  // Clear all account-scoped state whenever the identity changes: disconnect,
+  // account switch, or network switch. This prevents balances, history,
+  // cached requests, and pending UI from a previous identity remaining visible.
   useEffect(() => {
-    const prev = prevAddressRef.current;
-    const curr = wallet.address;
+    const prevIdentity = prevIdentityRef.current;
+    const prevAddress = prevAddressRef.current;
+    const currIdentity = identityKey;
+    const currAddress = wallet.address;
 
-    if (prev !== null && curr === null) {
-      // Invalidate every cached key — the simplest correct strategy.
-      // SWR will refetch any key that is currently mounted.
+    if (prevIdentity !== currIdentity) {
+      // 1. Bump the generation so stale in-flight responses are ignored.
+      setGeneration((g) => g + 1);
+
+      // 2. Drop every cached SWR entry. Keys are identity-scoped, so nothing
+      //    from the previous account/network can be reused.
       void mutate(() => true, undefined, { revalidate: false });
+
+      // 3. Clear pending transaction UI for the previous address.
+      if (prevAddress !== null) {
+        removePersistedStellarTransaction(prevAddress);
+      }
     }
 
-    prevAddressRef.current = curr;
-  }, [wallet.address, mutate]);
+    prevIdentityRef.current = currIdentity;
+    prevAddressRef.current = currAddress;
+  }, [identityKey, wallet.address, mutate]);
 
   // Wrap disconnect to also clear the cache immediately on user action,
   // without waiting for the useEffect to run on the next render cycle.
   const disconnect = useCallback(() => {
+    const prevAddress = wallet.address;
     wallet.disconnect();
+    setGeneration((g) => g + 1);
     void mutate(() => true, undefined, { revalidate: false });
+    if (prevAddress !== null) {
+      removePersistedStellarTransaction(prevAddress);
+    }
   }, [wallet, mutate]);
 
   // Keep the context value object reference stable when wallet state is
   // unchanged — prevents all consumers from re-rendering on unrelated updates.
-  const value = useMemo<WalletConnectionState>(
+  const value = useMemo<WalletContextValue>(
     () => ({
       address: wallet.address,
       isConnecting: wallet.isConnecting,
@@ -97,6 +138,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       connect: wallet.connect,
       disconnect,
       clearError: wallet.clearError,
+      identityKey,
+      generation,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -107,6 +150,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       wallet.connect,
       disconnect,
       wallet.clearError,
+      identityKey,
+      generation,
     ],
   );
 
@@ -123,7 +168,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
  * Throws a descriptive error when called outside <WalletProvider> so
  * misconfiguration surfaces immediately in development.
  */
-export function useWallet(): WalletConnectionState {
+export function useWallet(): WalletContextValue {
   const ctx = useContext(WalletContext);
   if (ctx === undefined) {
     throw new Error(
@@ -132,6 +177,21 @@ export function useWallet(): WalletConnectionState {
     );
   }
   return ctx;
+}
+
+/**
+ * useWalletIdentity — returns the identity key and generation counter.
+ *
+ * Account-scoped hooks should include `identityKey` in their SWR keys and
+ * compare `generation` before applying async results so responses from a
+ * previous account or network are never reused.
+ */
+export function useWalletIdentity(): {
+  identityKey: string | null;
+  generation: number;
+} {
+  const { identityKey, generation } = useWallet();
+  return { identityKey, generation };
 }
 
 /**
