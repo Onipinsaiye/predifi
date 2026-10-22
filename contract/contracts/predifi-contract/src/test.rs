@@ -1032,6 +1032,23 @@ fn test_referral_fee_distribution() {
             ],
         },
     );
+    let quote = client.quote_prediction(&pool_id, &100, &0u32);
+    assert_eq!(quote.expected_shares, 1_000_000_000_000_000_000);
+    assert_eq!(quote.protocol_fee, 2);
+    assert_eq!(quote.expected_payout, 98);
+    let minimum_quote = client.quote_prediction(&pool_id, &1, &0u32);
+    assert_eq!(minimum_quote.expected_shares, 1_000_000_000_000_000_000);
+    assert_eq!(minimum_quote.protocol_fee, 0);
+    assert_eq!(minimum_quote.expected_payout, 1);
+    let maximum_quote = client.quote_prediction(&pool_id, &MAX_AGGREGATE_STAKE_PER_POOL, &0u32);
+    assert_eq!(maximum_quote.protocol_fee, 20_000_000_000_000_000);
+    assert_eq!(maximum_quote.expected_payout, 980_000_000_000_000_000);
+    assert!(client.try_quote_prediction(&pool_id, &0, &0u32).is_err());
+    assert!(client.try_quote_prediction(&pool_id, &100, &2u32).is_err());
+    assert!(client
+        .try_quote_prediction(&pool_id, &(MAX_AGGREGATE_STAKE_PER_POOL + 1), &0u32)
+        .is_err());
+    assert_eq!(client.get_pool(&pool_id).total_stake, 0, "quotes are read-only");
     // Referred user places with referrer (100 on outcome 0)
     client.place_prediction(
         &referred_user,
@@ -1049,6 +1066,7 @@ fn test_referral_fee_distribution() {
     let winnings = client.claim_winnings(&referred_user, &pool_id);
     // Protocol fee = 2% of 100 = 2. Payout pool = 98. Winner gets 98.
     assert_eq!(winnings, 98);
+    assert_eq!(winnings, quote.expected_payout);
     // Referrer gets 50% of (100/100 * 2) = 1
     assert_eq!(token.balance(&referrer), 1);
     assert_eq!(token.balance(&referred_user), 1000 - 100 + 98);
@@ -13415,7 +13433,14 @@ fn setup_price_pool(env: &Env, max_price_age: u64) -> (PredifiContractClient<'_>
     let feed_pair = Symbol::new(env, "ETHUSD");
     client.set_price_condition(&operator, &pool_id, &feed_pair, &1_000i128, &1u32, &100u32);
     // Price stamped at t=999, valid (expires_at) far beyond any time used below.
-    client.update_price_feed(&oracle, &feed_pair, &1_005i128, &1i128, &999u64, &100_000u64);
+    client.update_price_feed(
+        &oracle,
+        &feed_pair,
+        &1_005i128,
+        &1i128,
+        &999u64,
+        &100_000u64,
+    );
     (client, pool_id)
 }
 

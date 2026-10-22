@@ -54,15 +54,108 @@ use soroban_sdk::{contractimpl, token, Address, Env, String, Symbol, Vec};
 
 use crate::{
     calculate_claim_payout, calculate_referral_amount, DataKey, HighValuePredictionEvent,
-    MarketState, OutcomeStakesUpdatedEvent, PayoutInput, Pool, Prediction,
+    MarketQuote, MarketState, OutcomeStakesUpdatedEvent, PayoutInput, Pool, Prediction,
     PredictionBlockedDelistedEvent, PredictionPlacedEvent, PredifiContract, PredifiContractArgs,
     PredifiContractClient, PredifiError, ReferralPaidEvent, RefundClaimedEvent, RewardClaimedEvent,
-    SuspiciousDoubleClaimEvent, UserPredictionDetail, WinningsClaimedEvent,
+    RoundingMode, SafeMath, SuspiciousDoubleClaimEvent, UserPredictionDetail, WinningsClaimedEvent,
     HIGH_VALUE_THRESHOLD, MAX_AGGREGATE_STAKE_PER_POOL, MAX_PREDICTIONS_PER_POOL,
 };
 
 #[contractimpl]
 impl PredifiContract {
+    /// Quote the expected fixed-point shares, protocol fee, and hypothetical
+    /// winning payout for a stake against the pool's current state.
+    ///
+    /// The quote assumes no later stakes or fee changes before resolution and
+    /// assumes this outcome wins. It treats `amount` as a new position because
+    /// the caller is not part of the input. Fees are floored in token base units
+    /// with the same `ProtocolFavor` rule used by settlement. Shares are
+    /// represented at 1e18 precision. This method is read-only and applies the
+    /// same stake, outcome, aggregate, and pool-cap bounds as `place_prediction`.
+    pub fn quote_prediction(
+        env: Env,
+        pool_id: u64,
+        amount: i128,
+        outcome: u32,
+    ) -> Result<MarketQuote, PredifiError> {
+        if amount <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+        if amount < Self::get_config(&env).min_stake {
+            return Err(PredifiError::InsufficientStake);
+        }
+        let pool_key = DataKey::Pool(pool_id);
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(PredifiError::PoolNotFound)?;
+        if pool.state != MarketState::Active {
+            return Err(PredifiError::InvalidPoolState);
+        }
+        if env.ledger().timestamp() >= pool.end_time {
+            return Err(PredifiError::InvalidPoolState);
+        }
+        if !Self::is_token_whitelisted(&env, &pool.token) {
+            return Err(PredifiError::TokenNotWhitelisted);
+        }
+        if outcome >= pool.options_count {
+            return Err(PredifiError::InvalidOutcome);
+        }
+        if amount < pool.min_stake {
+            return Err(PredifiError::StakeBelowMinimum);
+        }
+        if pool.max_stake > 0 && amount > pool.max_stake {
+            return Err(PredifiError::StakeAboveMaximum);
+        }
+        let projected_total = pool
+            .total_stake
+            .checked_add(amount)
+            .ok_or(PredifiError::MaxAggregateStakeExceeded)?;
+        if projected_total > MAX_AGGREGATE_STAKE_PER_POOL {
+            return Err(PredifiError::MaxAggregateStakeExceeded);
+        }
+        if pool.max_total_stake > 0 && projected_total > pool.max_total_stake {
+            return Err(PredifiError::MaxTotalStakeExceeded);
+        }
+
+        // Read directly without extending TTL or migrating legacy storage: a
+        // quote must not change persistent state or consume mutation budget.
+        let current_outcome_stake = if let Some(stakes) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<i128>>(&DataKey::OutStakes(pool_id))
+        {
+            stakes.get(outcome).unwrap_or(0)
+        } else {
+            env.storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::OutStake(pool_id, outcome))
+                .unwrap_or(0)
+        };
+        let projected_outcome_stake = current_outcome_stake
+            .checked_add(amount)
+            .ok_or(PredifiError::MaxAggregateStakeExceeded)?;
+        let protocol_fee = SafeMath::percentage(
+            projected_total,
+            pool.fee_bps as i128,
+            RoundingMode::ProtocolFavor,
+        )?;
+        let payout_pool = projected_total
+            .checked_sub(protocol_fee)
+            .ok_or(PredifiError::ArithmeticError)?;
+        let expected_shares =
+            SafeMath::calculate_share(amount, projected_outcome_stake, 1_000_000_000_000_000_000)?;
+        let expected_payout =
+            SafeMath::calculate_share(amount, projected_outcome_stake, payout_pool)?;
+
+        Ok(MarketQuote {
+            expected_shares,
+            protocol_fee,
+            expected_payout,
+        })
+    }
+
     /// Place a prediction on an active pool by staking tokens on a specific outcome.
     ///
     /// This function allows users to participate in prediction markets by transferring tokens
@@ -271,11 +364,9 @@ impl PredifiContract {
 
         // Validate referrer if provided: cannot be self or contract
         if let Some(ref r) = referrer {
-            assert!(r != &user, "referrer cannot be self");
-            assert!(
-                r != &env.current_contract_address(),
-                "referrer cannot be contract"
-            );
+            if r == &user || r == &env.current_contract_address() {
+                return Err(PredifiError::Unauthorized);
+            }
         }
 
         if let Some(ref invite_key) = invite_key {
@@ -450,7 +541,10 @@ impl PredifiContract {
                 Self::extend_persistent(&env, &referrer_key);
                 let vol_key = DataKey::ReferredVolume(referrer_addr.clone(), pool_id);
                 let vol: i128 = env.storage().persistent().get(&vol_key).unwrap_or(0);
-                env.storage().persistent().set(&vol_key, &(vol + amount));
+                let updated_volume = vol.checked_add(amount).unwrap_or_else(|| {
+                    soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded)
+                });
+                env.storage().persistent().set(&vol_key, &updated_volume);
                 Self::extend_persistent(&env, &vol_key);
             }
         } else {
@@ -474,7 +568,10 @@ impl PredifiContract {
             if let Some(referrer_addr) = active_referrer {
                 let vol_key = DataKey::ReferredVolume(referrer_addr.clone(), pool_id);
                 let vol: i128 = env.storage().persistent().get(&vol_key).unwrap_or(0);
-                env.storage().persistent().set(&vol_key, &(vol + amount));
+                let updated_volume = vol.checked_add(amount).unwrap_or_else(|| {
+                    soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded)
+                });
+                env.storage().persistent().set(&vol_key, &updated_volume);
                 Self::extend_persistent(&env, &vol_key);
             }
 
@@ -774,7 +871,12 @@ impl PredifiContract {
     /// - Payout is calculated proportionally based on the caller's stake relative to total winning stakes:
     ///   `user_payout = (user_stake / winning_stake) * (total_pool_stake - protocol_fee)`
     /// - Protocol fee is deducted based on the pool's configured basis points (`fee_bps`).
-    /// - If a referrer is associated with the user, a portion of the fee is transferred to the referrer.
+    /// - Winner transfers are floored to base token units; their aggregate cannot exceed
+    ///   `total_stake - protocol_fee` because each claim is a proportional share of that pool.
+    /// - Referral transfers are separately floored shares of the protocol fee. The referrer
+    ///   receives no reward when absent, self-referral is rejected when configured, and the
+    ///   single-hop model has no referral graph to cycle through.
+    /// - Any fee and rounding remainder stays in the contract for treasury accounting.
     ///
     /// # Claim Window Enforcement
     /// - If `claim_window_seconds` is configured, claims are strictly rejected with `InvalidTimestamp`

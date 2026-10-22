@@ -160,7 +160,8 @@ databases that already ran it — hence this issue being documentation-only.
 **Convention going forward:** always use the next unused integer prefix, and
 double-check this table (or `ls backend/migrations/`) before naming a new
 migration file so prefixes are never reused again. The next migration should
-be named `014_<description>.sql`.
+be named `016_<description>.sql` (`015_market_prediction_cursor_index.sql` is
+reserved for the market prediction keyset index).
 
 ## Upgrade compatibility matrix
 

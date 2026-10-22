@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 
 /// Clock-skew leeway applied to `exp` (seconds).
 pub const JWT_EXP_LEEWAY_SECS: u64 = 30;
+pub const JWT_ISSUER: &str = "predifi-api";
+pub const JWT_AUDIENCE: &str = "predifi-client";
+pub(crate) const TEST_WALLET: &str = "GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H";
 
 /// Errors returned when a token string fails the structural JWT check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +134,14 @@ impl std::error::Error for JwtVerifyError {}
 /// Claims extracted from a verified PrediFi JWT.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PredifiClaims {
+    /// Required token issuer.
+    pub iss: String,
+    /// Required token audience.
+    pub aud: String,
+    /// Required chain identifier.
+    pub chain: String,
+    /// Required Stellar network (`testnet`, `futurenet`, or `public`).
+    pub network: String,
     /// Subject — the authenticated user's wallet address.
     pub sub: String,
     /// Expiration time as a Unix timestamp (seconds since epoch).
@@ -245,13 +256,40 @@ pub fn verify_jwt_token(token: &str, secret: &str) -> Result<PredifiClaims, JwtV
     )
     .map_err(map_decode_error)?;
 
-    if token_data.claims.sub.is_empty() {
+    let mut claims = token_data.claims;
+    if claims.iss != JWT_ISSUER
+        || claims.aud != JWT_AUDIENCE
+        || claims.chain != "stellar"
+        || claims.network != configured_stellar_network()
+        || !matches!(claims.network.as_str(), "testnet" | "futurenet" | "public")
+    {
         return Err(JwtVerifyError::Decode(
-            "JWT subject claim must not be empty".to_string(),
+            "JWT issuer, audience, or chain context is invalid".to_string(),
         ));
     }
 
-    Ok(token_data.claims)
+    let wallet = crate::validated_types::normalize_wallet_address(&claims.sub).map_err(|_| {
+        JwtVerifyError::Decode("JWT subject must be a valid Stellar account address".to_string())
+    })?;
+    if !wallet.starts_with('G') {
+        return Err(JwtVerifyError::Decode(
+            "JWT subject must be a valid Stellar account address".to_string(),
+        ));
+    }
+    claims.sub = wallet;
+
+    Ok(claims)
+}
+
+/// Resolve the configured network name from explicit configuration or the
+/// Stellar RPC URL. Unknown RPC hosts are treated as public network endpoints.
+fn configured_stellar_network() -> String {
+    if let Ok(network) = std::env::var("PREDIFI_STELLAR_NETWORK") {
+        return network;
+    }
+    let rpc = std::env::var("PREDIFI_STELLAR_RPC_URL")
+        .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
+    crate::config::stellar_network_for_rpc_url(&rpc).to_string()
 }
 
 /// Verify a JWT and validate it matches the expected token type and key version.
@@ -334,6 +372,12 @@ pub fn sign_jwt_with_token_version(
 ) -> Result<String, String> {
     use jsonwebtoken::{encode, EncodingKey, Header};
 
+    let sub =
+        crate::validated_types::normalize_wallet_address(sub).map_err(|error| error.to_string())?;
+    if !sub.starts_with('G') {
+        return Err("JWT subject must be a Stellar account address".to_string());
+    }
+
     let expiry = if token_type == "refresh" {
         now_unix + JWT_REFRESH_TOKEN_EXPIRY_SECS
     } else {
@@ -341,7 +385,11 @@ pub fn sign_jwt_with_token_version(
     };
 
     let claims = PredifiClaims {
-        sub: sub.to_string(),
+        iss: JWT_ISSUER.to_string(),
+        aud: JWT_AUDIENCE.to_string(),
+        chain: "stellar".to_string(),
+        network: configured_stellar_network(),
+        sub,
         exp: expiry,
         iat: now_unix,
         jti: uuid::Uuid::new_v4().to_string(),
@@ -371,6 +419,10 @@ pub fn sign_jwt_for_test(sub: &str, secret: &str) -> String {
     encode(
         &Header::new(Algorithm::HS256),
         &PredifiClaims {
+            iss: JWT_ISSUER.to_string(),
+            aud: JWT_AUDIENCE.to_string(),
+            chain: "stellar".to_string(),
+            network: configured_stellar_network(),
             sub: sub.to_string(),
             exp: now + JWT_ACCESS_TOKEN_EXPIRY_SECS,
             iat: now,
@@ -397,6 +449,10 @@ mod tests {
 
     fn claims(sub: &str, exp: u64, token_type: &str, key_version: u64) -> PredifiClaims {
         PredifiClaims {
+            iss: JWT_ISSUER.to_string(),
+            aud: JWT_AUDIENCE.to_string(),
+            chain: "stellar".to_string(),
+            network: configured_stellar_network(),
             sub: sub.to_string(),
             exp,
             iat: 1_700_000_000,
@@ -515,9 +571,15 @@ mod tests {
 
     #[test]
     fn verify_jwt_token_accepts_valid_signed_token() {
-        let token = sign_jwt_for_test("GABC123", TEST_SECRET);
+        let token = sign_jwt_for_test(
+            TEST_WALLET,
+            TEST_SECRET,
+        );
         let claims = verify_jwt_token(&token, TEST_SECRET).expect("valid token");
-        assert_eq!(claims.sub, "GABC123");
+        assert_eq!(
+            claims.sub,
+            TEST_WALLET
+        );
         assert_eq!(claims.token_type, "access");
         assert!(!claims.jti.is_empty());
         assert!(claims.exp > claims.iat);
@@ -525,7 +587,10 @@ mod tests {
 
     #[test]
     fn verify_jwt_token_rejects_wrong_secret() {
-        let token = sign_jwt_for_test("GABC123", TEST_SECRET);
+        let token = sign_jwt_for_test(
+            TEST_WALLET,
+            TEST_SECRET,
+        );
         let error = verify_jwt_token(&token, "another-secret-that-is-long-enough-123456")
             .expect_err("wrong secret");
         assert_eq!(error, JwtVerifyError::InvalidSignature);
@@ -539,7 +604,12 @@ mod tests {
 
     #[test]
     fn verify_jwt_token_rejects_expired_token() {
-        let expired_claims = claims("GABC123", 1, "access", 0);
+        let expired_claims = claims(
+            TEST_WALLET,
+            1,
+            "access",
+            0,
+        );
         let token = encode(
             &Header::new(Algorithm::HS256),
             &expired_claims,
@@ -553,7 +623,7 @@ mod tests {
     #[test]
     fn verify_jwt_token_rejects_alg_none() {
         // Header alg:none, dummy non-empty signature so format checks pass.
-        // Payload: {"sub":"GABC123","exp":9999999999,"token_type":"access","key_version":0}
+        // Payload: {"sub":"GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H","exp":9999999999,"token_type":"access","key_version":0}
         let token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJHQUJDMTIzIiwiZXhwIjo5OTk5OTk5OTk5LCJ0b2tlbl90eXBlIjoiYWNjZXNzIiwia2V5X3ZlcnNpb24iOjB9.e30";
         let error = verify_jwt_token(token, TEST_SECRET).expect_err("alg none");
         assert_eq!(error, JwtVerifyError::InvalidSignature);
@@ -561,8 +631,14 @@ mod tests {
 
     #[test]
     fn verify_jwt_token_strict_rejects_refresh_used_as_access() {
-        let token = sign_jwt_with_type("GABC123", TEST_SECRET, 1_800_000_000, "refresh", 0)
-            .expect("signed refresh");
+        let token = sign_jwt_with_type(
+            TEST_WALLET,
+            TEST_SECRET,
+            1_800_000_000,
+            "refresh",
+            0,
+        )
+        .expect("signed refresh");
         let error = verify_jwt_token_strict(&token, TEST_SECRET, "access", 0)
             .expect_err("refresh must not authenticate as access");
         assert_eq!(error, JwtVerifyError::WrongTokenType);
@@ -570,37 +646,107 @@ mod tests {
 
     #[test]
     fn verify_jwt_token_strict_rejects_old_key_version() {
-        let token = sign_jwt_with_type("GABC123", TEST_SECRET, 1_800_000_000, "access", 0)
-            .expect("signed access");
-        let error = verify_jwt_token_strict(&token, TEST_SECRET, "access", 1)
-            .expect_err("old key version");
+        let token = sign_jwt_with_type(
+            TEST_WALLET,
+            TEST_SECRET,
+            1_800_000_000,
+            "access",
+            0,
+        )
+        .expect("signed access");
+        let error =
+            verify_jwt_token_strict(&token, TEST_SECRET, "access", 1).expect_err("old key version");
         assert_eq!(error, JwtVerifyError::KeyVersionMismatch);
     }
 
     #[test]
     fn verify_jwt_token_strict_accepts_matching_type_and_version() {
-        let token = sign_jwt_with_type("GABC123", TEST_SECRET, 1_800_000_000, "refresh", 2)
-            .expect("signed refresh");
+        let token = sign_jwt_with_type(
+            TEST_WALLET,
+            TEST_SECRET,
+            1_800_000_000,
+            "refresh",
+            2,
+        )
+        .expect("signed refresh");
         let claims = verify_jwt_token_strict(&token, TEST_SECRET, "refresh", 2).expect("ok");
         assert_eq!(claims.token_type, "refresh");
         assert_eq!(claims.key_version, 2);
     }
 
     #[test]
+    fn wallet_bound_claims_are_required_and_must_match_context() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        let now = 1_800_000_000u64;
+        let base = serde_json::json!({
+            "iss": JWT_ISSUER,
+            "aud": JWT_AUDIENCE,
+            "chain": "stellar",
+            "network": configured_stellar_network(),
+            "sub": TEST_WALLET,
+            "exp": now + 60,
+            "token_type": "access",
+            "key_version": 0,
+        });
+        for claim in ["iss", "aud", "exp", "chain", "network", "sub"] {
+            let mut missing = base.clone();
+            missing.as_object_mut().unwrap().remove(claim);
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &missing,
+                &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+            )
+            .unwrap();
+            assert!(
+                verify_jwt_token(&token, TEST_SECRET).is_err(),
+                "missing {claim}"
+            );
+        }
+        for (claim, value) in [
+            ("iss", serde_json::json!("other-issuer")),
+            ("aud", serde_json::json!("other-audience")),
+            ("chain", serde_json::json!("other-chain")),
+            ("network", serde_json::json!("other-network")),
+            ("sub", serde_json::json!("GABC123")),
+        ] {
+            let mut mismatched = base.clone();
+            mismatched[claim] = value;
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &mismatched,
+                &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+            )
+            .unwrap();
+            assert!(
+                verify_jwt_token(&token, TEST_SECRET).is_err(),
+                "mismatched {claim}"
+            );
+        }
+    }
+
+    #[test]
     fn refresh_tokens_live_longer_than_access_tokens() {
         let now = 1_800_000_000u64;
-        let access = sign_jwt_with_type("GABC123", TEST_SECRET, now, "access", 0).unwrap();
-        let refresh = sign_jwt_with_type("GABC123", TEST_SECRET, now, "refresh", 0).unwrap();
+        let access = sign_jwt_with_type(
+            TEST_WALLET,
+            TEST_SECRET,
+            now,
+            "access",
+            0,
+        )
+        .unwrap();
+        let refresh = sign_jwt_with_type(
+            TEST_WALLET,
+            TEST_SECRET,
+            now,
+            "refresh",
+            0,
+        )
+        .unwrap();
         let access_claims = verify_jwt_token(&access, TEST_SECRET).unwrap();
         let refresh_claims = verify_jwt_token(&refresh, TEST_SECRET).unwrap();
-        assert_eq!(
-            access_claims.exp,
-            now + JWT_ACCESS_TOKEN_EXPIRY_SECS
-        );
-        assert_eq!(
-            refresh_claims.exp,
-            now + JWT_REFRESH_TOKEN_EXPIRY_SECS
-        );
+        assert_eq!(access_claims.exp, now + JWT_ACCESS_TOKEN_EXPIRY_SECS);
+        assert_eq!(refresh_claims.exp, now + JWT_REFRESH_TOKEN_EXPIRY_SECS);
         assert_ne!(access_claims.jti, refresh_claims.jti);
     }
 

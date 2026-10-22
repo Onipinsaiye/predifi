@@ -230,4 +230,45 @@ mod tests {
         pool.close().await;
         drop(container);
     }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn market_prediction_cursor_is_stable_across_duplicate_times_and_inserts() {
+        let (pool, container) = setup().await;
+        sqlx::query("INSERT INTO pools (pool_id, name, end_time) VALUES (901, 'cursor', NOW() + INTERVAL '1 day')")
+            .execute(&pool).await.expect("insert pool");
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z").unwrap();
+        for address in ["G1", "G2", "G3"] {
+            sqlx::query("INSERT INTO predictions (pool_id, user_address, outcome, amount, created_at) VALUES (901, $1, 0, 1, $2)")
+                .bind(address).bind(timestamp).execute(&pool).await.expect("insert prediction");
+        }
+
+        let first = crate::db::get_market_predictions(&pool, 901, None, 2)
+            .await
+            .expect("first page");
+        assert_eq!(first.len(), 3, "fetches one lookahead row");
+        let cursor_row = &first[1];
+        let cursor = (cursor_row.created_at, cursor_row.id);
+
+        // An insertion newer than the cursor cannot move a later page boundary.
+        sqlx::query("INSERT INTO predictions (pool_id, user_address, outcome, amount, created_at) VALUES (901, 'G4', 0, 1, $1)")
+            .bind(timestamp).execute(&pool).await.expect("insert concurrent prediction");
+        let second = crate::db::get_market_predictions(&pool, 901, Some(cursor), 2)
+            .await
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, first[2].id);
+        let exhausted = crate::db::get_market_predictions(
+            &pool,
+            901,
+            Some((second[0].created_at, second[0].id)),
+            2,
+        )
+        .await
+        .expect("exhausted page");
+        assert!(exhausted.is_empty());
+
+        pool.close().await;
+        drop(container);
+    }
 }

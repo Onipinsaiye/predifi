@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn issue_token_pair_returns_distinct_typed_tokens() {
-        let pair = issue_token_pair("GABC123", TEST_SECRET, 1_800_000_000, 0).unwrap();
+        let pair = issue_token_pair(crate::jwt::TEST_WALLET, TEST_SECRET, 1_800_000_000, 0).unwrap();
         let access = verify_jwt_token(&pair.access_token, TEST_SECRET).unwrap();
         let refresh = verify_jwt_token(&pair.refresh_token, TEST_SECRET).unwrap();
         assert_eq!(access.token_type, "access");
@@ -247,7 +247,7 @@ mod tests {
     async fn rotate_refresh_token_fails_closed_without_redis() {
         let cache = RedisCache::disabled();
         let refresh =
-            sign_jwt_with_type("GABC123", TEST_SECRET, 1_800_000_000, "refresh", 0).unwrap();
+            sign_jwt_with_type(crate::jwt::TEST_WALLET, TEST_SECRET, 1_800_000_000, "refresh", 0).unwrap();
         let error = rotate_refresh_token(&cache, TEST_SECRET, &refresh, 0, 1_800_000_100)
             .await
             .expect_err("redis required");
@@ -258,7 +258,7 @@ mod tests {
     async fn rotate_refresh_token_rejects_access_token() {
         let cache = RedisCache::disabled();
         let access =
-            sign_jwt_with_type("GABC123", TEST_SECRET, 1_800_000_000, "access", 0).unwrap();
+            sign_jwt_with_type(crate::jwt::TEST_WALLET, TEST_SECRET, 1_800_000_000, "access", 0).unwrap();
         let error = rotate_refresh_token(&cache, TEST_SECRET, &access, 0, 1_800_000_100)
             .await
             .expect_err("access token");

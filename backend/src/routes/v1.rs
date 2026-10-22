@@ -294,7 +294,8 @@ pub async fn admin_replay_notification(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let authenticated = matches!((&admin_key, provided), (Some(expected), Some(got)) if expected == &got);
+    let authenticated =
+        matches!((&admin_key, provided), (Some(expected), Some(got)) if expected == &got);
     if !authenticated {
         return (
             StatusCode::UNAUTHORIZED,
@@ -408,7 +409,9 @@ fn parse_market_timestamp(s: &str) -> Result<chrono::DateTime<chrono::Utc>, Stri
     if let Ok(ts_sec) = s.parse::<i64>() {
         // Enforce reasonable epoch bounds: 2000-01-01 to 2100-01-01
         if ts_sec < 946684800 || ts_sec > 4102444800 {
-            return Err(format!("timestamp {ts_sec} is outside supported range (2000 to 2100)"));
+            return Err(format!(
+                "timestamp {ts_sec} is outside supported range (2000 to 2100)"
+            ));
         }
         chrono::DateTime::from_timestamp(ts_sec, 0)
             .ok_or_else(|| format!("invalid unix timestamp: {s}"))
@@ -1302,9 +1305,9 @@ pub async fn ingest_prediction_placed(
 /// Query parameters for `GET /api/v1/markets/:id/predictions`.
 #[derive(Debug, Deserialize)]
 pub struct MarketPredictionsQuery {
-    /// Opaque cursor: the `id` of the last item on the previous page.
+    /// Opaque cursor returned by the previous page.
     /// Omit (or set to null) to start from the most recent prediction.
-    pub after: Option<i64>,
+    pub after: Option<String>,
     /// Page size (1–100, default 20).
     pub limit: Option<i64>,
 }
@@ -1330,7 +1333,22 @@ pub async fn get_market_predictions(
 
     // Clamp limit: 1..=100, default 20.
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
-    let after = params.after;
+    let after = match params
+        .after
+        .as_deref()
+        .map(decode_market_cursor)
+        .transpose()
+    {
+        Ok(cursor) => cursor,
+        Err(()) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "invalid market predictions cursor",
+            )
+            .into_response()
+        }
+    };
 
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
@@ -1362,19 +1380,17 @@ pub async fn get_market_predictions(
         Ok(Some(_)) => {}
     }
 
-    match tokio::try_join!(
-        crate::db::get_market_predictions(db, market_id, after, limit),
-        crate::db::count_market_predictions(db, market_id),
-    ) {
-        Ok((mut rows, total)) => {
+    match crate::db::get_market_predictions(db, market_id, after, limit).await {
+        Ok(mut rows) => {
             // The query fetches limit+1 rows; if we got the extra one there is
             // another page available.
             let has_next = rows.len() as i64 > limit;
             if has_next {
                 rows.truncate(limit as usize);
             }
-            let next_cursor: Option<i64> = if has_next {
-                rows.last().map(|r| r.id)
+            let next_cursor: Option<String> = if has_next {
+                rows.last()
+                    .map(|row| encode_market_cursor(row.created_at, row.id))
             } else {
                 None
             };
@@ -1382,7 +1398,6 @@ pub async fn get_market_predictions(
             let response = serde_json::json!({
                 "market_id": market_id,
                 "predictions": rows,
-                "total": total,
                 "limit": limit,
                 "next_cursor": next_cursor,
             });
@@ -1394,6 +1409,56 @@ pub async fn get_market_predictions(
             e.to_string(),
         )
         .into_response(),
+    }
+}
+
+// A versioned hex encoding keeps the database key out of the public API and
+// leaves room to change the cursor payload without changing the query shape.
+fn encode_market_cursor(created_at: chrono::DateTime<chrono::Utc>, id: i64) -> String {
+    format!(
+        "m2{:016x}{:016x}",
+        created_at.timestamp_micros() as u64,
+        id as u64
+    )
+}
+
+fn decode_market_cursor(cursor: &str) -> Result<(chrono::DateTime<chrono::Utc>, i64), ()> {
+    let encoded = cursor.strip_prefix("m2").ok_or(())?;
+    if encoded.len() != 32 || !encoded.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    let micros = u64::from_str_radix(&encoded[..16], 16).map_err(|_| ())? as i64;
+    let id = u64::from_str_radix(&encoded[16..], 16).map_err(|_| ())?;
+    let id = i64::try_from(id).map_err(|_| ())?;
+    if id <= 0 {
+        return Err(());
+    }
+    let created_at = chrono::DateTime::from_timestamp_micros(micros).ok_or(())?;
+    Ok((created_at, id))
+}
+
+#[cfg(test)]
+mod market_cursor_tests {
+    use super::{decode_market_cursor, encode_market_cursor};
+
+    #[test]
+    fn cursor_round_trips_positive_row_id_without_exposing_integer() {
+        let timestamp = chrono::DateTime::from_timestamp_micros(1_700_000_000_123_456).unwrap();
+        let cursor = encode_market_cursor(timestamp, 42);
+        assert_ne!(cursor, "42");
+        assert_eq!(decode_market_cursor(&cursor), Ok((timestamp, 42)));
+    }
+
+    #[test]
+    fn malformed_and_out_of_range_cursors_are_rejected() {
+        for cursor in [
+            "42",
+            "m2",
+            "m2zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "m2ffffffffffffffffffffffffffffffff",
+        ] {
+            assert!(decode_market_cursor(cursor).is_err());
+        }
     }
 }
 
@@ -1450,7 +1515,10 @@ pub async fn pay_creator_incentive_handler(
     match crate::db::pay_creator_incentive(db, pool_id, state.config.treasury_fee_bps).await {
         Ok(Some(amount)) => {
             state.pool_cache.invalidate(pool_id);
-            state.market_reads.invalidate(&format!("pool:{pool_id}")).await;
+            state
+                .market_reads
+                .invalidate(&format!("pool:{pool_id}"))
+                .await;
             Json(json!({ "status": "paid", "pool_id": pool_id, "amount": amount }))
         }
         Ok(None) => Json(json!({ "status": "not_eligible", "pool_id": pool_id })),
@@ -1663,7 +1731,10 @@ pub async fn update_pool_tags_handler(
     match crate::tags::update_pool_tags(db, pool_id, body.creator.as_str(), &body.tags).await {
         Ok(true) => {
             state.pool_cache.invalidate(pool_id);
-            state.market_reads.invalidate(&format!("pool:{pool_id}")).await;
+            state
+                .market_reads
+                .invalidate(&format!("pool:{pool_id}"))
+                .await;
             state.redis.invalidate_pools_cache().await;
             ApiResponse::success(json!({ "pool_id": pool_id, "tags": body.tags })).into_response()
         }
@@ -1935,8 +2006,8 @@ pub fn router(
 
     // Idempotency-Key support for market mutations (#48). Without a database
     // the handlers answer 503 before doing any work, so nothing to guard.
-    let idempotent = |operation: &'static str, route: axum::routing::MethodRouter<AppState>| {
-        match &state.db {
+    let idempotent =
+        |operation: &'static str, route: axum::routing::MethodRouter<AppState>| match &state.db {
             Some(db) => crate::idempotency::Idempotency::new(
                 crate::idempotency::IdempotencyStore::postgres(db.clone()),
                 operation,
@@ -1945,8 +2016,7 @@ pub fn router(
             )
             .guard(route),
             None => route,
-        }
-    };
+        };
 
     // Admin tier — authenticated administrative operations (no public rate limit).
     let admin = Router::new()
@@ -1982,8 +2052,7 @@ pub fn router(
             )
             .route(
                 "/auth/logout",
-                post(logout_handler)
-                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TOKEN_REFRESH)),
+                post(logout_handler).layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TOKEN_REFRESH)),
             )
             .route("/ws", get(crate::ws::ws_handler))
             .with_state(state.clone()),
@@ -2140,10 +2209,8 @@ async fn refresh_tokens_handler(
     // With a database, rotation uses the durable cross-replica revocation
     // store (#55); without one it falls back to the Redis-only path.
     let result = if state.db.is_some() {
-        let store = crate::token_revocation::RevocationStore::new(
-            state.db.clone(),
-            state.redis.clone(),
-        );
+        let store =
+            crate::token_revocation::RevocationStore::new(state.db.clone(), state.redis.clone());
         crate::jwt_security::rotate_refresh_token_durable(
             &store,
             &state.config.secret_key,

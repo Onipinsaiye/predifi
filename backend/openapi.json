@@ -603,9 +603,8 @@
           },
           "next_cursor": {
             "description": "Opaque cursor: pass as `?after=<value>` to retrieve the next page.\n`null` when the current page is the last.",
-            "format": "int64",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -614,17 +613,11 @@
               "$ref": "#/components/schemas/MarketPredictionDoc"
             },
             "type": "array"
-          },
-          "total": {
-            "description": "Total number of predictions for this market (across all pages).",
-            "format": "int64",
-            "type": "integer"
           }
         },
         "required": [
           "market_id",
           "predictions",
-          "total",
           "limit"
         ],
         "type": "object"
@@ -2106,13 +2099,12 @@
             }
           },
           {
-            "description": "Cursor from previous page's `next_cursor` field",
+            "description": "Opaque cursor from previous page's `next_cursor` field",
             "in": "query",
             "name": "after",
             "required": false,
             "schema": {
-              "format": "int64",
-              "type": "integer"
+              "type": "string"
             }
           },
           {

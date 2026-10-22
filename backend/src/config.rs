@@ -37,6 +37,22 @@ pub const DEFAULT_CORS_ORIGINS: &[&str] = &[
     "https://predifi.app",
 ];
 
+/// Map the configured Stellar RPC endpoint to its token-bound network name.
+pub fn stellar_network_for_rpc_url(url: &str) -> &'static str {
+    let url = url.to_ascii_lowercase();
+    if url.contains("futurenet") {
+        "futurenet"
+    } else if url.contains("testnet")
+        || url.contains("localhost")
+        || url.contains("127.0.0.1")
+        || url.contains("stellar:8000")
+    {
+        "testnet"
+    } else {
+        "public"
+    }
+}
+
 /// Runtime configuration loaded from environment variables.
 ///
 /// All fields have compiled-in defaults so the server can start without any
@@ -216,6 +232,21 @@ impl Config {
         let treasury_fee_bps = get_u32(vars, "PREDIFI_TREASURY_FEE_BPS", DEFAULT_TREASURY_FEE_BPS)?;
         let referral_fee_bps = get_u32(vars, "PREDIFI_REFERRAL_FEE_BPS", DEFAULT_REFERRAL_FEE_BPS)?;
         let stellar_rpc_url = get_string(vars, "PREDIFI_STELLAR_RPC_URL", DEFAULT_STELLAR_RPC_URL);
+        let rpc_network = stellar_network_for_rpc_url(&stellar_rpc_url);
+        if let Some(configured_network) = vars.get("PREDIFI_STELLAR_NETWORK") {
+            if !matches!(
+                configured_network.as_str(),
+                "testnet" | "futurenet" | "public"
+            ) || configured_network != rpc_network
+            {
+                return Err(ConfigError::InvalidValue {
+                    key: "PREDIFI_STELLAR_NETWORK",
+                    reason: format!(
+                        "must match the configured Stellar RPC network ({rpc_network})"
+                    ),
+                });
+            }
+        }
         let sentry_dsn = vars.get("PREDIFI_SENTRY_DSN").cloned();
         let redis_url = get_string(vars, "PREDIFI_REDIS_URL", DEFAULT_REDIS_URL);
         let redis_required = get_bool(vars, "PREDIFI_REDIS_REQUIRED", DEFAULT_REDIS_REQUIRED)?;
@@ -446,10 +477,7 @@ impl Config {
                 if !origin.starts_with("https://") {
                     return Err(ConfigError::InvalidValue {
                         key: "PREDIFI_CORS_ALLOWED_ORIGINS",
-                        reason: format!(
-                            "production CORS origin '{}' must use https://",
-                            origin
-                        ),
+                        reason: format!("production CORS origin '{}' must use https://", origin),
                     });
                 }
                 if origin.contains("localhost") || origin.contains("127.0.0.1") {
@@ -1262,7 +1290,8 @@ mod tests {
                 String::from("https://app.predifi.com"),
             ),
         ]);
-        let error = Config::from_map(&vars).expect_err("production must reject default dev CORS origins");
+        let error =
+            Config::from_map(&vars).expect_err("production must reject default dev CORS origins");
         assert!(
             matches!(
                 error,
@@ -2167,5 +2196,26 @@ mod tests {
         let vars = HashMap::new();
         let config = Config::from_map(&vars).unwrap();
         assert_eq!(config.app_env, DEFAULT_APP_ENV);
+    }
+
+    #[test]
+    fn configured_stellar_network_must_match_rpc_endpoint() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_STELLAR_RPC_URL"),
+                String::from("https://horizon-testnet.stellar.org"),
+            ),
+            (
+                String::from("PREDIFI_STELLAR_NETWORK"),
+                String::from("public"),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_STELLAR_NETWORK",
+                ..
+            })
+        ));
     }
 }

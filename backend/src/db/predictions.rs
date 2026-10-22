@@ -70,11 +70,31 @@ pub struct ReadBudget {
 
 /// The canonical budgets checked by the benchmark harness.
 pub const READ_BUDGETS: &[ReadBudget] = &[
-    ReadBudget { group: QueryGroup::PredictionHistory, p95_latency_ms: 50, max_round_trips: 1 },
-    ReadBudget { group: QueryGroup::MarketPredictions, p95_latency_ms: 30, max_round_trips: 2 },
-    ReadBudget { group: QueryGroup::LeaderboardAggregates, p95_latency_ms: 150, max_round_trips: 1 },
-    ReadBudget { group: QueryGroup::LeaderboardExtended, p95_latency_ms: 200, max_round_trips: 1 },
-    ReadBudget { group: QueryGroup::ProtocolStats, p95_latency_ms: 100, max_round_trips: 1 },
+    ReadBudget {
+        group: QueryGroup::PredictionHistory,
+        p95_latency_ms: 50,
+        max_round_trips: 1,
+    },
+    ReadBudget {
+        group: QueryGroup::MarketPredictions,
+        p95_latency_ms: 30,
+        max_round_trips: 2,
+    },
+    ReadBudget {
+        group: QueryGroup::LeaderboardAggregates,
+        p95_latency_ms: 150,
+        max_round_trips: 1,
+    },
+    ReadBudget {
+        group: QueryGroup::LeaderboardExtended,
+        p95_latency_ms: 200,
+        max_round_trips: 1,
+    },
+    ReadBudget {
+        group: QueryGroup::ProtocolStats,
+        p95_latency_ms: 100,
+        max_round_trips: 1,
+    },
 ];
 
 /// Look up the budget for a query group.
@@ -131,7 +151,10 @@ struct QueryTimer {
 impl QueryTimer {
     fn start(group: QueryGroup) -> Self {
         record_round_trip(group);
-        Self { group, start: Instant::now() }
+        Self {
+            group,
+            start: Instant::now(),
+        }
     }
 }
 
@@ -367,15 +390,15 @@ pub async fn get_user_predictions(
         .collect())
 }
 
-/// Cursor-paginated market predictions for a pool (newest first by `id DESC`).
+/// Cursor-paginated market predictions for a pool (newest first by timestamp, then ID).
 ///
-/// `after_id` is the opaque cursor from the previous page. Pass `None` to
-/// start at the most recent row. Fetches `limit + 1` rows so the caller can
+/// `after` is the `(created_at, id)` position from the previous page. Pass
+/// `None` to start at the most recent row. Fetches `limit + 1` rows so the caller can
 /// detect whether a next page exists without an extra `COUNT(*)` query.
 pub async fn get_market_predictions(
     pool: &PgPool,
     pool_id: i64,
-    after_id: Option<i64>,
+    after: Option<(DateTime<Utc>, i64)>,
     limit: i64,
 ) -> Result<Vec<MarketPredictionRow>, sqlx::Error> {
     let _timer = QueryTimer::start(QueryGroup::MarketPredictions);
@@ -384,13 +407,14 @@ pub async fn get_market_predictions(
         SELECT id, pool_id, user_address, outcome, amount, created_at
         FROM predictions
         WHERE pool_id = $1
-          AND ($2::bigint IS NULL OR id < $2)
-        ORDER BY id DESC
-        LIMIT $3
+          AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4
         "#,
     )
     .bind(pool_id)
-    .bind(after_id)
+    .bind(after.as_ref().map(|cursor| cursor.0))
+    .bind(after.as_ref().map(|cursor| cursor.1))
     .bind(limit + 1) // +1 to detect next-page existence
     .fetch_all(pool)
     .await
@@ -399,11 +423,10 @@ pub async fn get_market_predictions(
 /// Total prediction count for a pool (used for the `total` response field).
 pub async fn count_market_predictions(pool: &PgPool, pool_id: i64) -> Result<i64, sqlx::Error> {
     let _timer = QueryTimer::start(QueryGroup::MarketPredictions);
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM predictions WHERE pool_id = $1")
-            .bind(pool_id)
-            .fetch_one(pool)
-            .await?;
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM predictions WHERE pool_id = $1")
+        .bind(pool_id)
+        .fetch_one(pool)
+        .await?;
     Ok(count)
 }
 
@@ -771,13 +794,11 @@ pub async fn insert_prediction_from_event(
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query(
-        "UPDATE pools SET total_stake = total_stake + $1 WHERE pool_id = $2",
-    )
-    .bind(event.amount)
-    .bind(event.pool_id as i64)
-    .execute(&mut **tx)
-    .await?;
+    sqlx::query("UPDATE pools SET total_stake = total_stake + $1 WHERE pool_id = $2")
+        .bind(event.amount)
+        .bind(event.pool_id as i64)
+        .execute(&mut **tx)
+        .await?;
 
     Ok(())
 }
@@ -860,7 +881,11 @@ mod tests {
         if has_next {
             rows.truncate(limit as usize);
         }
-        let cursor = if has_next { rows.last().map(|r| r.id) } else { None };
+        let cursor = if has_next {
+            rows.last().map(|r| r.id)
+        } else {
+            None
+        };
         assert!(has_next);
         assert_eq!(cursor, Some(8));
         assert_eq!(rows.len(), 3);

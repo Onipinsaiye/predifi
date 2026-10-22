@@ -704,6 +704,16 @@ pub struct PoolStats {
     pub current_odds: Vec<u64>,
 }
 
+/// Read-only quote for adding `amount` to an outcome in its current pool state.
+/// Shares use 18 decimal fixed-point units; fee and payout values use token base units.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketQuote {
+    pub expected_shares: i128,
+    pub protocol_fee: i128,
+    pub expected_payout: i128,
+}
+
 /// Global protocol configuration.
 ///
 /// Contains system-wide settings that control protocol behavior.

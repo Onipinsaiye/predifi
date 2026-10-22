@@ -77,12 +77,10 @@ pub struct MarketPredictionDoc {
 pub struct MarketPredictionsResponse {
     pub market_id: i64,
     pub predictions: Vec<MarketPredictionDoc>,
-    /// Total number of predictions for this market (across all pages).
-    pub total: i64,
     pub limit: i64,
     /// Opaque cursor: pass as `?after=<value>` to retrieve the next page.
     /// `null` when the current page is the last.
-    pub next_cursor: Option<i64>,
+    pub next_cursor: Option<String>,
 }
 
 /// OpenAPI schema for a single prediction record.
@@ -221,7 +219,6 @@ pub struct HealthResponse {
     pub dependencies: DependencyStatus,
     pub errors: HealthErrors,
 }
-
 
 // ── Envelopes ─────────────────────────────────────────────────────────────────
 
@@ -576,9 +573,21 @@ pub struct ApiDoc;
 ///
 /// Entries are `(METHOD, path)` with Axum-style `:param` segments.
 pub const UNDOCUMENTED_ROUTES: &[(&str, &str, &str)] = &[
-    ("GET", "/api/healthz", "orchestrator liveness probe, not a client API"),
-    ("GET", "/api/readyz", "orchestrator readiness probe, not a client API"),
-    ("GET", "/api/v1/ws", "WebSocket upgrade; not describable in OpenAPI 3.1"),
+    (
+        "GET",
+        "/api/healthz",
+        "orchestrator liveness probe, not a client API",
+    ),
+    (
+        "GET",
+        "/api/readyz",
+        "orchestrator readiness probe, not a client API",
+    ),
+    (
+        "GET",
+        "/api/v1/ws",
+        "WebSocket upgrade; not describable in OpenAPI 3.1",
+    ),
     (
         "PATCH",
         "/api/v1/admin/log-level",
@@ -891,7 +900,7 @@ async fn api_mark_notifications_read() {}
 #[utoipa::path(get, path = "/api/v1/markets/{market_id}/predictions", tag = "predictions",
     params(
         ("market_id" = i64, Path, description = "On-chain pool (market) identifier"),
-        ("after" = Option<i64>, Query, description = "Cursor from previous page's `next_cursor` field"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from previous page's `next_cursor` field"),
         ("limit" = Option<i64>, Query, description = "Page size (1–100, default 20)"),
     ),
     responses(
@@ -1092,7 +1101,12 @@ fn sort_keys(value: serde_json::Value) -> serde_json::Value {
         Value::Object(map) => {
             let mut entries: Vec<(String, Value)> = map.into_iter().collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Value::Object(entries.into_iter().map(|(k, v)| (k, sort_keys(v))).collect())
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, sort_keys(v)))
+                    .collect(),
+            )
         }
         Value::Array(items) => Value::Array(items.into_iter().map(sort_keys).collect()),
         other => other,

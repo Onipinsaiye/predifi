@@ -199,22 +199,27 @@ pub struct StellarAddress(String);
 
 impl StellarAddress {
     pub fn new(s: impl Into<String>) -> Result<Self, ValidationError> {
-        let s = s.into();
-        let shape_valid = (s.starts_with('G') || s.starts_with('C'))
-            && s.len() == 56
-            && s.chars().all(|c| c.is_ascii_alphanumeric());
-        if shape_valid && verify_strkey(&s) {
-            Ok(Self(s))
-        } else {
-            Err(ValidationError(
-                "must be a valid Stellar address (G/C prefix, 56 chars, valid strkey checksum)"
-                    .to_string(),
-            ))
-        }
+        Ok(Self(normalize_wallet_address(&s.into())?))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Normalize and validate a wallet address to canonical uppercase StrKey form.
+pub fn normalize_wallet_address(value: &str) -> Result<String, ValidationError> {
+    let canonical = value.trim().to_ascii_uppercase();
+    let shape_valid = (canonical.starts_with('G') || canonical.starts_with('C'))
+        && canonical.len() == 56
+        && canonical.chars().all(|c| c.is_ascii_alphanumeric());
+    if shape_valid && verify_strkey(&canonical) {
+        Ok(canonical)
+    } else {
+        Err(ValidationError(
+            "must be a valid Stellar address (G/C prefix, 56 chars, valid strkey checksum)"
+                .to_string(),
+        ))
     }
 }
 
@@ -474,6 +479,20 @@ mod tests {
         assert!(addr.starts_with('G'));
         assert_eq!(addr.len(), 56);
         assert!(StellarAddress::new(addr).is_ok());
+    }
+
+    #[test]
+    fn stellar_wallet_addresses_normalize_to_canonical_case() {
+        let addr = valid_strkey(STRKEY_VERSION_ACCOUNT_ID, 0x01);
+        let normalized = normalize_wallet_address(&format!("  {}  ", addr.to_ascii_lowercase()))
+            .expect("valid wallet address");
+        assert_eq!(normalized, addr);
+        assert_eq!(
+            StellarAddress::new(addr.to_ascii_lowercase())
+                .unwrap()
+                .as_str(),
+            addr
+        );
     }
 
     #[test]
