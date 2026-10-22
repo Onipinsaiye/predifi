@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
+import { usePrefersReducedMotion } from "@/lib/hooks/usePrefersReducedMotion";
 
 export interface AnimatedNumberProps {
   value: number;
@@ -17,6 +18,8 @@ export interface AnimatedNumberProps {
 
 /**
  * Smoothly interpolates toward `value` and flashes teal/rose on change.
+ * Immediately renders `value` if reduced motion is requested, while preserving
+ * meaningful color feedback (brief flash).
  */
 export function AnimatedNumber({
   value,
@@ -26,6 +29,7 @@ export function AnimatedNumber({
   suffix = "",
   durationMs = 450,
 }: AnimatedNumberProps) {
+  const prefersReducedMotion = usePrefersReducedMotion();
   const [display, setDisplay] = useState(value);
   const [flash, setFlash] = useState<"up" | "down" | null>(null);
   const fromRef = useRef(value);
@@ -37,6 +41,14 @@ export function AnimatedNumber({
     if (from === to) return;
 
     setFlash(to > from ? "up" : "down");
+
+    if (prefersReducedMotion || durationMs <= 0) {
+      fromRef.current = to;
+      setDisplay(to);
+      const timer = setTimeout(() => setFlash(null), prefersReducedMotion ? 150 : 350);
+      return () => clearTimeout(timer);
+    }
+
     const start = performance.now();
 
     const tick = (now: number) => {
@@ -57,7 +69,7 @@ export function AnimatedNumber({
     return () => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
     };
-  }, [value, durationMs]);
+  }, [value, durationMs, prefersReducedMotion]);
 
   const formatted = display.toLocaleString("en-US", {
     minimumFractionDigits: decimals,
