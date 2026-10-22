@@ -1,0 +1,13 @@
+[package]
+name    = "oracle-quorum"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-source oracle quorum resolution strategy for PrediFi price-feed markets."
+publish = false
+
+[lib]
+# Plain `no_std` library: usable from the Soroban contract and testable natively.
+crate-type = ["lib"]
+
+[dependencies]
+# Intentionally empty — no allocator, no Soroban SDK.

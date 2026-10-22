@@ -5,6 +5,7 @@ members = [
   "contracts/access-control",
   "contracts/predifi-contract",
   "contracts/predifi-reference-model",
+  "contracts/oracle-quorum",
 ]
 
 # ── Shared workspace dependencies ──────────────────────────────────────────────
