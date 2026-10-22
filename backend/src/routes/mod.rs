@@ -1,7 +1,9 @@
+use crate::abuse::AbuseController;
 use crate::config::Config;
 use crate::health::{self, DependencyProbes};
 use crate::price_cache::PriceCache;
 use crate::redis_cache::RedisCache;
+use crate::rpc_quota::RpcQuotaManager;
 use crate::ws::EventBus;
 use axum::routing::get;
 use axum::Router;
@@ -22,6 +24,8 @@ pub fn router(
     pool: Option<sqlx::PgPool>,
     metrics: crate::metrics::SharedMetrics,
     event_bus: EventBus,
+    abuse: Arc<AbuseController>,
+    rpc_quota: Arc<RpcQuotaManager>,
 ) -> Router {
     let probes = DependencyProbes::new(pool.clone(), redis.clone());
     let readiness = health::ReadinessState::new(
@@ -35,7 +39,9 @@ pub fn router(
         .with_state(readiness)
         .nest(
             "/v1",
-            v1::router(config, cache, redis, pool, metrics, event_bus),
+            v1::router(
+                config, cache, redis, pool, metrics, event_bus, abuse, rpc_quota,
+            ),
         )
 }
 
@@ -49,6 +55,8 @@ pub fn router_with_db(
     db: PgPool,
     metrics: crate::metrics::SharedMetrics,
     event_bus: EventBus,
+    abuse: Arc<AbuseController>,
+    rpc_quota: Arc<RpcQuotaManager>,
 ) -> Router {
     let probes = DependencyProbes::new(Some(db.clone()), redis.clone());
     let readiness = health::ReadinessState::new(
@@ -62,7 +70,16 @@ pub fn router_with_db(
         .with_state(readiness)
         .nest(
             "/v1",
-            v1::router(config, cache, redis, Some(db), metrics, event_bus),
+            v1::router(
+                config,
+                cache,
+                redis,
+                Some(db),
+                metrics,
+                event_bus,
+                abuse,
+                rpc_quota,
+            ),
         )
 }
 
@@ -76,13 +93,23 @@ mod tests {
     use std::time::Instant;
     use tower::ServiceExt;
 
+    use crate::abuse::AbuseController;
     use crate::config::Config;
     use crate::metrics::Metrics;
     use crate::price_cache::PriceCache;
     use crate::redis_cache::RedisCache;
+    use crate::rpc_quota::RpcQuotaManager;
     use crate::ws::EventBus;
 
     use super::{router, router_with_db};
+
+    fn test_abuse() -> Arc<AbuseController> {
+        Arc::new(AbuseController::default_for_test())
+    }
+
+    fn test_rpc_quota() -> Arc<RpcQuotaManager> {
+        Arc::new(RpcQuotaManager::default_for_test())
+    }
 
     fn test_metrics() -> crate::metrics::SharedMetrics {
         Arc::new(Metrics::new().expect("metrics must initialize in tests"))
@@ -113,6 +140,8 @@ mod tests {
             None,
             test_metrics(),
             EventBus::new(),
+            test_abuse(),
+            test_rpc_quota(),
         )
     }
 
@@ -129,6 +158,8 @@ mod tests {
             pool,
             test_metrics(),
             EventBus::new(),
+            test_abuse(),
+            test_rpc_quota(),
         )
     }
 
@@ -180,6 +211,8 @@ mod tests {
             None,
             test_metrics(),
             EventBus::new(),
+            test_abuse(),
+            test_rpc_quota(),
         );
 
         let response = app.oneshot(get("/v1/fees")).await.expect("request failed");

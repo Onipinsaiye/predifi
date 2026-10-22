@@ -792,3 +792,515 @@ pub async fn probe_health(config: &crate::config::Config) -> Result<(), RpcError
         .await
         .map(|_| ())
 }
+
+// ── Quotas, priority classes and failover ────────────────────────────────────
+
+/// Priority class of an RPC request. Higher-priority classes are served first
+/// when a network's request budget is contended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PriorityClass {
+    /// Background indexing / backfill work.
+    Background = 0,
+    /// User-facing transaction preparation (simulation, fee estimation).
+    UserTransaction = 1,
+    /// Health probes and operator tooling.
+    Critical = 2,
+}
+
+impl PriorityClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::UserTransaction => "user_transaction",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+/// Per-network request budget: a token bucket refilled at `refill_per_sec`
+/// with a burst capacity of `burst`. Each request costs one token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudget {
+    pub burst: u32,
+    pub refill_per_sec: u32,
+}
+
+impl RequestBudget {
+    pub const fn new(burst: u32, refill_per_sec: u32) -> Self {
+        Self {
+            burst,
+            refill_per_sec,
+        }
+    }
+}
+
+/// Budgets and fallback ordering for one network.
+#[derive(Debug, Clone)]
+pub struct NetworkPolicy {
+    /// Network identifier (e.g. `"testnet"`, `"mainnet"`).
+    pub network: String,
+    /// Budget applied to each provider URL on this network.
+    pub budget: RequestBudget,
+    /// Provider URLs in fallback order (index 0 is preferred).
+    pub providers: Vec<String>,
+    /// Retry policy used for calls on this network.
+    pub retry: RetryPolicy,
+}
+
+impl NetworkPolicy {
+    pub fn new(
+        network: impl Into<String>,
+        budget: RequestBudget,
+        providers: Vec<String>,
+        retry: RetryPolicy,
+    ) -> Self {
+        Self {
+            network: network.into(),
+            budget,
+            providers,
+            retry,
+        }
+    }
+}
+
+/// Health of a single provider endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderHealth {
+    /// Serving requests normally.
+    Healthy,
+    /// Recently failed; still tried but ranked below healthy providers.
+    Degraded,
+    /// Circuit open or repeatedly failing; skipped until it recovers.
+    Down,
+}
+
+impl ProviderHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// Snapshot of one provider for the operator dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderStatus {
+    pub url: String,
+    pub health: ProviderHealth,
+    pub consecutive_failures: u32,
+    pub total_requests: u64,
+    pub total_failures: u64,
+    pub circuit_state: CircuitState,
+}
+
+/// What to do when two providers return different results for the same
+/// idempotent read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisagreementPolicy {
+    /// Return the first provider's answer and log the disagreement.
+    TrustPrimary,
+    /// Treat the disagreement as an error so the caller can retry later.
+    Fail,
+}
+
+impl Default for DisagreementPolicy {
+    fn default() -> Self {
+        Self::TrustPrimary
+    }
+}
+
+/// Metrics sink for the quota/failover manager. Implementations forward to
+/// whatever metrics backend the process uses; the default is a no-op.
+pub trait RpcMetrics: Send + Sync {
+    fn on_request(&self, _network: &str, _provider: &str, _priority: PriorityClass) {}
+    fn on_retry(&self, _network: &str, _provider: &str, _attempt: u32) {}
+    fn on_failure(&self, _network: &str, _provider: &str, _error: &RpcError) {}
+    fn on_failover(&self, _network: &str, _from: &str, _to: &str) {}
+    fn on_budget_exhausted(&self, _network: &str, _priority: PriorityClass) {}
+    fn on_disagreement(&self, _network: &str, _method: &str) {}
+}
+
+/// No-op metrics sink.
+#[derive(Debug, Default)]
+pub struct NoopMetrics;
+
+impl RpcMetrics for NoopMetrics {}
+
+#[derive(Debug, Default)]
+struct BudgetState {
+    tokens: f64,
+    last_refill: Duration,
+    initialized: bool,
+}
+
+#[derive(Debug, Default)]
+struct ProviderState {
+    consecutive_failures: u32,
+    total_requests: u64,
+    total_failures: u64,
+}
+
+/// Per-network quota and failover manager.
+///
+/// * Enforces a token-bucket [`RequestBudget`] per provider.
+/// * Tracks [`ProviderHealth`] and orders providers by health, then by the
+///   configured fallback order.
+/// * Retries across providers with bounded backoff and per-provider circuit
+///   breakers.
+/// * Detects disagreement between providers on idempotent reads.
+/// * Uses idempotency keys for `sendTransaction` so a retry after an
+///   ambiguous failure never duplicates submission.
+pub struct RpcQuotaManager {
+    policy: NetworkPolicy,
+    clock: Arc<dyn Clock>,
+    metrics: Arc<dyn RpcMetrics>,
+    disagreement: DisagreementPolicy,
+    budgets: Mutex<HashMap<String, BudgetState>>,
+    providers: Mutex<HashMap<String, ProviderState>>,
+    breakers: HashMap<String, Arc<CircuitBreaker>>,
+    transports: HashMap<String, Arc<dyn RpcTransport>>,
+    seed: AtomicU64,
+}
+
+impl std::fmt::Debug for RpcQuotaManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcQuotaManager")
+            .field("network", &self.policy.network)
+            .field("providers", &self.policy.providers)
+            .finish()
+    }
+}
+
+impl RpcQuotaManager {
+    /// Build a manager for `policy`, creating an HTTP transport and a shared
+    /// circuit breaker per provider URL.
+    pub fn new(policy: NetworkPolicy, clock: Arc<dyn Clock>) -> Self {
+        let mut transports = HashMap::new();
+        let mut breakers = HashMap::new();
+        for url in &policy.providers {
+            transports.insert(url.clone(), Arc::new(HttpTransport::new(url)) as Arc<dyn RpcTransport>);
+            breakers.insert(url.clone(), shared_breaker(url));
+        }
+        Self {
+            policy,
+            clock,
+            metrics: Arc::new(NoopMetrics),
+            disagreement: DisagreementPolicy::default(),
+            budgets: Mutex::new(HashMap::new()),
+            providers: Mutex::new(HashMap::new()),
+            breakers,
+            transports,
+            seed: AtomicU64::new(0),
+        }
+    }
+
+    /// Override the transport for a provider (tests / custom clients).
+    pub fn with_transport(mut self, url: &str, transport: Arc<dyn RpcTransport>) -> Self {
+        self.transports.insert(url.to_string(), transport);
+        self
+    }
+
+    /// Override the circuit breaker for a provider (tests).
+    pub fn with_breaker(mut self, url: &str, breaker: Arc<CircuitBreaker>) -> Self {
+        self.breakers.insert(url.to_string(), breaker);
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<dyn RpcMetrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub fn with_disagreement_policy(mut self, policy: DisagreementPolicy) -> Self {
+        self.disagreement = policy;
+        self
+    }
+
+    pub fn with_seed(self, seed: u64) -> Self {
+        self.seed.store(seed, Ordering::SeqCst);
+        self
+    }
+
+    pub fn network(&self) -> &str {
+        &self.policy.network
+    }
+
+    /// Snapshot of every provider for the operator dashboard.
+    pub fn status(&self) -> Vec<ProviderStatus> {
+        let now = self.clock.now();
+        let providers = self.providers.lock().unwrap_or_else(|p| p.into_inner());
+        self.policy
+            .providers
+            .iter()
+            .map(|url| {
+                let state = providers.get(url);
+                let circuit_state = self
+                    .breakers
+                    .get(url)
+                    .map(|b| b.state(now))
+                    .unwrap_or(CircuitState::Closed);
+                let consecutive_failures = state.map(|s| s.consecutive_failures).unwrap_or(0);
+                let health = if circuit_state == CircuitState::Open {
+                    ProviderHealth::Down
+                } else if consecutive_failures > 0 {
+                    ProviderHealth::Degraded
+                } else {
+                    ProviderHealth::Healthy
+                };
+                ProviderStatus {
+                    url: url.clone(),
+                    health,
+                    consecutive_failures,
+                    total_requests: state.map(|s| s.total_requests).unwrap_or(0),
+                    total_failures: state.map(|s| s.total_failures).unwrap_or(0),
+                    circuit_state,
+                }
+            })
+            .collect()
+    }
+
+    /// Providers in the order they should be tried: healthy first, then
+    /// degraded, then down; ties broken by configured fallback order.
+    fn ordered_providers(&self) -> Vec<String> {
+        let now = self.clock.now();
+        let providers = self.providers.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ranked: Vec<(u8, usize, String)> = self
+            .policy
+            .providers
+            .iter()
+            .enumerate()
+            .map(|(idx, url)| {
+                let circuit = self
+                    .breakers
+                    .get(url)
+                    .map(|b| b.state(now))
+                    .unwrap_or(CircuitState::Closed);
+                let failures = providers.get(url).map(|s| s.consecutive_failures).unwrap_or(0);
+                let rank = if circuit == CircuitState::Open {
+                    2
+                } else if failures > 0 {
+                    1
+                } else {
+                    0
+                };
+                (rank, idx, url.clone())
+            })
+            .collect();
+        ranked.sort_by_key(|(rank, idx, _)| (*rank, *idx));
+        ranked.into_iter().map(|(_, _, url)| url).collect()
+    }
+
+    /// Try to take one token from `url`'s budget. Returns `false` when the
+    /// budget is exhausted for the current instant.
+    fn try_take_token(&self, url: &str, now: Duration) -> bool {
+        let budget = self.policy.budget;
+        let mut budgets = self.budgets.lock().unwrap_or_else(|p| p.into_inner());
+        let state = budgets.entry(url.to_string()).or_default();
+        if !state.initialized {
+            state.tokens = f64::from(budget.burst);
+            state.last_refill = now;
+            state.initialized = true;
+        } else {
+            let elapsed = now.saturating_sub(state.last_refill).as_secs_f64();
+            if elapsed > 0.0 {
+                state.tokens =
+                    (state.tokens + elapsed * f64::from(budget.refill_per_sec)).min(f64::from(budget.burst));
+                state.last_refill = now;
+            }
+        }
+        if state.tokens >= 1.0 {
+            state.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_outcome(&self, url: &str, success: bool) {
+        let mut providers = self.providers.lock().unwrap_or_else(|p| p.into_inner());
+        let state = providers.entry(url.to_string()).or_default();
+        state.total_requests += 1;
+        if success {
+            state.consecutive_failures = 0;
+        } else {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            state.total_failures += 1;
+        }
+    }
+
+    /// Call `method` with the given priority class, applying quotas, failover
+    /// and bounded retries.
+    pub async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        priority: PriorityClass,
+    ) -> Result<Value, RpcError> {
+        let idempotency = method_idempotency(method);
+        let policy = self.policy.retry;
+        let start = self.clock.now();
+        let deadline = start + policy.max_elapsed;
+        let max_attempts = policy.max_attempts.max(1);
+        let mut attempt: u32 = 0;
+        let mut last_error: Option<RpcError> = None;
+        let mut last_provider: Option<String> = None;
+
+        loop {
+            if attempt >= max_attempts {
+                break;
+            }
+            let now = self.clock.now();
+            let remaining = deadline.saturating_sub(now);
+            if remaining.is_zero() {
+                return Err(last_error.unwrap_or(RpcError::DeadlineExceeded));
+            }
+
+            let ordered = self.ordered_providers();
+            let mut chosen: Option<String> = None;
+            for url in &ordered {
+                if self.try_take_token(url, now) {
+                    chosen = Some(url.clone());
+                    break;
+                }
+            }
+            let Some(url) = chosen else {
+                self.metrics.on_budget_exhausted(&self.policy.network, priority);
+                // No provider has budget right now. If we already have a
+                // retryable error, surface it; otherwise report throttling.
+                return Err(last_error.unwrap_or(RpcError::Throttled { retry_after: None }));
+            };
+
+            if let Some(prev) = &last_provider {
+                if prev != &url {
+                    self.metrics.on_failover(&self.policy.network, prev, &url);
+                }
+            }
+            last_provider = Some(url.clone());
+            self.metrics.on_request(&self.policy.network, &url, priority);
+
+            let Some(transport) = self.transports.get(&url) else {
+                return Err(RpcError::Connect(format!("no transport for {url}")));
+            };
+            let breaker = self
+                .breakers
+                .get(&url)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())));
+
+            let permit = match breaker.try_acquire(now) {
+                Ok(permit) => permit,
+                Err(e) => {
+                    // Circuit open: try the next provider without consuming
+                    // an attempt.
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+
+            let timeout = policy.attempt_timeout.min(remaining);
+            let result = transport.send(method, &params, timeout).await;
+            let now = self.clock.now();
+
+            match result {
+                Ok(value) => {
+                    permit.success(now);
+                    self.record_outcome(&url, true);
+                    return Ok(value);
+                }
+                Err(error) => {
+                    if error.is_upstream_failure() {
+                        permit.failure(now);
+                    } else {
+                        permit.success(now);
+                    }
+                    self.record_outcome(&url, false);
+                    self.metrics.on_failure(&self.policy.network, &url, &error);
+
+                    attempt += 1;
+                    let retry = should_retry(error.class(), idempotency) && attempt < max_attempts;
+                    if !retry {
+                        tracing::warn!(network = %self.policy.network, method, attempt, error = %error, "rpc call failed");
+                        return Err(error);
+                    }
+
+                    let seed = self.seed.fetch_add(1, Ordering::Relaxed);
+                    let mut delay = policy.backoff(attempt - 1, seed);
+                    if let Some(retry_after) = error.retry_after() {
+                        delay = delay.max(retry_after);
+                    }
+                    if now + delay >= deadline {
+                        tracing::warn!(network = %self.policy.network, method, attempt, error = %error, "rpc retry budget exhausted");
+                        return Err(error);
+                    }
+                    self.metrics.on_retry(&self.policy.network, &url, attempt);
+                    tracing::debug!(network = %self.policy.network, method, attempt, provider = %url, delay_ms = delay.as_millis() as u64, error = %error, "retrying rpc call");
+                    last_error = Some(error);
+                    self.clock.sleep(delay).await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(RpcError::DeadlineExceeded))
+    }
+
+    /// Idempotent read with disagreement detection: queries the two highest
+    /// ranked providers and compares results. On disagreement the configured
+    /// [`DisagreementPolicy`] decides the outcome.
+    pub async fn call_consensus(
+        &self,
+        method: &str,
+        params: Value,
+        priority: PriorityClass,
+    ) -> Result<Value, RpcError> {
+        let first = self.call(method, params.clone(), priority).await?;
+        let ordered = self.ordered_providers();
+        let Some(second_url) = ordered.get(1).cloned() else {
+            return Ok(first);
+        };
+        let Some(transport) = self.transports.get(&second_url).cloned() else {
+            return Ok(first);
+        };
+        let now = self.clock.now();
+        if !self.try_take_token(&second_url, now) {
+            return Ok(first);
+        }
+        let timeout = self.policy.retry.attempt_timeout;
+        match transport.send(method, &params, timeout).await {
+            Ok(second) => {
+                self.record_outcome(&second_url, true);
+                if second == first {
+                    Ok(first)
+                } else {
+                    self.metrics.on_disagreement(&self.policy.network, method);
+                    tracing::warn!(network = %self.policy.network, method, "rpc providers disagree");
+                    match self.disagreement {
+                        DisagreementPolicy::TrustPrimary => Ok(first),
+                        DisagreementPolicy::Fail => Err(RpcError::InvalidResponse(
+                            "rpc providers disagree".to_string(),
+                        )),
+                    }
+                }
+            }
+            Err(error) => {
+                self.record_outcome(&second_url, false);
+                self.metrics.on_failure(&self.policy.network, &second_url, &error);
+                Ok(first)
+            }
+        }
+    }
+}
+
+/// Process-wide registry of [`RpcQuotaManager`]s keyed by network.
+pub fn shared_quota_manager(policy: NetworkPolicy) -> Arc<RpcQuotaManager> {
+    static MANAGERS: OnceLock<Mutex<HashMap<String, Arc<RpcQuotaManager>>>> = OnceLock::new();
+    let mut map = MANAGERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    Arc::clone(
+        map.entry(policy.network.clone())
+            .or_insert_with(|| Arc::new(RpcQuotaManager::new(policy, Arc::new(SystemClock::default())))),
+    )
+}

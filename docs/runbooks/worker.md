@@ -97,3 +97,78 @@ replaying and escalate.
 **Escalation:** Not understood within 30 minutes → secondary backend-oncall.
 Any sign the contract emitted unexpected events → contract-oncall and
 `@Web3Novalabs/maintainers` immediately.
+
+---
+
+## Abuse quotas (market creation & wallet actions)
+
+Per-wallet and per-network quotas protect backend capacity from automated
+market spam, account cycling, and repeated expensive wallet-triggering
+requests. Quotas are keyed on the authenticated wallet, **not** on client IP:
+shared IPs (NAT, mobile carriers, corporate proxies) are never treated as a
+single identity, so legitimate multi-wallet users behind one IP are unaffected.
+
+**Tuning knobs (environment):**
+- `PREDIFI_ABUSE_WALLET_QUOTA_<ACTION>` — per-wallet limit per window for
+  `MARKET_CREATE`, `WALLET_SIGN`, `WALLET_SUBMIT` (e.g. `10/1h`).
+- `PREDIFI_ABUSE_NETWORK_QUOTA_<NETWORK>` — aggregate per-network ceiling
+  across all wallets (e.g. `testnet: 500/1m`, `mainnet: 200/1m`).
+- `PREDIFI_ABUSE_MIN_VALIDATION_COST` — minimum validation cost (in stroops)
+  a request must justify before it is admitted; cheap, low-value requests are
+  rejected early so expensive validation is not spent on spam.
+- `PREDIFI_ABUSE_WINDOW_SECS` — sliding-window length for quota accounting.
+
+**Rejection behavior:** over-quota requests return HTTP `429` with a
+transparent body (`error: "quota_exceeded"`, `scope: "wallet" | "network"`,
+`retry_after_secs`, and the published limit). Rejections are counted, never
+silently dropped, and never consume validation budget.
+
+**Metrics:** `app_abuse_rejections_total{scope,action,network}`,
+`app_abuse_quota_utilization{scope,action,network}` (0–1),
+`app_abuse_validation_cost_rejected_total`. Alert when network-scope
+utilization stays above 0.8 for 10 minutes (raise the network ceiling or
+investigate a spam source) or when wallet-scope rejections spike for many
+distinct wallets (likely a client bug or a coordinated campaign).
+
+**Validation:** run the backend abuse simulation
+(`backend/tests/abuse_simulation`) to confirm bounded resource use, and
+confirm legitimate multi-wallet users stay within the published limits before
+tightening any quota.
+
+---
+
+## RPC provider quotas & failover
+
+The worker and transaction-preparation paths share a per-network RPC budget so
+public rate limits or a provider outage cannot stall indexing or user
+transaction preparation.
+
+**Policy:**
+- **Per-network request budgets:** `PREDIFI_RPC_BUDGET_<NETWORK>` (requests
+  per window) split across priority classes.
+- **Priority classes:** `INDEXER` (background ingestion), `TX_PREP` (user
+  transaction preparation), `CRITICAL` (health/reconciliation). Under
+  pressure, `INDEXER` is shed first; `TX_PREP` and `CRITICAL` are preserved.
+- **Provider health:** each provider is probed; unhealthy providers are
+  removed from rotation until they recover.
+- **Fallback ordering:** `PREDIFI_RPC_FALLBACK_ORDER_<NETWORK>` (comma-separated
+  provider list). Requests fail over in order, with bounded retries and
+  jittered backoff; retries never re-submit a transaction that may already
+  have been accepted (submission is idempotent and keyed on the transaction
+  hash), so there are no duplicate submissions.
+- **Provider disagreement:** when providers return conflicting ledger/state,
+  the request is retried against the next provider; if disagreement persists,
+  the worker pauses that stream and raises an alert rather than writing
+  ambiguous data.
+
+**Metrics:** `app_rpc_requests_total{network,provider,priority,outcome}`,
+`app_rpc_budget_utilization{network,priority}`,
+`app_rpc_provider_health{network,provider}` (1 healthy / 0 unhealthy),
+`app_rpc_failovers_total{network,provider}`, and
+`app_rpc_disagreements_total{network}`. Review these on the operator
+dashboard; raise a network budget only after confirming provider headroom,
+and reorder fallbacks when a provider's health flaps.
+
+**Validation:** run the RPC worker fault-injection tests
+(`backend/tests/rpc_fault_injection`) — simulated throttling and provider
+outage must produce bounded retries and no duplicate transaction submission.

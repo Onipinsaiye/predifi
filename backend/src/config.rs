@@ -30,6 +30,45 @@ const DEFAULT_SECRET_KEY: &str = "predifi-dev-secret-do-not-use-in-production-32
 const DEFAULT_APP_ENV: &str = "development";
 const DEFAULT_INDEXER_MAX_BATCH_SIZE: usize = crate::constants::DEFAULT_INDEXER_MAX_BATCH_SIZE;
 
+// ── Abuse-control defaults (issue #103) ──────────────────────────────────────
+/// Default number of market-creation requests a single wallet may make per
+/// abuse-control window.
+const DEFAULT_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW: u32 = 5;
+/// Default number of expensive wallet actions (e.g. transaction preparation)
+/// a single wallet may trigger per abuse-control window.
+const DEFAULT_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW: u32 = 30;
+/// Default length of the abuse-control sliding window, in seconds.
+const DEFAULT_ABUSE_QUOTA_WINDOW_SECS: u64 = 60;
+/// Default network-wide ceiling on market-creation requests per window. This
+/// bounds total backend capacity regardless of how many wallets are cycled.
+const DEFAULT_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW: u32 = 500;
+/// Default network-wide ceiling on wallet actions per window.
+const DEFAULT_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW: u32 = 3_000;
+/// Default minimum validation cost (in abstract units) that must be paid
+/// before a request is admitted. Raising this makes account cycling more
+/// expensive for automated abusers.
+const DEFAULT_ABUSE_MIN_VALIDATION_COST: u32 = 1;
+
+// ── RPC quota / failover defaults (issue #105) ───────────────────────────────
+/// Default per-network request budget (requests per window) for the RPC layer.
+const DEFAULT_RPC_PER_NETWORK_BUDGET: u32 = 1_000;
+/// Default length of the RPC budget window, in seconds.
+const DEFAULT_RPC_BUDGET_WINDOW_SECS: u64 = 60;
+/// Default maximum number of retries for a single RPC request.
+const DEFAULT_RPC_MAX_RETRIES: u8 = 2;
+/// Default number of consecutive failures before a provider is marked unhealthy.
+const DEFAULT_RPC_PROVIDER_UNHEALTHY_THRESHOLD: u8 = 3;
+/// Default number of consecutive successes before an unhealthy provider is
+/// considered healthy again.
+const DEFAULT_RPC_PROVIDER_HEALTHY_THRESHOLD: u8 = 2;
+/// Default policy applied when providers return conflicting results.
+const DEFAULT_RPC_DISAGREEMENT_POLICY: &str = "quorum";
+/// Default comma-separated priority classes, highest priority first.
+const DEFAULT_RPC_PRIORITY_CLASSES: &str = "transaction,indexer,health";
+/// Default comma-separated provider fallback order. Empty means "use the
+/// configured `PREDIFI_STELLAR_RPC_URL` only".
+const DEFAULT_RPC_PROVIDER_FALLBACK_ORDER: &str = "";
+
 /// Origins allowed by default when `CORS_ALLOWED_ORIGINS` is not set.
 pub const DEFAULT_CORS_ORIGINS: &[&str] = &[
     "http://localhost:3000",
@@ -158,6 +197,55 @@ pub struct Config {
     /// In production, this should be configured to restrict WebSocket connections to trusted domains.
     /// Uses the same validation logic as CORS origins.
     pub allowed_ws_origins: Vec<String>,
+
+    // ── Abuse controls (issue #103) ──────────────────────────────────────────
+    /// Maximum market-creation requests a single wallet may make per
+    /// abuse-control window (default `5`). Read from
+    /// `PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW`.
+    pub abuse_quota_market_create_per_window: u32,
+    /// Maximum expensive wallet actions a single wallet may trigger per
+    /// abuse-control window (default `30`). Read from
+    /// `PREDIFI_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW`.
+    pub abuse_quota_wallet_action_per_window: u32,
+    /// Length of the abuse-control sliding window in seconds (default `60`).
+    /// Read from `PREDIFI_ABUSE_QUOTA_WINDOW_SECS`.
+    pub abuse_quota_window_secs: u64,
+    /// Network-wide ceiling on market-creation requests per window (default
+    /// `500`). Read from `PREDIFI_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW`.
+    pub abuse_quota_network_market_create_per_window: u32,
+    /// Network-wide ceiling on wallet actions per window (default `3000`).
+    /// Read from `PREDIFI_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW`.
+    pub abuse_quota_network_wallet_action_per_window: u32,
+    /// Minimum validation cost that must be paid before a request is admitted
+    /// (default `1`). Read from `PREDIFI_ABUSE_MIN_VALIDATION_COST`.
+    pub abuse_min_validation_cost: u32,
+
+    // ── RPC quotas / failover (issue #105) ───────────────────────────────────
+    /// Per-network request budget per window (default `1000`). Read from
+    /// `PREDIFI_RPC_PER_NETWORK_BUDGET`.
+    pub rpc_per_network_budget: u32,
+    /// Length of the RPC budget window in seconds (default `60`). Read from
+    /// `PREDIFI_RPC_BUDGET_WINDOW_SECS`.
+    pub rpc_budget_window_secs: u64,
+    /// Maximum retries for a single RPC request (default `2`). Read from
+    /// `PREDIFI_RPC_MAX_RETRIES`.
+    pub rpc_max_retries: u8,
+    /// Priority classes, highest priority first (default
+    /// `["transaction", "indexer", "health"]`). Read from
+    /// `PREDIFI_RPC_PRIORITY_CLASSES`.
+    pub rpc_priority_classes: Vec<String>,
+    /// Provider fallback order (default empty → use `stellar_rpc_url` only).
+    /// Read from `PREDIFI_RPC_PROVIDER_FALLBACK_ORDER`.
+    pub rpc_provider_fallback_order: Vec<String>,
+    /// Consecutive failures before a provider is marked unhealthy (default `3`).
+    /// Read from `PREDIFI_RPC_PROVIDER_UNHEALTHY_THRESHOLD`.
+    pub rpc_provider_unhealthy_threshold: u8,
+    /// Consecutive successes before an unhealthy provider is marked healthy
+    /// again (default `2`). Read from `PREDIFI_RPC_PROVIDER_HEALTHY_THRESHOLD`.
+    pub rpc_provider_healthy_threshold: u8,
+    /// Policy applied when providers disagree (default `"quorum"`). One of
+    /// `quorum`, `first`, `strict`. Read from `PREDIFI_RPC_DISAGREEMENT_POLICY`.
+    pub rpc_disagreement_policy: String,
 }
 
 impl Config {
@@ -271,6 +359,76 @@ impl Config {
 
         let app_env = get_string(vars, "PREDIFI_APP_ENV", DEFAULT_APP_ENV);
 
+        // ── Abuse controls (issue #103) ──────────────────────────────────────
+        let abuse_quota_market_create_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW,
+        )?;
+        let abuse_quota_wallet_action_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW,
+        )?;
+        let abuse_quota_window_secs = get_u64(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_WINDOW_SECS",
+            DEFAULT_ABUSE_QUOTA_WINDOW_SECS,
+        )?;
+        let abuse_quota_network_market_create_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW,
+        )?;
+        let abuse_quota_network_wallet_action_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW,
+        )?;
+        let abuse_min_validation_cost = get_u32(
+            vars,
+            "PREDIFI_ABUSE_MIN_VALIDATION_COST",
+            DEFAULT_ABUSE_MIN_VALIDATION_COST,
+        )?;
+
+        // ── RPC quotas / failover (issue #105) ───────────────────────────────
+        let rpc_per_network_budget = get_u32(
+            vars,
+            "PREDIFI_RPC_PER_NETWORK_BUDGET",
+            DEFAULT_RPC_PER_NETWORK_BUDGET,
+        )?;
+        let rpc_budget_window_secs = get_u64(
+            vars,
+            "PREDIFI_RPC_BUDGET_WINDOW_SECS",
+            DEFAULT_RPC_BUDGET_WINDOW_SECS,
+        )?;
+        let rpc_max_retries = get_u8(vars, "PREDIFI_RPC_MAX_RETRIES", DEFAULT_RPC_MAX_RETRIES)?;
+        let rpc_priority_classes = parse_csv_list(
+            vars,
+            "PREDIFI_RPC_PRIORITY_CLASSES",
+            DEFAULT_RPC_PRIORITY_CLASSES,
+        );
+        let rpc_provider_fallback_order = parse_csv_list(
+            vars,
+            "PREDIFI_RPC_PROVIDER_FALLBACK_ORDER",
+            DEFAULT_RPC_PROVIDER_FALLBACK_ORDER,
+        );
+        let rpc_provider_unhealthy_threshold = get_u8(
+            vars,
+            "PREDIFI_RPC_PROVIDER_UNHEALTHY_THRESHOLD",
+            DEFAULT_RPC_PROVIDER_UNHEALTHY_THRESHOLD,
+        )?;
+        let rpc_provider_healthy_threshold = get_u8(
+            vars,
+            "PREDIFI_RPC_PROVIDER_HEALTHY_THRESHOLD",
+            DEFAULT_RPC_PROVIDER_HEALTHY_THRESHOLD,
+        )?;
+        let rpc_disagreement_policy = get_string(
+            vars,
+            "PREDIFI_RPC_DISAGREEMENT_POLICY",
+            DEFAULT_RPC_DISAGREEMENT_POLICY,
+        );
+
         if db_min_connections > db_max_connections {
             return Err(ConfigError::InvalidValue {
                 key: "PREDIFI_DB_MIN_CONNECTIONS",
@@ -310,6 +468,20 @@ impl Config {
             indexer_max_batch_size,
             app_env,
             allowed_ws_origins,
+            abuse_quota_market_create_per_window,
+            abuse_quota_wallet_action_per_window,
+            abuse_quota_window_secs,
+            abuse_quota_network_market_create_per_window,
+            abuse_quota_network_wallet_action_per_window,
+            abuse_min_validation_cost,
+            rpc_per_network_budget,
+            rpc_budget_window_secs,
+            rpc_max_retries,
+            rpc_priority_classes,
+            rpc_provider_fallback_order,
+            rpc_provider_unhealthy_threshold,
+            rpc_provider_healthy_threshold,
+            rpc_disagreement_policy,
         };
 
         config.validate()?;
@@ -530,6 +702,116 @@ impl Config {
             });
         }
 
+        // ── Abuse controls (issue #103) ──────────────────────────────────────
+        if self.abuse_quota_window_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_WINDOW_SECS",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_market_create_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_wallet_action_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_network_market_create_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_network_wallet_action_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        // Per-wallet quotas must fit inside the network-wide ceiling, otherwise
+        // a single wallet could exhaust the whole network budget.
+        if self.abuse_quota_market_create_per_window
+            > self.abuse_quota_network_market_create_per_window
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW",
+                reason: format!(
+                    "must be <= PREDIFI_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW ({}), got {}",
+                    self.abuse_quota_network_market_create_per_window,
+                    self.abuse_quota_market_create_per_window
+                ),
+            });
+        }
+        if self.abuse_quota_wallet_action_per_window
+            > self.abuse_quota_network_wallet_action_per_window
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW",
+                reason: format!(
+                    "must be <= PREDIFI_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW ({}), got {}",
+                    self.abuse_quota_network_wallet_action_per_window,
+                    self.abuse_quota_wallet_action_per_window
+                ),
+            });
+        }
+
+        // ── RPC quotas / failover (issue #105) ───────────────────────────────
+        if self.rpc_per_network_budget == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_PER_NETWORK_BUDGET",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.rpc_budget_window_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_BUDGET_WINDOW_SECS",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.rpc_priority_classes.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_PRIORITY_CLASSES",
+                reason: String::from("must contain at least one priority class"),
+            });
+        }
+        for class in &self.rpc_priority_classes {
+            if class.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    key: "PREDIFI_RPC_PRIORITY_CLASSES",
+                    reason: String::from("priority classes must not be empty"),
+                });
+            }
+        }
+        if self.rpc_provider_unhealthy_threshold == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_PROVIDER_UNHEALTHY_THRESHOLD",
+                reason: String::from("must be at least one"),
+            });
+        }
+        if self.rpc_provider_healthy_threshold == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_PROVIDER_HEALTHY_THRESHOLD",
+                reason: String::from("must be at least one"),
+            });
+        }
+        if !matches!(
+            self.rpc_disagreement_policy.as_str(),
+            "quorum" | "first" | "strict"
+        ) {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_DISAGREEMENT_POLICY",
+                reason: format!(
+                    "must be one of: quorum, first, strict; got '{}'",
+                    self.rpc_disagreement_policy
+                ),
+            });
+        }
+
         Ok(())
     }
 
@@ -578,6 +860,25 @@ impl Config {
             indexer_max_batch_size: DEFAULT_INDEXER_MAX_BATCH_SIZE,
             app_env: String::from(DEFAULT_APP_ENV),
             allowed_ws_origins: Vec::new(), // Empty for permissive mode in tests
+            abuse_quota_market_create_per_window: DEFAULT_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW,
+            abuse_quota_wallet_action_per_window: DEFAULT_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW,
+            abuse_quota_window_secs: DEFAULT_ABUSE_QUOTA_WINDOW_SECS,
+            abuse_quota_network_market_create_per_window:
+                DEFAULT_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW,
+            abuse_quota_network_wallet_action_per_window:
+                DEFAULT_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW,
+            abuse_min_validation_cost: DEFAULT_ABUSE_MIN_VALIDATION_COST,
+            rpc_per_network_budget: DEFAULT_RPC_PER_NETWORK_BUDGET,
+            rpc_budget_window_secs: DEFAULT_RPC_BUDGET_WINDOW_SECS,
+            rpc_max_retries: DEFAULT_RPC_MAX_RETRIES,
+            rpc_priority_classes: DEFAULT_RPC_PRIORITY_CLASSES
+                .split(',')
+                .map(|s| s.to_string())
+                .collect(),
+            rpc_provider_fallback_order: Vec::new(),
+            rpc_provider_unhealthy_threshold: DEFAULT_RPC_PROVIDER_UNHEALTHY_THRESHOLD,
+            rpc_provider_healthy_threshold: DEFAULT_RPC_PROVIDER_HEALTHY_THRESHOLD,
+            rpc_disagreement_policy: String::from(DEFAULT_RPC_DISAGREEMENT_POLICY),
         }
     }
 }
@@ -806,6 +1107,21 @@ pub fn validate_cors_origin(origin: &str) -> Result<(), ConfigError> {
 fn get_string(vars: &HashMap<String, String>, key: &'static str, default: &str) -> String {
     vars.get(key)
         .map_or_else(|| default.to_string(), |value| value.clone())
+}
+
+/// Parse a comma-separated list from `key`, trimming whitespace and dropping
+/// empty entries. Falls back to splitting `default` when the variable is
+/// absent. An explicitly empty value yields an empty vector.
+fn parse_csv_list(
+    vars: &HashMap<String, String>,
+    key: &'static str,
+    default: &str,
+) -> Vec<String> {
+    let raw = vars.get(key).map_or(default, String::as_str);
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn get_u16(
@@ -2214,6 +2530,288 @@ mod tests {
             Config::from_map(&vars),
             Err(ConfigError::InvalidValue {
                 key: "PREDIFI_STELLAR_NETWORK",
+                ..
+            })
+        ));
+    }
+
+    // ── Abuse controls (issue #103) ──────────────────────────────────────────
+
+    #[test]
+    fn abuse_controls_use_defaults_when_env_absent() {
+        let vars = HashMap::new();
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(
+            config.abuse_quota_market_create_per_window,
+            DEFAULT_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW
+        );
+        assert_eq!(
+            config.abuse_quota_wallet_action_per_window,
+            DEFAULT_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW
+        );
+        assert_eq!(
+            config.abuse_quota_window_secs,
+            DEFAULT_ABUSE_QUOTA_WINDOW_SECS
+        );
+        assert_eq!(
+            config.abuse_quota_network_market_create_per_window,
+            DEFAULT_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW
+        );
+        assert_eq!(
+            config.abuse_quota_network_wallet_action_per_window,
+            DEFAULT_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW
+        );
+        assert_eq!(
+            config.abuse_min_validation_cost,
+            DEFAULT_ABUSE_MIN_VALIDATION_COST
+        );
+    }
+
+    #[test]
+    fn abuse_controls_read_from_env() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW"),
+                String::from("2"),
+            ),
+            (
+                String::from("PREDIFI_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW"),
+                String::from("10"),
+            ),
+            (
+                String::from("PREDIFI_ABUSE_QUOTA_WINDOW_SECS"),
+                String::from("120"),
+            ),
+            (
+                String::from("PREDIFI_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW"),
+                String::from("100"),
+            ),
+            (
+                String::from("PREDIFI_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW"),
+                String::from("1000"),
+            ),
+            (
+                String::from("PREDIFI_ABUSE_MIN_VALIDATION_COST"),
+                String::from("5"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(config.abuse_quota_market_create_per_window, 2);
+        assert_eq!(config.abuse_quota_wallet_action_per_window, 10);
+        assert_eq!(config.abuse_quota_window_secs, 120);
+        assert_eq!(config.abuse_quota_network_market_create_per_window, 100);
+        assert_eq!(config.abuse_quota_network_wallet_action_per_window, 1000);
+        assert_eq!(config.abuse_min_validation_cost, 5);
+    }
+
+    #[test]
+    fn abuse_controls_reject_zero_window() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_ABUSE_QUOTA_WINDOW_SECS"),
+            String::from("0"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_WINDOW_SECS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn abuse_controls_reject_zero_per_wallet_quota() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW"),
+            String::from("0"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn abuse_controls_reject_per_wallet_quota_above_network_quota() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW"),
+                String::from("1000"),
+            ),
+            (
+                String::from("PREDIFI_ABUSE_QUOTA_NETWORK_MARKET_CREATE_PER_WINDOW"),
+                String::from("100"),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_MARKET_CREATE_PER_WINDOW",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn abuse_controls_reject_non_numeric_quota() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW"),
+            String::from("many"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidNumber {
+                key: "PREDIFI_ABUSE_QUOTA_WALLET_ACTION_PER_WINDOW",
+                ..
+            })
+        ));
+    }
+
+    // ── RPC quotas / failover (issue #105) ───────────────────────────────────
+
+    #[test]
+    fn rpc_quota_settings_use_defaults_when_env_absent() {
+        let vars = HashMap::new();
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(config.rpc_per_network_budget, DEFAULT_RPC_PER_NETWORK_BUDGET);
+        assert_eq!(config.rpc_budget_window_secs, DEFAULT_RPC_BUDGET_WINDOW_SECS);
+        assert_eq!(config.rpc_max_retries, DEFAULT_RPC_MAX_RETRIES);
+        assert_eq!(
+            config.rpc_priority_classes,
+            vec!["transaction", "indexer", "health"]
+        );
+        assert!(config.rpc_provider_fallback_order.is_empty());
+        assert_eq!(
+            config.rpc_provider_unhealthy_threshold,
+            DEFAULT_RPC_PROVIDER_UNHEALTHY_THRESHOLD
+        );
+        assert_eq!(
+            config.rpc_provider_healthy_threshold,
+            DEFAULT_RPC_PROVIDER_HEALTHY_THRESHOLD
+        );
+        assert_eq!(config.rpc_disagreement_policy, DEFAULT_RPC_DISAGREEMENT_POLICY);
+    }
+
+    #[test]
+    fn rpc_quota_settings_read_from_env() {
+        let vars = HashMap::from([
+            (
+                String::from("PREDIFI_RPC_PER_NETWORK_BUDGET"),
+                String::from("250"),
+            ),
+            (
+                String::from("PREDIFI_RPC_BUDGET_WINDOW_SECS"),
+                String::from("30"),
+            ),
+            (String::from("PREDIFI_RPC_MAX_RETRIES"), String::from("4")),
+            (
+                String::from("PREDIFI_RPC_PRIORITY_CLASSES"),
+                String::from("transaction, indexer"),
+            ),
+            (
+                String::from("PREDIFI_RPC_PROVIDER_FALLBACK_ORDER"),
+                String::from("https://a.example.com, https://b.example.com"),
+            ),
+            (
+                String::from("PREDIFI_RPC_PROVIDER_UNHEALTHY_THRESHOLD"),
+                String::from("5"),
+            ),
+            (
+                String::from("PREDIFI_RPC_PROVIDER_HEALTHY_THRESHOLD"),
+                String::from("3"),
+            ),
+            (
+                String::from("PREDIFI_RPC_DISAGREEMENT_POLICY"),
+                String::from("strict"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(config.rpc_per_network_budget, 250);
+        assert_eq!(config.rpc_budget_window_secs, 30);
+        assert_eq!(config.rpc_max_retries, 4);
+        assert_eq!(config.rpc_priority_classes, vec!["transaction", "indexer"]);
+        assert_eq!(
+            config.rpc_provider_fallback_order,
+            vec!["https://a.example.com", "https://b.example.com"]
+        );
+        assert_eq!(config.rpc_provider_unhealthy_threshold, 5);
+        assert_eq!(config.rpc_provider_healthy_threshold, 3);
+        assert_eq!(config.rpc_disagreement_policy, "strict");
+    }
+
+    #[test]
+    fn rpc_quota_settings_reject_zero_budget() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_RPC_PER_NETWORK_BUDGET"),
+            String::from("0"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_PER_NETWORK_BUDGET",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rpc_quota_settings_reject_empty_priority_classes() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_RPC_PRIORITY_CLASSES"),
+            String::from("  "),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_PRIORITY_CLASSES",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rpc_quota_settings_reject_zero_health_thresholds() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_RPC_PROVIDER_UNHEALTHY_THRESHOLD"),
+            String::from("0"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_PROVIDER_UNHEALTHY_THRESHOLD",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rpc_quota_settings_reject_unknown_disagreement_policy() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_RPC_DISAGREEMENT_POLICY"),
+            String::from("majority-rules"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "PREDIFI_RPC_DISAGREEMENT_POLICY",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rpc_quota_settings_reject_non_numeric_retries() {
+        let vars = HashMap::from([(
+            String::from("PREDIFI_RPC_MAX_RETRIES"),
+            String::from("lots"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidNumber {
+                key: "PREDIFI_RPC_MAX_RETRIES",
                 ..
             })
         ));

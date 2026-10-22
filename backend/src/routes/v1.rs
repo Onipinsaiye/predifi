@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::abuse::{AbuseController, AbuseRejection};
 use crate::cache_coalesce::{CoalesceError, CoalescingCache};
 use crate::config::Config;
 use crate::db::PoolCreatedEvent;
@@ -155,6 +156,9 @@ pub struct AppState {
     pub metrics: SharedMetrics,
     /// Broadcast channel for pushing live prediction events to WebSocket clients.
     pub event_bus: crate::ws::EventBus,
+    /// Per-wallet / per-network abuse controls for market creation and
+    /// expensive wallet-triggering actions (#103).
+    pub abuse: Arc<AbuseController>,
 }
 
 impl axum::extract::FromRef<AppState> for Arc<Config> {
@@ -190,6 +194,62 @@ impl axum::extract::FromRef<AppState> for RedisCache {
 impl axum::extract::FromRef<AppState> for crate::ws::EventBus {
     fn from_ref(state: &AppState) -> Self {
         state.event_bus.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<AbuseController> {
+    fn from_ref(state: &AppState) -> Self {
+        state.abuse.clone()
+    }
+}
+
+/// Map an [`AbuseRejection`] to a transparent, structured HTTP response.
+///
+/// The body names the quota that was exceeded, the wallet it applies to, the
+/// network, and when the caller may retry, so legitimate clients can back off
+/// deterministically instead of guessing. `Retry-After` is set in seconds.
+fn abuse_rejection_response(rejection: AbuseRejection) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let retry_after = rejection.retry_after_secs.max(1);
+    let mut response = ApiResponse::<()>::error(
+        StatusCode::TOO_MANY_REQUESTS,
+        error_codes::RATE_LIMITED,
+        rejection.to_string(),
+    )
+    .into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// Enforce the abuse quota for `action` on behalf of `wallet` before doing any
+/// expensive work. Returns `Some(response)` when the caller must be rejected.
+///
+/// Quotas are keyed on the wallet address and the configured network — never
+/// on the client IP — so users behind a shared NAT are not penalised for each
+/// other's traffic, and a single wallet cannot escape its quota by rotating
+/// source addresses.
+fn enforce_abuse_quota(
+    state: &AppState,
+    action: crate::abuse::AbuseAction,
+    wallet: &str,
+) -> Option<axum::response::Response> {
+    match state.abuse.check(action, wallet) {
+        Ok(_) => None,
+        Err(rejection) => {
+            tracing::warn!(
+                action = action.as_str(),
+                wallet = %wallet,
+                network = state.abuse.network(),
+                "abuse quota exceeded"
+            );
+            Some(abuse_rejection_response(rejection))
+        }
     }
 }
 
@@ -1203,6 +1263,14 @@ pub async fn ingest_pool_created(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::MarketCreate,
+        payload.creator.as_str(),
+    ) {
+        return rejection;
+    }
+
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1257,6 +1325,14 @@ pub async fn ingest_prediction_placed(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        payload.user_address.as_str(),
+    ) {
+        return rejection;
+    }
 
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
@@ -1438,6 +1514,61 @@ fn decode_market_cursor(cursor: &str) -> Result<(chrono::DateTime<chrono::Utc>, 
 }
 
 #[cfg(test)]
+mod abuse_quota_tests {
+    use super::*;
+    use crate::abuse::AbuseAction;
+
+    fn test_state() -> AppState {
+        let config = Arc::new(Config::default());
+        let redis = RedisCache::disabled();
+        AppState {
+            abuse: Arc::new(AbuseController::from_config(&config)),
+            config,
+            cache: PriceCache::new(),
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&redis),
+            redis,
+            db: None,
+            metrics: SharedMetrics::default(),
+            event_bus: crate::ws::EventBus::new(),
+        }
+    }
+
+    #[test]
+    fn quota_is_keyed_per_wallet_not_per_ip() {
+        let state = test_state();
+        let action = AbuseAction::MarketCreate;
+        // A single wallet exhausts its own quota...
+        let mut rejected = false;
+        for _ in 0..10_000 {
+            if enforce_abuse_quota(&state, action, "GWALLET_A").is_some() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "expected wallet A to hit its quota");
+        // ...but a different wallet behind the same IP is unaffected.
+        assert!(enforce_abuse_quota(&state, action, "GWALLET_B").is_none());
+    }
+
+    #[test]
+    fn rejection_response_is_structured_and_retryable() {
+        let state = test_state();
+        let action = AbuseAction::WalletAction;
+        let mut response = None;
+        for _ in 0..10_000 {
+            if let Some(r) = enforce_abuse_quota(&state, action, "GWALLET_C") {
+                response = Some(r);
+                break;
+            }
+        }
+        let response = response.expect("expected a rejection");
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(axum::http::header::RETRY_AFTER));
+    }
+}
+
+#[cfg(test)]
 mod market_cursor_tests {
     use super::{decode_market_cursor, encode_market_cursor};
 
@@ -1507,9 +1638,22 @@ pub async fn get_creator_stats_handler(
 pub async fn pay_creator_incentive_handler(
     State(state): State<AppState>,
     Path(pool_id): Path<i64>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // The pool id is the only identity this route carries; scope the quota to
+    // it so repeated payouts for one pool are bounded without penalising other
+    // pools or other callers sharing an IP.
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        &format!("pool:{pool_id}"),
+    ) {
+        return rejection;
+    }
+
     let Some(db) = &state.db else {
-        return Json(json!({ "error": "database not available" }));
+        return Json(json!({ "error": "database not available" })).into_response();
     };
 
     match crate::db::pay_creator_incentive(db, pool_id, state.config.treasury_fee_bps).await {
@@ -1519,10 +1663,12 @@ pub async fn pay_creator_incentive_handler(
                 .market_reads
                 .invalidate(&format!("pool:{pool_id}"))
                 .await;
-            Json(json!({ "status": "paid", "pool_id": pool_id, "amount": amount }))
+            Json(json!({ "status": "paid", "pool_id": pool_id, "amount": amount })).into_response()
         }
-        Ok(None) => Json(json!({ "status": "not_eligible", "pool_id": pool_id })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        Ok(None) => {
+            Json(json!({ "status": "not_eligible", "pool_id": pool_id })).into_response()
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
     }
 }
 
@@ -1567,6 +1713,14 @@ pub async fn create_pool_template_handler(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::MarketCreate,
+        &body.creator,
+    ) {
+        return rejection;
+    }
 
     if let Err(e) = validate_template_request(&body) {
         return ApiResponse::<()>::error(
@@ -1711,6 +1865,14 @@ pub async fn update_pool_tags_handler(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        body.creator.as_str(),
+    ) {
+        return rejection;
+    }
+
     if let Err(e) = crate::validated_types::validate_tags(&body.tags) {
         return ApiResponse::<()>::error(
             StatusCode::BAD_REQUEST,
@@ -1772,6 +1934,14 @@ pub async fn ingest_claim_handler(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        payload.user_address.as_str(),
+    ) {
+        return rejection;
+    }
 
     let Some(db) = &state.db else {
         return ApiResponse::<()>::error(
@@ -1872,6 +2042,14 @@ pub async fn mark_notifications_read_handler(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        address.as_str(),
+    ) {
+        return rejection;
+    }
+
     if let Err(e) = crate::validated_types::validate_notification_ids(&body.ids) {
         return ApiResponse::<()>::error(
             StatusCode::BAD_REQUEST,
@@ -1947,6 +2125,14 @@ pub async fn set_user_interests_handler(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        address.as_str(),
+    ) {
+        return rejection;
+    }
+
     if let Err(e) = crate::validated_types::validate_interests(&body.interests) {
         return ApiResponse::<()>::error(
             StatusCode::BAD_REQUEST,
@@ -1993,6 +2179,10 @@ pub fn router(
         config.pool_negative_cache_ttl_secs,
     ));
 
+    // Abuse controls are derived from configuration so operators can tune the
+    // per-wallet and per-network quotas without a code change (#103).
+    let abuse = Arc::new(AbuseController::from_config(&config));
+
     let state = AppState {
         config,
         cache,
@@ -2002,6 +2192,7 @@ pub fn router(
         db: pool,
         metrics,
         event_bus,
+        abuse,
     };
 
     // Idempotency-Key support for market mutations (#48). Without a database

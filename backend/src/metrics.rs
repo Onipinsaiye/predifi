@@ -88,6 +88,36 @@ pub struct Metrics {
     /// Counter of core read requests that exceeded the documented query-count
     /// budget, labelled by `endpoint`.
     pub core_read_query_budget_exceeded_total: CounterVec,
+
+    // ── Abuse controls ───────────────────────────────────────────────────────
+    /// Counter of requests rejected by abuse-control quotas, labelled by
+    /// `action_class` (e.g. "market_create", "wallet_action") and `network`.
+    pub abuse_quota_rejections_total: CounterVec,
+    /// Counter of requests rejected because they did not meet the minimum
+    /// validation cost, labelled by `action_class` and `network`.
+    pub abuse_min_validation_cost_rejections_total: CounterVec,
+    /// Counter of abuse-control quota decisions, labelled by `action_class`,
+    /// `network`, and `outcome` ("allowed" / "rejected").
+    pub abuse_quota_decisions_total: CounterVec,
+
+    // ── RPC quota / failover ─────────────────────────────────────────────────
+    /// Counter of RPC requests, labelled by `network`, `priority_class`
+    /// (e.g. "critical", "high", "normal", "low"), and `provider`.
+    pub rpc_requests_total: CounterVec,
+    /// Counter of RPC requests rejected by the per-network request budget,
+    /// labelled by `network` and `priority_class`.
+    pub rpc_quota_rejections_total: CounterVec,
+    /// Counter of RPC provider health transitions, labelled by `network`,
+    /// `provider`, and `to_state` ("healthy" / "degraded" / "unhealthy").
+    pub rpc_provider_health_transitions_total: CounterVec,
+    /// Counter of fallback activations (primary provider skipped or failed
+    /// over), labelled by `network` and `provider`.
+    pub rpc_fallback_activations_total: CounterVec,
+    /// Counter of detected provider disagreements, labelled by `network`.
+    pub rpc_provider_disagreements_total: CounterVec,
+    /// Counter of bounded-retry outcomes, labelled by `network` and `outcome`
+    /// ("success", "exhausted", "not_retryable", "duplicate_suppressed").
+    pub rpc_retry_outcomes_total: CounterVec,
 }
 
 /// Type alias for a reference-counted [`Metrics`] instance shared across handlers.
@@ -322,6 +352,87 @@ impl Metrics {
             &["endpoint"],
         )?;
 
+        // ── Abuse controls ────────────────────────────────────────────────────
+        let abuse_quota_rejections_total = CounterVec::new(
+            Opts::new(
+                "app_abuse_quota_rejections_total",
+                "Total requests rejected by abuse-control quotas, labelled by \
+                 action class and network.",
+            ),
+            &["action_class", "network"],
+        )?;
+
+        let abuse_min_validation_cost_rejections_total = CounterVec::new(
+            Opts::new(
+                "app_abuse_min_validation_cost_rejections_total",
+                "Total requests rejected for not meeting the minimum validation \
+                 cost, labelled by action class and network.",
+            ),
+            &["action_class", "network"],
+        )?;
+
+        let abuse_quota_decisions_total = CounterVec::new(
+            Opts::new(
+                "app_abuse_quota_decisions_total",
+                "Total abuse-control quota decisions, labelled by action class, \
+                 network, and outcome (allowed/rejected).",
+            ),
+            &["action_class", "network", "outcome"],
+        )?;
+
+        // ── RPC quota / failover ─────────────────────────────────────────────
+        let rpc_requests_total = CounterVec::new(
+            Opts::new(
+                "app_rpc_requests_total",
+                "Total RPC requests, labelled by network, priority class, and \
+                 provider.",
+            ),
+            &["network", "priority_class", "provider"],
+        )?;
+
+        let rpc_quota_rejections_total = CounterVec::new(
+            Opts::new(
+                "app_rpc_quota_rejections_total",
+                "Total RPC requests rejected by the per-network request budget, \
+                 labelled by network and priority class.",
+            ),
+            &["network", "priority_class"],
+        )?;
+
+        let rpc_provider_health_transitions_total = CounterVec::new(
+            Opts::new(
+                "app_rpc_provider_health_transitions_total",
+                "Total RPC provider health transitions, labelled by network, \
+                 provider, and target state.",
+            ),
+            &["network", "provider", "to_state"],
+        )?;
+
+        let rpc_fallback_activations_total = CounterVec::new(
+            Opts::new(
+                "app_rpc_fallback_activations_total",
+                "Total RPC fallback activations, labelled by network and \
+                 provider.",
+            ),
+            &["network", "provider"],
+        )?;
+
+        let rpc_provider_disagreements_total = CounterVec::new(
+            Opts::new(
+                "app_rpc_provider_disagreements_total",
+                "Total detected RPC provider disagreements, labelled by network.",
+            ),
+            &["network"],
+        )?;
+
+        let rpc_retry_outcomes_total = CounterVec::new(
+            Opts::new(
+                "app_rpc_retry_outcomes_total",
+                "Total bounded-retry outcomes, labelled by network and outcome.",
+            ),
+            &["network", "outcome"],
+        )?;
+
         // ── Register all metrics ──────────────────────────────────────────────
         registry.register(Box::new(http_requests_total.clone()))?;
         registry.register(Box::new(http_request_duration_seconds.clone()))?;
@@ -352,6 +463,15 @@ impl Metrics {
         registry.register(Box::new(core_read_db_roundtrips.clone()))?;
         registry.register(Box::new(core_read_latency_budget_exceeded_total.clone()))?;
         registry.register(Box::new(core_read_query_budget_exceeded_total.clone()))?;
+        registry.register(Box::new(abuse_quota_rejections_total.clone()))?;
+        registry.register(Box::new(abuse_min_validation_cost_rejections_total.clone()))?;
+        registry.register(Box::new(abuse_quota_decisions_total.clone()))?;
+        registry.register(Box::new(rpc_requests_total.clone()))?;
+        registry.register(Box::new(rpc_quota_rejections_total.clone()))?;
+        registry.register(Box::new(rpc_provider_health_transitions_total.clone()))?;
+        registry.register(Box::new(rpc_fallback_activations_total.clone()))?;
+        registry.register(Box::new(rpc_provider_disagreements_total.clone()))?;
+        registry.register(Box::new(rpc_retry_outcomes_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -384,6 +504,15 @@ impl Metrics {
             core_read_db_roundtrips,
             core_read_latency_budget_exceeded_total,
             core_read_query_budget_exceeded_total,
+            abuse_quota_rejections_total,
+            abuse_min_validation_cost_rejections_total,
+            abuse_quota_decisions_total,
+            rpc_requests_total,
+            rpc_quota_rejections_total,
+            rpc_provider_health_transitions_total,
+            rpc_fallback_activations_total,
+            rpc_provider_disagreements_total,
+            rpc_retry_outcomes_total,
         })
     }
 
@@ -471,6 +600,84 @@ impl Metrics {
                     .inc();
             }
         }
+    }
+
+    /// Record an abuse-control quota decision.
+    ///
+    /// `action_class` should be a short stable label such as `"market_create"`
+    /// or `"wallet_action"`.  `network` is the target network (e.g. `"testnet"`,
+    /// `"mainnet"`).  `allowed` indicates whether the request was permitted.
+    /// Rejections additionally increment the rejection counter.
+    pub fn record_abuse_quota_decision(
+        &self,
+        action_class: &str,
+        network: &str,
+        allowed: bool,
+    ) {
+        let outcome = if allowed { "allowed" } else { "rejected" };
+        self.abuse_quota_decisions_total
+            .with_label_values(&[action_class, network, outcome])
+            .inc();
+        if !allowed {
+            self.abuse_quota_rejections_total
+                .with_label_values(&[action_class, network])
+                .inc();
+        }
+    }
+
+    /// Record a rejection for failing to meet the minimum validation cost.
+    pub fn record_min_validation_cost_rejection(&self, action_class: &str, network: &str) {
+        self.abuse_min_validation_cost_rejections_total
+            .with_label_values(&[action_class, network])
+            .inc();
+    }
+
+    /// Record an RPC request attributed to a network, priority class, and
+    /// provider.
+    pub fn record_rpc_request(&self, network: &str, priority_class: &str, provider: &str) {
+        self.rpc_requests_total
+            .with_label_values(&[network, priority_class, provider])
+            .inc();
+    }
+
+    /// Record an RPC request rejected by the per-network request budget.
+    pub fn record_rpc_quota_rejection(&self, network: &str, priority_class: &str) {
+        self.rpc_quota_rejections_total
+            .with_label_values(&[network, priority_class])
+            .inc();
+    }
+
+    /// Record an RPC provider health transition to `to_state`.
+    pub fn record_rpc_provider_health_transition(
+        &self,
+        network: &str,
+        provider: &str,
+        to_state: &str,
+    ) {
+        self.rpc_provider_health_transitions_total
+            .with_label_values(&[network, provider, to_state])
+            .inc();
+    }
+
+    /// Record a fallback activation for a provider on a network.
+    pub fn record_rpc_fallback_activation(&self, network: &str, provider: &str) {
+        self.rpc_fallback_activations_total
+            .with_label_values(&[network, provider])
+            .inc();
+    }
+
+    /// Record a detected provider disagreement on a network.
+    pub fn record_rpc_provider_disagreement(&self, network: &str) {
+        self.rpc_provider_disagreements_total
+            .with_label_values(&[network])
+            .inc();
+    }
+
+    /// Record a bounded-retry outcome for a network.
+    pub fn record_rpc_retry_outcome(&self, network: &str, outcome: &str) {
+        self.rpc_retry_outcomes_total
+            .with_label_values(&[network, outcome])
+            .inc();
     }
 
     /// Increment the active WebSocket connection count (call on connect).
@@ -901,5 +1108,51 @@ mod tests {
         assert!(text.contains("app_core_read_duration_seconds"));
         assert!(!text.contains("app_core_read_latency_budget_exceeded_total"));
         assert!(!text.contains("app_core_read_query_budget_exceeded_total"));
+    }
+
+    /// Abuse-control helpers record decisions, rejections, and validation-cost
+    /// failures with the expected labels.
+    #[test]
+    fn abuse_control_helpers_record_metrics() {
+        let metrics = Metrics::new().expect("Metrics::new() must succeed");
+
+        metrics.record_abuse_quota_decision("market_create", "testnet", true);
+        metrics.record_abuse_quota_decision("market_create", "testnet", false);
+        metrics.record_min_validation_cost_rejection("wallet_action", "testnet");
+
+        let text = metrics.gather_text().expect("gather_text must succeed");
+        assert!(text.contains("app_abuse_quota_decisions_total"));
+        assert!(text.contains("outcome=\"allowed\""));
+        assert!(text.contains("outcome=\"rejected\""));
+        assert!(text.contains("app_abuse_quota_rejections_total"));
+        assert!(text.contains("app_abuse_min_validation_cost_rejections_total"));
+        assert!(text.contains("action_class=\"market_create\""));
+        assert!(text.contains("action_class=\"wallet_action\""));
+        assert!(text.contains("network=\"testnet\""));
+    }
+
+    /// RPC quota/failover helpers record all expected metric families.
+    #[test]
+    fn rpc_quota_failover_helpers_record_metrics() {
+        let metrics = Metrics::new().expect("Metrics::new() must succeed");
+
+        metrics.record_rpc_request("mainnet", "critical", "provider_a");
+        metrics.record_rpc_quota_rejection("mainnet", "low");
+        metrics.record_rpc_provider_health_transition("mainnet", "provider_a", "unhealthy");
+        metrics.record_rpc_fallback_activation("mainnet", "provider_b");
+        metrics.record_rpc_provider_disagreement("mainnet");
+        metrics.record_rpc_retry_outcome("mainnet", "exhausted");
+
+        let text = metrics.gather_text().expect("gather_text must succeed");
+        assert!(text.contains("app_rpc_requests_total"));
+        assert!(text.contains("priority_class=\"critical\""));
+        assert!(text.contains("provider=\"provider_a\""));
+        assert!(text.contains("app_rpc_quota_rejections_total"));
+        assert!(text.contains("app_rpc_provider_health_transitions_total"));
+        assert!(text.contains("to_state=\"unhealthy\""));
+        assert!(text.contains("app_rpc_fallback_activations_total"));
+        assert!(text.contains("app_rpc_provider_disagreements_total"));
+        assert!(text.contains("app_rpc_retry_outcomes_total"));
+        assert!(text.contains("outcome=\"exhausted\""));
     }
 }

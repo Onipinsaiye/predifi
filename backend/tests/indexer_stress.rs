@@ -6,6 +6,10 @@
 use predifi_backend::{
     db::{self, PoolCreatedEvent, PredictionPlacedEvent},
     redis_cache::RedisCache,
+    rpc::{
+        self, MockRpcProvider, ProviderHealth, RpcBudget, RpcError, RpcPriority, RpcRequest,
+        RpcResponse, RpcRouter,
+    },
     worker::queue::{Job, JobQueue},
 };
 use serde::{Deserialize, Serialize};
@@ -33,6 +37,12 @@ const FIXTURE_LEDGER_START: u64 = 50_000_000;
 const QUERY_P95_LIMIT: Duration = Duration::from_millis(500);
 const QUERY_P99_LIMIT: Duration = Duration::from_millis(1_500);
 const BACKLOG_RECOVERY_LIMIT: Duration = Duration::from_secs(60);
+const RPC_MAX_ATTEMPTS: usize = 3;
+const RPC_BUDGET_PER_WINDOW: u32 = 5;
+const RPC_WINDOW: Duration = Duration::from_secs(1);
+const RPC_HEALTH_FAILURE_THRESHOLD: u32 = 2;
+const RPC_HEALTH_COOLDOWN: Duration = Duration::from_millis(250);
+const RPC_MAX_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StressPrediction {
@@ -58,6 +68,201 @@ fn fixture_pool(pool_id: u64) -> PoolCreatedEvent {
         category: "stress-fixture".to_string(),
         description: format!("Fixture pool {pool_id}"),
     }
+}
+
+/// Builds a router with a deterministic provider ordering and shared budget so
+/// fault-injection scenarios are reproducible.
+fn fault_injection_router(providers: Vec<MockRpcProvider>) -> RpcRouter {
+    let budget = RpcBudget::new(RPC_BUDGET_PER_WINDOW, RPC_WINDOW);
+    RpcRouter::builder()
+        .budget(budget)
+        .max_attempts(RPC_MAX_ATTEMPTS)
+        .max_retry_delay(RPC_MAX_RETRY_DELAY)
+        .health_failure_threshold(RPC_HEALTH_FAILURE_THRESHOLD)
+        .health_cooldown(RPC_HEALTH_COOLDOWN)
+        .providers(providers)
+        .build()
+        .expect("build fault-injection RPC router")
+}
+
+fn sample_request(idempotency_key: &str, priority: RpcPriority) -> RpcRequest {
+    RpcRequest::new("getLatestLedger", serde_json::json!({}))
+        .with_priority(priority)
+        .with_idempotency_key(idempotency_key)
+}
+
+#[tokio::test]
+#[ignore = "Scheduled fault-injection test; run with --ignored"]
+async fn rpc_throttling_produces_bounded_retries_without_duplicate_submission() {
+    let primary = MockRpcProvider::new("primary")
+        .with_throttle_after(1)
+        .with_throttle_retry_after(Duration::from_millis(5));
+    let fallback = MockRpcProvider::new("fallback");
+    let router = fault_injection_router(vec![primary.clone(), fallback.clone()]);
+
+    let request = sample_request("tx-throttle-1", RpcPriority::UserTransaction);
+    let outcome = router
+        .execute(request.clone())
+        .await
+        .expect("router must eventually succeed via fallback");
+
+    assert_eq!(outcome.provider, "fallback", "fallback ordering must be honored");
+    assert!(
+        outcome.attempts <= RPC_MAX_ATTEMPTS,
+        "retries must be bounded: {} > {RPC_MAX_ATTEMPTS}",
+        outcome.attempts
+    );
+    assert_eq!(
+        primary.throttled_requests(),
+        1,
+        "primary should observe exactly one throttled attempt"
+    );
+    assert_eq!(
+        fallback.successful_requests(),
+        1,
+        "fallback must serve the request exactly once"
+    );
+
+    // Replaying the same idempotency key must not submit the transaction twice.
+    let replay = router
+        .execute(request)
+        .await
+        .expect("idempotent replay must succeed");
+    assert_eq!(
+        replay.provider, "fallback",
+        "replay must reuse the recorded provider"
+    );
+    assert_eq!(
+        fallback.successful_requests(),
+        1,
+        "idempotency key must prevent duplicate transaction submission"
+    );
+    assert_eq!(
+        router.submission_count("tx-throttle-1"),
+        1,
+        "router must record exactly one submission per idempotency key"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Scheduled fault-injection test; run with --ignored"]
+async fn rpc_provider_outage_transitions_health_and_fails_over() {
+    let primary = MockRpcProvider::new("primary").with_outage();
+    let secondary = MockRpcProvider::new("secondary");
+    let router = fault_injection_router(vec![primary.clone(), secondary.clone()]);
+
+    let first = router
+        .execute(sample_request("tx-outage-1", RpcPriority::Indexer))
+        .await
+        .expect("router must fail over to a healthy provider");
+    assert_eq!(first.provider, "secondary");
+    assert!(
+        first.attempts <= RPC_MAX_ATTEMPTS,
+        "outage retries must be bounded"
+    );
+
+    let health = router.provider_health("primary");
+    assert_eq!(
+        health,
+        ProviderHealth::Unhealthy,
+        "primary must be marked unhealthy after repeated failures"
+    );
+    assert_eq!(
+        router.provider_health("secondary"),
+        ProviderHealth::Healthy
+    );
+
+    // While the primary is cooling down, subsequent requests must skip it.
+    let second = router
+        .execute(sample_request("tx-outage-2", RpcPriority::Indexer))
+        .await
+        .expect("router must keep serving during cooldown");
+    assert_eq!(second.provider, "secondary");
+    assert_eq!(
+        primary.attempted_requests(),
+        RPC_HEALTH_FAILURE_THRESHOLD as usize,
+        "unhealthy provider must not be retried beyond the failure threshold"
+    );
+
+    // After the cooldown elapses the primary is probed again and recovers.
+    primary.recover();
+    sleep(RPC_HEALTH_COOLDOWN + Duration::from_millis(25)).await;
+    let third = router
+        .execute(sample_request("tx-outage-3", RpcPriority::Indexer))
+        .await
+        .expect("router must recover the primary provider");
+    assert_eq!(third.provider, "primary", "recovered provider must be preferred");
+    assert_eq!(
+        router.provider_health("primary"),
+        ProviderHealth::Healthy,
+        "health must transition back to healthy after a successful probe"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Scheduled fault-injection test; run with --ignored"]
+async fn rpc_budget_exhaustion_returns_bounded_error() {
+    let primary = MockRpcProvider::new("primary").with_throttle_after(0);
+    let router = fault_injection_router(vec![primary.clone()]);
+
+    let mut errors = 0;
+    for attempt in 0..(RPC_BUDGET_PER_WINDOW as usize + 2) {
+        let request = sample_request(&format!("tx-budget-{attempt}"), RpcPriority::Indexer);
+        match router.execute(request).await {
+            Ok(_) => {}
+            Err(RpcError::BudgetExhausted { .. }) => errors += 1,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    assert!(
+        errors > 0,
+        "exhausting the per-network budget must surface a bounded error"
+    );
+    assert!(
+        primary.attempted_requests() <= RPC_BUDGET_PER_WINDOW as usize,
+        "provider must not receive more requests than the budget allows"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Scheduled fault-injection test; run with --ignored"]
+async fn rpc_provider_disagreement_is_detected_and_not_resubmitted() {
+    let primary = MockRpcProvider::new("primary")
+        .with_response(RpcResponse::ledger(100, "hash-a"));
+    let secondary = MockRpcProvider::new("secondary")
+        .with_response(RpcResponse::ledger(100, "hash-b"));
+    let router = fault_injection_router(vec![primary.clone(), secondary.clone()]);
+
+    let request = sample_request("tx-disagree-1", RpcPriority::UserTransaction);
+    let outcome = router
+        .execute(request.clone())
+        .await
+        .expect("router must return the primary response");
+
+    assert_eq!(outcome.provider, "primary");
+    assert!(
+        outcome.disagreement.is_some(),
+        "router must flag disagreement between providers"
+    );
+    assert_eq!(
+        outcome.disagreement.as_ref().map(|d| d.providers.clone()),
+        Some(vec!["primary".to_string(), "secondary".to_string()])
+    );
+
+    // Disagreement must not trigger a duplicate transaction submission.
+    let replay = router
+        .execute(request)
+        .await
+        .expect("idempotent replay must succeed");
+    assert_eq!(replay.provider, "primary");
+    assert_eq!(
+        router.submission_count("tx-disagree-1"),
+        1,
+        "disagreement handling must not resubmit the transaction"
+    );
+    assert_eq!(primary.successful_requests(), 1);
+    assert_eq!(secondary.successful_requests(), 1);
 }
 
 #[tokio::test]

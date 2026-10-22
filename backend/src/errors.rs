@@ -11,6 +11,42 @@ use std::fmt;
 
 use crate::response::FieldViolation;
 
+/// Structured, client-safe details for an abuse-control rejection (#103).
+///
+/// Carries only what a legitimate caller needs to understand and recover from
+/// the rejection: a stable machine-readable reason, how long to wait, and the
+/// quota that was exceeded. It never contains internal counters, keys, IPs or
+/// other server state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbuseRejection {
+    /// Stable reason code, e.g. `market_creation_quota` or `wallet_action_quota`.
+    pub reason: &'static str,
+    /// Seconds the caller should wait before retrying (rendered as `Retry-After`).
+    pub retry_after_secs: u64,
+    /// Human-readable quota description, e.g. `10 per 3600s`.
+    pub quota: String,
+    /// Optional scope the quota applies to, e.g. `wallet` or `network`.
+    pub scope: Option<String>,
+}
+
+impl AbuseRejection {
+    /// Build a rejection with a reason, retry delay and quota description.
+    pub fn new(reason: &'static str, retry_after_secs: u64, quota: impl Into<String>) -> Self {
+        Self {
+            reason,
+            retry_after_secs,
+            quota: quota.into(),
+            scope: None,
+        }
+    }
+
+    /// Attach the scope the quota applies to.
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
+        self
+    }
+}
+
 /// Centralized application error type for mapping lower-level errors
 /// (like database errors) to high-level variants used by the API.
 #[derive(Debug)]
@@ -25,6 +61,8 @@ pub enum AppError {
     TokenRevoked,
     Forbidden(String),
     RateLimited,
+    /// Abuse-control rejection with transparent, client-safe quota details.
+    AbuseRejected(AbuseRejection),
     DatabaseUnavailable,
     TokenStoreUnavailable,
     /// Upstream dependency (Soroban RPC) failed or its circuit is open.
@@ -47,6 +85,11 @@ impl fmt::Display for AppError {
             AppError::TokenRevoked => write!(f, "unauthorized: token revoked"),
             AppError::Forbidden(msg) => write!(f, "forbidden: {}", msg),
             AppError::RateLimited => write!(f, "rate limited"),
+            AppError::AbuseRejected(r) => write!(
+                f,
+                "abuse rejected: reason={} retry_after={}s quota={}",
+                r.reason, r.retry_after_secs, r.quota
+            ),
             AppError::DatabaseUnavailable => write!(f, "database unavailable"),
             AppError::TokenStoreUnavailable => write!(f, "token store unavailable"),
             AppError::UpstreamUnavailable(msg) => write!(f, "upstream unavailable: {}", msg),
@@ -73,6 +116,7 @@ impl AppError {
             AppError::TokenRevoked => (S::UNAUTHORIZED, c::TOKEN_REVOKED),
             AppError::Forbidden(_) => (S::FORBIDDEN, c::FORBIDDEN),
             AppError::RateLimited => (S::TOO_MANY_REQUESTS, c::RATE_LIMIT_EXCEEDED),
+            AppError::AbuseRejected(_) => (S::TOO_MANY_REQUESTS, c::RATE_LIMIT_EXCEEDED),
             AppError::DatabaseUnavailable => (S::SERVICE_UNAVAILABLE, c::DATABASE_UNAVAILABLE),
             AppError::TokenStoreUnavailable => {
                 (S::SERVICE_UNAVAILABLE, c::TOKEN_STORE_UNAVAILABLE)
@@ -164,6 +208,57 @@ impl axum::response::IntoResponse for AppError {
             | AppError::UpstreamTimeout(msg)
             | AppError::ServiceUnavailable(msg)
             | AppError::Internal(msg) => ApiResponse::<()>::error(status, code, msg).into_response(),
+            AppError::AbuseRejected(rejection) => {
+                let mut details = serde_json::Map::new();
+                details.insert(
+                    "reason".to_string(),
+                    serde_json::Value::String(rejection.reason.to_string()),
+                );
+                details.insert(
+                    "retry_after_secs".to_string(),
+                    serde_json::Value::from(rejection.retry_after_secs),
+                );
+                details.insert(
+                    "quota".to_string(),
+                    serde_json::Value::String(rejection.quota.clone()),
+                );
+                if let Some(scope) = &rejection.scope {
+                    details.insert(
+                        "scope".to_string(),
+                        serde_json::Value::String(scope.clone()),
+                    );
+                }
+                let mut resp = ApiResponse::<()>::error(
+                    status,
+                    code,
+                    crate::response::safe_message(code),
+                )
+                .into_response();
+                // Attach the structured details alongside the standard envelope.
+                let (mut parts, body) = resp.into_parts();
+                let mut value = match axum::body::to_bytes(body, usize::MAX).await {
+                    Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    Err(_) => serde_json::json!({}),
+                };
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "details".to_string(),
+                        serde_json::Value::Object(details),
+                    );
+                }
+                let bytes = serde_json::to_vec(&value).unwrap_or_default();
+                parts.headers.insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_str(&rejection.retry_after_secs.to_string())
+                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("1")),
+                );
+                resp = axum::response::Response::from_parts(
+                    parts,
+                    axum::body::Body::from(bytes),
+                );
+                resp
+            }
             AppError::TokenRevoked
             | AppError::RateLimited
             | AppError::DatabaseUnavailable
@@ -246,5 +341,56 @@ mod tests {
     fn internal_maps_to_500() {
         let resp = AppError::Internal("x".to_string()).into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn display_abuse_rejected() {
+        let err = AppError::AbuseRejected(AbuseRejection::new(
+            "market_creation_quota",
+            60,
+            "10 per 3600s",
+        ));
+        assert_eq!(
+            err.to_string(),
+            "abuse rejected: reason=market_creation_quota retry_after=60s quota=10 per 3600s"
+        );
+    }
+
+    #[test]
+    fn abuse_rejected_maps_to_429() {
+        let (status, code) = AppError::AbuseRejected(AbuseRejection::new(
+            "wallet_action_quota",
+            30,
+            "20 per 60s",
+        ))
+        .status_and_code();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(code, crate::response::error_codes::RATE_LIMIT_EXCEEDED);
+    }
+
+    #[tokio::test]
+    async fn abuse_rejected_renders_transparent_envelope() {
+        let rejection = AbuseRejection::new("market_creation_quota", 120, "10 per 3600s")
+            .with_scope("wallet");
+        let resp = AppError::AbuseRejected(rejection).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("120")
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let details = &value["details"];
+        assert_eq!(details["reason"], "market_creation_quota");
+        assert_eq!(details["retry_after_secs"], 120);
+        assert_eq!(details["quota"], "10 per 3600s");
+        assert_eq!(details["scope"], "wallet");
+        // No internal state leaks into the payload.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("internal"));
     }
 }
