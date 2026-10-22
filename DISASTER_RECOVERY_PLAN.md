@@ -54,6 +54,8 @@ ASG EC2 Instances (private subnet) ← Security Group ingress
 
 ## 2. RTO/RPO Targets by Service
 
+The targets below are proposed operational objectives, not measured results. The RTO clock starts when a regional incident is declared and stops only when the service passes its documented health and functional checks. Infrastructure, database, and security owners must approve the objectives before they are treated as production commitments; record approval and exercise measurements in the exercise report.
+
 ### Recovery Time Objective (RTO) — Maximum acceptable downtime
 
 | Scenario | Service | RTO | Justification |
@@ -63,6 +65,7 @@ ASG EC2 Instances (private subnet) ← Security Group ingress
 | **Regional Outage** | PostgreSQL | 4–8 hours | RDS snapshot restore to alternate region; data integrity verification |
 | **Regional Outage** | Redis Cache | 30 minutes | Cache data is non-critical; miss = database query; ephemeral loss acceptable |
 | **Regional Outage** | Frontend UI | 15 minutes | Static content via S3 + CloudFront; reroute to cached/static version |
+| **Regional Outage** | Configuration / Secrets | 90 minutes | Restore required secrets and regional TLS before backend activation; based on the existing 70–90 minute recovery estimate |
 | **Stellar RPC Failure** | Blockchain queries | 10 minutes | Manual DNS update to alternate RPC endpoint |
 
 ### Recovery Point Objective (RPO) — Maximum acceptable data loss
@@ -141,11 +144,14 @@ Entire AWS region (us-east-1, eu-west-1, etc.) is unavailable:
 
 ### Recovery Priority Order
 
-1. **DNS Failover** (tier 0) — Enable traffic to alternate region
-2. **PostgreSQL Restore** (tier 1) — Restore database to alternate region
-3. **Redis Warm-up** (tier 2) — Repopulate cache (lower priority; can operate with cache miss)
-4. **Backend API Scale** (tier 1) — Launch new ASG in alternate region and configure health checks
-5. **Monitoring** (tier 3) — Re-setup Prometheus/Grafana for observability
+1. **PostgreSQL Restore** (tier 1) — Restore and validate the database in the alternate region
+2. **Secrets and TLS** (tier 1) — Restore required secrets and install a valid regional certificate
+3. **Backend API Scale** (tier 1) — Launch the alternate-region ASG and pass health checks
+4. **DNS Failover** (tier 0) — Shift traffic only after the backend and its dependencies are ready
+5. **Redis Warm-up** (tier 2) — Repopulate cache; cache misses are acceptable during recovery
+6. **Monitoring** (tier 3) — Restore or verify observability without delaying safe traffic recovery
+
+Route53 is the final traffic switch, not the first recovery action. Do not update DNS until the restored database is validated, required secrets are available, the regional TLS certificate is valid, and the alternate backend passes health checks.
 
 ### Detailed Failover Runbook
 
@@ -317,6 +323,8 @@ Entire AWS region (us-east-1, eu-west-1, etc.) is unavailable:
 
 #### Phase 4: DNS Failover (~45–50 minutes)
 
+**Cutover gate**: Complete database validation, required secret restoration, regional certificate setup, and direct health checks against the alternate ALB before changing Route53. If any dependency is unavailable, keep traffic on the existing record and continue recovery; do not expose an unhealthy or unauthenticated backend.
+
 **Goal**: Point Route53 alias record to new ALB in alternate region.
 
 1. **Update Route53 DNS record**:
@@ -410,7 +418,9 @@ Entire AWS region (us-east-1, eu-west-1, etc.) is unavailable:
 
 **Timeline**: ~10–20 minutes (full testing cycle)
 
-#### Phase 6: Secrets and TLS Recovery (~70–90 minutes, parallel)
+#### Secrets and TLS Recovery (prerequisite for backend deployment and DNS failover)
+
+The following steps may run in parallel with database recovery, but must be complete before the alternate backend starts serving traffic. This section's position in the document does not change the recovery order.
 
 1. **JWT Secret Restoration**:
    - **Source**: Secrets Manager in failed region (snapshot/backup if available)

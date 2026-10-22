@@ -108,8 +108,10 @@ This directory contains comprehensive disaster recovery (DR) documentation for t
 | Scenario | Service | RTO |
 |----------|---------|-----|
 | **Single AZ Failure** | All | 2–3 minutes (automatic) |
-| **Regional Outage** | Backend API | 4–6 hours (realistic) / 90 min (optimistic) |
+| **Regional Outage** | Backend API | 4–6 hours (objective; 90 min is an ideal phase estimate) |
 | **Regional Outage** | Database | 4–8 hours (with data validation) |
+| **Regional Outage** | Redis cache | 30 minutes (cache rebuild is non-blocking) |
+| **Regional Outage** | Configuration / Secrets | 90 minutes (before backend activation) |
 | **Regional Outage** | Stellar RPC | 10 minutes (DNS failover) |
 | **Regional Outage** | Frontend | 15 minutes (CloudFront serving cache) |
 

@@ -224,6 +224,8 @@ done
 
 **Owner: Infrastructure Lead**
 
+**Cutover gate**: Before changing Route53, verify the restored database, required application secrets, valid regional TLS certificate, and healthy alternate-region backend. If any check fails, do not switch traffic; finish recovery first.
+
 ### Step 1: Get New ALB Details
 ```bash
 NEW_ALB_DNS=$(aws elbv2 describe-load-balancers \
@@ -344,9 +346,11 @@ aws logs tail /aws/ec2/predifi-prod-us-west-2 --follow --since 10m
 
 ---
 
-## 6. Secrets & TLS (parallel with validation)
+## Reference: Secrets & TLS Recovery (complete before backend deployment and DNS failover)
 
 **Owner: Infrastructure Lead (or Backend Lead)**
+
+Run these recovery steps before launching the alternate backend whenever the required secrets or certificate are not already available in the target region. This section appears after validation for reference only; it is a prerequisite, not a post-cutover task.
 
 ### JWT Secret
 ```bash
