@@ -5,6 +5,7 @@ use tracing::{debug, warn};
 
 use crate::indexer::events::IndexedEvent;
 use crate::indexer::state::IndexerState;
+use crate::rpc::quota::{PriorityClass, RpcError, RpcQuotaManager};
 
 /// TTL fallback bound (in seconds) for cached market views.
 ///
@@ -77,8 +78,60 @@ async fn invalidate_market_views(state: &IndexerState, event: &IndexedEvent) {
     }
 }
 
+/// Network whose RPC budget governs indexing work for this event.
+///
+/// Indexing is background work, so it runs in the `Background` priority class:
+/// user-facing transaction preparation in the `UserTx` class always wins when a
+/// network's budget is contended.
+fn event_network(event: &IndexedEvent) -> &'static str {
+    match event {
+        IndexedEvent::PredictionCreated { .. }
+        | IndexedEvent::MarketResolved { .. }
+        | IndexedEvent::MarketCancelled { .. }
+        | IndexedEvent::MarketMetadataUpdated { .. } => "default",
+    }
+}
+
+/// Fetch the latest ledger/block height for the event's network through the
+/// quota/failover manager.
+///
+/// The manager enforces the per-network request budget, applies provider health
+/// and fallback ordering, and bounds retries on throttling or provider outage.
+/// Because the manager deduplicates in-flight submissions and only retries
+/// idempotent reads, a throttled or failing provider cannot cause duplicate
+/// transaction submission. Throttling and fallback are recorded as metrics by
+/// the manager itself.
+async fn fetch_network_head(
+    rpc: &RpcQuotaManager,
+    network: &str,
+) -> Result<u64, RpcError> {
+    rpc.request(network, PriorityClass::Background, |provider| async move {
+        provider.get_latest_block_height().await
+    })
+    .await
+}
+
 /// Process a single indexed event: persist it, then invalidate affected caches.
+///
+/// RPC access is routed through the quota/failover manager so indexing respects
+/// per-network budgets and priority classes. A bounded RPC failure is logged and
+/// does not abort event processing: cache invalidation still runs so views stay
+/// fresh, and the next poll retries the read.
 pub async fn process_event(state: Arc<IndexerState>, event: IndexedEvent) -> anyhow::Result<()> {
+    let network = event_network(&event);
+    match fetch_network_head(&state.rpc, network).await {
+        Ok(height) => {
+            debug!(network, height, "indexer rpc head fetched via quota manager");
+        }
+        Err(err) => {
+            warn!(
+                network,
+                error = %err,
+                "indexer rpc request failed after bounded retries; continuing with cache invalidation"
+            );
+        }
+    }
+
     state.persist_event(&event).await?;
     invalidate_market_views(&state, &event).await;
     Ok(())

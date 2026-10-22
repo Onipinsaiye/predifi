@@ -45,7 +45,10 @@
 
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{ConnectInfo, Request, State},
@@ -191,6 +194,299 @@ pub fn request_identity(
         return info.0.ip().to_string();
     }
     "unknown".to_string()
+}
+
+/// The class of expensive action an abuse quota governs.
+///
+/// Each class has its own quota so a burst of cheap wallet reads cannot starve
+/// market creation, and vice versa.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ActionClass {
+    /// Creating a new prediction market (expensive: validation + indexer write).
+    MarketCreation,
+    /// Wallet-triggering actions such as placing a prediction or claiming.
+    WalletAction,
+}
+
+impl ActionClass {
+    /// Stable label used in Redis keys and rejection metadata.
+    pub fn label(self) -> &'static str {
+        match self {
+            ActionClass::MarketCreation => "market_creation",
+            ActionClass::WalletAction => "wallet_action",
+        }
+    }
+}
+
+/// A quota policy for one action class.
+///
+/// Quotas are expressed per-wallet and per-network so that a single wallet
+/// cannot exhaust capacity for everyone, and so that testnet/mainnet usage is
+/// accounted for independently. IP addresses are deliberately *not* part of the
+/// identity: shared NAT / proxy egress must not couple unrelated wallets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuotaPolicy {
+    /// The action class this policy governs.
+    pub action: ActionClass,
+    /// Maximum number of actions allowed per wallet within `window`.
+    pub per_wallet_limit: u32,
+    /// Maximum number of actions allowed across the whole network within
+    /// `window`. This bounds aggregate resource use even under account cycling.
+    pub per_network_limit: u32,
+    /// The fixed window over which the limits apply.
+    pub window: Duration,
+    /// Minimum validation cost (in abstract units) that must be paid before
+    /// the expensive work runs. Requests below this are rejected up front.
+    pub min_validation_cost: u32,
+}
+
+impl QuotaPolicy {
+    /// Default market-creation policy: 5 per wallet / 200 per network per hour,
+    /// requiring a validation cost of at least 1.
+    pub fn market_creation() -> Self {
+        QuotaPolicy {
+            action: ActionClass::MarketCreation,
+            per_wallet_limit: 5,
+            per_network_limit: 200,
+            window: Duration::from_secs(60 * 60),
+            min_validation_cost: 1,
+        }
+    }
+
+    /// Default wallet-action policy: 60 per wallet / 2000 per network per hour,
+    /// requiring a validation cost of at least 1.
+    pub fn wallet_action() -> Self {
+        QuotaPolicy {
+            action: ActionClass::WalletAction,
+            per_wallet_limit: 60,
+            per_network_limit: 2000,
+            window: Duration::from_secs(60 * 60),
+            min_validation_cost: 1,
+        }
+    }
+}
+
+/// Why an abuse check rejected a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbuseReason {
+    /// The wallet exhausted its own quota for this action class.
+    WalletQuotaExceeded,
+    /// The network-wide quota for this action class was exhausted.
+    NetworkQuotaExceeded,
+    /// The request did not meet the minimum validation cost.
+    InsufficientValidationCost,
+}
+
+impl AbuseReason {
+    /// Stable machine-readable reason code for the rejection body.
+    pub fn code(self) -> &'static str {
+        match self {
+            AbuseReason::WalletQuotaExceeded => "wallet_quota_exceeded",
+            AbuseReason::NetworkQuotaExceeded => "network_quota_exceeded",
+            AbuseReason::InsufficientValidationCost => "insufficient_validation_cost",
+        }
+    }
+}
+
+/// A structured, transparent rejection returned by the abuse controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbuseRejection {
+    /// Why the request was rejected.
+    pub reason: AbuseReason,
+    /// Seconds the caller should wait before retrying.
+    pub retry_after_secs: u64,
+    /// The applicable per-wallet limit for the action class.
+    pub per_wallet_limit: u32,
+    /// The applicable per-network limit for the action class.
+    pub per_network_limit: u32,
+    /// The minimum validation cost required for the action class.
+    pub min_validation_cost: u32,
+}
+
+impl AbuseRejection {
+    /// Render the rejection as a transparent JSON body.
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"error\":\"rate_limited\",\"reason\":\"{}\",\"retry_after\":{},\
+             \"per_wallet_limit\":{},\"per_network_limit\":{},\
+             \"min_validation_cost\":{}}}",
+            self.reason.code(),
+            self.retry_after_secs,
+            self.per_wallet_limit,
+            self.per_network_limit,
+            self.min_validation_cost,
+        )
+    }
+}
+
+/// A single fixed-window counter.
+#[derive(Clone, Copy, Debug)]
+struct WindowCounter {
+    count: u32,
+    window_start: Instant,
+}
+
+impl WindowCounter {
+    fn new(now: Instant) -> Self {
+        WindowCounter {
+            count: 0,
+            window_start: now,
+        }
+    }
+
+    /// Reset the counter if the window has elapsed, returning the remaining
+    /// seconds until the current window ends.
+    fn refresh(&mut self, now: Instant, window: Duration) -> u64 {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed >= window {
+            self.count = 0;
+            self.window_start = now;
+            window.as_secs()
+        } else {
+            (window - elapsed).as_secs().max(1)
+        }
+    }
+}
+
+/// Per-wallet + per-network abuse controller.
+///
+/// Identity is `(wallet, network)`; the client IP is never used as identity, so
+/// many legitimate wallets behind a shared NAT/proxy are independent, while a
+/// single wallet cycling IPs cannot escape its quota.
+pub struct AbuseController {
+    policies: HashMap<ActionClass, QuotaPolicy>,
+    wallets: Mutex<HashMap<(String, String, ActionClass), WindowCounter>>,
+    networks: Mutex<HashMap<(String, ActionClass), WindowCounter>>,
+}
+
+impl AbuseController {
+    /// Build a controller with the default market-creation and wallet-action
+    /// policies.
+    pub fn with_defaults() -> Self {
+        let mut policies = HashMap::new();
+        let mc = QuotaPolicy::market_creation();
+        let wa = QuotaPolicy::wallet_action();
+        policies.insert(mc.action, mc);
+        policies.insert(wa.action, wa);
+        Self::new(policies)
+    }
+
+    /// Build a controller from an explicit set of policies.
+    pub fn new(policies: HashMap<ActionClass, QuotaPolicy>) -> Self {
+        AbuseController {
+            policies,
+            wallets: Mutex::new(HashMap::new()),
+            networks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The policy for `action`, if configured.
+    pub fn policy(&self, action: ActionClass) -> Option<QuotaPolicy> {
+        self.policies.get(&action).copied()
+    }
+
+    /// Check a market-creation request for `wallet` on `network`.
+    ///
+    /// `validation_cost` is the cost the caller is willing to pay for
+    /// validation; it must meet the policy minimum before any expensive work.
+    pub fn check_market_creation(
+        &self,
+        wallet: &str,
+        network: &str,
+        validation_cost: u32,
+    ) -> Result<(), AbuseRejection> {
+        self.check(ActionClass::MarketCreation, wallet, network, validation_cost)
+    }
+
+    /// Check a wallet-triggering action for `wallet` on `network`.
+    pub fn check_wallet_action(
+        &self,
+        wallet: &str,
+        network: &str,
+        validation_cost: u32,
+    ) -> Result<(), AbuseRejection> {
+        self.check(ActionClass::WalletAction, wallet, network, validation_cost)
+    }
+
+    fn check(
+        &self,
+        action: ActionClass,
+        wallet: &str,
+        network: &str,
+        validation_cost: u32,
+    ) -> Result<(), AbuseRejection> {
+        let policy = match self.policies.get(&action) {
+            Some(policy) => *policy,
+            // No policy configured means no abuse control for this class.
+            None => return Ok(()),
+        };
+
+        if validation_cost < policy.min_validation_cost {
+            return Err(AbuseRejection {
+                reason: AbuseReason::InsufficientValidationCost,
+                retry_after_secs: policy.window.as_secs(),
+                per_wallet_limit: policy.per_wallet_limit,
+                per_network_limit: policy.per_network_limit,
+                min_validation_cost: policy.min_validation_cost,
+            });
+        }
+
+        let wallet_key = (
+            normalize_identity(wallet),
+            normalize_identity(network),
+            action,
+        );
+        let network_key = (normalize_identity(network), action);
+        let now = Instant::now();
+
+        // Check the network quota first so a single wallet cannot consume the
+        // last network slot before we know the network is exhausted.
+        {
+            let mut networks = self.networks.lock().expect("abuse networks poisoned");
+            let counter = networks
+                .entry(network_key.clone())
+                .or_insert_with(|| WindowCounter::new(now));
+            let reset = counter.refresh(now, policy.window);
+            if counter.count >= policy.per_network_limit {
+                return Err(AbuseRejection {
+                    reason: AbuseReason::NetworkQuotaExceeded,
+                    retry_after_secs: reset,
+                    per_wallet_limit: policy.per_wallet_limit,
+                    per_network_limit: policy.per_network_limit,
+                    min_validation_cost: policy.min_validation_cost,
+                });
+            }
+        }
+
+        let mut wallets = self.wallets.lock().expect("abuse wallets poisoned");
+        let counter = wallets
+            .entry(wallet_key)
+            .or_insert_with(|| WindowCounter::new(now));
+        let reset = counter.refresh(now, policy.window);
+        if counter.count >= policy.per_wallet_limit {
+            return Err(AbuseRejection {
+                reason: AbuseReason::WalletQuotaExceeded,
+                retry_after_secs: reset,
+                per_wallet_limit: policy.per_wallet_limit,
+                per_network_limit: policy.per_network_limit,
+                min_validation_cost: policy.min_validation_cost,
+            });
+        }
+
+        // Admit the request: consume one slot from both counters.
+        counter.count += 1;
+        drop(wallets);
+        let mut networks = self.networks.lock().expect("abuse networks poisoned");
+        if let Some(network_counter) = networks.get_mut(&network_key) {
+            network_counter.count += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Normalize a wallet/network identifier for use as a map key.
+fn normalize_identity(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 #[derive(Clone)]
@@ -486,5 +782,154 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("1")
         );
+    }
+
+    fn controller_with_limits(
+        per_wallet: u32,
+        per_network: u32,
+        min_cost: u32,
+    ) -> AbuseController {
+        let mut policies = HashMap::new();
+        policies.insert(
+            ActionClass::MarketCreation,
+            QuotaPolicy {
+                action: ActionClass::MarketCreation,
+                per_wallet_limit: per_wallet,
+                per_network_limit: per_network,
+                window: Duration::from_secs(3600),
+                min_validation_cost: min_cost,
+            },
+        );
+        policies.insert(
+            ActionClass::WalletAction,
+            QuotaPolicy {
+                action: ActionClass::WalletAction,
+                per_wallet_limit: per_wallet,
+                per_network_limit: per_network,
+                window: Duration::from_secs(3600),
+                min_validation_cost: min_cost,
+            },
+        );
+        AbuseController::new(policies)
+    }
+
+    #[test]
+    fn market_creation_quota_exhaustion_rejects_with_metadata() {
+        let controller = controller_with_limits(2, 100, 1);
+        assert!(controller
+            .check_market_creation("GABC", "testnet", 1)
+            .is_ok());
+        assert!(controller
+            .check_market_creation("GABC", "testnet", 1)
+            .is_ok());
+
+        let rejection = controller
+            .check_market_creation("GABC", "testnet", 1)
+            .expect_err("third creation should be rejected");
+        assert_eq!(rejection.reason, AbuseReason::WalletQuotaExceeded);
+        assert_eq!(rejection.per_wallet_limit, 2);
+        assert_eq!(rejection.per_network_limit, 100);
+        assert_eq!(rejection.min_validation_cost, 1);
+        assert!(rejection.retry_after_secs > 0);
+        let json = rejection.to_json();
+        assert!(json.contains("\"reason\":\"wallet_quota_exceeded\""));
+        assert!(json.contains("\"per_wallet_limit\":2"));
+    }
+
+    #[test]
+    fn insufficient_validation_cost_is_rejected_before_work() {
+        let controller = controller_with_limits(10, 100, 5);
+        let rejection = controller
+            .check_wallet_action("GABC", "testnet", 1)
+            .expect_err("cost below minimum should be rejected");
+        assert_eq!(rejection.reason, AbuseReason::InsufficientValidationCost);
+        assert_eq!(rejection.min_validation_cost, 5);
+        // The rejected request must not have consumed quota.
+        assert!(controller
+            .check_wallet_action("GABC", "testnet", 5)
+            .is_ok());
+    }
+
+    #[test]
+    fn network_quota_bounds_account_cycling() {
+        let controller = controller_with_limits(10, 3, 1);
+        assert!(controller
+            .check_market_creation("GAAA", "testnet", 1)
+            .is_ok());
+        assert!(controller
+            .check_market_creation("GBBB", "testnet", 1)
+            .is_ok());
+        assert!(controller
+            .check_market_creation("GCCC", "testnet", 1)
+            .is_ok());
+        // A brand-new wallet is still bounded by the network quota.
+        let rejection = controller
+            .check_market_creation("GDDD", "testnet", 1)
+            .expect_err("network quota should reject a fresh wallet");
+        assert_eq!(rejection.reason, AbuseReason::NetworkQuotaExceeded);
+    }
+
+    #[test]
+    fn multi_wallet_users_operate_within_limits() {
+        let controller = controller_with_limits(3, 100, 1);
+        // A legitimate user with several wallets, each under its own quota.
+        for wallet in ["GAAA", "GBBB", "GCCC"] {
+            for _ in 0..3 {
+                assert!(
+                    controller
+                        .check_market_creation(wallet, "testnet", 1)
+                        .is_ok(),
+                    "wallet {wallet} should stay within its quota"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_ip_does_not_couple_wallets() {
+        // The controller has no IP input at all; two wallets on the same
+        // network are independent up to the network quota.
+        let controller = controller_with_limits(2, 100, 1);
+        assert!(controller
+            .check_wallet_action("GAAA", "testnet", 1)
+            .is_ok());
+        assert!(controller
+            .check_wallet_action("GAAA", "testnet", 1)
+            .is_ok());
+        assert!(controller
+            .check_wallet_action("GAAA", "testnet", 1)
+            .is_err());
+        // A different wallet behind the same IP still has full quota.
+        assert!(controller
+            .check_wallet_action("GBBB", "testnet", 1)
+            .is_ok());
+        assert!(controller
+            .check_wallet_action("GBBB", "testnet", 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn networks_are_accounted_independently() {
+        let controller = controller_with_limits(1, 100, 1);
+        assert!(controller
+            .check_market_creation("GAAA", "testnet", 1)
+            .is_ok());
+        assert!(controller
+            .check_market_creation("GAAA", "testnet", 1)
+            .is_err());
+        // The same wallet on mainnet has its own quota.
+        assert!(controller
+            .check_market_creation("GAAA", "mainnet", 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn default_policies_are_configured() {
+        let controller = AbuseController::with_defaults();
+        assert!(controller.policy(ActionClass::MarketCreation).is_some());
+        assert!(controller.policy(ActionClass::WalletAction).is_some());
+        assert!(controller
+            .check_market_creation("GAAA", "testnet", 1)
+            .is_ok());
     }
 }

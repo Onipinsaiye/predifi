@@ -16,6 +16,7 @@ use tracing::{error, info, instrument, warn};
 
 use crate::config::Config;
 use crate::rpc_resilience::{ResilientRpcClient, RpcError};
+use crate::rpc_quota::{PriorityClass, QuotaManager, RpcMethod};
 
 /// Result of a single pool sync operation.
 #[derive(Debug)]
@@ -34,19 +35,34 @@ pub struct PoolSyncResult {
 ///
 /// This calls `get_pool_outcome_stakes` on the predifi contract (simulated,
 /// so the call is idempotent and safe to retry) and sums all outcome stakes.
-/// Goes through [`ResilientRpcClient`] so transient failures are retried with
-/// backoff and a failing node trips the shared circuit breaker (#58).
-#[instrument(skip(config, rpc), name = "sync.fetch_contract_total_stake",
+/// Goes through the [`QuotaManager`] so the request is charged against the
+/// network's per-method budget, scheduled under the `Background` priority
+/// class (indexing must never starve user transaction preparation), and
+/// failed over across healthy providers with bounded retries (#105).
+///
+/// `simulateTransaction` is read-only and idempotent, so retries and provider
+/// failover can never cause a duplicate state change. When providers disagree
+/// the manager's quorum policy decides which response is authoritative; a
+/// disagreement that cannot be resolved surfaces as an error and the pool is
+/// left untouched for the next pass.
+#[instrument(skip(config, rpc, quota), name = "sync.fetch_contract_total_stake",
     fields(pool_id = pool_id))]
 async fn fetch_contract_total_stake(
     config: &Config,
     rpc: &ResilientRpcClient,
+    quota: &QuotaManager,
     pool_id: i64,
 ) -> Result<Option<i64>, RpcError> {
     let params = serde_json::json!({
         "transaction": build_get_stakes_xdr(config, pool_id)
     });
-    let result = rpc.call("simulateTransaction", params).await?;
+    let result = quota
+        .execute(
+            RpcMethod::SimulateTransaction,
+            PriorityClass::Background,
+            || rpc.call("simulateTransaction", params.clone()),
+        )
+        .await?;
     Ok(parse_total_stake_from_rpc(&result))
 }
 
@@ -128,12 +144,15 @@ pub async fn run_full_sync(
     let mut error_count = 0u32;
 
     let rpc = ResilientRpcClient::from_config(config);
+    // Shared quota/failover manager: enforces per-network request budgets,
+    // priority classes and provider health/fallback ordering (#105).
+    let quota = QuotaManager::from_config(config);
 
     for row in &rows {
         let pool_id = row.pool_id;
         let db_stake = row.total_stake;
 
-        match fetch_contract_total_stake(config, &rpc, pool_id).await {
+        match fetch_contract_total_stake(config, &rpc, &quota, pool_id).await {
             Ok(Some(contract_stake)) => {
                 let needs_fix = db_stake != contract_stake;
                 if needs_fix {
@@ -160,13 +179,24 @@ pub async fn run_full_sync(
                 error_count += 1;
             }
             Err(RpcError::CircuitOpen) => {
-                // The node is unhealthy: stop this pass instead of queueing a
+                // All providers are unhealthy or the quota manager exhausted
+                // its bounded retries: stop this pass instead of queueing a
                 // failure per remaining pool. The next pass retries.
-                warn!(pool_id, "rpc circuit open — aborting sync pass early");
+                warn!(pool_id, "rpc providers unavailable — aborting sync pass early");
+                error_count += 1;
+                break;
+            }
+            Err(RpcError::RateLimited) => {
+                // Budget exhausted for this network. Back off the whole pass
+                // rather than hammering the provider; the next pass resumes.
+                warn!(pool_id, "rpc request budget exhausted — aborting sync pass early");
                 error_count += 1;
                 break;
             }
             Err(e) => {
+                // Includes unresolved provider disagreement: leave the DB row
+                // untouched (contract is truth only when confirmed) and retry
+                // on the next pass.
                 warn!(pool_id, error = %e, "could not fetch on-chain stake — skipping");
                 error_count += 1;
             }
