@@ -60,6 +60,21 @@ Set `PREDIFI_REDIS_REQUIRED=true` in production to fail fast at startup instead
 of serving a degraded, partially fail-closed API. The default is `false` so
 local development works without Redis.
 
+## Consumer timeouts and fallbacks
+
+Every Redis operation has a bounded wait. The timeout class determines the
+latency budget; the consumer determines the fallback:
+
+| Consumer class | Timeout | Failure behavior |
+| --- | ---: | --- |
+| Optional cached views | 75 ms | Treat reads as misses; skip writes and invalidations. Continue through the authoritative data path. |
+| Rate-limit critical | 125 ms | Apply the tier policy above; security-sensitive tiers reject with `503`. |
+| Session critical | 150 ms | Fail closed. Token checks and revocation writes return an error; refresh returns `503`. |
+
+Session-critical operations distinguish a missing revocation key from a Redis
+timeout, connection failure, malformed value, or command error. Only a confirmed
+missing key means “not revoked.”
+
 ## Configuration
 
 The limits are compiled-in constants in `src/constants.rs` (the values in the
@@ -86,3 +101,6 @@ and in the constants' documentation.
   ```
 
   It requires Docker, like the existing Redis TTL integration tests.
+- The same integration module injects wrong-type command failures and a Redis
+  pause to verify fail-closed session checks, bounded limiter latency, and
+  recovery after Redis resumes.

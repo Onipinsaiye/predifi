@@ -74,7 +74,7 @@ pub async fn is_token_valid_for_user(
     cache: &RedisCache,
     user_address: &str,
     issued_at: u64,
-) -> bool
+) -> Result<bool, JwtVerifyError>
 ```
 
 **Usage:**
@@ -85,8 +85,9 @@ pub async fn is_token_valid_for_user(
 **Implementation Details:**
 - Revocation entries stored in Redis with TTL matching token expiry
 - Revoke-before timestamps allow efficient bulk invalidation
-- Redis unavailability defaults to accepting tokens (fail-open strategy)
-  - *Note:* Consider fail-closed strategy for critical environments
+- Redis unavailability, timeouts, and command errors fail closed for token
+  validation, revocation checks, and revocation writes. The refresh endpoint
+  returns `503` when this session-critical state cannot be read or persisted.
 
 ### 4. Refresh Token Rotation
 

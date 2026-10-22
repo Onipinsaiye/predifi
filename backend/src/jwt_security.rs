@@ -76,17 +76,19 @@ pub async fn rotate_refresh_token(
         return Err(JwtVerifyError::TokenStoreUnavailable);
     }
 
-    if !claims.jti.is_empty() && is_token_revoked(cache, &claims.jti).await {
+    if !claims.jti.is_empty() && is_token_revoked(cache, &claims.jti).await? {
         return Err(JwtVerifyError::Revoked);
     }
 
-    if claims.iat > 0 && !is_token_valid_for_user(cache, &claims.sub, claims.iat).await {
+    if claims.iat > 0 && !is_token_valid_for_user(cache, &claims.sub, claims.iat).await? {
         return Err(JwtVerifyError::Revoked);
     }
 
     if !claims.jti.is_empty() {
         let remaining = claims.exp.saturating_sub(now_unix).max(1);
-        let _ = revoke_token(cache, &claims.jti, remaining).await;
+        revoke_token(cache, &claims.jti, remaining)
+            .await
+            .map_err(|_| JwtVerifyError::TokenStoreUnavailable)?;
     }
 
     issue_token_pair(&claims.sub, secret, now_unix, current_key_version)
@@ -137,12 +139,19 @@ pub async fn rotate_refresh_token_durable(
 ///
 /// Revoked tokens are stored in Redis under the key pattern:
 /// `jwt:revoked:{jti}` with a TTL matching the token's remaining expiry.
-pub async fn is_token_revoked(cache: &RedisCache, token_jti: &str) -> bool {
-    if token_jti.is_empty() || !cache.is_available() {
-        return false;
+pub async fn is_token_revoked(
+    cache: &RedisCache,
+    token_jti: &str,
+) -> Result<bool, JwtVerifyError> {
+    if token_jti.is_empty() {
+        return Ok(false);
     }
 
-    cache.exists(&revoked_key(token_jti)).await
+    cache
+        .get_session_critical::<u8>(&revoked_key(token_jti))
+        .await
+        .map(|value| value.is_some())
+        .map_err(|_| JwtVerifyError::TokenStoreUnavailable)
 }
 
 /// Revoke a token by storing its JTI in Redis.
@@ -156,14 +165,10 @@ pub async fn revoke_token(
     if token_jti.is_empty() {
         return Err("token jti must not be empty".to_string());
     }
-    if !cache.is_available() {
-        return Err("Redis cache not available".to_string());
-    }
-
     cache
-        .set(&revoked_key(token_jti), &1u8, ttl_secs)
-        .await;
-    Ok(())
+        .set_session_critical(&revoked_key(token_jti), &1u8, ttl_secs)
+        .await
+        .map_err(|error| format!("session token store failed: {error:?}"))
 }
 
 /// Revoke all tokens for a user (on password change, logout, etc.).
@@ -172,19 +177,15 @@ pub async fn revoke_token(
 /// `jwt:user:revoke_before:{user_address}` to the current Unix timestamp.
 /// Tokens issued before this time are considered revoked.
 pub async fn revoke_user_tokens(cache: &RedisCache, user_address: &str) -> Result<(), String> {
-    if !cache.is_available() {
-        return Err("Redis cache not available".to_string());
-    }
-
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
     cache
-        .set(&user_revoke_key(user_address), &now, 86400 * 30)
-        .await;
-    Ok(())
+        .set_session_critical(&user_revoke_key(user_address), &now, 86400 * 30)
+        .await
+        .map_err(|error| format!("session token store failed: {error:?}"))
 }
 
 /// Check if a token (issued at `issued_at`) is still valid for a user.
@@ -195,15 +196,12 @@ pub async fn is_token_valid_for_user(
     cache: &RedisCache,
     user_address: &str,
     issued_at: u64,
-) -> bool {
-    if !cache.is_available() {
-        return true;
-    }
-
-    if let Some(revoke_before) = cache.get::<u64>(&user_revoke_key(user_address)).await {
-        return issued_at >= revoke_before;
-    }
-    true
+) -> Result<bool, JwtVerifyError> {
+    cache
+        .get_session_critical::<u64>(&user_revoke_key(user_address))
+        .await
+        .map(|revoke_before| revoke_before.map_or(true, |revoke_before| issued_at >= revoke_before))
+        .map_err(|_| JwtVerifyError::TokenStoreUnavailable)
 }
 
 fn revoked_key(jti: &str) -> String {
@@ -252,6 +250,20 @@ mod tests {
             .await
             .expect_err("redis required");
         assert_eq!(error, JwtVerifyError::TokenStoreUnavailable);
+    }
+
+    #[tokio::test]
+    async fn token_state_checks_fail_closed_without_redis() {
+        let cache = RedisCache::disabled();
+        assert_eq!(
+            is_token_revoked(&cache, "token-id").await,
+            Err(JwtVerifyError::TokenStoreUnavailable)
+        );
+        assert_eq!(
+            is_token_valid_for_user(&cache, "GABC123", 1_800_000_000).await,
+            Err(JwtVerifyError::TokenStoreUnavailable)
+        );
+        assert!(revoke_token(&cache, "token-id", 60).await.is_err());
     }
 
     #[tokio::test]

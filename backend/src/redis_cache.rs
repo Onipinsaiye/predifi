@@ -69,6 +69,46 @@ const MAX_VALUE_BYTES: usize = 512 * 1024;
 /// service (readiness).
 pub const DEFAULT_REDIS_PROBE_TIMEOUT_MS: u64 = 100;
 
+/// Latency budget for optional cache reads, writes, and invalidation.
+pub const OPTIONAL_CACHE_TIMEOUT: Duration = Duration::from_millis(75);
+/// Latency budget for distributed rate-limit commands.
+pub const RATE_LIMIT_TIMEOUT: Duration = Duration::from_millis(125);
+/// Latency budget for session-critical token-state commands.
+pub const SESSION_CRITICAL_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Failure behavior and timeout class for Redis consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisConsumerClass {
+    /// Cached views may fall back to the authoritative data source.
+    Optional,
+    /// Distributed rate limiting uses tier-specific fail-open/closed behavior.
+    RateLimitCritical,
+    /// Token revocation state must never fail open.
+    SessionCritical,
+}
+
+impl RedisConsumerClass {
+    /// Maximum time a consumer in this class may wait for Redis.
+    pub const fn timeout(self) -> Duration {
+        match self {
+            Self::Optional => OPTIONAL_CACHE_TIMEOUT,
+            Self::RateLimitCritical => RATE_LIMIT_TIMEOUT,
+            Self::SessionCritical => SESSION_CRITICAL_TIMEOUT,
+        }
+    }
+}
+
+/// Error from a session-critical Redis operation. Any error must be treated as
+/// unavailable security state, never as an absent revocation record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisCacheError {
+    Unavailable,
+    Timeout,
+    CommandFailed,
+    InvalidKey,
+    InvalidValue,
+}
+
 /// Envelope stored in Redis so expiry is enforced even if Redis TTL is stripped.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope {
@@ -420,8 +460,18 @@ impl RedisCache {
         };
         let mut conn = manager.clone();
 
-        match conn.get::<_, Option<String>>(&namespaced).await {
-            Ok(Some(data)) => match decode_envelope(&data) {
+        match tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.get::<_, Option<String>>(&namespaced),
+        )
+        .await
+        {
+            Err(_) => {
+                warn!("Redis GET timed out for {}", key);
+                self.record_lookup(&cache_name, "error");
+                None
+            }
+            Ok(Ok(Some(data))) => match decode_envelope(&data) {
                 Some(value) => {
                     debug!("Cache hit: {}", key);
                     self.record_lookup(&cache_name, "hit");
@@ -433,12 +483,12 @@ impl RedisCache {
                     None
                 }
             },
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 debug!("Cache miss: {}", key);
                 self.record_lookup(&cache_name, "miss");
                 None
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 if is_connection_error(err.kind()) {
                     warn!("Redis connection dropout on GET {}: {}", key, err);
                 } else {
@@ -479,14 +529,23 @@ impl RedisCache {
             None => return,
         };
 
-        if let Err(err) = conn.set_ex::<_, _, _>(&namespaced, data, ttl).await {
-            if is_connection_error(err.kind()) {
-                warn!("Redis connection dropout on SET {}: {}", key, err);
-            } else {
-                error!("Redis SET error for {}: {}", key, err);
+        let result = tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.set_ex::<_, _, _>(&namespaced, data, ttl),
+        )
+        .await;
+        match result {
+            Err(_) => warn!("Redis SET timed out for {}", key),
+            Ok(Err(err)) => {
+                if is_connection_error(err.kind()) {
+                    warn!("Redis connection dropout on SET {}: {}", key, err);
+                } else {
+                    error!("Redis SET error for {}: {}", key, err);
+                }
             }
-        } else {
-            debug!("Cached: {} (TTL: {}s)", key, ttl);
+            Ok(Ok(())) => {
+                debug!("Cached: {} (TTL: {}s)", key, ttl);
+            }
         }
     }
 
@@ -504,14 +563,23 @@ impl RedisCache {
 
         let mut conn = manager.clone();
 
-        if let Err(err) = conn.del::<_, _>(&namespaced).await {
-            if is_connection_error(err.kind()) {
-                warn!("Redis connection dropout on DEL {}: {}", key, err);
-            } else {
-                error!("Redis DEL error for {}: {}", key, err);
+        let result = tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.del::<_, _>(&namespaced),
+        )
+        .await;
+        match result {
+            Err(_) => warn!("Redis DEL timed out for {}", key),
+            Ok(Err(err)) => {
+                if is_connection_error(err.kind()) {
+                    warn!("Redis connection dropout on DEL {}: {}", key, err);
+                } else {
+                    error!("Redis DEL error for {}: {}", key, err);
+                }
             }
-        } else {
-            debug!("Invalidated cache: {}", key);
+            Ok(Ok(_)) => {
+                debug!("Invalidated cache: {}", key);
+            }
         }
     }
 
@@ -531,9 +599,18 @@ impl RedisCache {
         let mut conn = manager.clone();
 
         // Get all keys matching pattern (already namespaced)
-        let keys: Vec<String> = match conn.keys(&namespaced).await {
-            Ok(k) => k,
-            Err(err) => {
+        let keys: Vec<String> = match tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.keys(&namespaced),
+        )
+        .await
+        {
+            Err(_) => {
+                warn!("Redis KEYS timed out for pattern {}", pattern);
+                return;
+            }
+            Ok(Ok(k)) => k,
+            Ok(Err(err)) => {
                 if is_connection_error(err.kind()) {
                     warn!("Redis connection dropout on KEYS {}: {}", pattern, err);
                 } else {
@@ -556,18 +633,27 @@ impl RedisCache {
             return;
         }
 
-        if let Err(err) = conn.del::<_, _>(&scoped).await {
-            if is_connection_error(err.kind()) {
-                warn!(
-                    "Redis connection dropout on DEL (multi) for pattern {}: {}",
-                    pattern,
-                    err
-                );
-            } else {
-                error!("Redis DEL error for pattern {}: {}", pattern, err);
+        let result = tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.del::<_, _>(&scoped),
+        )
+        .await;
+        match result {
+            Err(_) => warn!("Redis multi-key DEL timed out for pattern {}", pattern),
+            Ok(Err(err)) => {
+                if is_connection_error(err.kind()) {
+                    warn!(
+                        "Redis connection dropout on DEL (multi) for pattern {}: {}",
+                        pattern,
+                        err
+                    );
+                } else {
+                    error!("Redis DEL error for pattern {}: {}", pattern, err);
+                }
             }
-        } else {
-            debug!("Invalidated {} cache keys for pattern {}", scoped.len(), pattern);
+            Ok(Ok(_)) => {
+                debug!("Invalidated {} cache keys for pattern {}", scoped.len(), pattern);
+            }
         }
     }
 
@@ -600,9 +686,18 @@ impl RedisCache {
         };
 
         let mut conn = manager.clone();
-        match conn.exists::<_, bool>(&namespaced).await {
-            Ok(exists) => exists,
-            Err(err) => {
+        match tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.exists::<_, bool>(&namespaced),
+        )
+        .await
+        {
+            Ok(Ok(exists)) => exists,
+            Err(_) => {
+                debug!("Redis EXISTS timed out for {}", key);
+                false
+            }
+            Ok(Err(err)) => {
                 if is_connection_error(err.kind()) {
                     debug!("Redis connection dropout on EXISTS {}: {}", key, err);
                 } else {
@@ -625,8 +720,12 @@ impl RedisCache {
         };
 
         let mut conn = manager.clone();
-        let r: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
-        r.is_ok()
+        tokio::time::timeout(
+            self.probe_timeout,
+            redis::cmd("PING").query_async::<_, String>(&mut conn),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
     }
 
     /// Atomically increment a distributed rate-limit counter.
@@ -654,11 +753,28 @@ impl RedisCache {
         let mut conn = manager.clone();
         let window_ms = window_secs.saturating_mul(1000).max(1);
         let started = std::time::Instant::now();
-        let result: Result<(i64, i64), redis::RedisError> = Script::new(RATE_LIMIT_SCRIPT)
-            .key(namespaced)
-            .arg(window_ms as i64)
-            .invoke_async(&mut conn)
-            .await;
+        let result: Result<(i64, i64), redis::RedisError> = match tokio::time::timeout(
+            RedisConsumerClass::RateLimitCritical.timeout(),
+            Script::new(RATE_LIMIT_SCRIPT)
+                .key(namespaced)
+                .arg(window_ms as i64)
+                .invoke_async(&mut conn),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_redis_op(
+                        "rate_limit_incr",
+                        "timeout",
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
+                warn!("Redis rate-limit INCR timed out");
+                return None;
+            }
+        };
         match result {
             Ok((count, ttl_ms)) => {
                 if let Some(metrics) = &self.metrics {
@@ -694,6 +810,52 @@ impl RedisCache {
                 None
             }
         }
+    }
+
+    /// Read a session-critical value. Redis errors and malformed stored values
+    /// are distinct from a missing key so callers can fail closed.
+    pub async fn get_session_critical<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, RedisCacheError> {
+        let namespaced = namespaced_key(key).ok_or(RedisCacheError::InvalidKey)?;
+        let manager = self.manager.as_ref().ok_or(RedisCacheError::Unavailable)?;
+        let mut conn = manager.clone();
+        let result = tokio::time::timeout(
+            RedisConsumerClass::SessionCritical.timeout(),
+            conn.get::<_, Option<String>>(&namespaced),
+        )
+        .await
+        .map_err(|_| RedisCacheError::Timeout)?
+        .map_err(|_| RedisCacheError::CommandFailed)?;
+
+        result
+            .map(|data| decode_envelope(&data).ok_or(RedisCacheError::InvalidValue))
+            .transpose()
+    }
+
+    /// Write a session-critical value and report any failure to the caller.
+    pub async fn set_session_critical<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl_secs: u64,
+    ) -> Result<(), RedisCacheError> {
+        if ttl_secs < MIN_TTL_SECS {
+            return Err(RedisCacheError::InvalidValue);
+        }
+        let namespaced = namespaced_key(key).ok_or(RedisCacheError::InvalidKey)?;
+        let manager = self.manager.as_ref().ok_or(RedisCacheError::Unavailable)?;
+        let ttl = ttl_secs.min(MAX_TTL_SECS);
+        let data = encode_envelope(value, ttl).ok_or(RedisCacheError::InvalidValue)?;
+        let mut conn = manager.clone();
+        tokio::time::timeout(
+            RedisConsumerClass::SessionCritical.timeout(),
+            conn.set_ex::<_, _, _>(&namespaced, data, ttl),
+        )
+        .await
+        .map_err(|_| RedisCacheError::Timeout)?
+        .map_err(|_| RedisCacheError::CommandFailed)
     }
 }
 
