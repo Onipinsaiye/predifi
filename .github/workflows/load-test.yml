@@ -8,6 +8,9 @@ on:
     paths:
       - 'backend/**'
 
+permissions:
+  contents: read
+
 jobs:
   capacity-test:
     name: Run Capacity Load Test
