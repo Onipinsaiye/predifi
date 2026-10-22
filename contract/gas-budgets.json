@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "description": "Per-entry-point Soroban resource budgets (issue #42). 'ceiling' is the agreed hard limit (CI fails at or above it), set at roughly half of the Soroban per-transaction limits to leave headroom for Wasm/VM costs that native test metering excludes. CI warns once a metric reaches alert_threshold_pct of its ceiling. 'baseline' is the last recorded measurement (scripts/check_gas_budgets.py --record) and is used to report regressions; it never blocks.",
+  "alert_threshold_pct": 80,
+  "metrics": ["cpu_insns", "mem_bytes", "read_entries", "write_entries", "read_bytes", "write_bytes"],
+  "entry_points": {
+    "create_pool": {
+      "ceiling": { "cpu_insns": 50000000, "mem_bytes": 20971520, "read_entries": 40, "write_entries": 25, "read_bytes": 100000, "write_bytes": 65536 },
+      "baseline": null
+    },
+    "place_prediction": {
+      "ceiling": { "cpu_insns": 50000000, "mem_bytes": 20971520, "read_entries": 40, "write_entries": 25, "read_bytes": 100000, "write_bytes": 65536 },
+      "baseline": null
+    },
+    "resolve_pool": {
+      "ceiling": { "cpu_insns": 50000000, "mem_bytes": 20971520, "read_entries": 40, "write_entries": 25, "read_bytes": 100000, "write_bytes": 65536 },
+      "baseline": null
+    },
+    "cancel_pool": {
+      "ceiling": { "cpu_insns": 50000000, "mem_bytes": 20971520, "read_entries": 40, "write_entries": 25, "read_bytes": 100000, "write_bytes": 65536 },
+      "baseline": null
+    },
+    "claim_winnings": {
+      "ceiling": { "cpu_insns": 50000000, "mem_bytes": 20971520, "read_entries": 40, "write_entries": 25, "read_bytes": 100000, "write_bytes": 65536 },
+      "baseline": null
+    },
+    "claim_refund": {
+      "ceiling": { "cpu_insns": 50000000, "mem_bytes": 20971520, "read_entries": 40, "write_entries": 25, "read_bytes": 100000, "write_bytes": 65536 },
+      "baseline": null
+    }
+  }
+}

@@ -238,6 +238,37 @@ jobs:
             exit 1
           fi
 
+  # Issue #42: per-entry-point Soroban resource budgets (contract/gas-budgets.json).
+  # Warns at the alert threshold and fails only when an agreed ceiling is reached.
+  gas-budgets:
+    name: contract / gas budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ./contract
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          enableCrossOsArchive: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contract/target
+          key: ${{ runner.os }}-contract-gas-${{ hashFiles('contract/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-contract-gas-
+      - name: Test budget checker
+        run: python3 -m unittest discover -s scripts/tests -p 'test_check_gas_budgets.py'
+      - name: Measure and check per-entry-point budgets
+        run: |
+          set -euo pipefail
+          cargo test -p predifi-contract --lib gas_budget_tests \
+            -- --nocapture --test-threads=1 | tee gas-budget-output.txt
+          python3 scripts/check_gas_budgets.py --input gas-budget-output.txt
+
   wasm-build:
     name: contract / WASM build verification
     runs-on: ubuntu-latest
