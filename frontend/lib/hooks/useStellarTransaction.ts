@@ -35,6 +35,8 @@ export type StellarTxStatus = "idle" | "running" | "confirmed" | "ambiguous" | "
 export interface UseStellarTransactionOptions<TParams> {
   /** Connected source account, or null when disconnected. */
   address: string | null;
+  /** Network the wallet is connected to; scopes persisted state. */
+  network?: string;
   /** Build, sign and broadcast the intent. Throw `TransactionSubmitError`. */
   submit: SubmitFn<TParams>;
   /** Override account-state refresh (tests / custom RPC). */
@@ -78,7 +80,14 @@ function defaultIntent<TParams>(params: TParams): TransactionIntent<TParams> {
 export function useStellarTransaction<TParams>(
   options: UseStellarTransactionOptions<TParams>,
 ): UseStellarTransactionResult<TParams> {
-  const { address, submit, maxAutoRetries = 1, createIntent, persistTransaction = true } = options;
+  const {
+    address,
+    network,
+    submit,
+    maxAutoRetries = 1,
+    createIntent,
+    persistTransaction = true,
+  } = options;
   const refreshAccountState = options.refreshAccountState ?? refreshAccountSequence;
 
   const [status, setStatus] = useState<StellarTxStatus>("idle");
@@ -93,6 +102,13 @@ export function useStellarTransaction<TParams>(
   const mountedRef = useRef(true);
   const addressRef = useRef(address);
   addressRef.current = address;
+  const networkRef = useRef(network);
+  networkRef.current = network;
+  // Identity key: account data is owned by (network, address). Any change
+  // invalidates in-flight runs and all account-scoped UI state.
+  const identityKey = address ? `${network ?? "unknown"}:${address}` : null;
+  const identityRef = useRef(identityKey);
+  identityRef.current = identityKey;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -102,6 +118,8 @@ export function useStellarTransaction<TParams>(
   }, []);
 
   useEffect(() => {
+    // Detach any in-flight run so its result cannot touch the new identity.
+    activeRunRef.current = null;
     intentRef.current = null;
     setStatus("idle");
     setHash(undefined);
@@ -112,7 +130,7 @@ export function useStellarTransaction<TParams>(
 
     if (!persistTransaction || !address) return;
 
-    const saved = getPersistedStellarTransaction<TParams>(address);
+    const saved = getPersistedStellarTransaction<TParams>(address, network);
 
     if (!saved) return;
 
@@ -123,7 +141,7 @@ export function useStellarTransaction<TParams>(
     setStatus(saved.status);
     setRequiresUserConfirmation(saved.requiresUserConfirmation);
     setError(saved.error);
-  }, [address, persistTransaction]);
+  }, [identityKey, address, network, persistTransaction]);
 
   const persistResult = useCallback(
     (
@@ -139,6 +157,7 @@ export function useStellarTransaction<TParams>(
       setPersistedStellarTransaction({
         version: 1,
         address,
+        network,
         status: nextStatus,
         intent: txIntent,
         hash: nextHash,
@@ -155,7 +174,7 @@ export function useStellarTransaction<TParams>(
         updatedAt: Date.now(),
       });
     },
-    [address, persistTransaction],
+    [address, network, persistTransaction],
   );
 
   const execute = useCallback(
@@ -164,6 +183,7 @@ export function useStellarTransaction<TParams>(
       userConfirmedRetry: boolean,
     ): Promise<TransactionRunResult<TParams>> => {
       const executionAddress = address;
+      const executionIdentity = identityKey;
       intentRef.current = txIntent;
       persistResult("running", txIntent);
       setStatus("running");
@@ -190,7 +210,11 @@ export function useStellarTransaction<TParams>(
       );
 
       // Do not let an old wallet's result overwrite the current wallet's UI.
-      if (!mountedRef.current || addressRef.current !== executionAddress) {
+      if (
+        !mountedRef.current ||
+        addressRef.current !== executionAddress ||
+        identityRef.current !== executionIdentity
+      ) {
         return result;
       }
 
@@ -213,7 +237,7 @@ export function useStellarTransaction<TParams>(
 
       return result;
     },
-    [address, submit, refreshAccountState, maxAutoRetries, persistResult],
+    [address, identityKey, submit, refreshAccountState, maxAutoRetries, persistResult],
   );
 
   const startExecution = useCallback(
@@ -280,7 +304,7 @@ export function useStellarTransaction<TParams>(
 
   const reset = useCallback(() => {
     if (persistTransaction && address) {
-      removePersistedStellarTransaction(address);
+      removePersistedStellarTransaction(address, network);
     }
 
     intentRef.current = null;
@@ -290,7 +314,7 @@ export function useStellarTransaction<TParams>(
     setIntent(null);
     setRequiresUserConfirmation(false);
     setAccountState(null);
-  }, [address, persistTransaction]);
+  }, [address, network, persistTransaction]);
 
   return useMemo(
     () => ({

@@ -9,6 +9,15 @@ function fallbackKey(key: string): string {
   return `${FALLBACK_PREFIX}${key}`;
 }
 
+/**
+ * Builds a namespaced storage key from an optional identity scope
+ * (e.g. network + address). Scoped values never collide with unscoped ones,
+ * so account-specific data can be cleared on disconnect/account change.
+ */
+function scopedKey(key: string, scope?: string | null): string {
+  return scope ? `${scope}:${key}` : key;
+}
+
 function readCookie(key: string): string | null {
   try {
     const encodedKey = `${encodeURIComponent(key)}=`;
@@ -49,10 +58,14 @@ function readLocalStorage(key: string): string | null {
  * Reads a value from cookies first, then localStorage. The fallback keeps
  * preferences available in browsers or privacy modes that block cookies.
  */
-export function getPersistedValue(key: string): string | null {
+export function getPersistedValue(
+  key: string,
+  scope?: string | null,
+): string | null {
   if (!canUseBrowserStorage()) return null;
 
-  return readCookie(key) ?? readLocalStorage(key);
+  const namespacedKey = scopedKey(key, scope);
+  return readCookie(namespacedKey) ?? readLocalStorage(namespacedKey);
 }
 
 /**
@@ -63,12 +76,15 @@ export function setPersistedValue(
   key: string,
   value: string,
   maxAgeSeconds = DEFAULT_MAX_AGE_SECONDS,
+  scope?: string | null,
 ): boolean {
   if (!canUseBrowserStorage()) return false;
 
-  if (writeCookie(key, value, maxAgeSeconds)) {
+  const namespacedKey = scopedKey(key, scope);
+
+  if (writeCookie(namespacedKey, value, maxAgeSeconds)) {
     try {
-      window.localStorage.removeItem(fallbackKey(key));
+      window.localStorage.removeItem(fallbackKey(namespacedKey));
     } catch {
       // The cookie write succeeded, so an unavailable localStorage is harmless.
     }
@@ -76,20 +92,22 @@ export function setPersistedValue(
   }
 
   try {
-    window.localStorage.setItem(fallbackKey(key), value);
+    window.localStorage.setItem(fallbackKey(namespacedKey), value);
     return true;
   } catch {
     return false;
   }
 }
 
-export function removePersistedValue(key: string): void {
+export function removePersistedValue(key: string, scope?: string | null): void {
   if (!canUseBrowserStorage()) return;
 
-  writeCookie(key, "", 0);
+  const namespacedKey = scopedKey(key, scope);
+
+  writeCookie(namespacedKey, "", 0);
 
   try {
-    window.localStorage.removeItem(fallbackKey(key));
+    window.localStorage.removeItem(fallbackKey(namespacedKey));
   } catch {
     // Storage can be unavailable in strict privacy contexts.
   }

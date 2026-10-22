@@ -19,6 +19,15 @@ export interface WalletDropdownProps {
   onDisconnect: () => void;
   /** Optional extra class names for the trigger container. */
   className?: string;
+  /**
+   * True when the wallet is connected to an unsupported network.
+   * While true, economic (transaction-triggering) actions are disabled.
+   */
+  isMismatch?: boolean;
+  /** Human-readable label of the expected network, e.g. "Base Sepolia". */
+  expectedNetworkLabel?: string;
+  /** Optional contract environment label, e.g. "testnet" or "mainnet". */
+  contractEnvironment?: string;
 }
 
 function truncateAddress(addr: string): string {
@@ -75,6 +84,9 @@ export function WalletDropdown({
   explorerBaseUrl = "https://etherscan.io/address/",
   onDisconnect,
   className,
+  isMismatch = false,
+  expectedNetworkLabel,
+  contractEnvironment,
 }: WalletDropdownProps) {
   const [isOpen, setIsOpen] = React.useState(false);
   const [copied, setCopied] = React.useState(false);
@@ -234,6 +246,32 @@ export function WalletDropdown({
           </div>
         </div>
 
+        {isMismatch && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={cn(
+              "mx-2 mb-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2",
+              "text-xs text-amber-200"
+            )}
+          >
+            <div className="font-semibold text-amber-100">
+              Wrong network
+            </div>
+            <div className="mt-0.5 text-amber-200/90">
+              {expectedNetworkLabel
+                ? `Switch your wallet to ${expectedNetworkLabel} to continue.`
+                : "Switch your wallet to the supported network to continue."}
+              {contractEnvironment
+                ? ` Contract environment: ${contractEnvironment}.`
+                : null}
+            </div>
+            <div className="mt-1 text-amber-200/70">
+              Transaction actions are disabled until the network matches.
+            </div>
+          </div>
+        )}
+
         <div className="px-2 pb-2">
           <div className="grid gap-1">
             <button
@@ -270,11 +308,13 @@ export function WalletDropdown({
               role="menuitem"
               aria-label="View in explorer"
               href={explorerUrl ?? undefined}
+              aria-disabled={!explorerUrl || isMismatch ? "true" : undefined}
+              tabIndex={!explorerUrl || isMismatch ? -1 : undefined}
 
               target="_blank"
               rel="noreferrer noopener"
               onClick={(e) => {
-                if (!explorerUrl) e.preventDefault();
+                if (!explorerUrl || isMismatch) e.preventDefault();
                 close();
               }}
               className={cn(
@@ -282,13 +322,16 @@ export function WalletDropdown({
                 "transition-colors duration-150",
                 "hover:bg-accent/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                 "bg-transparent",
-                !explorerUrl && "pointer-events-none opacity-60"
+                (!explorerUrl || isMismatch) && "pointer-events-none opacity-60"
               )}
             >
               <span className="flex items-center gap-2">
                 <ExternalLink className="h-4 w-4 text-muted-foreground transition-all duration-200 group-hover:text-foreground" />
                 <span className="text-sm font-medium">View in Explorer</span>
               </span>
+              {isMismatch && (
+                <span className="text-xs text-amber-300/80">Wrong network</span>
+              )}
             </a>
           </div>
         </div>

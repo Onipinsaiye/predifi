@@ -20,9 +20,15 @@ export interface UseNotificationsResult {
 /**
  * useNotifications — polls a user's notifications every 30s so the bell badge
  * stays fresh without a WebSocket round-trip.
+ *
+ * The SWR key is scoped by both network and address so that notifications from
+ * a previous account or network are never reused after an identity change.
  */
-export function useNotifications(address: string | undefined): UseNotificationsResult {
-  const key = address ? notificationsUrl(address) : null;
+export function useNotifications(
+  address: string | undefined,
+  network?: string,
+): UseNotificationsResult {
+  const key = address ? notificationsUrl(address, network) : null;
 
   const { data, error, isLoading, mutate } = useSWR<NotificationsResponse>(
     key,
@@ -32,14 +38,19 @@ export function useNotifications(address: string | undefined): UseNotificationsR
 
   async function markRead(ids?: number[]) {
     if (!address) return;
-    await markNotificationsRead(address, ids);
+    await markNotificationsRead(address, ids, network);
     void mutate();
   }
 
+  // When there is no identity (disconnected) or the key has changed, never
+  // surface data from a previous account/network.
+  const notifications = key ? data?.notifications ?? [] : [];
+  const unreadCount = key ? data?.unread_count ?? 0 : 0;
+
   return {
-    notifications: data?.notifications ?? [],
-    unreadCount: data?.unread_count ?? 0,
-    isLoading,
+    notifications,
+    unreadCount,
+    isLoading: key ? isLoading : false,
     isError: Boolean(error),
     markRead,
     refresh: () => {

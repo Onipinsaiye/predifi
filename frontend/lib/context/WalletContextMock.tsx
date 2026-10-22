@@ -41,6 +41,7 @@ import {
   useWalletConnection,
   type WalletConnectionState,
 } from "@/lib/hooks/useWalletConnection";
+import { useNetwork } from "@/lib/context/NetworkContext";
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -58,31 +59,39 @@ WalletContext.displayName = "WalletContext";
 export function WalletProvider({ children }: { children: ReactNode }) {
   const wallet = useWalletConnection();
   const { mutate } = useSWRConfig();
+  const { network } = useNetwork();
 
-  // Track the previous address so we can detect a disconnect transition.
-  const prevAddressRef = useRef<string | null>(wallet.address);
+  // Identity = network + address. Account-scoped cache entries are keyed by
+  // this identity so data from one wallet/network is never reused for another.
+  const identityKey = useMemo(
+    () => `${network}:${wallet.address ?? ""}`,
+    [network, wallet.address],
+  );
 
-  // When the user disconnects (address transitions from some value to null),
-  // invalidate all address-scoped SWR cache entries (notifications, profile,
-  // referral earnings). This prevents stale data from a previous session
-  // appearing when a different wallet connects.
+  // Bumped on every identity transition so consumers can reset local
+  // account-bound state (balances, history, pending UI) in one place.
+  const generationRef = useRef(0);
+  const prevIdentityRef = useRef<string>(identityKey);
+
+  // On any identity change (connect, disconnect, account switch, network
+  // switch) drop all cached account data so nothing from the previous
+  // identity flashes or is reused.
   useEffect(() => {
-    const prev = prevAddressRef.current;
-    const curr = wallet.address;
-
-    if (prev !== null && curr === null) {
-      // Invalidate every cached key — the simplest correct strategy.
-      // SWR will refetch any key that is currently mounted.
+    const prev = prevIdentityRef.current;
+    if (prev !== identityKey) {
+      generationRef.current += 1;
+      // Clear every cached key — the simplest correct strategy. SWR will
+      // refetch any key that is currently mounted.
       void mutate(() => true, undefined, { revalidate: false });
+      prevIdentityRef.current = identityKey;
     }
-
-    prevAddressRef.current = curr;
-  }, [wallet.address, mutate]);
+  }, [identityKey, mutate]);
 
   // Wrap disconnect to also clear the cache immediately on user action,
   // without waiting for the useEffect to run on the next render cycle.
   const disconnect = useCallback(() => {
     wallet.disconnect();
+    generationRef.current += 1;
     void mutate(() => true, undefined, { revalidate: false });
   }, [wallet, mutate]);
 
@@ -97,6 +106,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       connect: wallet.connect,
       disconnect,
       clearError: wallet.clearError,
+      identityKey,
+      generation: generationRef.current,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -107,6 +118,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       wallet.connect,
       disconnect,
       wallet.clearError,
+      identityKey,
     ],
   );
 
