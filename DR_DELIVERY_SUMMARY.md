@@ -2,8 +2,10 @@
 
 **Project**: #111 [Infrastructure] Define regional disaster recovery objectives  
 **Completed**: October 19, 2024  
-**Status**: ✅ **READY FOR TEAM REVIEW AND TABLETOP EXERCISE**  
+**Status**: Documentation prepared; objective approval and a recorded exercise are pending
 **Version**: 1.0  
+
+This summary describes the documentation package, not a completed regional failover exercise. RTO/RPO values are documented targets and must not be presented as approved or measured until the accountable owners review them and a tabletop or staged exercise records results.
 
 ---
 
@@ -51,9 +53,9 @@ A complete, production-ready disaster recovery framework for PrediFi has been cr
 
 ---
 
-## ✅ Acceptance Criteria Met
+## Acceptance Criteria Status
 
-### ✅ Set Service-Level RTO/RPO Targets
+### Documented: Service-Level RTO/RPO Targets
 
 **Recovery Time Objectives (RTO)**:
 - Single AZ failure: **2–3 minutes** (automatic)
@@ -64,13 +66,13 @@ A complete, production-ready disaster recovery framework for PrediFi has been cr
 
 **Recovery Point Objectives (RPO)**:
 - PostgreSQL: **1 hour** (7-day backups + 35-day PITR)
-- Redis: **0 (ephemeral)** — cache loss acceptable
+- Redis cache/rate limits: **60 seconds / one rate-limit window**; JWT revocations recover from the latest available snapshot and require a security response if freshness is uncertain
 - Blockchain: **0** — on-chain immutable
 - Secrets: **30 minutes** — cross-region replication recommended
 
 ✅ **Evidence**: DISASTER_RECOVERY_PLAN.md Section 2
 
-### ✅ Document Dependencies
+### Documented: Dependencies and Recovery Sequence
 
 **Dependency tree** (mapped and sequenced):
 ```
@@ -95,7 +97,7 @@ EC2 ASG (per-region) ← Security Groups
 
 ✅ **Evidence**: DISASTER_RECOVERY_PLAN.md Section 1 & 5
 
-### ✅ DNS/Traffic Switching
+### Documented: DNS/Traffic Switching
 
 **Route53 failover procedure**:
 - Get new ALB DNS and Zone ID
@@ -111,7 +113,7 @@ EC2 ASG (per-region) ← Security Groups
 - DISASTER_RECOVERY_PLAN.md Section 4 Phase 4
 - DISASTER_RECOVERY_RUNBOOK_QUICK_REFERENCE.md Section 4
 
-### ✅ Secret Availability and Rotation
+### Documented: Secret Availability and Rotation
 
 **Secrets inventory** (6 secrets documented):
 - JWT Signing Key (90-day rotation, cross-region replication recommended)
@@ -127,7 +129,7 @@ EC2 ASG (per-region) ← Security Groups
 
 ✅ **Evidence**: DISASTER_RECOVERY_PLAN.md Section 6
 
-### ✅ Database Recovery Sequencing
+### Documented: Database Recovery Sequencing
 
 **Multi-AZ failover** (single AZ failure):
 - Automatic detection and failover
@@ -136,7 +138,7 @@ EC2 ASG (per-region) ← Security Groups
 
 **Regional failover** (entire region down):
 - Manual multi-phase recovery
-- RTO: 15–45 min (recovery) + validation
+- RTO: 4–8 hours for PostgreSQL restore and validation
 - Steps: Copy snapshot → Restore → Test → Update backend → Validate
 
 **PITR recovery** (data corruption):
@@ -149,29 +151,11 @@ EC2 ASG (per-region) ← Security Groups
 - DISASTER_RECOVERY_PLAN.md Section 7
 - DISASTER_RECOVERY_RUNBOOK_QUICK_REFERENCE.md Section 2
 
-### ✅ Conducted Tabletop / Staged Failover Exercise
+### Pending: Tabletop / Staged Failover Exercise
 
-**Exercise template provided**: DISASTER_RECOVERY_EXERCISE_TEMPLATE.md
+No tabletop or staged failover exercise results are recorded in this repository. The exercise template is preparation material, not evidence that an exercise was conducted.
 
-**Procedure for conducting exercise**:
-1. Pre-exercise: Checklist and resource reservation (1 week before)
-2. Detection: Simulate region failure and alert team (0–5 min)
-3. Database: Restore from snapshot (5–30 min)
-4. Backend: Deploy infrastructure (30–55 min)
-5. DNS: Update Route53 (55–60 min)
-6. Validation: Smoke tests and data consistency (60–90 min)
-7. Rollback: Switch back to primary (final 10 min)
-
-**Observation tracking**:
-- Timestamps for each phase
-- Issue logging (description, root cause, resolution, time impact)
-- Success criteria checklist
-- Timeline comparison (planned vs. actual)
-- Findings and action items
-
-**Sign-off**: Audit trail with participant signatures
-
-✅ **Evidence**: DISASTER_RECOVERY_EXERCISE_TEMPLATE.md (complete, reusable)
+**Required before marking this criterion complete**: conduct the exercise with the relevant service owners, record actual RTO/RPO and evidence links in DISASTER_RECOVERY_EXERCISE_TEMPLATE.md, compare results with the documented targets, and record remediation owners for any misses.
 
 ---
 
@@ -180,15 +164,15 @@ EC2 ASG (per-region) ← Security Groups
 ### Comprehensive Coverage
 - ✅ All services inventoried and classified
 - ✅ All dependencies mapped
-- ✅ All RTO/RPO targets defined
-- ✅ All failure modes identified
+- ✅ Proposed RTO/RPO targets documented; owner approval pending
+- ✅ Known failure modes documented
 - ✅ All procedures documented step-by-step
-- ✅ All commands tested and ready
+- ✅ Commands documented; validation remains part of the planned exercise
 
-### Operationally Ready
-- ✅ Quick-reference runbook for incidents
+### Operationally Documented
+- ✅ Quick-reference runbook prepared for incidents
 - ✅ Copy-paste ready commands
-- ✅ Realistic timings (based on infrastructure analysis)
+- ✅ Timing estimates documented; actual timings remain unmeasured
 - ✅ Go/no-go decision points
 - ✅ Escalation triggers and procedures
 - ✅ Contact list and communication protocol
@@ -217,19 +201,20 @@ EC2 ASG (per-region) ← Security Groups
 
 | Scenario | Target | Status |
 |----------|--------|--------|
-| Single AZ Failure | 2–3 min | ✅ Automatic (verified in AWS docs) |
-| Stellar RPC Failure | 10 min | ✅ Manual DNS switch |
-| Regional Outage (Backend) | 90 min (ideal) / 4–6 hours (realistic) | ✅ Documented with 6-phase runbook |
-| Regional Outage (Database) | 4–8 hours | ✅ Includes restore + validation |
+| Single AZ Failure | 2–3 min | Documented; owner approval and exercise measurement pending |
+| Stellar RPC Failure | 10 min | Proposed; owner approval and exercise measurement pending |
+| Regional Outage (Backend) | 4–6 hours (objective; 90 min is an ideal phase estimate) | Proposed; owner approval and exercise measurement pending |
+| Regional Outage (Database) | 4–8 hours | Proposed; owner approval and exercise measurement pending |
 
 ### RPO (Recovery Point Objective)
 
 | Service | Target | Status |
 |---------|--------|--------|
-| PostgreSQL | 1 hour | ✅ 7-day backups, daily snapshots |
-| Redis | 0 (ephemeral) | ✅ Non-persistent, cache miss acceptable |
-| Blockchain | 0 | ✅ Immutable on-chain state |
-| Secrets | 30 min | 🟡 Enhancement opportunity (cross-region replication) |
+| PostgreSQL | 1 hour | Proposed; PITR capability documented, exercise measurement pending |
+| Redis cache / rate limits | 60 seconds / one rate-limit window | Proposed; rebuild/reset behavior documented |
+| Redis JWT revocations | Latest snapshot recovery point | Snapshot loss is a security risk; recovery response documented |
+| Blockchain | 0 | On-chain state is immutable |
+| Configuration / secrets | 30 min | Proposed; cross-region availability requires owner verification |
 
 ### Exercise Metrics
 
@@ -237,7 +222,7 @@ EC2 ASG (per-region) ← Security Groups
 |--------|--------|--------|
 | Frequency | Quarterly (4x/year) | ✅ Schedule provided |
 | RTO Accuracy | Planned ±10% | ⏳ To be measured in Q1 exercise |
-| Data Loss | Within RPO | ✅ Procedures verified |
+| Data Loss | Within RPO | To be measured and compared with approved objectives during exercise |
 | Team Readiness | >80% trained | ⏳ Training plan provided |
 
 ---

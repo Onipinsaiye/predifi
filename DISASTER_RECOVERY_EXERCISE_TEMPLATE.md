@@ -6,6 +6,21 @@
 **Primary Region**: [us-east-1]  
 **Alternate Region**: [us-west-2]  
 
+## Objective Results
+
+Copy the approved targets from `DISASTER_RECOVERY_PLAN.md` before the exercise. Enter observed durations and recovery points only after collecting exercise evidence; leave them blank until measured. Record evidence links or artifact identifiers, not credentials or database contents.
+
+| Service | Target RTO | Actual RTO | Target RPO | Actual RPO | Evidence / Result |
+|---------|------------|------------|------------|------------|-------------------|
+| Frontend | 15 min | [duration] | N/A | N/A | [evidence / pass or miss] |
+| Backend API | 4–6 hr | [duration] | 1 hr (database-backed state) | [duration] | [evidence / pass or miss] |
+| PostgreSQL | 4–8 hr | [duration] | 1 hr | [duration] | [evidence / pass or miss] |
+| Redis cache | 30 min | [duration] | 60 sec / one rate-limit window | [duration] | [evidence / pass or miss] |
+| Stellar RPC | 10 min | [duration] | N/A | N/A | [evidence / pass or miss] |
+| Configuration / secrets | 90 min | [duration] | 30 min | [duration] | [evidence / pass or miss] |
+
+The regional RTO target for the backend and database is measured separately for each service. The plan's ideal phase durations are estimates, not exercise results or substitutes for these targets.
+
 ## 0. PostgreSQL Backup Restore Drill Evidence
 
 **Scheduled cadence**: Monthly (`PostgreSQL Restore Drill` workflow)
