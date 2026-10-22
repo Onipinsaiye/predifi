@@ -9,7 +9,7 @@ members = [
 
 # ── Shared workspace dependencies ──────────────────────────────────────────────
 [workspace.dependencies]
-soroban-sdk     = "23"
+soroban-sdk     = "29"
 predifi-errors  = { path = "contracts/predifi-errors" }
 access-control  = { path = "contracts/access-control" }
 proptest = "1.6.0"
