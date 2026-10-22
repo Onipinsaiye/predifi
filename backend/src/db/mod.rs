@@ -11,6 +11,7 @@
 //! without any changes.
 
 pub mod checkpoints;
+pub mod event_projection;
 pub mod health;
 
 mod pools;
@@ -101,6 +102,10 @@ pub use referrals::{
     insert_referral_from_event,
     insert_referrals_bulk,
     insert_referrals_bulk_tx,
+};
+
+pub use event_projection::{
+    project_event_tx, project_events, ContractEvent, EventKey, ProjectedEvent, ProjectionSummary,
 };
 
 pub use outbox::{ClaimedNotification, NotificationIntent};
