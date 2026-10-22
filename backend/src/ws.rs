@@ -884,9 +884,9 @@ mod tests {
     #[test]
     fn ws_token_from_query_param_verifies_against_secret() {
         let secret = "predifi-dev-secret-do-not-use-in-production-32";
-        let token = sign_jwt_for_test("GABC123", secret);
+        let token = sign_jwt_for_test(crate::jwt::TEST_WALLET, secret);
         let claims = verify_jwt_token(&token, secret).expect("valid token");
-        assert_eq!(claims.sub, "GABC123");
+        assert_eq!(claims.sub, crate::jwt::TEST_WALLET);
     }
 
     #[test]
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn refresh_token_is_rejected_for_websocket_access() {
         let secret = "predifi-dev-secret-do-not-use-in-production-32";
-        let token = sign_jwt_with_type("GABC123", secret, 1_800_000_000, "refresh", 0).unwrap();
+        let token = sign_jwt_with_type(crate::jwt::TEST_WALLET, secret, 1_800_000_000, "refresh", 0).unwrap();
         let error = verify_jwt_token_strict(&token, secret, "access", 0).unwrap_err();
         assert_eq!(error, crate::jwt::JwtVerifyError::WrongTokenType);
     }

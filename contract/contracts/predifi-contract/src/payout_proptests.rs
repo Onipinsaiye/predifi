@@ -3,7 +3,10 @@ extern crate std;
 #[cfg(test)]
 use crate::payouts::calculate_claim_payout_with_remainder;
 #[cfg(test)]
-use crate::payouts::{calculate_claim_payout, calculate_payout_pool, PayoutInput};
+use crate::payouts::{
+    calculate_claim_payout, calculate_payout_pool, calculate_protocol_fee,
+    calculate_referral_amount, PayoutInput,
+};
 #[cfg(test)]
 use crate::safe_math::{RoundingMode, SafeMath};
 #[cfg(test)]
@@ -268,6 +271,40 @@ proptest! {
             total_claimed,
             total_stake
         );
+    }
+
+    /// Referral cuts, winner claims, treasury remainder, and payout rounding
+    /// dust always reconcile to the escrow collected for the pool.
+    #[test]
+    fn prop_referral_settlement_never_exceeds_escrow(
+        winner_stakes in prop::collection::vec(1i128..=1_000_000_000i128, 1..30),
+        losing_stake in 0i128..=1_000_000_000i128,
+        fee_bps in 0..=10_000u32,
+        referral_cut_bps in 0..=10_000i128,
+    ) {
+        let winning_stake: i128 = winner_stakes.iter().sum();
+        let total_stake = winning_stake + losing_stake;
+        let fee = calculate_protocol_fee(total_stake, fee_bps as i128).unwrap();
+        let payout_pool = calculate_payout_pool(total_stake, fee_bps as i128).unwrap();
+        let mut winner_paid = 0i128;
+        let mut referral_paid = 0i128;
+        for &stake in &winner_stakes {
+            winner_paid += calculate_claim_payout(&PayoutInput {
+                pool_total_stake: total_stake,
+                fee_bps: fee_bps as i128,
+                user_stake: stake,
+                winning_stake,
+            }).unwrap().winnings;
+            referral_paid += calculate_referral_amount(
+                stake, total_stake, fee, referral_cut_bps,
+            ).unwrap();
+        }
+        prop_assert!(winner_paid <= payout_pool);
+        prop_assert!(referral_paid <= fee);
+
+        let payout_dust = payout_pool - winner_paid;
+        let treasury_remainder = fee - referral_paid;
+        prop_assert_eq!(winner_paid + referral_paid + payout_dust + treasury_remainder, total_stake);
     }
 
     /// Issue #1753 — deterministic remainder allocation invariant.
