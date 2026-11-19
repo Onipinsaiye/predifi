@@ -55,6 +55,13 @@ export interface Pool {
   result: string | null;
   /** Optional market description. */
   description?: string;
+  /**
+   * When the indexer last mirrored this pool's on-chain state, as an ISO
+   * timestamp. Absent when the backend doesn't report it (e.g. the indexer
+   * is unreachable) — the UI must treat that as "freshness unavailable",
+   * never as "fresh".
+   */
+  indexed_at?: string | null;
 }
 
 /**

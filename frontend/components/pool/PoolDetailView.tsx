@@ -13,6 +13,7 @@ import {
 import { usePoolWebSocket } from "@/lib/hooks/usePoolWebSocket";
 import { AnimatedNumber } from "@/components/pool/AnimatedNumber";
 import { CountdownTimer } from "@/components/pool/CountdownTimer";
+import { FreshnessIndicator } from "@/components/common/FreshnessIndicator";
 import { cn } from "@/lib/utils";
 
 export interface PoolDetailViewProps {
@@ -135,6 +136,7 @@ export function PoolDetailView({ poolId, wsToken }: PoolDetailViewProps) {
               </span>
               <span className="capitalize">{pool.state}</span>
               <LiveBadge status={status} />
+              <FreshnessIndicator indexedAt={pool.indexed_at} />
             </div>
           </div>
           <CountdownTimer endTime={pool.end_time} />

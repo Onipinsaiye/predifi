@@ -4,7 +4,12 @@
       "startServerCommand": "pnpm run start",
       "startServerReadyPattern": "Ready in",
       "startServerReadyTimeout": 120000,
-      "url": ["http://localhost:3000/"],
+      "url": [
+        "http://localhost:3000/",
+        "http://localhost:3000/markets",
+        "http://localhost:3000/user/pool-market",
+        "http://localhost:3000/user/wallet-token"
+      ],
       "numberOfRuns": 3,
       "settings": {
         "preset": "desktop",

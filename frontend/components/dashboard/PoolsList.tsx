@@ -14,6 +14,8 @@ import {
   SearchBar,
 } from "@/components/ui";
 import { cn } from "@/lib/utils";
+import { VirtualizedList } from "@/components/common/VirtualizedList";
+import { FreshnessIndicator } from "@/components/common/FreshnessIndicator";
 import { SearchResultHighlighter } from "@/components/search/SearchResultHighlighter";
 import { usePools } from "@/lib/hooks/usePools";
 import { useTags } from "@/lib/hooks/useTags";
@@ -24,6 +26,13 @@ interface PoolsListProps {
   isLoading?: boolean;
   forceLoading?: boolean;
 }
+
+/**
+ * Fixed row height (content + bottom gap) used for virtualization. Pool
+ * names/categories/tags are truncated to a single line each so every row
+ * fits this height regardless of content.
+ */
+const POOL_ROW_HEIGHT = 108;
 
 export function PoolsList({ isLoading = false, forceLoading = false }: PoolsListProps) {
   const [query, setQuery] = useState("");
@@ -140,11 +149,19 @@ export function PoolsList({ isLoading = false, forceLoading = false }: PoolsList
             className="h-[300px] border-none bg-transparent py-0"
           />
         ) : (
-          <div className="space-y-3">
-            {filteredPools.map((pool) => (
-              <PoolRow key={pool.pool_id} pool={pool} query={query} />
-            ))}
-          </div>
+          <VirtualizedList
+            items={filteredPools}
+            itemKey={(pool) => pool.pool_id}
+            rowHeight={POOL_ROW_HEIGHT}
+            height={Math.min(filteredPools.length * POOL_ROW_HEIGHT, 480)}
+            ariaLabel="Active pools"
+            className="space-y-3"
+            renderRow={(pool) => (
+              <div className="pb-3">
+                <PoolRow pool={pool} query={query} />
+              </div>
+            )}
+          />
         )}
       </CardContent>
     </Card>
@@ -153,12 +170,12 @@ export function PoolsList({ isLoading = false, forceLoading = false }: PoolsList
 
 function PoolRow({ pool, query }: { pool: Pool; query: string }) {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-lg bg-zinc-900/50 p-3">
+    <div className="flex h-24 items-center justify-between gap-3 overflow-hidden rounded-lg bg-zinc-900/50 p-3">
       <div className="min-w-0 space-y-1">
         <p className="truncate text-sm font-medium text-white">
           <SearchResultHighlighter text={pool.name} searchQuery={query} />
         </p>
-        <p className="text-xs text-zinc-500">
+        <p className="truncate text-xs text-zinc-500">
           <SearchResultHighlighter text={pool.category} searchQuery={query} />
           {" · "}
           {pool.total_stake.toLocaleString()} {pool.token}
@@ -168,6 +185,7 @@ function PoolRow({ pool, query }: { pool: Pool; query: string }) {
             {pool.tags.map((t) => `#${t}`).join(" ")}
           </p>
         )}
+        <FreshnessIndicator indexedAt={pool.indexed_at} />
       </div>
       <span className="shrink-0 rounded-full bg-emerald-400/10 px-3 py-1 text-xs font-medium capitalize text-emerald-400">
         {pool.state}

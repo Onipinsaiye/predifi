@@ -6,6 +6,7 @@ import { formatUtcDateTime } from "@/lib/date";
 import { formatChartValue } from "@/lib/stakeFilters";
 import { useCurrentUserAddress } from "@/lib/hooks/useCurrentUserAddress";
 import { useProfile } from "@/lib/hooks/useProfile";
+import { VirtualizedList } from "@/components/common/VirtualizedList";
 import { NotificationBell } from "@/components/notifications/NotificationBell";
 import { PerformanceCharts } from "@/components/profile/PerformanceCharts";
 import {
@@ -28,6 +29,9 @@ const STATUS_STYLES: Record<PredictionStatus, string> = {
 
 type Tab = "All" | PredictionStatus;
 const TABS: Tab[] = ["All", "Active", "Won", "Lost", "Pending"];
+
+/** Fixed row height used for virtualizing long prediction histories. */
+const CLAIM_ROW_HEIGHT = 56;
 
 function predictionStatus(claim: ClaimStatus): PredictionStatus {
   if (claim.pool_state === "active") return "Active";
@@ -58,6 +62,35 @@ function ClaimBadge({ claim }: { claim: ClaimStatus }) {
 function truncateAddress(address: string): string {
   if (address.length <= 10) return address;
   return `${address.slice(0, 4)}…${address.slice(-4)}`;
+}
+
+function ClaimRow({ claim }: { claim: ClaimStatus }) {
+  const status = predictionStatus(claim);
+  return (
+    <div
+      style={{ height: CLAIM_ROW_HEIGHT }}
+      className="grid grid-cols-2 sm:grid-cols-7 items-center gap-2 px-4 border-b border-zinc-800/50 hover:bg-white/[0.02] transition-colors overflow-hidden"
+    >
+      <div className="col-span-2 sm:col-span-2 min-w-0">
+        <p className="text-sm text-white truncate">{claim.pool_name}</p>
+      </div>
+      <span className="text-sm text-zinc-300 hidden sm:block">Outcome {claim.outcome}</span>
+      <span className="text-sm font-mono text-zinc-300 hidden sm:block">
+        {formatChartValue(claim.amount)}
+      </span>
+      <span
+        className={cn(
+          "text-[10px] font-semibold px-2 py-1 rounded-full w-fit",
+          STATUS_STYLES[status],
+        )}
+      >
+        {status}
+      </span>
+      <div className="col-span-2 hidden sm:block">
+        <ClaimBadge claim={claim} />
+      </div>
+    </div>
+  );
 }
 
 export function PredictionHistoryClient() {
@@ -199,36 +232,14 @@ export function PredictionHistoryClient() {
                   <span className="col-span-2">Claim</span>
                 </div>
                 {/* Rows */}
-                {filtered.map((claim) => {
-                  const status = predictionStatus(claim);
-                  return (
-                    <div
-                      key={claim.prediction_id}
-                      className="grid grid-cols-2 sm:grid-cols-7 items-center gap-2 px-4 py-3 border-b border-zinc-800/50 last:border-0 hover:bg-white/[0.02] transition-colors"
-                    >
-                      <div className="col-span-2 sm:col-span-2 min-w-0">
-                        <p className="text-sm text-white truncate">{claim.pool_name}</p>
-                      </div>
-                      <span className="text-sm text-zinc-300 hidden sm:block">
-                        Outcome {claim.outcome}
-                      </span>
-                      <span className="text-sm font-mono text-zinc-300 hidden sm:block">
-                        {formatChartValue(claim.amount)}
-                      </span>
-                      <span
-                        className={cn(
-                          "text-[10px] font-semibold px-2 py-1 rounded-full w-fit",
-                          STATUS_STYLES[status],
-                        )}
-                      >
-                        {status}
-                      </span>
-                      <div className="col-span-2 hidden sm:block">
-                        <ClaimBadge claim={claim} />
-                      </div>
-                    </div>
-                  );
-                })}
+                <VirtualizedList
+                  items={filtered}
+                  itemKey={(claim) => claim.prediction_id}
+                  rowHeight={CLAIM_ROW_HEIGHT}
+                  height={Math.min(filtered.length * CLAIM_ROW_HEIGHT, 560)}
+                  ariaLabel="Prediction history"
+                  renderRow={(claim) => <ClaimRow claim={claim} />}
+                />
               </div>
             )}
           </div>

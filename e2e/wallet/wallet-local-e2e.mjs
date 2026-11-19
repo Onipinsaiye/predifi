@@ -25,7 +25,7 @@ const network = "wallet-e2e-local";
 // Supported browser/device/wallet profiles. Keep in sync with docs/BROWSER_SUPPORT.md.
 // Each profile is exercised by the critical wallet smoke flows: connect, simulate,
 // sign, and recover. A regression in any critical flow fails the profile.
-const criticalFlows = ["connect", "simulate", "sign", "recover"];
+const criticalFlows = ["connect", "simulate", "sign", "recover", "claim", "refund"];
 const browserMatrix = [
   { id: "chrome-desktop", browser: "chrome", device: "desktop", wallet: "freighter" },
   { id: "chrome-desktop-rabet", browser: "chrome", device: "desktop", wallet: "rabet" },
@@ -43,7 +43,7 @@ if (selectedProfile && activeProfiles.length === 0) {
   throw new Error(`Unknown WALLET_PROFILE "${selectedProfile}". Known profiles: ${browserMatrix.map((p) => p.id).join(", ")}`);
 }
 
-function publishProfileResult(profile, flows, error) {
+function publishProfileResult(profile, flows, error, transactions = []) {
   const dir = process.env.WALLET_RESULTS_DIR;
   if (!dir) return;
   mkdirSync(dir, { recursive: true });
@@ -55,8 +55,15 @@ function publishProfileResult(profile, flows, error) {
     flows,
     status: error ? "failed" : "passed",
     error: error ? String(error.message || error) : null,
+    // Every submitted transaction's hash + ledger, in submission order — on
+    // a failure this is how you find the on-chain state the run left behind
+    // without re-running it under a debugger.
+    transactions,
   };
   writeFileSync(join(dir, `${profile.id}.json`), `${JSON.stringify(payload, null, 2)}\n`);
+  if (error) {
+    console.error(`[${profile.id}] FAILED — submitted transactions: ${JSON.stringify(transactions)}`);
+  }
 }
 
 function command(program, args, cwd = root, quiet = false) {
@@ -144,11 +151,15 @@ async function fixture(server, configDir) {
     cli("contract", "invoke", "--id", id, ...base, "--", method, ...args);
 
   invoke(access, "init", "--admin", admin);
+  // Settlement (`resolve_pool`) is gated on Operator role (1), distinct from
+  // the Admin role (0) `init` already grants — settlement/claim coverage
+  // below resolves pools as `admin`, so it needs Operator too.
+  invoke(access, "assign_role", "--admin_caller", admin, "--user", admin, "--role", "Operator");
   invoke(core, "init", "--access_control", access, "--treasury", admin,
     "--fee_bps", "100", "--resolution_delay", "0", "--min_pool_duration", "0",
     "--max_predictions_per_user", "0");
   invoke(core, "add_token_to_whitelist", "--admin", admin, "--token", token);
-  const config = {
+  const baseConfig = {
     start_time: 0,
     description: "Local wallet signing test",
     metadata_url: "",
@@ -162,13 +173,36 @@ async function fixture(server, configDir) {
     whitelist_key: null,
     outcome_descriptions: ["Yes", "No"],
   };
-  const ledgerTime = Number((await server.getLatestLedger()).closeTime);
-  assert.ok(Number.isSafeInteger(ledgerTime), "RPC returned an invalid ledger close time");
-  const poolId = Number(JSON.parse(invoke(core, "create_pool", "--creator", admin,
-    "--end_time", String(ledgerTime + 3_600), "--token", token,
-    "--options_count", "2", "--category", "Tech", "--config", JSON.stringify(config))));
-  assert.equal(poolId, 0, "Fresh contract should start at pool 0");
-  return { core, poolId, wallet };
+
+  /**
+   * Create a pool ending `secondsFromNow` after the current ledger close
+   * time (so it can be deliberately aged into an eligible-for-resolution or
+   * overdue-for-cancellation state later in the test).
+   */
+  const createPool = async (secondsFromNow, configOverrides = {}) => {
+    const ledgerTime = Number((await server.getLatestLedger()).closeTime);
+    assert.ok(Number.isSafeInteger(ledgerTime), "RPC returned an invalid ledger close time");
+    const config = { ...baseConfig, ...configOverrides };
+    const id = Number(JSON.parse(invoke(core, "create_pool", "--creator", admin,
+      "--end_time", String(ledgerTime + secondsFromNow), "--token", token,
+      "--options_count", "2", "--category", "Tech", "--config", JSON.stringify(config))));
+    return { id, endTime: ledgerTime + secondsFromNow };
+  };
+
+  const settlementPool = await createPool(3_600);
+  assert.equal(settlementPool.id, 0, "Fresh contract should start at pool 0");
+  return { core, admin, token, wallet, invoke, createPool, poolId: settlementPool.id };
+}
+
+/** Poll the local ledger until its close time passes `targetTime`. */
+async function waitForLedgerTime(server, targetTime, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const closeTime = Number((await server.getLatestLedger()).closeTime);
+    if (closeTime >= targetTime) return closeTime;
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  throw new Error(`Ledger did not reach close time ${targetTime} within ${timeoutMs} ms`);
 }
 
 async function transaction(server, passphrase, core, wallet, poolId, outcome) {
@@ -213,6 +247,7 @@ for (const profile of activeProfiles) {
   test(`local Soroban wallet signing flow [${profile.id}]`, async (t) => {
     const flows = Object.fromEntries(criticalFlows.map((flow) => [flow, "pending"]));
     const configDir = mkdtempSync(join(tmpdir(), "predifi-wallet-e2e-"));
+    const submittedTransactions = [];
     try {
       try {
         command("docker", ["info", "--format", "{{.ServerVersion}}"]);
@@ -228,7 +263,7 @@ for (const profile of activeProfiles) {
       const server = new rpc.Server(rpcUrl, { allowHttp: true });
       await ready();
       console.log(`[${profile.id}] Local Soroban protocol ${(await server.getLatestLedger()).protocolVersion}`);
-      const { core, poolId, wallet } = await fixture(server, configDir);
+      const { core, admin, wallet, invoke, createPool, poolId } = await fixture(server, configDir);
       let submissions = 0;
       const submit = async (signed) => {
         submissions++;
@@ -237,6 +272,7 @@ for (const profile of activeProfiles) {
         const confirmed = await confirm(server, sent.hash);
         assert.equal(confirmed.status, "SUCCESS");
         assert.ok(Number(confirmed.ledger) > 0, "Confirmed transaction has no ledger");
+        submittedTransactions.push({ hash: sent.hash, ledger: confirmed.ledger });
         return { hash: sent.hash, ledger: confirmed.ledger };
       };
       const signAndSubmit = async (signer) => {
@@ -293,9 +329,76 @@ for (const profile of activeProfiles) {
         console.log(`[${profile.id}] Confirmation timeout: PASS (injected RPC response)`);
       });
 
-      publishProfileResult(profile, flows, null);
+      await t.test("claim: winnings are paid out once the pool resolves in the wallet's favor", async () => {
+        const pool = await createPool(5);
+        const raw = await transaction(server, localPassphrase, core, wallet, pool.id, 0);
+        const prepared = await server.prepareTransaction(raw);
+        prepared.sign(wallet);
+        await submit(prepared);
+        assert.deepEqual(await stakes(server, localPassphrase, core, wallet, pool.id), [10_000_000n, 0n]);
+
+        // Settlement is only valid once the pool's end_time has actually
+        // passed on-chain — wait for the local ledger to get there instead of
+        // resolving early (which the contract would reject).
+        await waitForLedgerTime(server, pool.endTime);
+        invoke(core, "resolve_pool", "--operator", admin, "--pool_id", String(pool.id), "--outcome", "0");
+
+        const account = await server.getAccount(wallet.publicKey());
+        const claim = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: localPassphrase })
+          .addOperation(new Contract(core).call("claim_winnings",
+            new Address(wallet.publicKey()).toScVal(),
+            nativeToScVal(BigInt(pool.id), { type: "u64" })))
+          .setTimeout(60)
+          .build();
+        const preparedClaim = await server.prepareTransaction(claim);
+        preparedClaim.sign(wallet);
+        const { hash: claimHash, ledger: claimLedger } = await submit(preparedClaim);
+        assert.match(claimHash, /^[a-f0-9]{64}$/i);
+
+        // A second claim must be rejected — the payout already happened.
+        const accountAfter = await server.getAccount(wallet.publicKey());
+        const replay = new TransactionBuilder(accountAfter, { fee: BASE_FEE, networkPassphrase: localPassphrase })
+          .addOperation(new Contract(core).call("claim_winnings",
+            new Address(wallet.publicKey()).toScVal(),
+            nativeToScVal(BigInt(pool.id), { type: "u64" })))
+          .setTimeout(60)
+          .build();
+        const replaySimulation = await server.simulateTransaction(replay);
+        assert.match(replaySimulation.error || "", /AlreadyClaimed|#2[0-9]\b/i);
+
+        flows.claim = "passed";
+        console.log(`[${profile.id}] Claimed winnings: PASS (pool ${pool.id}, hash ${claimHash}, ledger ${claimLedger})`);
+      });
+
+      await t.test("refund: stake is returned in full once the pool is canceled", async () => {
+        const pool = await createPool(3_600);
+        const raw = await transaction(server, localPassphrase, core, wallet, pool.id, 1);
+        const prepared = await server.prepareTransaction(raw);
+        prepared.sign(wallet);
+        await submit(prepared);
+        assert.deepEqual(await stakes(server, localPassphrase, core, wallet, pool.id), [0n, 10_000_000n]);
+
+        invoke(core, "cancel_pool", "--operator", admin, "--pool_id", String(pool.id), "--reason", "E2E refund coverage");
+
+        const account = await server.getAccount(wallet.publicKey());
+        const refund = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: localPassphrase })
+          .addOperation(new Contract(core).call("claim_refund",
+            new Address(wallet.publicKey()).toScVal(),
+            nativeToScVal(BigInt(pool.id), { type: "u64" })))
+          .setTimeout(60)
+          .build();
+        const preparedRefund = await server.prepareTransaction(refund);
+        preparedRefund.sign(wallet);
+        const { hash: refundHash, ledger: refundLedger } = await submit(preparedRefund);
+        assert.match(refundHash, /^[a-f0-9]{64}$/i);
+
+        flows.refund = "passed";
+        console.log(`[${profile.id}] Claimed refund: PASS (pool ${pool.id}, hash ${refundHash}, ledger ${refundLedger})`);
+      });
+
+      publishProfileResult(profile, flows, null, submittedTransactions);
     } catch (error) {
-      publishProfileResult(profile, flows, error);
+      publishProfileResult(profile, flows, error, submittedTransactions);
       throw error;
     } finally {
       rmSync(configDir, { recursive: true, force: true });
