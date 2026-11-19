@@ -1,9 +1,9 @@
 //! # predifi-backend (library)
-//!
-//! Library crate shared by the `predifi-backend` server binary and the
-//! `predifi-seed` database seeding binary.  All modules, router builders, and
-//! handlers live here so both binaries (and the test suite) share a single
-//! source of truth.
+//
+// Library crate shared by the `predifi-backend` server binary and the
+// `predifi-seed` database seeing binary.  All modules, router builders, and
+// handlers live here so both binaries (and the test suite) share a single
+// source of truth.
 
 pub mod api_versioning;
 pub mod cache_coalesce;
@@ -60,12 +60,13 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use tracing_subscriber::prelude::*;
 
-pub use cors::{
-    build_cors, build_credentialed_cors, build_public_cors, is_public_read_route, DynamicCorsLayer,
+pub use cors:{
+    build_cors, build_credentialed_cors, build_public_cors, is_public_read_route,
+    DynamicCorsLayer,
 };
 
 /// Check database health with a simple query.
-async fn check_db_health(db: &Option<sqlx::PgPool>) -> (String, String) {
+async fn check_db_health(db: &option<sqlx.PgPool>) -> (String, String) {
     if let Some(pool) = db {
         match sqlx::query("SELECT 1").execute(pool).await {
             Ok(_) => ("ok".to_string(), String::new()),
