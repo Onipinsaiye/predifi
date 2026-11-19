@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "contract_version": 1,
+  "source": "contract/contracts/predifi-contract/tests/event_schema_tests.rs",
+  "events": [
+    {
+      "topic": "init",
+      "category": "pool_lifecycle",
+      "payload": {
+        "access_control": "CDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "treasury": "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        "fee_bps": 100,
+        "resolution_delay": 3600,
+        "min_pool_duration": 300,
+        "max_predictions_per_user": 0
+      }
+    },
+    {
+      "topic": "pool_created",
+      "category": "pool_lifecycle",
+      "payload": {
+        "pool_id": 1,
+        "creator": "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        "end_time": 1767225600,
+        "token": "CDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "options_count": 2,
+        "metadata_url": "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        "initial_liquidity": "10000000",
+        "category": "Crypto",
+        "required_resolutions": 2,
+        "max_total_stake": "0",
+        "outcome_descriptions": [
+          "Yes",
+          "No"
+        ]
+      }
+    },
+    {
+      "topic": "prediction_placed",
+      "category": "prediction",
+      "payload": {
+        "pool_id": 1,
+        "user": "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        "option": 0,
+        "amount": "5000000",
+        "referrer": null
+      }
+    },
+    {
+      "topic": "pool_resolved",
+      "category": "resolution",
+      "payload": {
+        "pool_id": 1,
+        "winning_option": 0,
+        "resolved_at": 1767229200
+      }
+    },
+    {
+      "topic": "winnings_claimed",
+      "category": "payout",
+      "payload": {
+        "pool_id": 1,
+        "user": "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        "payout": "14850000",
+        "fee": "150000"
+      }
+    }
+  ],
+  "verified_test_topics": [
+    "Tech"
+  ]
+}
