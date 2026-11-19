@@ -1086,6 +1086,27 @@ Import the OpenAPI spec into Postman to generate an API collection automatically
 
 ---
 
+## Mutation Authentication & Cross-Site Request Protection Model
+
+All state-changing routes (`POST`, `PUT`, `PATCH`, `DELETE`) enforce explicit caller authentication, bounded request body limits, and cross-site request validation (`Origin` allowlist + bearer header authentication so browser ambient credentials alone cannot trigger state mutations):
+
+| Mutation Route | Method | Authentication Model | CSRF / Cross-Site Protection | Rate-Limit Tier & Body Cap |
+| :--- | :---: | :--- | :--- | :--- |
+| `/api/v1/auth/refresh` | `POST` | Signed refresh token payload rotation (`jwt.rs`) | Strict `Origin` validation + token rotation invalidating prior token ID (`jti`) | `Token` tier (`MAX_BODY_BYTES_TOKEN_REFRESH`) |
+| `/api/v1/auth/logout` | `POST` | `Authorization: Bearer <jwt>` + revocation store (`token_revocation.rs`) | Requires non-ambient `Authorization` header + `Origin` check | `Token` tier (`MAX_BODY_BYTES_TOKEN_REFRESH`) |
+| `/api/v1/users/:address/interests` | `PUT` | `Authorization: Bearer <jwt>` with `sub == :address` | Header-borne Bearer token + strict CORS `Origin` allowlist | `User` tier (`MAX_BODY_BYTES_INTERESTS`) |
+| `/api/v1/notifications/:address/read` | `POST` | `Authorization: Bearer <jwt>` with `sub == :address` | Header-borne Bearer token + strict CORS `Origin` allowlist | `User` tier (`MAX_BODY_BYTES_NOTIFICATIONS_READ`) |
+| `/api/v1/pools/:id/tags` | `PATCH` | Creator or Operator `Authorization: Bearer <jwt>` | Header-borne Bearer token + `Origin` allowlist | `Write` tier (`MAX_BODY_BYTES_TAGS`) |
+| `/api/v1/pools/:id/pay-creator-incentive` | `POST` | Treasury / Operator `Authorization: Bearer <jwt>` | Header-borne Bearer token + `Origin` allowlist | `Admin/Write` guard |
+| `/api/v1/pool-templates` | `POST` | Authenticated Creator / Operator `Authorization: Bearer <jwt>` | Header-borne Bearer token + `Origin` allowlist | `MAX_BODY_BYTES_POOL_TEMPLATE` |
+| `/api/v1/indexer/pool-created` | `POST` | Internal indexer service credentials + `Idempotency-Key` (`pools.create`) | Non-browser service token + idempotency digest validation | `Write` tier (`MAX_BODY_BYTES_POOL_CREATED`) |
+| `/api/v1/indexer/prediction-placed` | `POST` | Internal indexer service credentials + `Idempotency-Key` (`predictions.create`) | Non-browser service token + idempotency digest validation | `Write` tier (`MAX_BODY_BYTES_INDEXER_EVENT`) |
+| `/api/v1/indexer/claim` | `POST` | Internal indexer service credentials + `Idempotency-Key` (`claims.submit`) | Non-browser service token + idempotency digest validation | `Write` tier (`MAX_BODY_BYTES_INDEXER_EVENT`) |
+| `/api/v1/admin/log-level` | `PATCH` | Admin Bearer token (`ADMIN_API_KEY` / Admin role claim) | Non-ambient Admin header + `Origin` rejection on untrusted origins | `Admin` tier (`MAX_BODY_BYTES_ADMIN`) |
+| `/api/v1/admin/notifications/:id/replay` | `POST` | Admin Bearer token (`ADMIN_API_KEY` / Admin role claim) | Non-ambient Admin header + `Origin` rejection on untrusted origins | `Admin` tier |
+
+---
+
 ## Documentation Sources
 
 - **OpenAPI Source**: `backend/src/openapi.rs`
