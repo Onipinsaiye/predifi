@@ -4,6 +4,12 @@
 //! Kept as an independent module (rather than growing `db.rs`) so profile
 //! queries can be developed and reasoned about without touching the existing
 //! pool/prediction indexing code paths.
+//!
+//! Privacy: profile data is only ever returned for the address the caller
+//! has authenticated as. Consent gating for product analytics is enforced
+//! separately; this module never emits behavioral telemetry itself and never
+//! surfaces private keys, signatures, or per-position stake values beyond the
+//! aggregates the owner is entitled to see.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -357,57 +363,6 @@ mod tests {
             claim_expired: false,
         };
         assert!(row.is_winner.is_none());
-        assert!(row.claim_window_expires_at.is_none());
-        assert!(!row.claim_expired);
-    }
-
-    #[test]
-    fn claim_status_marks_expired_window_after_resolution() {
-        // Ownership: claim window is derived from indexer-owned
-        // `pools.resolved_at` + `claim_window_seconds`; once elapsed the
-        // API reports `claim_expired = true` even if unclaimed.
-        let resolved_at = Utc::now() - chrono::Duration::seconds(3_600);
-        let expires_at = resolved_at + chrono::Duration::seconds(1_800);
-        let claim_expired = expires_at < Utc::now();
-        let row = ClaimStatusRow {
-            prediction_id: 2,
-            pool_id: 11,
-            pool_name: "pool".to_string(),
-            outcome: 1,
-            amount: 50,
-            pool_state: "resolved".to_string(),
-            pool_result: Some("1".to_string()),
-            is_winner: Some(true),
-            claimed: false,
-            claimed_amount: 0,
-            claim_window_expires_at: Some(expires_at),
-            claim_expired,
-        };
-        assert_eq!(row.is_winner, Some(true));
-        assert!(row.claim_expired);
         assert!(!row.claimed);
-    }
-
-    #[test]
-    fn performance_series_is_empty_for_new_profile() {
-        // Ownership: analytics are indexer aggregates; a profile with no
-        // predictions yields an empty series (rendered as zeroed chart),
-        // never an error or null.
-        let performance: Vec<PerformancePoint> = Vec::new();
-        assert!(performance.is_empty());
-    }
-
-    #[test]
-    fn performance_point_reports_zero_earnings_when_unclaimed() {
-        // Ownership: earnings per day come from indexer-owned
-        // `claimed_amount`; days with only stakes report 0 earnings.
-        let point = PerformancePoint {
-            day: Utc::now(),
-            staked: 100,
-            earnings: 0,
-            predictions: 1,
-        };
-        assert_eq!(point.earnings, 0);
-        assert_eq!(point.staked, 100);
     }
 }

@@ -93,6 +93,37 @@ Private platform data is created and held by the platform. It is subject to acce
 
 ---
 
+## 4. Product analytics
+
+Product analytics is a **non-essential** processing purpose. It is off by default and only runs after explicit user consent. The rules below are the authoritative definition used by the analytics client (`frontend/src/lib/analytics/`).
+
+### 4.1 Event categories
+
+| Category | Examples | Contains user-linked identifiers? | Retention |
+| --- | --- | --- | --- |
+| `navigation` | Page views, route changes | No (route name only) | 30 days |
+| `feature_usage` | Button/feature interactions, counts | No | 30 days |
+| `performance` | Load timings, render errors (no stack payloads with user data) | No | 14 days |
+
+### 4.2 Prohibited data
+
+Analytics payloads must never contain:
+
+- private keys, seed phrases, or signing material
+- transaction signatures or signed payloads
+- position-level values (stake amounts, prediction sizes, balances tied to a user)
+- wallet addresses or other direct identifiers
+
+The client enforces this by dropping any property whose key matches a denylist pattern and by never emitting position-level fields.
+
+### 4.3 Consent model
+
+- Default state is **denied**: no analytics event is sent until the user grants consent.
+- Consent is stored locally and can be withdrawn at any time; withdrawal stops all future collection immediately and clears any queued events.
+- Essential, non-analytics operations are unaffected by consent state.
+
+---
+
 ## Audit Checklist
 
 Use this checklist to verify that each inventory entry is backed by a real migration, a documented API schema, and a worker payload definition. Run the checklist script (added in the follow-up step, referenced below) to automate the cross-reference; the table records the expected mapping.

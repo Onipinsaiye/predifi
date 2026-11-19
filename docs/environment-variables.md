@@ -85,6 +85,32 @@ These variables configure the Rust Axum backend (`backend/src/config.rs`). They 
 | `PREDIFI_REFERRAL_FEE_BPS` | u32 | `5000` (50%) | No | Share of platform fee allocated to referrers. |
 | `PREDIFI_SENTRY_DSN` | String | *unset* | No | Sentry DSN for error and panic tracking. |
 
+### Analytics & Privacy
+
+Product analytics collection is **default-deny**. No non-essential analytics events are sent until the user grants explicit consent.
+
+| Variable | Type | Default | Required | Description |
+| :--- | :--- | :--- | :---: | :--- |
+| `PREDIFI_ANALYTICS_ENABLED` | bool | `false` | No | Master switch for product analytics. When `false`, no analytics events are emitted regardless of consent state. |
+| `PREDIFI_ANALYTICS_ENDPOINT` | String | *unset* | No (if analytics disabled) | Outbound ingestion URL for analytics payloads. Required only when `PREDIFI_ANALYTICS_ENABLED=true`. |
+| `PREDIFI_ANALYTICS_RETENTION_DAYS` | u32 | `90` | No | Retention period for analytics events stored by PrediFi-operated ingestion. |
+
+**Event categories**
+
+| Category | Essential | Consent required | Retention | Examples |
+| :--- | :---: | :---: | :--- | :--- |
+| `essential` | Yes | No | Session lifetime | Authentication status, request error codes needed for service operation. |
+| `analytics.usage` | No | Yes | `PREDIFI_ANALYTICS_RETENTION_DAYS` | Page views, feature navigation, UI interaction counts. |
+| `analytics.performance` | No | Yes | `PREDIFI_ANALYTICS_RETENTION_DAYS` | Client-side load timings, aggregated error rates. |
+
+**Data restrictions:** Analytics payloads must never include private keys, signatures, seed phrases, or position-level values (stake amounts, prediction outcomes tied to a wallet address). Only aggregated or coarse-grained categorical fields are permitted.
+
+**Consent behavior**
+
+- Default state for every user is *no consent*; non-essential events are dropped client-side before any network request is made.
+- Consent may be granted or withdrawn at any time. Withdrawal stops future collection immediately and clears any queued, unsent events.
+- Consent state is stored locally in the browser and is not transmitted to analytics endpoints.
+
 ---
 
 ## 3. Frontend Environment Variables
@@ -95,4 +121,5 @@ These variables configure the Next.js web application (`frontend/.env.example` -
 | :--- | :--- | :--- |
 | `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:3000` | Base URL for the PrediFi REST and WebSocket API. |
 | `NEXT_PUBLIC_STELLAR_NETWORK` | `TESTNET` | Stellar network mode (`TESTNET`, `MAINNET`, `FUTURENET`, `STANDALONE`). |
+| `NEXT_PUBLIC_ANALYTICS_ENABLED` | `false` | Client-side mirror of `PREDIFI_ANALYTICS_ENABLED`. Analytics SDK is not initialized unless this is `true` and the user has granted consent. |
 | `WATCHPACK_POLLING` | `true` | Enables polling-based file watching inside Docker containers on Windows/macOS. |

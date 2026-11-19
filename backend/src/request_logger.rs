@@ -434,7 +434,6 @@ where
             correlation_id = %correlation_id,
             user_address = %user_address,
             pool_id = pool_id.as_deref().unwrap_or(""),
-            trace_id = %trace_ctx.trace_id,
             span_id = %trace_ctx.span_id,
             sampled = trace_ctx.sampled,
         );
