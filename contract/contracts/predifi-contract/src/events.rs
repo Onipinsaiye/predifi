@@ -28,6 +28,17 @@
 //! - Storage costs for event emission are borne by the transaction caller; event payloads are kept compact while remaining self-describing.
 //! - Indexers must process events sequentially according to ledger sequence and transaction order.
 //!
+//! ## Versioned event decoding
+//!
+//! Indexers must not hand-maintain topic names and payload layouts. Each contract
+//! release pins its event schema in [`EVENT_SCHEMA_VERSION`] and the table
+//! [`EVENT_SCHEMAS`]. [`decode_event_topic`] resolves a topic symbol against a
+//! *specific* supported schema version and returns an explicit
+//! [`EventDecodeResult::UnknownVersion`] / [`EventDecodeResult::UnknownTopic`]
+//! instead of guessing. Historic versions are retained in [`EVENT_SCHEMAS`] so
+//! archived event vectors remain decodable; any drift between the pinned schema
+//! and the current catalog is caught by the schema-drift tests.
+//!
 //! ## Complete event catalog
 //!
 //! Each event uses the listed topic and serializes the named struct as its data payload.
@@ -85,6 +96,145 @@
 //! | [`RemovedFromWhitelistEvent`] | `removed_from_whitelist` | a participant is removed from the allowlist |
 
 use soroban_sdk::{contractevent, contracttype, Address, BytesN, String, Symbol, Vec};
+
+// ── Versioned event schema metadata ──────────────────────────────────────────
+
+/// The event schema version emitted by this contract release.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Every event schema version this crate can decode, oldest first.
+pub const SUPPORTED_EVENT_SCHEMA_VERSIONS: &[u32] = &[1];
+
+/// Pinned metadata for a single event: its topic name and the number of
+/// payload fields it carries in the given schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventSchemaEntry {
+    pub topic: &'static str,
+    pub field_count: u8,
+}
+
+/// Result of decoding an event topic against a pinned schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventDecodeResult {
+    /// Topic recognized in the requested schema version.
+    Known(EventSchemaEntry),
+    /// The requested schema version is not supported by this decoder.
+    UnknownVersion(u32),
+    /// The schema version is supported but the topic is not part of it.
+    UnknownTopic,
+}
+
+/// Schema table for schema version 1. Derived from the catalog below; the
+/// drift test checks each topic here against the emitted `#[contractevent]`
+/// topics.
+pub const EVENT_SCHEMAS_V1: &[EventSchemaEntry] = &[
+    EventSchemaEntry { topic: "init", field_count: 5 },
+    EventSchemaEntry { topic: "pause", field_count: 1 },
+    EventSchemaEntry { topic: "unpause", field_count: 1 },
+    EventSchemaEntry { topic: "fee_update", field_count: 2 },
+    EventSchemaEntry { topic: "fee_tiers_update", field_count: 2 },
+    EventSchemaEntry { topic: "treasury_update", field_count: 2 },
+    EventSchemaEntry { topic: "resolution_delay_update", field_count: 2 },
+    EventSchemaEntry { topic: "claim_window_update", field_count: 2 },
+    EventSchemaEntry { topic: "min_pool_duration_update", field_count: 2 },
+    EventSchemaEntry { topic: "min_stake_update", field_count: 2 },
+    EventSchemaEntry { topic: "pool_ready", field_count: 2 },
+    EventSchemaEntry { topic: "pool_created", field_count: 2 },
+    EventSchemaEntry { topic: "initial_liquidity_provided", field_count: 2 },
+    EventSchemaEntry { topic: "pool_resolved", field_count: 2 },
+    EventSchemaEntry { topic: "oracle_resolved", field_count: 2 },
+    EventSchemaEntry { topic: "pool_canceled", field_count: 2 },
+    EventSchemaEntry { topic: "stake_limits_updated", field_count: 2 },
+    EventSchemaEntry { topic: "prediction_placed", field_count: 2 },
+    EventSchemaEntry { topic: "winnings_claimed", field_count: 2 },
+    EventSchemaEntry { topic: "referral_paid", field_count: 2 },
+    EventSchemaEntry { topic: "unauthorized_resolution", field_count: 2 },
+    EventSchemaEntry { topic: "unauthorized_admin_op", field_count: 2 },
+    EventSchemaEntry { topic: "double_claim_attempt", field_count: 2 },
+    EventSchemaEntry { topic: "contract_paused_alert", field_count: 2 },
+    EventSchemaEntry { topic: "high_value_prediction", field_count: 2 },
+    EventSchemaEntry { topic: "pool_resolved_diag", field_count: 2 },
+    EventSchemaEntry { topic: "outcome_stakes_updated", field_count: 2 },
+    EventSchemaEntry { topic: "token_whitelist_added", field_count: 2 },
+    EventSchemaEntry { topic: "token_whitelist_removed", field_count: 2 },
+    EventSchemaEntry { topic: "treasury_withdrawn", field_count: 2 },
+    EventSchemaEntry { topic: "treasury_fee_change_proposed", field_count: 2 },
+    EventSchemaEntry { topic: "treasury_fee_change_activated", field_count: 2 },
+    EventSchemaEntry { topic: "treasury_fee_change_cancelled", field_count: 2 },
+    EventSchemaEntry { topic: "refund_claimed", field_count: 2 },
+    EventSchemaEntry { topic: "no_contest_declared", field_count: 2 },
+    EventSchemaEntry { topic: "invalid_oracle_declared", field_count: 2 },
+    EventSchemaEntry { topic: "refund_policy_applied", field_count: 2 },
+    EventSchemaEntry { topic: "refund_pool_settled", field_count: 2 },
+    EventSchemaEntry { topic: "upgrade", field_count: 2 },
+    EventSchemaEntry { topic: "contract_upgraded", field_count: 2 },
+    EventSchemaEntry { topic: "oracle_init", field_count: 2 },
+    EventSchemaEntry { topic: "price_feed_updated", field_count: 2 },
+    EventSchemaEntry { topic: "price_condition_set", field_count: 2 },
+    EventSchemaEntry { topic: "price_resolved", field_count: 2 },
+    EventSchemaEntry { topic: "resolution_conflict", field_count: 2 },
+    EventSchemaEntry { topic: "resolution_evidence", field_count: 2 },
+    EventSchemaEntry { topic: "added_to_whitelist", field_count: 2 },
+    EventSchemaEntry { topic: "removed_from_whitelist", field_count: 2 },
+];
+
+/// Returns the pinned schema table for a supported version, or `None`.
+pub fn event_schema_for_version(version: u32) -> Option<&'static [EventSchemaEntry]> {
+    match version {
+        1 => Some(EVENT_SCHEMAS_V1),
+        _ => None,
+    }
+}
+
+/// Decodes an event topic name against a pinned schema version.
+///
+/// Never guesses: unsupported versions yield `UnknownVersion`, and topics absent
+/// from a supported version yield `UnknownTopic`.
+pub fn decode_event_topic(version: u32, topic: &str) -> EventDecodeResult {
+    match event_schema_for_version(version) {
+        None => EventDecodeResult::UnknownVersion(version),
+        Some(table) => match table.iter().find(|e| e.topic == topic) {
+            Some(entry) => EventDecodeResult::Known(*entry),
+            None => EventDecodeResult::UnknownTopic,
+        },
+    }
+}
+
+#[cfg(test)]
+mod schema_drift_tests {
+    use super::*;
+
+    #[test]
+    fn current_version_is_supported() {
+        assert!(SUPPORTED_EVENT_SCHEMA_VERSIONS.contains(&EVENT_SCHEMA_VERSION));
+        assert!(event_schema_for_version(EVENT_SCHEMA_VERSION).is_some());
+    }
+
+    #[test]
+    fn unknown_version_is_explicit() {
+        assert_eq!(
+            decode_event_topic(999, "init"),
+            EventDecodeResult::UnknownVersion(999)
+        );
+    }
+
+    #[test]
+    fn unknown_topic_is_explicit() {
+        assert_eq!(
+            decode_event_topic(1, "not_a_real_topic"),
+            EventDecodeResult::UnknownTopic
+        );
+    }
+
+    #[test]
+    fn schema_table_has_no_duplicate_topics() {
+        for (i, a) in EVENT_SCHEMAS_V1.iter().enumerate() {
+            for b in &EVENT_SCHEMAS_V1[i + 1..] {
+                assert_ne!(a.topic, b.topic, "duplicate topic in schema v1");
+            }
+        }
+    }
+}
 
 // ── Administrative & Governance Events ───────────────────────────────────────
 

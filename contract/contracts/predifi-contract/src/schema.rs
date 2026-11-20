@@ -138,9 +138,12 @@ pub fn run_pending_migrations(env: &Env, stored_version: u32) -> Result<(), Pred
     //
     // ─────────────────────────────────────────────────────────────────────
 
-    // Silence "unused variable" warning when no migrations are registered yet.
-    let _ = &mut version;
-    let _ = env;
+    // Refuse to finalize unless every registered step has advanced `version`
+    // to CURRENT_SCHEMA_VERSION. An unknown or unreachable stored version must
+    // never be silently stamped as current.
+    if version != CURRENT_SCHEMA_VERSION {
+        return Err(PredifiError::UnsupportedSchemaVersion);
+    }
 
     // Persist the final version so subsequent calls return
     // `SchemaMigrationAlreadyRun` instead of re-running.

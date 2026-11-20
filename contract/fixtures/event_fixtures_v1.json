@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "supported_schema_versions": [1],
   "contract_version": 1,
   "source": "contract/contracts/predifi-contract/tests/event_schema_tests.rs",
   "events": [
