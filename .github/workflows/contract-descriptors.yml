@@ -1,0 +1,154 @@
+name: Publish Contract Descriptors
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to build descriptors for (optional, defaults to latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-descriptors:
+    name: Build Contract Descriptors
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      descriptor-dir: ${{ steps.set-output.outputs.descriptor-dir }}
+      index-path: ${{ steps.set-output.outputs.index-path }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install binaryen (wasm-opt)
+        run: |
+          BINARYEN_VERSION="120"
+          curl -fsSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | tar -xz -C /tmp
+          sudo mv "/tmp/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt
+          wasm-opt --version
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli --features opt
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contract/target
+          key: ${{ runner.os }}-contract-descriptors-${{ hashFiles('contract/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-contract-descriptors-
+
+      - name: Build contracts
+        run: |
+          cd contract
+          cargo build --target wasm32-unknown-unknown --release
+
+      - name: Generate contract descriptors
+        id: gen-descriptors
+        run: |
+          cd contract
+          ./scripts/generate-contract-descriptors.sh
+
+      - name: Set output paths
+        id: set-output
+        run: |
+          DESCRIPTOR_DIR="contract/releases/contract-descriptors"
+          echo "descriptor-dir=${DESCRIPTOR_DIR}" >> $GITHUB_OUTPUT
+          echo "index-path=${DESCRIPTOR_DIR}/index.json" >> $GITHUB_OUTPUT
+
+      - name: Upload descriptor artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: contract-descriptors-${{ github.sha }}
+          path: |
+            contract/releases/contract-descriptors/*.json
+          retention-days: 90
+
+  publish-descriptors:
+    name: Publish Descriptors to Release
+    needs: build-descriptors
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'release'
+    steps:
+      - name: Download descriptor artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-descriptors-${{ github.sha }}
+          path: descriptors
+
+      - name: Verify descriptors
+        run: |
+          shopt -s nullglob
+          descriptors=(descriptors/*-descriptor.json)
+          if [[ "${#descriptors[@]}" -ne 2 ]]; then
+            echo "❌ Expected descriptors for both contract WASM artifacts"
+            exit 1
+          fi
+
+          echo "📋 Verifying descriptors..."
+          for f in "${descriptors[@]}"; do
+            echo "Checking $f..."
+            jq empty "$f"
+            jq -e '
+              (.spec.data | length > 0) and
+              (.artifacts.raw_wasm.sha256 | test("^[0-9a-f]{64}$")) and
+              (.artifacts.optimized_wasm.sha256 | test("^[0-9a-f]{64}$"))
+            ' "$f" >/dev/null
+            CONTRACT=$(jq -r '.contract' "$f")
+            VERSION=$(jq -r '.version' "$f")
+            SPEC_LEN=$(jq -r '.spec.data | length' "$f")
+            OPT_HASH=$(jq -r '.artifacts.optimized_wasm.sha256' "$f")
+            echo "  Contract: $CONTRACT"
+            echo "  Version: $VERSION"
+            echo "  Spec length: $SPEC_LEN"
+            echo "  Optimized WASM: $OPT_HASH"
+          done
+
+      - name: Upload descriptors to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            descriptors/*.json
+          tag_name: ${{ github.event.release.tag_name }}
+          generate_release_notes: false
+
+  attest-descriptors:
+    name: Attest Descriptor Provenance
+    needs: build-descriptors
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+    steps:
+      - name: Download descriptor artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-descriptors-${{ github.sha }}
+          path: descriptors
+
+      - name: Attest descriptor files (Sigstore)
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: descriptors/*.json
