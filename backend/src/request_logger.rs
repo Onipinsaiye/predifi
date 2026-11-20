@@ -33,7 +33,7 @@
 //!     "http.route": "/api/v1/pools/42",
 //!     "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
 //!     "correlation_id": "01J2K3L4M5N6P7Q8R9S0T1U2V3",
-//!     "user_address": "GABC...XYZ",
+//!     "user_address": "psid-3f7a9b2c",
 //!     "pool_id": "42"
 //!   },
 //!   "fields": {
@@ -397,8 +397,11 @@ where
         let traceparent = extract_traceparent(req.headers());
         let tracestate = extract_tracestate(req.headers());
         let user_address = extract_user_address(req.headers())
-            .map(|a| redact_address(&a))
-            .unwrap_or_else(|| "anonymous".to_string());
+            // Use a keyed pseudonym instead of a raw-address prefix truncation.
+            // The pseudonym is stable within an hour, so traces from the same
+            // request chain can be correlated without exposing the full address.
+            .map(|a| crate::address_pseudonym::pseudonym(&a))
+            .unwrap_or_else(|| "psid-anonymous".to_string());
         let pool_id = extract_pool_id(&path);
         // Continue the W3C trace context from `traceparent`, or start a new
         // (possibly unsampled) root when the client did not send one.

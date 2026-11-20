@@ -121,7 +121,13 @@ pub async fn rotate_refresh_token_durable(
         RevokeOutcome::Revoked => snapshot.token_version,
         RevokeOutcome::EscalatedToUserWide { token_version } => token_version,
         RevokeOutcome::AlreadyRevoked => {
-            tracing::warn!(user = %claims.sub, "refresh token reuse detected; revoking all sessions");
+            // Log the pseudonym, not the raw wallet address, so the warning
+            // is correlatable within the current time bucket without leaking
+            // the address into retained log storage.
+            tracing::warn!(
+                user = %crate::address_pseudonym::pseudonym(&claims.sub),
+                "refresh token reuse detected; revoking all sessions"
+            );
             store
                 .revoke_all(&claims.sub, RevocationReason::RefreshReuseDetected, now_unix)
                 .await?;

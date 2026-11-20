@@ -418,7 +418,7 @@ impl SessionStore {
         };
         tracing::info!(
             kind = ?entry.kind,
-            user = %entry.user_address,
+            user = %crate::address_pseudonym::pseudonym(&entry.user_address),
             session_id = ?entry.session_id,
             detail = %entry.detail,
             "session.activity"
