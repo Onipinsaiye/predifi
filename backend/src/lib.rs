@@ -6,6 +6,7 @@
 //! source of truth.
 
 pub mod api_versioning;
+pub mod abuse;
 pub mod cache_coalesce;
 pub mod config;
 pub mod constants;

@@ -146,6 +146,7 @@ pub mod error_codes {
     pub const TOKEN_STORE_UNAVAILABLE: &str = "TOKEN_STORE_UNAVAILABLE";
     pub const RATE_LIMIT_EXCEEDED: &str = "RATE_LIMIT_EXCEEDED";
     pub const RATE_LIMITER_UNAVAILABLE: &str = "RATE_LIMITER_UNAVAILABLE";
+    pub const RATE_LIMITED: &str = "RATE_LIMITED";
     pub const UNAUTHORIZED: &str = "UNAUTHORIZED";
     pub const TOKEN_REVOKED: &str = "TOKEN_REVOKED";
     pub const FORBIDDEN: &str = "FORBIDDEN";
@@ -166,6 +167,7 @@ pub fn is_retryable(code: &str) -> bool {
             | TOKEN_STORE_UNAVAILABLE
             | RATE_LIMIT_EXCEEDED
             | RATE_LIMITER_UNAVAILABLE
+            | RATE_LIMITED
     )
 }
 
@@ -190,6 +192,7 @@ pub fn safe_message(code: &str) -> &'static str {
         CONFLICT => "conflict",
         API_VERSION_SUNSET => "this API version or route has been retired",
         RATE_LIMIT_EXCEEDED => "Too many requests",
+        RATE_LIMITED => "posting quota exceeded",
         _ => "internal server error",
     }
 }

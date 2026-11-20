@@ -382,6 +382,14 @@ const DEFAULT_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW: u32 = 3_000;
 /// before a request is admitted. Raising this makes account cycling more
 /// expensive for automated abusers.
 const DEFAULT_ABUSE_MIN_VALIDATION_COST: u32 = 1;
+/// Default number of comments a single wallet may post per abuse-control window.
+const DEFAULT_ABUSE_QUOTA_COMMENT_PER_WINDOW: u32 = 20;
+/// Default network-wide ceiling on comments per abuse-control window.
+const DEFAULT_ABUSE_QUOTA_NETWORK_COMMENT_PER_WINDOW: u32 = 500;
+/// Default number of reports a single wallet may submit per abuse-control window.
+const DEFAULT_ABUSE_QUOTA_REPORT_PER_WINDOW: u32 = 10;
+/// Default network-wide ceiling on reports per abuse-control window.
+const DEFAULT_ABUSE_QUOTA_NETWORK_REPORT_PER_WINDOW: u32 = 200;
 
 // ── RPC quota / failover defaults (issue #105) ───────────────────────────────
 /// Default per-network request budget (requests per window) for the RPC layer.
@@ -561,6 +569,18 @@ pub struct Config {
     /// Minimum validation cost that must be paid before a request is admitted
     /// (default `1`). Read from `PREDIFI_ABUSE_MIN_VALIDATION_COST`.
     pub abuse_min_validation_cost: u32,
+    /// Maximum comments a single wallet may post per window (default `20`).
+    /// Read from `PREDIFI_ABUSE_QUOTA_COMMENT_PER_WINDOW`.
+    pub abuse_quota_comment_per_window: u32,
+    /// Network-wide ceiling on comments per window (default `500`).
+    /// Read from `PREDIFI_ABUSE_QUOTA_NETWORK_COMMENT_PER_WINDOW`.
+    pub abuse_quota_network_comment_per_window: u32,
+    /// Maximum reports a single wallet may submit per window (default `10`).
+    /// Read from `PREDIFI_ABUSE_QUOTA_REPORT_PER_WINDOW`.
+    pub abuse_quota_report_per_window: u32,
+    /// Network-wide ceiling on reports per window (default `200`).
+    /// Read from `PREDIFI_ABUSE_QUOTA_NETWORK_REPORT_PER_WINDOW`.
+    pub abuse_quota_network_report_per_window: u32,
 
     // ── RPC quotas / failover (issue #105) ───────────────────────────────────
     /// Per-network request budget per window (default `1000`). Read from
@@ -788,6 +808,26 @@ impl Config {
             "PREDIFI_ABUSE_MIN_VALIDATION_COST",
             DEFAULT_ABUSE_MIN_VALIDATION_COST,
         )?;
+        let abuse_quota_comment_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_COMMENT_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_COMMENT_PER_WINDOW,
+        )?;
+        let abuse_quota_network_comment_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_NETWORK_COMMENT_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_NETWORK_COMMENT_PER_WINDOW,
+        )?;
+        let abuse_quota_report_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_REPORT_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_REPORT_PER_WINDOW,
+        )?;
+        let abuse_quota_network_report_per_window = get_u32(
+            vars,
+            "PREDIFI_ABUSE_QUOTA_NETWORK_REPORT_PER_WINDOW",
+            DEFAULT_ABUSE_QUOTA_NETWORK_REPORT_PER_WINDOW,
+        )?;
 
         // ── RPC quotas / failover (issue #105) ───────────────────────────────
         let rpc_per_network_budget = get_u32(
@@ -942,6 +982,10 @@ impl Config {
             abuse_quota_network_market_create_per_window,
             abuse_quota_network_wallet_action_per_window,
             abuse_min_validation_cost,
+            abuse_quota_comment_per_window,
+            abuse_quota_network_comment_per_window,
+            abuse_quota_report_per_window,
+            abuse_quota_network_report_per_window,
             rpc_per_network_budget,
             rpc_budget_window_secs,
             rpc_max_retries,
@@ -1263,6 +1307,52 @@ impl Config {
             });
         }
 
+        // ── Comment and report quotas ─────────────────────────────────────────
+        if self.abuse_quota_comment_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_COMMENT_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_network_comment_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_NETWORK_COMMENT_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_comment_per_window > self.abuse_quota_network_comment_per_window {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_COMMENT_PER_WINDOW",
+                reason: format!(
+                    "must be <= PREDIFI_ABUSE_QUOTA_NETWORK_COMMENT_PER_WINDOW ({}), got {}",
+                    self.abuse_quota_network_comment_per_window,
+                    self.abuse_quota_comment_per_window
+                ),
+            });
+        }
+        if self.abuse_quota_report_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_REPORT_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_network_report_per_window == 0 {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_NETWORK_REPORT_PER_WINDOW",
+                reason: String::from("must be greater than zero"),
+            });
+        }
+        if self.abuse_quota_report_per_window > self.abuse_quota_network_report_per_window {
+            return Err(ConfigError::InvalidValue {
+                key: "PREDIFI_ABUSE_QUOTA_REPORT_PER_WINDOW",
+                reason: format!(
+                    "must be <= PREDIFI_ABUSE_QUOTA_NETWORK_REPORT_PER_WINDOW ({}), got {}",
+                    self.abuse_quota_network_report_per_window,
+                    self.abuse_quota_report_per_window
+                ),
+            });
+        }
+
         // ── RPC quotas / failover (issue #105) ───────────────────────────────
         if self.rpc_per_network_budget == 0 {
             return Err(ConfigError::InvalidValue {
@@ -1539,6 +1629,10 @@ impl Config {
             abuse_quota_network_wallet_action_per_window:
                 DEFAULT_ABUSE_QUOTA_NETWORK_WALLET_ACTION_PER_WINDOW,
             abuse_min_validation_cost: DEFAULT_ABUSE_MIN_VALIDATION_COST,
+            abuse_quota_comment_per_window: DEFAULT_ABUSE_QUOTA_COMMENT_PER_WINDOW,
+            abuse_quota_network_comment_per_window: DEFAULT_ABUSE_QUOTA_NETWORK_COMMENT_PER_WINDOW,
+            abuse_quota_report_per_window: DEFAULT_ABUSE_QUOTA_REPORT_PER_WINDOW,
+            abuse_quota_network_report_per_window: DEFAULT_ABUSE_QUOTA_NETWORK_REPORT_PER_WINDOW,
             rpc_per_network_budget: DEFAULT_RPC_PER_NETWORK_BUDGET,
             rpc_budget_window_secs: DEFAULT_RPC_BUDGET_WINDOW_SECS,
             rpc_max_retries: DEFAULT_RPC_MAX_RETRIES,
