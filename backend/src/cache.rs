@@ -2,6 +2,8 @@ use redis::{aio::ConnectionManager, AsyncCommands, RedisError};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::redis_cache::RedisConsumerClass;
+
 /// Default TTL fallback bound for cached market views.
 ///
 /// Even if an invalidation is missed (e.g. a worker crash between the DB
@@ -77,7 +79,9 @@ impl Cache {
             return Ok(());
         }
         let mut conn = self.conn.clone();
-        let _: () = conn.del(keys).await?;
+        tokio::time::timeout(RedisConsumerClass::Optional.timeout(), conn.del::<_, ()>(keys))
+            .await
+            .map_err(|_| redis_timeout_error())??;
         Ok(())
     }
 
@@ -88,22 +92,35 @@ impl Cache {
         value: &str,
     ) -> Result<(), RedisError> {
         let mut conn = self.conn.clone();
-        let _: () = conn
-            .set_ex(
+        tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.set_ex::<_, _, ()>(
                 market_detail_key(market_id),
                 value,
                 MARKET_VIEW_TTL.as_secs(),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| redis_timeout_error())??;
         Ok(())
     }
 
     /// Store the market list view with the TTL fallback bound applied.
     pub async fn set_market_list(&self, value: &str) -> Result<(), RedisError> {
         let mut conn = self.conn.clone();
-        let _: () = conn
-            .set_ex(market_list_key(), value, MARKET_VIEW_TTL.as_secs())
-            .await?;
+        tokio::time::timeout(
+            RedisConsumerClass::Optional.timeout(),
+            conn.set_ex::<_, _, ()>(market_list_key(), value, MARKET_VIEW_TTL.as_secs()),
+        )
+        .await
+        .map_err(|_| redis_timeout_error())??;
         Ok(())
     }
+}
+
+fn redis_timeout_error() -> RedisError {
+    RedisError::from((
+        redis::ErrorKind::IoError,
+        "optional Redis cache operation timed out",
+    ))
 }

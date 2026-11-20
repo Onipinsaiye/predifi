@@ -281,5 +281,133 @@ mod tests {
         let cache = RedisCache::disabled();
         let key = rate_limit_key(RateLimitTier::Write, "indexer");
         assert!(cache.rate_limit_consume(&key, 60).await.is_none());
+        assert!(cache.get::<String>("optional-view").await.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Redis"]
+    async fn session_checks_fail_closed_on_partial_redis_command_failure() {
+        let (cache, container) = setup().await;
+        let port = container
+            .get_host_port_ipv4(6379)
+            .await
+            .expect("redis port");
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+
+        let _: () = redis::cmd("HSET")
+            .arg("predifi:jwt:revoked:partial-failure")
+            .arg("field")
+            .arg("value")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg("predifi:jwt:user:revoke_before:GABC123")
+            .arg("field")
+            .arg("value")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::jwt_security::is_token_revoked(&cache, "partial-failure").await,
+            Err(crate::jwt::JwtVerifyError::TokenStoreUnavailable)
+        );
+        assert_eq!(
+            crate::jwt_security::is_token_valid_for_user(&cache, "GABC123", 1_800_000_000)
+                .await,
+            Err(crate::jwt::JwtVerifyError::TokenStoreUnavailable)
+        );
+
+        drop(container);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Redis"]
+    async fn rate_limit_timeout_is_bounded_and_recovers_after_redis_unpauses() {
+        use crate::rate_limit::{rate_limit_key, RateLimitTier};
+
+        let (cache, container) = setup().await;
+        let port = container
+            .get_host_port_ipv4(6379)
+            .await
+            .expect("redis port");
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let _: String = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(400)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let key = rate_limit_key(RateLimitTier::Write, "outage-recovery");
+        let started = std::time::Instant::now();
+        assert!(cache.rate_limit_consume(&key, 60).await.is_none());
+        assert!(
+            started.elapsed() < crate::redis_cache::RATE_LIMIT_TIMEOUT + Duration::from_millis(100),
+            "rate-limit call exceeded its configured budget"
+        );
+
+        let optional_started = std::time::Instant::now();
+        assert!(cache.get::<String>("paused-view").await.is_none());
+        assert!(
+            optional_started.elapsed()
+                < crate::redis_cache::OPTIONAL_CACHE_TIMEOUT + Duration::from_millis(100),
+            "optional cache read exceeded its configured budget"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let recovered = cache
+            .rate_limit_consume(&key, 60)
+            .await
+            .expect("limiter should recover after Redis resumes");
+        assert_eq!(recovered.count, 1);
+
+        drop(container);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Redis"]
+    async fn rate_limit_reconnects_after_redis_drops_the_cache_connection() {
+        use crate::rate_limit::{rate_limit_key, RateLimitTier};
+
+        let (cache, container) = setup().await;
+        let port = container
+            .get_host_port_ipv4(6379)
+            .await
+            .expect("redis port");
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let killed: i64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("TYPE")
+            .arg("normal")
+            .arg("SKIPME")
+            .arg("yes")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(killed >= 1, "Redis should close the cache connection");
+
+        let key = rate_limit_key(RateLimitTier::Write, "reconnect");
+        let mut recovered = None;
+        for _ in 0..5 {
+            let result = tokio::time::timeout(
+                crate::redis_cache::RATE_LIMIT_TIMEOUT + Duration::from_millis(100),
+                cache.rate_limit_consume(&key, 60),
+            )
+            .await
+            .expect("rate-limit command should stay bounded");
+            if result.is_some() {
+                recovered = result;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(recovered.is_some(), "connection manager should reconnect");
+
+        drop(container);
     }
 }
