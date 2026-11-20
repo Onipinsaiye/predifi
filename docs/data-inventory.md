@@ -26,6 +26,7 @@ Public chain data is derived from on-chain events. It is public by construction 
 
 - Wallet addresses appearing in chain data are pseudonymous public identifiers. They are not treated as private platform data.
 - "Projected contract events" are listed here because they are a faithful projection of public chain events. Any *derived, non-public* enrichment of those events belongs in the private section below.
+- Reproducibility: public chain-derived history must be reproducible by re-indexing from chain. Retention jobs for private data MUST NOT delete, rewrite, or compact public chain projections. Synthetic-record tests for retention jobs must assert that chain-derived projections are unchanged after a retention run.
 
 ---
 
@@ -43,8 +44,8 @@ Private platform data is created and held by the platform. It is subject to acce
 
 | Record type | Owner | Purpose | Retention | Deletion path |
 | --- | --- | --- | --- | --- |
-| **Notification outbox** (pending notifications) | Notification service | Queue notifications for delivery | Until delivered or expired (short-lived) | Delivered/expired rows purged by retention worker; purged on account deletion |
-| **Notification deliveries** (delivery records / status) | Notification service | Track delivery status and support retries | Bounded window (see retention worker config) | Retention worker purge; purged on account deletion |
+| **Notification outbox** (pending notifications) | Notification service | Queue notifications for delivery | Until delivered or expired (short-lived; max 30 days) | Delivered/expired rows purged by retention worker; purged on account deletion |
+| **Notification deliveries** (delivery records / status) | Notification service | Track delivery status and support retries | Bounded window of 90 days after delivery | Retention worker purge; purged on account deletion |
 
 ### 2.3 Discussion data
 
@@ -57,21 +58,22 @@ Private platform data is created and held by the platform. It is subject to acce
 | Record type | Owner | Purpose | Retention | Deletion path |
 | --- | --- | --- | --- | --- |
 | **Tags** (user-applied tags) | Profile / discussion service | Organize and label content | Until removed or account deletion | Remove-tag endpoint; account deletion cascade |
-| **Claims** (ownership / verification claims) | Profile service | Verify ownership of a wallet or handle | Until revoked or account deletion | Revoke-claim endpoint; account deletion cascade |
+| **Claims** (ownership / verification claims) | Profile service | Verify ownership of a wallet or handle | Until revoked or account deletion; revoked claims retained as audit record for 365 days, then identifiers purged | Revoke-claim endpoint; account deletion cascade |
 
 ### 2.5 Export data
 
 | Record type | Owner | Purpose | Retention | Deletion path |
 | --- | --- | --- | --- | --- |
-| **Exports** (user data export jobs and artifacts) | Export service | Fulfil data-portability requests | Short-lived; artifacts expire after download window | Expiry worker deletes artifacts; purged on account deletion |
+| **Exports** (user data export jobs and artifacts) | Export service | Fulfil data-portability requests | Short-lived; artifacts expire after 7-day download window | Expiry worker deletes artifacts; purged on account deletion |
 
 ### 2.6 Operational data
 
 | Record type | Owner | Purpose | Retention | Deletion path |
 | --- | --- | --- | --- | --- |
-| **Idempotency keys** | API gateway / services | Prevent duplicate processing of retried requests | Short TTL (request-scoped) | TTL expiry; not user-addressable |
-| **Background jobs** (job payloads) | Worker / job runner | Execute asynchronous work (notifications, exports, indexing) | Until job completion + short retention | Job completion purge; payloads must not retain private data beyond need |
+| **Idempotency keys** | API gateway / services | Prevent duplicate processing of retried requests | Short TTL (request-scoped, 24 hours) | TTL expiry; not user-addressable |
+| **Background jobs** (job payloads) | Worker / job runner | Execute asynchronous work (notifications, exports, indexing) | Until job completion + 7 days | Job completion purge; payloads must not retain private data beyond need |
 | **Token revocation** (revoked token records) | Auth service | Enforce logout / revocation of credentials | Until token would have expired | TTL expiry aligned to token lifetime |
+| **Audit records** (retained compliance trail) | Platform / compliance | Evidence of deletion requests and retention actions | 365 days; contain request ID, action, timestamp, and a salted hash of the user identifier — no personal fields | Expiry worker after 365 days |
 
 **Notes**
 
@@ -84,12 +86,23 @@ Private platform data is created and held by the platform. It is subject to acce
 
 | Category | Public? | User-deletable? | Primary control |
 | --- | --- | --- | --- |
-| Pools, predictions, referrals, projected contract events | Yes (on-chain) | No | Accuracy / provenance |
+| Pools, predictions, referrals, projected contract events | Yes (on-chain) | No | Accuracy / provenance; reproducible by re-index |
 | Profiles, tags, claims | No | Yes | Access control + deletion cascade |
 | Notification outbox / deliveries | No | Yes | Retention worker + deletion cascade |
 | Discussions | No | Yes | Content deletion + cascade |
 | Exports | No | Yes | Expiry + deletion cascade |
 | Idempotency keys, background jobs, token revocation | No | Indirect (TTL) | Minimization + TTL |
+| Audit records | No | No (retained for compliance) | Minimized fields + fixed TTL |
+
+### 3.1 Scheduled cleanup
+
+A scheduled retention job runs at least daily and applies the rules in section 2. For each eligible record it:
+
+1. Selects rows whose retention window has elapsed (e.g. delivered notifications older than 30 days, deliveries older than 90 days, exports past their 7-day window, claims revoked more than 365 days ago).
+2. Hard-deletes private rows and their dependent private records.
+3. Writes one minimized audit record per run (counts and rule IDs only).
+
+The job must never select or modify public chain data categories listed in section 1. Validation: run the job against synthetic private records in a test environment, assert that all expired private rows are removed and unexpired rows remain, and assert that synthetic public chain projections are byte-for-byte unchanged and that re-indexing from the same chain events reproduces them.
 
 ---
 
@@ -153,6 +166,7 @@ Use this checklist to verify that each inventory entry is backed by a real migra
 | Idempotency keys | `migrations/*_idempotency_keys.*` | (internal) | — |
 | Background jobs | `migrations/*_jobs.*` | (internal) | Job envelope payload |
 | Token revocation | `migrations/*_token_revocation.*` | (internal) | — |
+| Audit records | `migrations/*_audit_records.*` | (internal) | Retention job audit payload |
 
 ### Review steps
 
@@ -160,6 +174,7 @@ Use this checklist to verify that each inventory entry is backed by a real migra
 2. **API schemas** — Confirm each user-facing entry appears in the OpenAPI spec and that private fields are not over-exposed.
 3. **Worker payloads** — Confirm each worker payload is minimized (identifiers over full records) and that retention is enforced.
 4. **Deletion paths** — Confirm each private entry has a working deletion path (endpoint, cascade, or TTL) and that the path is covered by a test.
-5. **Run the checklist script** — Execute `scripts/audit-data-inventory.*` and resolve any reported gaps before merging changes that add or alter user-linked records.
+5. **Retention job tests** — Confirm the scheduled cleanup is exercised against synthetic private records, and that public chain-derived projections remain unchanged and reproducible after each run.
+6. **Run the checklist script** — Execute `scripts/audit-data-inventory.*` and resolve any reported gaps before merging changes that add or alter user-linked records.
 
 When you add a new user-linked record type, add a row to the appropriate table above **and** a row to the audit checklist, then run the checklist script.
