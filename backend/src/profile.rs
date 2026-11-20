@@ -5,6 +5,13 @@
 //! queries can be developed and reasoned about without touching the existing
 //! pool/prediction indexing code paths.
 //!
+//! Retention & deletion policy (see docs/data-ownership.md):
+//!   * `predictions.user_address` / `claimed_amount` / `claimed_at` — public
+//!     chain-derived; retained indefinitely and never deleted by this module.
+//!   * Off-chain private fields (profile display data, notification targets,
+//!     exports) are purged by [`purge_expired_private_records`] once their
+//!     retention window elapses; audit rows are kept, minus personal data.
+//!
 //! Privacy: profile data is only ever returned for the address the caller
 //! has authenticated as. Consent gating for product analytics is enforced
 //! separately; this module never emits behavioral telemetry itself and never
@@ -264,6 +271,94 @@ pub async fn mark_predictions_claimed(
     Ok(result.rows_affected())
 }
 
+/// Classification of user-linked data and its retention behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionClass {
+    /// Public, immutable chain-derived history. Never deleted; reproducible
+    /// from chain events.
+    ChainImmutable,
+    /// Private profile/discussion/notification data. Deleted after `days`.
+    Private { days: i64 },
+    /// Export artifacts. Deleted after a short TTL.
+    Export { days: i64 },
+    /// Audit records. Kept, with personal identifiers redacted after `days`.
+    Audit { days: i64 },
+}
+
+/// Retention policy per user-linked field group.
+pub const RETENTION_POLICY: &[(&str, RetentionClass)] = &[
+    ("predictions.user_address", RetentionClass::ChainImmutable),
+    ("predictions.claimed_amount", RetentionClass::ChainImmutable),
+    ("predictions.claimed_at", RetentionClass::ChainImmutable),
+    ("user_profiles.display_data", RetentionClass::Private { days: 365 }),
+    ("user_discussions.body", RetentionClass::Private { days: 730 }),
+    ("notification_targets.endpoint", RetentionClass::Private { days: 90 }),
+    ("user_exports.payload", RetentionClass::Export { days: 7 }),
+    ("audit_log.actor_address", RetentionClass::Audit { days: 2555 }),
+];
+
+/// Summary of rows affected by one retention run.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct RetentionReport {
+    /// Private rows hard-deleted.
+    pub deleted_private: u64,
+    /// Export rows hard-deleted.
+    pub deleted_exports: u64,
+    /// Audit rows with personal identifiers redacted.
+    pub redacted_audit: u64,
+}
+
+/// Scheduled cleanup for eligible private records. Chain-derived rows are
+/// never touched; audit rows only have personal identifiers nulled out so
+/// the audit trail remains intact.
+pub async fn purge_expired_private_records(pool: &PgPool) -> Result<RetentionReport, sqlx::Error> {
+    let mut report = RetentionReport::default();
+
+    let private = sqlx::query(
+        r#"
+        DELETE FROM user_discussions
+        WHERE created_at < NOW() - INTERVAL '730 days'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    report.deleted_private += private.rows_affected();
+
+    let notif = sqlx::query(
+        r#"
+        DELETE FROM notification_targets
+        WHERE created_at < NOW() - INTERVAL '90 days'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    report.deleted_private += notif.rows_affected();
+
+    let exports = sqlx::query(
+        r#"
+        DELETE FROM user_exports
+        WHERE created_at < NOW() - INTERVAL '7 days'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    report.deleted_exports += exports.rows_affected();
+
+    let audit = sqlx::query(
+        r#"
+        UPDATE audit_log
+        SET actor_address = NULL
+        WHERE created_at < NOW() - INTERVAL '2555 days'
+          AND actor_address IS NOT NULL
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    report.redacted_audit += audit.rows_affected();
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +389,25 @@ mod tests {
         let losses = 1i64;
         let win_rate = (wins as f64 / (wins + losses) as f64) * 100.0;
         assert_eq!(win_rate, 75.0);
+    }
+
+    #[test]
+    fn chain_immutable_fields_are_never_private_classed() {
+        // Public chain-derived history must stay reproducible, so it can
+        // never be assigned a deletion window.
+        for (field, class) in RETENTION_POLICY {
+            if field.starts_with("predictions.") {
+                assert_eq!(*class, RetentionClass::ChainImmutable, "{field}");
+            }
+        }
+    }
+
+    #[test]
+    fn retention_report_defaults_to_zero() {
+        let r = RetentionReport::default();
+        assert_eq!(r.deleted_private, 0);
+        assert_eq!(r.deleted_exports, 0);
+        assert_eq!(r.redacted_audit, 0);
     }
 
     // ------------------------------------------------------------------

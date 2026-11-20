@@ -205,9 +205,56 @@ mod tests {
         drop(container);
     }
 
-    #[tokio::test]
-    #[ignore = "Requires Docker container for Postgres"]
-    async fn pool_status_defaults_to_open() {
+     #[tokio::test]
+ #[ignore = "Requires Docker container for Postgres"]
+ async fn retention_cleanup_deletes_expired_private_records_and_keeps_public_history() {
+ let (pool, container) = setup().await;
+
+ // Synthetic private user record linked to a prediction.
+ sqlx::query(
+ "INSERT INTO pools (pool_id, name, end_time) VALUES (950, 'retention', NOW() - INTERVAL '400 days')",
+ )
+ .execute(&pool)
+ .await
+ .expect("insert pool");
+
+ sqlx::query(
+ "INSERT INTO predictions (pool_id, user_address, outcome, amount, created_at) \
+ VALUES (950, 'GOLD', 0, 10, NOW() - INTERVAL '400 days')",
+ )
+ .execute(&pool)
+ .await
+ .expect("insert prediction");
+
+ // Run the retention job (expected to purge private, expired personal data).
+ crate::db::run_retention_cleanup(&pool)
+ .await
+ .expect("retention cleanup");
+
+ // Private personal-linked row past retention is removed.
+ let remaining: i64 =
+ sqlx::query("SELECT COUNT(*) FROM predictions WHERE user_address = 'GOLD'")
+ .fetch_one(&pool)
+ .await
+ .expect("count private")
+ .get(0);
+ assert_eq!(remaining, 0, "expired private user record must be deleted");
+
+ // Public, chain-derived pool history remains and stays reproducible.
+ let pool_count: i64 = sqlx::query("SELECT COUNT(*) FROM pools WHERE pool_id = 950")
+ .fetch_one(&pool)
+ .await
+ .expect("count pool")
+ .get(0);
+ assert_eq!(pool_count, 1, "public chain-derived history must be retained");
+
+ pool.close().await;
+ drop(container);
+ }
+
+ #[tokio::test]
+ #[ignore = "Requires Docker container for Postgres"]
+ async fn pool_status_defaults_to_open() {
         let (pool, container) = setup().await;
 
         sqlx::query(

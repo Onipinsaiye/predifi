@@ -24,6 +24,93 @@ const CLAIM_EXPIRING_WINDOW: &str = "1 day";
 const NEW_POOL_LOOKBACK: &str = "1 day";
 /// Maximum delivery attempts before an outbox row is marked terminally failed.
 const MAX_DELIVERY_ATTEMPTS: i32 = 5;
+
+// ── Retention and deletion policy for private user records ──────────────────
+//
+// Classification of user-linked fields:
+//
+// | Data class                  | Examples                                 | Retention                     | Deletion behavior                              |
+// |-----------------------------|------------------------------------------|-------------------------------|------------------------------------------------|
+// | Delivered notifications     | notification_outbox rows in `delivered`  | 30 days after delivery        | Hard delete; recipient id scrubbed first       |
+// | Terminally failed outbox    | outbox rows in `failed`                  | 30 days after last attempt    | Hard delete; payload and recipient scrubbed    |
+// | Notification targets        | recipient address/handle on outbox rows  | Lifetime of pending delivery  | Nulled on account deletion, then row purged    |
+// | Exports                     | export artifacts referencing user data   | 7 days after creation         | Hard delete of artifact                        |
+// | Audit records               | credential_rotation_audit                | Retained (no personal data)   | Never deleted; contains key ids only           |
+// | Public chain-derived events | pool/prediction/resolution history       | Immutable, public             | Never deleted; not personal data by policy     |
+//
+// Private profile and discussion content is scrubbed (not kept) once the
+// account is deleted; only non-personal audit and chain-derived history remain.
+
+/// Retention window for terminal outbox rows (delivered or failed).
+const OUTBOX_TERMINAL_RETENTION: &str = "30 days";
+/// Retention window for generated export artifacts.
+const EXPORT_RETENTION: &str = "7 days";
+
+/// Summary of a single retention sweep, used for observability and tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub outbox_scrubbed: u64,
+    pub outbox_purged: u64,
+    pub exports_purged: u64,
+}
+
+/// Scrub personal fields and purge terminal outbox rows older than the
+/// retention window. Audit tables and chain-derived data are never touched.
+///
+/// Scrubbing happens before purging so that rows retained by a concurrent
+/// transaction never carry recipient data past the window.
+#[instrument(skip(pool))]
+pub async fn run_retention_sweep(pool: &PgPool) -> Result<RetentionReport, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let scrubbed = sqlx::query(
+        r#"
+        UPDATE notification_outbox
+        SET recipient = NULL,
+            payload = '{}'::jsonb
+        WHERE status IN ('delivered', 'failed')
+          AND recipient IS NOT NULL
+          AND updated_at < now() - $1::interval
+        "#,
+    )
+    .bind(OUTBOX_TERMINAL_RETENTION)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    let purged = sqlx::query(
+        r#"
+        DELETE FROM notification_outbox
+        WHERE status IN ('delivered', 'failed')
+          AND updated_at < now() - $1::interval
+        "#,
+    )
+    .bind(OUTBOX_TERMINAL_RETENTION)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    let exports = sqlx::query(
+        r#"
+        DELETE FROM notification_exports
+        WHERE created_at < now() - $1::interval
+        "#,
+    )
+    .bind(EXPORT_RETENTION)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    tx.commit().await?;
+
+    let report = RetentionReport {
+        outbox_scrubbed: scrubbed,
+        outbox_purged: purged,
+        exports_purged: exports,
+    };
+    info!(?report, "retention sweep complete");
+    Ok(report)
+}
 /// How long a claimed outbox row is leased before another worker may reclaim it.
 const CLAIM_LEASE_SECONDS: i64 = 60;
 

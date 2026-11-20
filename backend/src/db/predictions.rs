@@ -296,6 +296,85 @@ struct LeaderboardRow {
 
 // ── Read queries ──────────────────────────────────────────────────────────────
 
+/// Retention classification for user-linked fields.
+///
+/// - `Personal`: private user data subject to scheduled deletion.
+/// - `ChainDerived`: public, immutable chain events that must remain reproducible.
+/// - `AuditRequired`: minimal records retained for compliance, stripped of personal data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionClass {
+    Personal,
+    ChainDerived,
+    AuditRequired,
+}
+
+/// Retention policy for a single user-linked table/field group.
+#[derive(Debug, Clone, Copy)]
+pub struct RetentionPolicy {
+    pub table: &'static str,
+    pub class: RetentionClass,
+    /// Records older than this many days are eligible for cleanup (None = never).
+    pub max_age_days: Option<i64>,
+}
+
+/// Canonical retention policy for user-linked data.
+pub const RETENTION_POLICIES: &[RetentionPolicy] = &[
+    RetentionPolicy {
+        table: "predictions",
+        class: RetentionClass::ChainDerived,
+        max_age_days: None,
+    },
+    RetentionPolicy {
+        table: "user_profiles",
+        class: RetentionClass::Personal,
+        max_age_days: Some(365),
+    },
+    RetentionPolicy {
+        table: "user_discussions",
+        class: RetentionClass::Personal,
+        max_age_days: Some(180),
+    },
+    RetentionPolicy {
+        table: "notification_targets",
+        class: RetentionClass::Personal,
+        max_age_days: Some(90),
+    },
+    RetentionPolicy {
+        table: "user_exports",
+        class: RetentionClass::Personal,
+        max_age_days: Some(7),
+    },
+    RetentionPolicy {
+        table: "deletion_audit",
+        class: RetentionClass::AuditRequired,
+        max_age_days: Some(730),
+    },
+];
+
+/// Delete personal records older than their policy window.
+///
+/// Chain-derived rows are never touched. Returns the total number of rows
+/// removed across all personal tables. Audit rows are retained by policy and
+/// only the stripped audit table is pruned at its own horizon.
+#[instrument(skip(pool))]
+pub async fn run_retention_cleanup(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    let mut deleted: u64 = 0;
+    for policy in RETENTION_POLICIES {
+        if policy.class != RetentionClass::Personal {
+            continue;
+        }
+        let Some(days) = policy.max_age_days else {
+            continue;
+        };
+        let cutoff = now - chrono::Duration::days(days);
+        // Table names come from the static policy list above, never user input.
+        let sql = format!("DELETE FROM {} WHERE created_at < $1", policy.table);
+        let result = sqlx::query(&sql).bind(cutoff).execute(pool).await?;
+        deleted += result.rows_affected();
+    }
+    Ok(deleted)
+}
+
 /// Paginated lightweight prediction history for a user address.
 pub async fn get_user_prediction_history(
     pool: &PgPool,

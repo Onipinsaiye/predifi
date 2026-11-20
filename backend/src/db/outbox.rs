@@ -6,9 +6,102 @@
 //! outbox implemented in [`crate::notifications`], which owns the
 //! `notification_outbox` table, claiming, retries, and terminal failure
 //! handling.
+//!
+//! # Retention and deletion policy
+//!
+//! Every user-linked field carried by this module is classified below so
+//! that scheduled cleanup can be applied deterministically.
+//!
+//! | Field / record                         | Class            | Retention                         | Deletion behaviour                                  |
+//! |----------------------------------------|------------------|-----------------------------------|-----------------------------------------------------|
+//! | `NotificationIntent::user_id`          | Personal (PII)   | Until outbox row is delivered/failed | Row purged by [`RetentionPolicy::eligible_for_purge`] after `outbox_ttl` |
+//! | `NotificationIntent::payload`          | Personal (PII)   | Same as outbox row               | Purged with the row; never copied to audit records  |
+//! | `NotificationIntent::kind`             | Non-personal     | Same as outbox row               | Purged with the row                                 |
+//! | `ClaimedNotification::*` (transient)   | Derived          | In-memory only                   | Not persisted; nothing to delete                    |
+//! | `CredentialRotationAudit::provider`    | Operational      | Audit retention (`audit_ttl`)    | Retained for audit; contains no user data           |
+//! | `CredentialRotationAudit::old/new_key_id` | Operational   | Audit retention                  | Retained; identifiers only, never secrets           |
+//! | `CredentialRotationAudit::actor`       | Operator PII    | Audit retention                  | Retained as required audit record                   |
+//! | `CredentialRotationAudit::reason/outcome/timestamp` | Operational | Audit retention            | Retained as required audit record                   |
+//!
+//! Public chain-derived history is not stored in this module and is therefore
+//! out of scope for deletion; it remains reproducible from chain data.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Classification of a user-linked or audit field for retention purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldClass {
+    /// Personal data about a user; subject to deletion once no longer needed.
+    Personal,
+    /// Operational data that is not personal but may reference operators.
+    Operational,
+    /// Derived or transient data that is never persisted.
+    Transient,
+    /// Data reproducible from public chain events; never deleted by this policy.
+    ChainDerived,
+}
+
+/// Retention windows in seconds for the notification outbox and audit records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// How long a terminal (delivered or failed) outbox row is kept.
+    pub outbox_ttl_secs: i64,
+    /// How long credential rotation audit records are kept.
+    pub audit_ttl_secs: i64,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            // 30 days for personal notification data.
+            outbox_ttl_secs: 30 * 24 * 60 * 60,
+            // 7 years for security audit records.
+            audit_ttl_secs: 7 * 365 * 24 * 60 * 60,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Whether a terminal outbox row created at `created_at` is eligible for
+    /// deletion at `now` (both Unix seconds).
+    pub fn outbox_row_eligible_for_purge(&self, created_at: i64, now: i64) -> bool {
+        now.saturating_sub(created_at) >= self.outbox_ttl_secs
+    }
+
+    /// Whether an audit record stamped `timestamp` is eligible for deletion at
+    /// `now`. Audit records are only purged after the longer audit window.
+    pub fn audit_record_eligible_for_purge(&self, timestamp: i64, now: i64) -> bool {
+        now.saturating_sub(timestamp) >= self.audit_ttl_secs
+    }
+
+    /// Return a copy of `payload` with personal fields removed, suitable for
+    /// retention in places where the full payload must not persist.
+    pub fn redact_payload(payload: &Value) -> Value {
+        match payload {
+            Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (k, v) in map {
+                    if is_personal_key(k) {
+                        continue;
+                    }
+                    out.insert(k.clone(), v.clone());
+                }
+                Value::Object(out)
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+/// Keys in a notification payload that carry personal data and must be
+/// stripped before long-term retention.
+fn is_personal_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "email" | "phone" | "address" | "name" | "ip" | "user_agent"
+    )
+}
 
 /// Outcome of a notification provider credential rotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,5 +309,37 @@ mod tests {
         let raw = audit.to_json();
         assert!(raw.contains("\"outcome\":\"completed\""));
         assert!(raw.contains("\"old_key_id\":null"));
+    }
+
+    #[test]
+    fn outbox_purge_respects_ttl() {
+        let policy = RetentionPolicy::default();
+        let created = 1_700_000_000;
+        assert!(!policy.outbox_row_eligible_for_purge(created, created + 1));
+        assert!(policy.outbox_row_eligible_for_purge(
+            created,
+            created + policy.outbox_ttl_secs
+        ));
+    }
+
+    #[test]
+    fn audit_purge_uses_longer_window() {
+        let policy = RetentionPolicy::default();
+        let ts = 1_700_000_000;
+        // Past the outbox window but well within the audit window.
+        let now = ts + policy.outbox_ttl_secs + 1;
+        assert!(!policy.audit_record_eligible_for_purge(ts, now));
+        assert!(policy.audit_record_eligible_for_purge(ts, ts + policy.audit_ttl_secs));
+    }
+
+    #[test]
+    fn redact_payload_strips_personal_keys() {
+        let payload = serde_json::json!({
+            "pool": 7,
+            "email": "user@test.invalid",
+            "ip": "203.0.113.1",
+        });
+        let redacted = RetentionPolicy::redact_payload(&payload);
+        assert_eq!(redacted, serde_json::json!({"pool": 7}));
     }
 }
