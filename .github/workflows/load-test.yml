@@ -20,6 +20,9 @@ env:
     worker:10:2
     scheduler:5:1
 
+permissions:
+  contents: read
+
 jobs:
   connection-budget:
     name: Check Database Connection Budget

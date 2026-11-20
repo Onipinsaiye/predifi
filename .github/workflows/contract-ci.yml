@@ -36,13 +36,11 @@ concurrency:
   group: contract-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Issue #137 — required for Sigstore-attested WASM artifacts.
-# `id-token: write` lets the workflow request a short-lived OIDC token to
-# sign the artifact; `attestations: write` lets it publish the attestation.
+# Issue #137 — default workflow-level read-only permissions to limit blast radius
+# across check/fmt/clippy/test jobs. Specific permissions (e.g. id-token and attestations
+# for Sigstore provenance signing) are scoped down to the jobs that strictly require them.
 permissions:
   contents: read
-  id-token: write
-  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -273,6 +271,10 @@ jobs:
     name: contract / WASM build verification
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     defaults:
       run:
         working-directory: ./contract
@@ -417,6 +419,9 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: read
     defaults:
       run:
         working-directory: ./contract
@@ -540,8 +545,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write
-      attestations: write
+      attestations: read
     steps:
       - uses: actions/checkout@v4
 
