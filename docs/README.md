@@ -10,6 +10,9 @@ This directory contains comprehensive documentation for the PrediFi prediction m
 
 | Document | Description | Status |
 |----------|-------------|--------|
+| **[DEVELOPER_PORTAL.md](./DEVELOPER_PORTAL.md)** | **Developer portal landing page** — task-oriented index for external integrators | Current |
+| **[CONTRACT_INTERFACE_DESCRIPTORS.md](./CONTRACT_INTERFACE_DESCRIPTORS.md)** | **Contract interface descriptors** — release-pinned specs, hashes, and verification | Current |
+| **[INTEGRATION_COMPATIBILITY_MATRIX.md](./INTEGRATION_COMPATIBILITY_MATRIX.md)** | **Versioned integration compatibility matrix** — supported component combinations with validation evidence | Current |
 | **[API_REFERENCE.md](./API_REFERENCE.md)** | Complete API reference with OpenAPI specification, authentication, rate limiting, and WebSocket subscriptions | Current |
 | **[MIGRATION_DEPLOYMENT_GUIDE.md](./MIGRATION_DEPLOYMENT_GUIDE.md)** | Database migration safety guide, lock classifications, rollback runbooks, and recovery procedures | Current |
 | **[releases/staged-deployment-checklist.md](./releases/staged-deployment-checklist.md)** | Ordered, auditable staged deployment, verification, sign-off, and rollback procedure | Current |
@@ -114,11 +117,12 @@ These documents are point-in-time reports and are maintained for historical refe
 
 ### For Developers
 
-1. **Start Here**: [Quickstart Guide](./quickstart.md)
-2. **API Documentation**: [API Reference](./API_REFERENCE.md)
-3. **Smart Contract Deployment**: [Deployment Guide](./SMART_CONTRACT_DEPLOYMENT_GUIDE.md)
-4. **Client SDKs**: [OpenAPI Client Generation](./OPENAPI_CLIENT_GENERATION.md)
-5. **Frontend Performance**: [CLS Implementation Guide](./frontend/README_CLS_IMPLEMENTATION.md)
+1. **Start Here**: [Developer Portal](./DEVELOPER_PORTAL.md)
+2. **Quickstart**: [Quickstart Guide](./quickstart.md)
+3. **API Documentation**: [API Reference](./API_REFERENCE.md)
+4. **Smart Contract Deployment**: [Deployment Guide](./SMART_CONTRACT_DEPLOYMENT_GUIDE.md)
+5. **Client SDKs**: [OpenAPI Client Generation](./OPENAPI_CLIENT_GENERATION.md)
+6. **Frontend Performance**: [CLS Implementation Guide](./frontend/README_CLS_IMPLEMENTATION.md)
 
 ### For Operators
 
@@ -150,6 +154,9 @@ These documents are point-in-time reports and are maintained for historical refe
 │
 docs/                                  # Documentation directory
 ├── README.md                          # This documentation index
+├── DEVELOPER_PORTAL.md                # Developer portal landing page
+├── CONTRACT_INTERFACE_DESCRIPTORS.md  # Contract interface descriptors
+├── INTEGRATION_COMPATIBILITY_MATRIX.md # Integration compatibility matrix
 ├── audits/                            # Security & arithmetic audit reports
 │   ├── ARITHMETIC_AUDIT_START_HERE.md
 │   ├── ARITHMETIC_AUDIT_SUMMARY.md

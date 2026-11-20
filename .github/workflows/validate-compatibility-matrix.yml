@@ -1,0 +1,78 @@
+name: Validate Compatibility Matrix
+
+on:
+  pull_request:
+    paths:
+      - "docs/INTEGRATION_COMPATIBILITY_MATRIX.md"
+      - "docs/DEVELOPER_PORTAL.md"
+      - "scripts/validate-compatibility-matrix.sh"
+      - "scripts/validate-developer-portal.sh"
+      - ".github/workflows/validate-compatibility-matrix.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/INTEGRATION_COMPATIBILITY_MATRIX.md"
+      - "docs/DEVELOPER_PORTAL.md"
+      - "scripts/validate-compatibility-matrix.sh"
+      - "scripts/validate-developer-portal.sh"
+      - ".github/workflows/validate-compatibility-matrix.yml"
+  workflow_dispatch:
+
+jobs:
+  validate-matrix:
+    name: Validate Compatibility Matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Validate matrix entries have evidence
+        run: |
+          echo "🔍 Running compatibility matrix validation..."
+          ./scripts/validate-compatibility-matrix.sh docs/INTEGRATION_COMPATIBILITY_MATRIX.md
+
+      - name: Validate developer portal
+        run: ./scripts/validate-developer-portal.sh docs/DEVELOPER_PORTAL.md
+
+      - name: Check matrix version header
+        run: |
+          echo "📋 Checking matrix version..."
+          if ! grep -q "Matrix Version:" docs/INTEGRATION_COMPATIBILITY_MATRIX.md; then
+            echo "❌ Matrix version header not found"
+            exit 1
+          fi
+          VERSION=$(sed -n 's/.*Matrix Version:\*\* *//p' docs/INTEGRATION_COMPATIBILITY_MATRIX.md)
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Matrix version must use semantic versioning"
+            exit 1
+          fi
+          echo "✅ Matrix version: ${VERSION}"
+
+      - name: Verify required sections exist
+        run: |
+          echo "📋 Checking required sections..."
+          for section in "Compatibility Matrix" "Network Requirements" "Deprecation Windows" "Validation Evidence Requirements" "Quick Reference"; do
+            if ! grep -q "## ${section}" docs/INTEGRATION_COMPATIBILITY_MATRIX.md; then
+              echo "❌ Missing required section: ${section}"
+              exit 1
+            fi
+            echo "  ✅ ${section}"
+          done
+
+      - name: Verify current source entry exists
+        run: |
+          echo "📋 Checking current source entry..."
+          if ! grep -q "Current source snapshot" docs/INTEGRATION_COMPATIBILITY_MATRIX.md; then
+            echo "❌ Current source snapshot section not found"
+            exit 1
+          fi
+          echo "✅ Current source snapshot section exists"
+
+      - name: Summary
+        run: |
+          echo "✅ Compatibility matrix validation passed"
+          echo "   Supported entries link to an existing test, workflow, or release"
+          echo "   Required sections present"
+          echo "   Link formats valid"
