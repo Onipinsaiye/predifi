@@ -412,9 +412,12 @@ pub fn bound_value(value: &str) -> String {
     truncate_bounded(value, MAX_ATTRIBUTE_VALUE_LEN)
 }
 
-/// Shorten a wallet address to an 8-character prefix plus `...`.
+/// Replace a wallet address with a keyed pseudonym for trace/log output.
+///
+/// Delegates to [`crate::address_pseudonym::pseudonym`] so the output is
+/// consistent with every other address-pseudonymisation call site.
 pub fn redact_wallet(address: &str) -> String {
-    crate::request_logger::redact_address(address)
+    crate::address_pseudonym::pseudonym(address)
 }
 
 /// Recursively sanitize a JSON attribute map for tracing:
@@ -695,13 +698,15 @@ mod tests {
         );
 
         let addr = redacted["user_address"].as_str().expect("string");
-        let expected_prefix: String = wallet.chars().take(8).collect();
+        // With pseudonymisation the address is replaced by a psid-prefixed
+        // token, not a raw prefix. Verify: it doesn't contain the input,
+        // it starts with the pseudonym prefix, and it is shorter than the
+        // original 56-char address.
         assert!(
-            addr.starts_with(&expected_prefix),
-            "prefix kept: {addr} (expected {expected_prefix}...)"
+            addr.starts_with("psid-"),
+            "pseudonymised address must start with 'psid-': {addr}"
         );
-        assert!(addr.ends_with("..."));
-        assert!(addr.len() < wallet.len());
+        assert!(addr.len() < wallet.len(), "pseudonym must be shorter than raw address: {addr}");
     }
 
     #[test]

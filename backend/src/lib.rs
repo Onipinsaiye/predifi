@@ -5,6 +5,7 @@
 // handlers live here so both binaries (and the test suite) share a single
 // source of truth.
 
+pub mod address_pseudonym;
 pub mod api_versioning;
 pub mod abuse;
 pub mod cache_coalesce;

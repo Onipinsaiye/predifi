@@ -854,8 +854,11 @@ pub async fn get_protocol_stats(
 ///
 /// Must be called inside an open transaction. For single-event convenience
 /// use [`insert_prediction_from_event_with_pool`].
+// The user_address field uses a pseudonym so the raw wallet address is never
+// emitted into traces or logs. The pseudonym is stable within the current
+// time bucket, so spans from the same hour can be correlated.
 #[instrument(skip(tx), name = "db.insert_prediction_from_event",
-    fields(pool_id = event.pool_id, user_address = %event.user_address))]
+    fields(pool_id = event.pool_id, user_pseudonym = %crate::address_pseudonym::pseudonym(&event.user_address)))]
 pub async fn insert_prediction_from_event(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     event: &PredictionPlacedEvent,
@@ -883,8 +886,10 @@ pub async fn insert_prediction_from_event(
 }
 
 /// Convenience wrapper: open a transaction, insert prediction, commit.
+// user_pseudonym replaces user_address in the span to prevent raw wallet
+// addresses from appearing in traces.
 #[instrument(skip(pool), name = "db.insert_prediction_from_event_with_pool",
-    fields(pool_id = event.pool_id, user_address = %event.user_address))]
+    fields(pool_id = event.pool_id, user_pseudonym = %crate::address_pseudonym::pseudonym(&event.user_address)))]
 pub async fn insert_prediction_from_event_with_pool(
     pool: &PgPool,
     event: &PredictionPlacedEvent,

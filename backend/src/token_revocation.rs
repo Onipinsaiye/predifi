@@ -249,7 +249,7 @@ impl RevocationStore {
 
         self.refresh_cache(&claims.sub, now_unix).await;
         tracing::info!(
-            user = %claims.sub,
+            user = %crate::address_pseudonym::pseudonym(&claims.sub),
             jti = %claims.jti,
             reason = reason.as_str(),
             "token revoked"
@@ -290,7 +290,7 @@ impl RevocationStore {
         tx.commit().await?;
 
         self.refresh_cache(user, now_unix).await;
-        tracing::info!(user = %user, token_version = version, reason = reason.as_str(), "all user tokens revoked");
+        tracing::info!(user = %crate::address_pseudonym::pseudonym(user), token_version = version, reason = reason.as_str(), "all user tokens revoked");
         Ok(version.max(0) as u64)
     }
 
@@ -346,7 +346,7 @@ impl RevocationStore {
                     .await
             }
             Err(error) => {
-                tracing::warn!(user = %user, error = %error, "could not refresh revocation cache");
+                tracing::warn!(user = %crate::address_pseudonym::pseudonym(user), error = %error, "could not refresh revocation cache");
                 self.redis.delete(&snapshot_key(user)).await;
             }
         }
