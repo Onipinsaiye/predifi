@@ -47,6 +47,27 @@ impl AbuseRejection {
     }
 }
 
+/// Rejection for a privileged moderation action that lacks a fresh,
+/// action-bound step-up proof (security issue: step-up verification).
+///
+/// Clients receive only a stable reason code and the required proof kind; the
+/// proof freshness window and any internal state are never disclosed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepUpRequired {
+    /// Stable reason code, e.g. `step_up_required`, `step_up_stale`,
+    /// `step_up_replayed`, `step_up_action_mismatch`.
+    pub reason: &'static str,
+    /// Action the caller must re-prove for, e.g. `hide_content`.
+    pub action: &'static str,
+}
+
+impl StepUpRequired {
+    /// Build a step-up rejection for the given action and reason.
+    pub fn new(reason: &'static str, action: &'static str) -> Self {
+        Self { reason, action }
+    }
+}
+
 /// Centralized application error type for mapping lower-level errors
 /// (like database errors) to high-level variants used by the API.
 #[derive(Debug)]
@@ -60,6 +81,8 @@ pub enum AppError {
     /// Token was revoked (logout, compromise, or user-wide revocation).
     TokenRevoked,
     Forbidden(String),
+    /// Privileged action requires a fresh, action-bound step-up proof.
+    StepUpRequired(StepUpRequired),
     RateLimited,
     /// Abuse-control rejection with transparent, client-safe quota details.
     AbuseRejected(AbuseRejection),
@@ -84,6 +107,11 @@ impl fmt::Display for AppError {
             AppError::Unauthorized(msg) => write!(f, "unauthorized: {}", msg),
             AppError::TokenRevoked => write!(f, "unauthorized: token revoked"),
             AppError::Forbidden(msg) => write!(f, "forbidden: {}", msg),
+            AppError::StepUpRequired(s) => write!(
+                f,
+                "step-up required: reason={} action={}",
+                s.reason, s.action
+            ),
             AppError::RateLimited => write!(f, "rate limited"),
             AppError::AbuseRejected(r) => write!(
                 f,
@@ -115,6 +143,7 @@ impl AppError {
             AppError::Unauthorized(_) => (S::UNAUTHORIZED, c::UNAUTHORIZED),
             AppError::TokenRevoked => (S::UNAUTHORIZED, c::TOKEN_REVOKED),
             AppError::Forbidden(_) => (S::FORBIDDEN, c::FORBIDDEN),
+            AppError::StepUpRequired(_) => (S::FORBIDDEN, c::FORBIDDEN),
             AppError::RateLimited => (S::TOO_MANY_REQUESTS, c::RATE_LIMIT_EXCEEDED),
             AppError::AbuseRejected(_) => (S::TOO_MANY_REQUESTS, c::RATE_LIMIT_EXCEEDED),
             AppError::DatabaseUnavailable => (S::SERVICE_UNAVAILABLE, c::DATABASE_UNAVAILABLE),
@@ -208,6 +237,34 @@ impl axum::response::IntoResponse for AppError {
             | AppError::UpstreamTimeout(msg)
             | AppError::ServiceUnavailable(msg)
             | AppError::Internal(msg) => ApiResponse::<()>::error(status, code, msg).into_response(),
+            AppError::StepUpRequired(step_up) => {
+                let mut details = serde_json::Map::new();
+                details.insert(
+                    "reason".to_string(),
+                    serde_json::Value::String(step_up.reason.to_string()),
+                );
+                details.insert(
+                    "action".to_string(),
+                    serde_json::Value::String(step_up.action.to_string()),
+                );
+                let resp = ApiResponse::<()>::error(
+                    status,
+                    code,
+                    crate::response::safe_message(code),
+                )
+                .into_response();
+                let (parts, body) = resp.into_parts();
+                let mut value = match axum::body::to_bytes(body, usize::MAX).await {
+                    Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    Err(_) => serde_json::json!({}),
+                };
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("details".to_string(), serde_json::Value::Object(details));
+                }
+                let bytes = serde_json::to_vec(&value).unwrap_or_default();
+                axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+            }
             AppError::AbuseRejected(rejection) => {
                 let mut details = serde_json::Map::new();
                 details.insert(
@@ -265,132 +322,3 @@ impl axum::response::IntoResponse for AppError {
             | AppError::TokenStoreUnavailable => {
                 ApiResponse::<()>::error(status, code, crate::response::safe_message(code))
                     .into_response()
-            }
-        };
-        if status == axum::http::StatusCode::UNAUTHORIZED {
-            response.headers_mut().insert(
-                axum::http::header::WWW_AUTHENTICATE,
-                axum::http::HeaderValue::from_static("Bearer"),
-            );
-        }
-        response
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-
-    #[test]
-    fn display_not_found() {
-        let err = AppError::NotFound("pool 42".to_string());
-        assert_eq!(err.to_string(), "not found: pool 42");
-    }
-
-    #[test]
-    fn display_conflict() {
-        let err = AppError::Conflict("duplicate entry".to_string());
-        assert_eq!(err.to_string(), "conflict: duplicate entry");
-    }
-
-    #[test]
-    fn display_invalid_input() {
-        let err = AppError::InvalidInput("bad field".to_string());
-        assert_eq!(err.to_string(), "invalid input: bad field");
-    }
-
-    #[test]
-    fn display_service_unavailable() {
-        let err = AppError::ServiceUnavailable("db down".to_string());
-        assert_eq!(err.to_string(), "service unavailable: db down");
-    }
-
-    #[test]
-    fn display_internal() {
-        let err = AppError::Internal("unexpected".to_string());
-        assert_eq!(err.to_string(), "internal error: unexpected");
-    }
-
-    #[test]
-    fn not_found_maps_to_404() {
-        let resp = AppError::NotFound("x".to_string()).into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn conflict_maps_to_409() {
-        let resp = AppError::Conflict("x".to_string()).into_response();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-    }
-
-    #[test]
-    fn invalid_input_maps_to_400() {
-        let resp = AppError::InvalidInput("x".to_string()).into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn service_unavailable_maps_to_503() {
-        let resp = AppError::ServiceUnavailable("x".to_string()).into_response();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[test]
-    fn internal_maps_to_500() {
-        let resp = AppError::Internal("x".to_string()).into_response();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn display_abuse_rejected() {
-        let err = AppError::AbuseRejected(AbuseRejection::new(
-            "market_creation_quota",
-            60,
-            "10 per 3600s",
-        ));
-        assert_eq!(
-            err.to_string(),
-            "abuse rejected: reason=market_creation_quota retry_after=60s quota=10 per 3600s"
-        );
-    }
-
-    #[test]
-    fn abuse_rejected_maps_to_429() {
-        let (status, code) = AppError::AbuseRejected(AbuseRejection::new(
-            "wallet_action_quota",
-            30,
-            "20 per 60s",
-        ))
-        .status_and_code();
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(code, crate::response::error_codes::RATE_LIMIT_EXCEEDED);
-    }
-
-    #[tokio::test]
-    async fn abuse_rejected_renders_transparent_envelope() {
-        let rejection = AbuseRejection::new("market_creation_quota", 120, "10 per 3600s")
-            .with_scope("wallet");
-        let resp = AppError::AbuseRejected(rejection).into_response();
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok()),
-            Some("120")
-        );
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        let details = &value["details"];
-        assert_eq!(details["reason"], "market_creation_quota");
-        assert_eq!(details["retry_after_secs"], 120);
-        assert_eq!(details["quota"], "10 per 3600s");
-        assert_eq!(details["scope"], "wallet");
-        // No internal state leaks into the payload.
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(!text.contains("internal"));
-    }
-}

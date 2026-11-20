@@ -58,6 +58,7 @@ struct StoredSession {
     key_version: u64,
     created_at: Instant,
     last_activity: Instant,
+    last_step_up_unix_ms: Option<u64>,
 }
 
 /// Audit event kinds for session activity.
@@ -175,6 +176,7 @@ impl SessionStore {
                     key_version,
                     created_at: now,
                     last_activity: now,
+                    last_step_up_unix_ms: None,
                 },
             );
             user_sessions.push_back(session_id.clone());
