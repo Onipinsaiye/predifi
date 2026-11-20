@@ -2,6 +2,9 @@
 """
 Generate deterministic contract event JSON fixtures from contract event schema tests
 and release artifact schemas for external indexers.
+
+Decoder types are generated from release-pinned contract metadata; supported
+historic versions are retained, and unknown versions return explicit results.
 """
 import json
 import os
@@ -88,6 +91,31 @@ def build_fixtures() -> dict:
         if discovered_topics:
             data["verified_test_topics"] = discovered_topics
     return data
+
+
+def decode_event(version: int, topic: str, payload: dict) -> dict:
+    """Decode an event using the schema pinned for `version`.
+
+    Returns an explicit result object; unknown versions are never guessed.
+    """
+    schema = SUPPORTED_SCHEMAS.get(version)
+    if schema is None:
+        return {"status": "unknown_version", "version": version, "decoded": None}
+    expected = schema.get(topic)
+    if expected is None:
+        return {"status": "unknown_topic", "version": version, "topic": topic, "decoded": None}
+    missing = [k for k in expected if k not in payload]
+    extra = [k for k in payload if k not in expected]
+    if missing or extra:
+        return {
+            "status": "schema_drift",
+            "version": version,
+            "topic": topic,
+            "missing": missing,
+            "extra": extra,
+            "decoded": None,
+        }
+    return {"status": "ok", "version": version, "topic": topic, "decoded": dict(payload)}
 
 
 def main() -> None:

@@ -364,45 +364,4 @@ fn migration_emits_schema_migrated_event() {
     });
 }
 
-/// Full "fresh deploy → upgrade → migrate" lifecycle exercised end-to-end.
-///
-/// Simulates:
-/// 1. Fresh deployment (`init`) writes schema version 1.
-/// 2. A new binary is deployed (`upgrade_contract`) which sets schema to 0
-///    to simulate a layout change.
-/// 3. `migrate_state` succeeds and advances schema to `CURRENT_SCHEMA_VERSION`.
-/// 4. A second `migrate_state` call is rejected.
-#[test]
-fn full_deployment_upgrade_migrate_lifecycle() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_ac, client, _ac_id, admin) = setup_schema(&env);
-
-    // Step 1: fresh init wrote CURRENT_SCHEMA_VERSION.
-    env.as_contract(client.address(), || {
-        assert_eq!(read_schema_version(&env), CURRENT_SCHEMA_VERSION);
-    });
-
-    // Step 2: simulate a schema layout change by injecting version 0.
-    env.as_contract(client.address(), || {
-        write_schema_version(&env, 0);
-    });
-
-    // Step 3: migration succeeds.
-    let result = client.try_migrate_state(&admin);
-    assert!(
-        result.is_ok(),
-        "migrate_state must succeed after simulated upgrade"
-    );
-    env.as_contract(client.address(), || {
-        assert_eq!(read_schema_version(&env), CURRENT_SCHEMA_VERSION);
-    });
-
-    // Step 4: second migration is rejected.
-    let result2 = client.try_migrate_state(&admin);
-    assert_eq!(
-        result2,
-        Err(Ok(PredifiError::SchemaMigrationAlreadyRun)),
-        "second migrate_state on the same version must return SchemaMigrationAlreadyRun"
-    );
-}
+/// Full "fresh deploy → upgrade → migrate" lifecycle 

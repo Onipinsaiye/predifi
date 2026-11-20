@@ -8,6 +8,10 @@
 //! and the whole projection is skipped. Retries, listener restarts, and
 //! overlapping ledger windows therefore never create duplicate pools,
 //! predictions, stake increments, or notifications.
+//!
+//! Event topic names and payload layouts are decoded through versioned,
+//! release-pinned schemas (see [`SchemaRegistry`]). Unknown topics or payload
+//! layouts produce explicit [`DecodeError`] results instead of guessing.
 
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::instrument;
@@ -72,6 +76,164 @@ pub struct ContractEvent {
 pub struct ProjectionSummary {
     pub applied: u64,
     pub duplicates: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Versioned schema registry
+// ---------------------------------------------------------------------------
+
+/// Field type of a topic/payload slot in a pinned contract schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    U64,
+    I32,
+    Str,
+    Address,
+}
+
+/// A single named field in an event payload layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldSpec {
+    pub name: &'static str,
+    pub kind: FieldKind,
+}
+
+/// Pinned layout of one event topic within one contract release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventSchema {
+    /// Topic symbol as emitted on-chain (e.g. `pool_created`).
+    pub topic: &'static str,
+    pub fields: &'static [FieldSpec],
+}
+
+/// Release-pinned contract metadata: every event topic the release emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractSchema {
+    /// Contract release identifier (e.g. `v1`, `v2`).
+    pub version: &'static str,
+    pub events: &'static [EventSchema],
+}
+
+const POOL_CREATED_V1: &[FieldSpec] = &[
+    FieldSpec { name: "pool_id", kind: FieldKind::U64 },
+    FieldSpec { name: "creator", kind: FieldKind::Address },
+    FieldSpec { name: "question", kind: FieldKind::Str },
+    FieldSpec { name: "options", kind: FieldKind::Str },
+    FieldSpec { name: "deadline", kind: FieldKind::U64 },
+    FieldSpec { name: "created_at", kind: FieldKind::U64 },
+];
+
+const PREDICTION_PLACED_V1: &[FieldSpec] = &[
+    FieldSpec { name: "pool_id", kind: FieldKind::U64 },
+    FieldSpec { name: "user", kind: FieldKind::Address },
+    FieldSpec { name: "outcome", kind: FieldKind::I32 },
+    FieldSpec { name: "amount", kind: FieldKind::U64 },
+];
+
+const POOL_RESOLVED_V1: &[FieldSpec] = &[
+    FieldSpec { name: "pool_id", kind: FieldKind::U64 },
+    FieldSpec { name: "winning_outcome", kind: FieldKind::I32 },
+];
+
+const SCHEMA_V1: ContractSchema = ContractSchema {
+    version: "v1",
+    events: &[
+        EventSchema { topic: "pool_created", fields: POOL_CREATED_V1 },
+        EventSchema { topic: "prediction_placed", fields: PREDICTION_PLACED_V1 },
+        EventSchema { topic: "pool_resolved", fields: POOL_RESOLVED_V1 },
+    ],
+};
+
+/// All contract releases this indexer can decode, oldest first.
+pub const SUPPORTED_SCHEMAS: &[ContractSchema] = &[SCHEMA_V1];
+
+/// Errors produced when decoding raw events against pinned schemas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    /// No supported release is known for this contract version tag.
+    UnknownVersion { version: String },
+    /// The release is known but does not define this topic.
+    UnknownTopic { version: &'static str, topic: String },
+    /// Payload field count or kinds do not match the pinned layout.
+    SchemaDrift {
+        version: &'static str,
+        topic: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::UnknownVersion { version } => {
+                write!(f, "unknown contract schema version: {version}")
+            }
+            DecodeError::UnknownTopic { version, topic } => {
+                write!(f, "topic `{topic}` not defined in schema {version}")
+            }
+            DecodeError::SchemaDrift {
+                version,
+                topic,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "schema drift in {version}/{topic}: expected {expected} fields, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// Look up a pinned contract schema by release version.
+///
+/// Returns an explicit [`DecodeError::UnknownVersion`] for any version that is
+/// not in [`SUPPORTED_SCHEMAS`]; callers must never fall back to a guess.
+pub fn schema_for_version(version: &str) -> Result<&'static ContractSchema, DecodeError> {
+    SUPPORTED_SCHEMAS
+        .iter()
+        .find(|s| s.version == version)
+        .ok_or_else(|| DecodeError::UnknownVersion {
+            version: version.to_string(),
+        })
+}
+
+/// Resolve the pinned layout of `topic` within a release.
+pub fn event_schema<'a>(
+    schema: &'a ContractSchema,
+    topic: &str,
+) -> Result<&'a EventSchema, DecodeError> {
+    schema
+        .events
+        .iter()
+        .find(|e| e.topic == topic)
+        .ok_or_else(|| DecodeError::UnknownTopic {
+            version: schema.version,
+            topic: topic.to_string(),
+        })
+}
+
+/// Verify that a raw payload's field count matches the pinned layout.
+///
+/// Any mismatch is reported as [`DecodeError::SchemaDrift`]; the decoder never
+/// silently truncates or pads a payload.
+pub fn check_payload_shape(
+    schema: &ContractSchema,
+    event: &EventSchema,
+    actual_fields: usize,
+) -> Result<(), DecodeError> {
+    let expected = event.fields.len();
+    if expected != actual_fields {
+        return Err(DecodeError::SchemaDrift {
+            version: schema.version,
+            topic: event.topic,
+            expected,
+            actual: actual_fields,
+        });
+    }
+    Ok(())
 }
 
 /// Claim `key` for projection. Returns `false` when it was already projected.
@@ -245,5 +407,58 @@ mod tests {
         let summary = ProjectionSummary::default();
         assert_eq!(summary.applied, 0);
         assert_eq!(summary.duplicates, 0);
+    }
+
+    // --- Versioned schema decoding -----------------------------------------
+
+    #[test]
+    fn unknown_version_is_explicit_not_guessed() {
+        let err = schema_for_version("v999").unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::UnknownVersion {
+                version: "v999".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_topic_is_explicit_not_guessed() {
+        let schema = schema_for_version("v1").unwrap();
+        let err = event_schema(schema, "not_a_topic").unwrap_err();
+        assert!(matches!(err, DecodeError::UnknownTopic { version: "v1", .. }));
+    }
+
+    #[test]
+    fn payload_shape_drift_is_detected() {
+        let schema = schema_for_version("v1").unwrap();
+        let event = event_schema(schema, "pool_resolved").unwrap();
+        assert!(check_payload_shape(schema, event, 2).is_ok());
+        let err = check_payload_shape(schema, event, 3).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::SchemaDrift {
+                version: "v1",
+                topic: "pool_resolved",
+                expected: 2,
+                actual: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn every_supported_release_declares_all_projected_topics() {
+        // Every release we keep decoders for must cover the topics the
+        // projection layer consumes, so archived vectors never silently lose
+        // a projection path.
+        for schema in SUPPORTED_SCHEMAS {
+            for topic in ["pool_created", "prediction_placed", "pool_resolved"] {
+                assert!(
+                    event_schema(schema, topic).is_ok(),
+                    "schema {} missing topic {topic}",
+                    schema.version
+                );
+            }
+        }
     }
 }
