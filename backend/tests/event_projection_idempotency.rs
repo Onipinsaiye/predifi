@@ -64,6 +64,31 @@ const BASE_SCHEMA: &str = r#"
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+        CREATE TABLE IF NOT EXISTS user_notification_outbox (
+            id BIGSERIAL PRIMARY KEY,
+            event_key TEXT NOT NULL,
+            user_address TEXT NOT NULL,
+            notif_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            pool_id BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 5,
+            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_error TEXT,
+            claimed_at TIMESTAMPTZ,
+            claimed_by TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (event_key, user_address)
+        );
+        CREATE TABLE IF NOT EXISTS notification_preferences (
+            user_address TEXT PRIMARY KEY,
+            schema_version SMALLINT NOT NULL DEFAULT 1,
+            preferences JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
 "#;
 
 async fn get_test_pool() -> Option<PgPool> {
@@ -96,6 +121,7 @@ async fn setup_schema(pool: &PgPool) {
 /// Remove rows left by a previous run for this test's pool, creator and network.
 async fn reset(pool: &PgPool, pool_id: u64, creator: &str, network: &str) {
     for sql in [
+        "DELETE FROM user_notification_outbox WHERE pool_id = $1",
         "DELETE FROM notification_outbox WHERE pool_id = $1",
         "DELETE FROM predictions WHERE pool_id = $1",
         "DELETE FROM pools WHERE pool_id = $1",
@@ -116,6 +142,19 @@ async fn reset(pool: &PgPool, pool_id: u64, creator: &str, network: &str) {
         .execute(pool)
         .await
         .unwrap();
+    for user in ["GALICE", "GBOB"] {
+        sqlx::query(
+            r#"
+            INSERT INTO notification_preferences (user_address, schema_version, preferences)
+            VALUES ($1, 1, '{"channels":{"in_app":true},"events":{"pool_resolved":true}}'::jsonb)
+            ON CONFLICT (user_address) DO UPDATE SET preferences = EXCLUDED.preferences
+            "#,
+        )
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 fn key(ledger: u64, tx: &str, event_index: u32) -> EventKey {
@@ -223,7 +262,7 @@ async fn snapshot(pool: &PgPool) -> Snapshot {
         .await
         .unwrap(),
         notifications: sqlx::query_as(
-            "SELECT user_address, notif_type FROM notification_outbox
+            "SELECT user_address, notif_type FROM user_notification_outbox
              WHERE pool_id = $1 ORDER BY user_address, notif_type",
         )
         .bind(pool_id)

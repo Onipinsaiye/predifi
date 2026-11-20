@@ -646,6 +646,12 @@ where
                 .await;
         });
 
+    let outbox_pool = pool.clone();
+    let notification_outbox_handle: JoinHandle<()> =
+        crate::tracing_context::spawn_worker("notification_outbox", async move {
+            crate::notifications::run_outbox_loop(outbox_pool, Duration::from_secs(5)).await;
+        });
+
     // Purges token revocation records whose tokens have expired (#55).
     let revocation_store =
         crate::token_revocation::RevocationStore::new(Some(pool.clone()), redis.clone());
@@ -707,6 +713,7 @@ where
     fetcher_handle.abort();
     listener_handle.abort();
     notifications_handle.abort();
+    notification_outbox_handle.abort();
     revocation_purge_handle.abort();
 
     // Close the pool after aborting workers.

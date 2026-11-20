@@ -463,6 +463,31 @@ pub struct SetInterestsRequestDoc {
     pub interests: Vec<String>,
 }
 
+/// Versioned notification preferences. Unknown fields are disabled.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct NotificationPreferencesDoc {
+    pub schema_version: i16,
+    pub channels: std::collections::BTreeMap<String, bool>,
+    pub events: std::collections::BTreeMap<String, bool>,
+}
+
+/// Browser push endpoint and encryption keys. The server encrypts the payload
+/// before storing it and does not return the endpoint in API responses.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PushSubscriptionRequestDoc {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub expires_at: Option<String>,
+    pub previous_endpoint: Option<String>,
+}
+
+/// Optional endpoint to revoke; omit to revoke every subscription for the wallet.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct DeletePushSubscriptionRequestDoc {
+    pub endpoint: Option<String>,
+}
+
 // ── OpenAPI spec ──────────────────────────────────────────────────────────────
 
 #[derive(OpenApi)]
@@ -492,8 +517,13 @@ pub struct SetInterestsRequestDoc {
         api_get_user_profile,
         api_get_user_interests,
         api_set_user_interests,
+        api_get_notification_preferences,
+        api_put_notification_preferences,
+        api_reset_notification_preferences,
         api_list_notifications,
         api_mark_notifications_read,
+        api_put_push_subscription,
+        api_delete_push_subscription,
         api_get_market_predictions,
         api_get_referrals,
         api_get_referral_estimate,
@@ -553,6 +583,9 @@ pub struct SetInterestsRequestDoc {
         UpdatePoolTagsRequestDoc,
         MarkNotificationsReadRequestDoc,
         SetInterestsRequestDoc,
+        NotificationPreferencesDoc,
+        PushSubscriptionRequestDoc,
+        DeletePushSubscriptionRequestDoc,
     )),
     tags(
         (name = "health", description = "Service liveness and dependency checks"),
@@ -862,15 +895,61 @@ async fn api_get_user_interests() {}
 async fn api_set_user_interests() {}
 
 #[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/users/{address}/notification-preferences", tag = "users",
+    params(("address" = String, Path, description = "Wallet address bound to the bearer access token")),
+    responses(
+        (status = 200, description = "Current versioned preferences", body = DataEnvelope),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another wallet", body = ErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database or token store unavailable", body = ServiceUnavailableResponse),
+    ),
+    description = "Requires Authorization: Bearer <access-token> for the wallet in the path."
+)]
+async fn api_get_notification_preferences() {}
+
+#[allow(dead_code)]
+#[utoipa::path(put, path = "/api/v1/users/{address}/notification-preferences", tag = "users",
+    params(("address" = String, Path, description = "Wallet address bound to the bearer access token")),
+    request_body = NotificationPreferencesDoc,
+    responses(
+        (status = 200, description = "Preferences replaced", body = DataEnvelope),
+        (status = 400, description = "Unsupported schema version", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another wallet", body = ErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database or token store unavailable", body = ServiceUnavailableResponse),
+    ),
+    description = "Requires Authorization: Bearer <access-token> for the wallet in the path. New and unknown preference fields default to false."
+)]
+async fn api_put_notification_preferences() {}
+
+#[allow(dead_code)]
+#[utoipa::path(delete, path = "/api/v1/users/{address}/notification-preferences", tag = "users",
+    params(("address" = String, Path, description = "Wallet address bound to the bearer access token")),
+    responses(
+        (status = 200, description = "Preferences reset to all-disabled defaults", body = DataEnvelope),
+        (status = 401, description = "Missing or invalid access token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another wallet", body = ErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database or token store unavailable", body = ServiceUnavailableResponse),
+    ),
+    description = "Requires Authorization: Bearer <access-token> for the wallet in the path."
+)]
+async fn api_reset_notification_preferences() {}
+
+#[allow(dead_code)]
 #[utoipa::path(get, path = "/api/v1/notifications/{address}", tag = "users",
     params(
         ("address" = String, Path, description = "Stellar account address (G...)"),
         ("unread_only" = Option<bool>, Query, description = "Only unread notifications"),
         ("limit" = Option<i64>, Query, description = "Max results (1-100)"),
         ("offset" = Option<i64>, Query, description = "Pagination offset"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor for stable keyset pagination"),
     ),
     responses(
-        (status = 200, description = "Notifications, newest first", body = DataEnvelope),
+        (status = 200, description = "Notifications in deterministic reverse-chronological order with a next_cursor", body = DataEnvelope),
         (status = 400, description = "Invalid address or query parameter", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
@@ -895,6 +974,39 @@ async fn api_list_notifications() {}
     )
 )]
 async fn api_mark_notifications_read() {}
+
+#[allow(dead_code)]
+#[utoipa::path(put, path = "/api/v1/notifications/{address}/push-subscription", tag = "users",
+    params(("address" = String, Path, description = "Wallet address bound to the bearer access token")),
+    request_body = PushSubscriptionRequestDoc,
+    responses(
+        (status = 200, description = "Subscription saved; endpoint is never returned", body = DataEnvelope),
+        (status = 400, description = "Invalid push endpoint or keys", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another wallet", body = ErrorResponse),
+        (status = 409, description = "Endpoint already belongs to another wallet", body = ErrorResponse),
+        (status = 500, description = "Database or encryption error", body = ErrorResponse),
+        (status = 503, description = "Database or token store unavailable", body = ServiceUnavailableResponse),
+    ),
+    description = "Requires Authorization: Bearer <access-token> for the wallet in the path. A previous_endpoint may be provided for atomic endpoint rotation."
+)]
+async fn api_put_push_subscription() {}
+
+#[allow(dead_code)]
+#[utoipa::path(delete, path = "/api/v1/notifications/{address}/push-subscription", tag = "users",
+    params(("address" = String, Path, description = "Wallet address bound to the bearer access token")),
+    request_body = DeletePushSubscriptionRequestDoc,
+    responses(
+        (status = 200, description = "Subscription(s) revoked", body = DataEnvelope),
+        (status = 400, description = "Invalid endpoint", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another wallet", body = ErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database or token store unavailable", body = ServiceUnavailableResponse),
+    ),
+    description = "Requires Authorization: Bearer <access-token> for the wallet in the path. An omitted body revokes all endpoints for that wallet."
+)]
+async fn api_delete_push_subscription() {}
 
 #[allow(dead_code)]
 #[utoipa::path(get, path = "/api/v1/markets/{market_id}/predictions", tag = "predictions",

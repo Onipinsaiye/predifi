@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -251,6 +251,46 @@ fn enforce_abuse_quota(
             Some(abuse_rejection_response(rejection))
         }
     }
+}
+
+/// Authenticate a wallet-scoped notification mutation using the access token
+/// bound to the wallet path. Revocation checks fail closed when token state is
+/// unavailable.
+async fn authorize_notification_wallet(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    address: &str,
+) -> Result<(), crate::errors::AppError> {
+    use crate::errors::AppError;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+        .ok_or_else(|| AppError::Unauthorized("missing bearer token".to_string()))?;
+    let claims = crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    )
+    .map_err(AppError::from)?;
+    if claims.sub != address {
+        return Err(AppError::Forbidden(
+            "access token belongs to a different wallet".to_string(),
+        ));
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    crate::token_revocation::RevocationStore::new(state.db.clone(), state.redis.clone())
+        .ensure_not_revoked(&claims, now)
+        .await
+        .map_err(AppError::from)?;
+    Ok(())
 }
 
 // ── Admin: runtime log-level control ─────────────────────────────────────────
@@ -1980,6 +2020,9 @@ pub struct NotificationsQuery {
     pub unread_only: Option<bool>,
     pub limit: Option<BoundedI64<1, 100>>,
     pub offset: Option<crate::validated_types::PageOffset>,
+    /// Opaque cursor returned by the previous page. When supplied, `offset`
+    /// must be zero or omitted.
+    pub cursor: Option<String>,
 }
 
 /// `GET /api/v1/notifications/:address` — list a user's notifications, newest first.
@@ -2004,6 +2047,55 @@ pub async fn list_notifications_handler(
     let limit = params.limit.map(|b| b.get()).unwrap_or(20);
     let offset = params.offset.map(|b| b.get()).unwrap_or(0);
 
+    if params.cursor.is_some() && offset != 0 {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "cursor and nonzero offset cannot be used together",
+        )
+        .into_response();
+    }
+
+    if offset == 0 {
+        return match crate::notifications::list_notifications_page(
+            db,
+            address.as_str(),
+            unread_only,
+            limit,
+            params.cursor.as_deref(),
+        )
+        .await
+        {
+            Ok(page) => ApiResponse::success(json!({
+                "address": address,
+                "notifications": page.notifications,
+                "unread_count": page.unread_count,
+                "limit": limit,
+                "offset": 0,
+                "next_cursor": page.next_cursor,
+            }))
+            .into_response(),
+            Err(error) => {
+                if matches!(&error, sqlx::Error::Protocol(message) if message == "invalid notification cursor")
+                {
+                    return ApiResponse::<()>::error(
+                        StatusCode::BAD_REQUEST,
+                        error_codes::INVALID_INPUT,
+                        "invalid notification cursor",
+                    )
+                    .into_response();
+                }
+                tracing::error!(error = %error, "notification inbox query failed");
+                ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "failed to load notifications",
+                )
+                .into_response()
+            }
+        };
+    }
+
     match tokio::try_join!(
         crate::notifications::list_notifications(db, address.as_str(), unread_only, limit, offset),
         crate::notifications::count_unread(db, address.as_str())
@@ -2014,6 +2106,7 @@ pub async fn list_notifications_handler(
             "unread_count": unread_count,
             "limit": limit,
             "offset": offset,
+            "next_cursor": null,
         }))
         .into_response(),
         Err(e) => ApiResponse::<()>::error(
@@ -2074,13 +2167,270 @@ pub async fn mark_notifications_read_handler(
     };
 
     match crate::notifications::mark_read(db, address.as_str(), ids).await {
-        Ok(updated) => ApiResponse::success(json!({ "updated": updated })).into_response(),
+        Ok(updated) => match crate::notifications::count_unread(db, address.as_str()).await {
+            Ok(unread_count) => ApiResponse::success(json!({
+                "updated": updated,
+                "unread_count": unread_count,
+            }))
+            .into_response(),
+            Err(e) => ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                e.to_string(),
+            )
+            .into_response(),
+        },
         Err(e) => ApiResponse::<()>::error(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_codes::INTERNAL_ERROR,
             e.to_string(),
         )
         .into_response(),
+    }
+}
+
+/// `GET /api/v1/users/:address/notification-preferences` — return the
+/// wallet's versioned preferences, migrating older records on read.
+pub async fn get_notification_preferences_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::get_notification_preferences(db, address.as_str()).await {
+        Ok(preferences) => ApiResponse::success(preferences).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "notification preference lookup failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load notification preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `PUT /api/v1/users/:address/notification-preferences` — replace preferences.
+pub async fn put_notification_preferences_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<crate::notifications::NotificationPreferences>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::save_notification_preferences(db, address.as_str(), body).await {
+        Ok(preferences) => ApiResponse::success(preferences).into_response(),
+        Err(crate::notifications::PreferenceUpdateError::InvalidSchemaVersion) => {
+            ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "schema_version is unsupported",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PreferenceUpdateError::Serialization(error)) => {
+            tracing::error!(error = %error, "notification preference serialization failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to save notification preferences",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PreferenceUpdateError::Database(error)) => {
+            tracing::error!(error = %error, "notification preference update failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to save notification preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/users/:address/notification-preferences` — reset to
+/// default-disabled settings.
+pub async fn reset_notification_preferences_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::reset_notification_preferences(db, address.as_str()).await {
+        Ok(preferences) => ApiResponse::success(preferences).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "notification preference reset failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to reset notification preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `PUT /api/v1/notifications/:address/push-subscription` — create or rotate
+/// a browser push subscription after proving ownership of the wallet.
+pub async fn put_push_subscription_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<crate::notifications::PushSubscriptionRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::save_push_subscription(
+        db,
+        address.as_str(),
+        body,
+        &state.config.secret_key,
+    )
+    .await
+    {
+        Ok(subscription) => ApiResponse::success(subscription).into_response(),
+        Err(crate::notifications::PushSubscriptionError::InvalidInput(message)) => {
+            ApiResponse::<()>::error(StatusCode::BAD_REQUEST, error_codes::INVALID_INPUT, message)
+                .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::EndpointInUse) => {
+            ApiResponse::<()>::error(
+                StatusCode::CONFLICT,
+                error_codes::CONFLICT,
+                "push endpoint is already registered to another wallet",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::Encryption) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "failed to protect push subscription",
+        )
+        .into_response(),
+        Err(crate::notifications::PushSubscriptionError::Database(error)) => {
+            tracing::error!(error = %error, "push subscription update failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to update push subscription",
+            )
+            .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DeletePushSubscriptionRequest {
+    pub endpoint: Option<String>,
+}
+
+/// `DELETE /api/v1/notifications/:address/push-subscription` — revoke one
+/// endpoint or all endpoints for the authenticated wallet.
+pub async fn delete_push_subscription_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<DeletePushSubscriptionRequest>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    let endpoint = body.and_then(|Json(body)| body.endpoint);
+    match crate::notifications::revoke_push_subscription(db, address.as_str(), endpoint.as_deref())
+        .await
+    {
+        Ok(revoked) => ApiResponse::success(json!({ "revoked": revoked })).into_response(),
+        Err(crate::notifications::PushSubscriptionError::InvalidInput(message)) => {
+            ApiResponse::<()>::error(StatusCode::BAD_REQUEST, error_codes::INVALID_INPUT, message)
+                .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::Database(error)) => {
+            tracing::error!(error = %error, "push subscription revocation failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to revoke push subscription",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::Encryption) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "failed to revoke push subscription",
+        )
+        .into_response(),
+        Err(crate::notifications::PushSubscriptionError::EndpointInUse) => {
+            ApiResponse::<()>::error(
+                StatusCode::CONFLICT,
+                error_codes::CONFLICT,
+                "push endpoint is already registered to another wallet",
+            )
+            .into_response()
+        }
     }
 }
 
@@ -2287,11 +2637,29 @@ pub fn router(
                     .put(set_user_interests_handler)
                     .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INTERESTS)),
             )
+            .route(
+                "/users/:address/notification-preferences",
+                get(get_notification_preferences_handler)
+                    .put(put_notification_preferences_handler)
+                    .delete(reset_notification_preferences_handler)
+                    .layer(DefaultBodyLimit::max(
+                        crate::notifications::MAX_NOTIFICATION_PREFERENCES_BODY_BYTES,
+                    )),
+            )
             .route("/notifications/:address", get(list_notifications_handler))
             .route(
+                "/notifications/:address/push-subscription",
+                put(put_push_subscription_handler)
+                    .delete(delete_push_subscription_handler)
+                    .layer(DefaultBodyLimit::max(
+                        crate::notifications::MAX_PUSH_SUBSCRIPTION_BODY_BYTES,
+                    )),
+            )
+            .route(
                 "/notifications/:address/read",
-                post(mark_notifications_read_handler)
-                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_NOTIFICATIONS_READ)),
+                post(mark_notifications_read_handler).layer(DefaultBodyLimit::max(
+                    crate::notifications::MAX_NOTIFICATION_PREFERENCES_BODY_BYTES,
+                )),
             )
             .with_state(state.clone()),
         RateLimitTier::User,

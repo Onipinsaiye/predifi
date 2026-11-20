@@ -285,3 +285,29 @@ Pass `next_cursor` from the previous response as `after`. When `next_cursor` is
 | 404    | `NOT_FOUND`            | The market ID does not exist     |
 | 503    | `DATABASE_UNAVAILABLE` | No database pool configured      |
 | 500    | `INTERNAL_ERROR`       | Unexpected database query error  |
+
+## Notification inbox, preferences, and browser push
+
+`GET /api/v1/notifications/:address` returns notifications ordered by
+`created_at DESC, id DESC`. The response includes `unread_count` and an opaque
+`next_cursor`; pass that value as `?cursor=...` for the next page. `limit` is
+bounded to 1–100. The legacy `offset` parameter remains available for existing
+clients, but cannot be combined with a cursor.
+
+`POST /api/v1/notifications/:address/read` is idempotent and only changes rows
+belonging to the requested wallet. It returns both the number changed and that
+wallet's unread count.
+
+Notification preferences are managed at
+`/api/v1/users/:address/notification-preferences` using `GET`, `PUT`, and
+`DELETE` (reset to defaults). Writes and reads require an unrevoked bearer
+access token whose subject matches the wallet path. The preference payload
+contains `schema_version`, `channels`, and `events`; unknown fields are
+discarded and default to `false`.
+
+Browser subscriptions are registered with `PUT` and revoked with `DELETE` at
+`/api/v1/notifications/:address/push-subscription`. Both require the matching
+wallet access token. A `PUT` can include `previous_endpoint` to atomically
+rotate a browser endpoint. Endpoint URLs and encryption keys are AES-GCM
+encrypted at rest; endpoint hashes are used for uniqueness checks. Expired
+subscriptions are removed by the notification worker.
