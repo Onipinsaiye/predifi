@@ -23,6 +23,7 @@ import * as React from "react";
 import { X, CheckCircle2, AlertCircle, AlertTriangle, Info } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
+import { usePrefersReducedMotion } from "@/lib/hooks/usePrefersReducedMotion";
 
 // ─── Variants ─────────────────────────────────────────────────────────────────
 
@@ -113,6 +114,7 @@ const Toast = React.forwardRef<HTMLDivElement, ToastProps>(
     },
     ref,
   ) => {
+    const prefersReducedMotion = usePrefersReducedMotion();
     const Icon = icons[variant ?? "info"];
     const autoDismiss = !persistent && duration > 0;
 
@@ -170,6 +172,15 @@ const Toast = React.forwardRef<HTMLDivElement, ToastProps>(
     const role =
       variant === "error" || variant === "warning" ? "alert" : "status";
 
+    const handleDismiss = () => {
+      if (prefersReducedMotion) {
+        setOpen(false);
+        onClose?.();
+      } else {
+        setOpen(false);
+      }
+    };
+
     return (
       <div
         ref={ref}
@@ -201,7 +212,7 @@ const Toast = React.forwardRef<HTMLDivElement, ToastProps>(
               type="button"
               onClick={() => {
                 action.onClick();
-                setOpen(false);
+                handleDismiss();
               }}
               className="mt-1.5 text-xs font-semibold underline underline-offset-2 opacity-90 hover:opacity-100 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
             >
@@ -213,7 +224,7 @@ const Toast = React.forwardRef<HTMLDivElement, ToastProps>(
         {/* Dismiss button */}
         <button
           type="button"
-          onClick={() => setOpen(false)}
+          onClick={handleDismiss}
           aria-label="Dismiss notification"
           className="absolute right-2 top-2 rounded-md p-1 text-zinc-500 transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
         >
@@ -224,10 +235,16 @@ const Toast = React.forwardRef<HTMLDivElement, ToastProps>(
         {autoDismiss && (
           <span
             aria-hidden="true"
-            className={cn(progressVariants({ variant }))}
+            className={cn(
+              progressVariants({ variant }),
+              prefersReducedMotion && "transition-none",
+            )}
             style={{
-              animation: `toast-progress ${duration}ms linear forwards`,
+              animation: prefersReducedMotion
+                ? "none"
+                : `toast-progress ${duration}ms linear forwards`,
               animationPlayState: paused ? "paused" : "running",
+              opacity: prefersReducedMotion ? 0.3 : 1,
             }}
           />
         )}

@@ -14,6 +14,7 @@ import {
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui";
 import { formatChartValue } from "@/lib/stakeFilters";
+import { usePrefersReducedMotion } from "@/lib/hooks/usePrefersReducedMotion";
 import type { PerformancePoint, ProfileStats } from "@/lib/api/profile";
 
 const WIN_COLOR = "#34d399";
@@ -71,6 +72,7 @@ interface PerformanceChartsProps {
 }
 
 export function PerformanceCharts({ stats, performance }: PerformanceChartsProps) {
+  const prefersReducedMotion = usePrefersReducedMotion();
   const cumulative = useMemo(() => toCumulative(performance), [performance]);
 
   const winLossData = useMemo(
@@ -127,6 +129,8 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
                   stroke={STAKED_COLOR}
                   fill="url(#stakedGradient)"
                   strokeWidth={2}
+                  isAnimationActive={!prefersReducedMotion}
+                  animationDuration={prefersReducedMotion ? 0 : 1500}
                 />
                 <Area
                   type="monotone"
@@ -134,6 +138,8 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
                   stroke={EARNINGS_COLOR}
                   fill="url(#earningsGradient)"
                   strokeWidth={2}
+                  isAnimationActive={!prefersReducedMotion}
+                  animationDuration={prefersReducedMotion ? 0 : 1500}
                 />
               </AreaChart>
             </ResponsiveContainer>
@@ -159,6 +165,8 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
                     innerRadius={50}
                     outerRadius={80}
                     paddingAngle={2}
+                    isAnimationActive={!prefersReducedMotion}
+                    animationDuration={prefersReducedMotion ? 0 : 800}
                   >
                     {winLossData.map((entry) => (
                       <Cell key={entry.name} fill={entry.color} />

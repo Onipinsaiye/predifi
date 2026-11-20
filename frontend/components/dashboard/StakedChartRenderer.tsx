@@ -28,6 +28,7 @@ import {
   XAxis,
 } from "recharts";
 import { formatChartValue } from "@/lib/stakeFilters";
+import { usePrefersReducedMotion } from "@/lib/hooks/usePrefersReducedMotion";
 
 const data = [
   { name: "JAN", value: 35000 },
@@ -83,6 +84,8 @@ export interface StakedChartRendererProps {
  * on window resize, sidebar collapse, or responsive breakpoint transitions.
  */
 export function StakedChartRenderer({ width, height }: StakedChartRendererProps) {
+  const prefersReducedMotion = usePrefersReducedMotion();
+
   // Don't render until we have real measurements
   if (width === 0 || height === 0) return null;
 
@@ -103,12 +106,17 @@ export function StakedChartRenderer({ width, height }: StakedChartRendererProps)
           content={<CustomTooltip />}
           cursor={{ fill: "transparent" }}
         />
-        <Bar dataKey="value" radius={[4, 4, 4, 4]}>
+        <Bar
+          dataKey="value"
+          radius={[4, 4, 4, 4]}
+          isAnimationActive={!prefersReducedMotion}
+          animationDuration={prefersReducedMotion ? 0 : 800}
+        >
           {data.map((entry, index) => (
             <Cell
               key={`cell-${index}`}
               fill={entry.active ? "#37B7C3" : "#262626"}
-              className="transition-all duration-300 hover:opacity-80"
+              className={prefersReducedMotion ? "hover:opacity-80" : "transition-all duration-300 hover:opacity-80"}
             />
           ))}
         </Bar>
