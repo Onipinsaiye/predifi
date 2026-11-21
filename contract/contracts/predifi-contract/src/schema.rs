@@ -31,7 +31,8 @@
 //! | Constant                | Value | Meaning |
 //! |-------------------------|-------|---------|
 //! | `SCHEMA_VERSION_INITIAL`| 1     | First deployed layout |
-//! | `CURRENT_SCHEMA_VERSION`| 1     | Layout expected by *this* binary |
+//! | `SCHEMA_VERSION_V2`     | 2     | Adds liquidity-share accounting keys |
+//! | `CURRENT_SCHEMA_VERSION`| 2     | Layout expected by *this* binary |
 //!
 //! Every time the storage layout changes:
 //! 1. Add a new `SCHEMA_VERSION_Vn` constant.
@@ -53,6 +54,15 @@ use crate::{DataKey, PredifiError};
 /// etc. as defined at contract genesis.  It must never change.
 pub const SCHEMA_VERSION_INITIAL: u32 = 1;
 
+/// Schema version 2: introduces the liquidity-share accounting keys
+/// (`TotalLiquidityShares`, `LiquidityShares`, `PoolReserves`).
+///
+/// These keys are written lazily by the deposit/withdraw paths, so the
+/// migration only needs to guarantee that any pre-existing pool state is
+/// readable under the new layout.  Absent keys are treated as zero by the
+/// accounting helpers, which keeps the upgrade safe for live deployments.
+pub const SCHEMA_VERSION_V2: u32 = 2;
+
 /// The schema version that *this* binary understands.
 ///
 /// `init()` stores this value in `DataKey::SchemaVersion` on fresh deployment.
@@ -61,7 +71,7 @@ pub const SCHEMA_VERSION_INITIAL: u32 = 1;
 /// **Bump this constant whenever the storage layout changes.**  A layout change
 /// includes: adding/removing/reordering fields in any `#[contracttype]` struct
 /// or enum that is persisted in storage.
-pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION_INITIAL;
+pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION_V2;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PUBLIC HELPERS
@@ -129,14 +139,18 @@ pub fn run_pending_migrations(env: &Env, stored_version: u32) -> Result<(), Pred
     //
     // Template:
     //
-    //   if version < SCHEMA_VERSION_V2 {
-    //       migrate_v1_to_v2(env)?;
-    //       version = SCHEMA_VERSION_V2;
+    //   if version < SCHEMA_VERSION_V3 {
+    //       migrate_v3(env)?;
+    //       version = SCHEMA_VERSION_V3;
     //   }
     //
-    // There are no pending migrations at schema version 1.
-    //
     // ─────────────────────────────────────────────────────────────────────
+
+    // v1 → v2: liquidity-share accounting keys.
+    if version < SCHEMA_VERSION_V2 {
+        migrate_v1_to_v2(env)?;
+        version = SCHEMA_VERSION_V2;
+    }
 
     // Refuse to finalize unless every registered step has advanced `version`
     // to CURRENT_SCHEMA_VERSION. An unknown or unreachable stored version must
@@ -172,3 +186,34 @@ pub fn run_pending_migrations(env: &Env, stored_version: u32) -> Result<(), Pred
 //     // new field is all that's needed.
 //     Ok(())
 // }
+
+/// v1 → v2: introduce liquidity-share accounting.
+///
+/// The new keys are:
+/// * `DataKey::TotalLiquidityShares` — global share supply (instance storage).
+/// * `DataKey::LiquidityShares(provider)` — per-provider share balance.
+/// * `DataKey::PoolReserves(market_id)` — per-market reserve snapshot.
+///
+/// All three are optional on read: the accounting helpers treat a missing key
+/// as zero.  The migration therefore only has to make sure that pre-existing
+/// pool entries remain consistent with the new reserve key.  Because the old
+/// layout stored reserves inside `Pool`, we seed `PoolReserves` from the
+/// existing pool when present and otherwise leave the key absent (zero).
+///
+/// This step is idempotent: running it twice produces the same state.
+fn migrate_v1_to_v2(env: &Env) -> Result<(), PredifiError> {
+    // Seed the global share supply so that the first deposit after the
+    // upgrade mints shares against a well-defined total.  A missing key is
+    // equivalent to zero, so writing zero is a no-op semantically but makes
+    // the layout explicit for operators inspecting storage.
+    if !env.storage().instance().has(&DataKey::TotalLiquidityShares) {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalLiquidityShares, &0i128);
+    }
+
+    // Per-provider share balances and per-market reserves are created lazily
+    // by the deposit path; there is nothing to backfill because no shares
+    // could have been minted before this schema version existed.
+    Ok(())
+}

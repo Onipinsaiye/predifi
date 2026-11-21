@@ -1843,4 +1843,399 @@ impl PredifiContract {
 
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Liquidity-share accounting (issues #270 / #271 / #272)
+    // -----------------------------------------------------------------------
+    //
+    // Liquidity providers contribute the pool's escrowed token and receive
+    // shares in return. The accounting model is deliberately simple and
+    // provable:
+    //
+    //   * `total_shares` is the sum of all outstanding provider shares.
+    //   * `total_liabilities` is the amount of escrow owed to providers.
+    //   * `total_escrow` is the amount of tokens the contract actually holds
+    //     on behalf of the pool (initial liquidity + deposits - withdrawals).
+    //
+    // Invariants enforced on every accounting transition:
+    //
+    //   INV-L1 (solvency): `total_liabilities <= total_escrow`.
+    //   INV-L2 (conservation): `sum(provider_shares) == total_shares`.
+    //   INV-L3 (rounding): shares minted on deposit round *down* and the
+    //          amount returned on withdrawal rounds *down*, so the pool can
+    //          never owe more than it holds.
+    //
+    // The first deposit (when `total_shares == 0`) mints shares 1:1 with the
+    // deposited amount, establishing the initial share price. Subsequent
+    // deposits mint `amount * total_shares / total_liabilities`.
+
+    /// Maximum number of shares a single `withdraw_liquidity` call may burn.
+    /// Caps per-call execution work so a withdrawal can never iterate over an
+    /// unbounded amount of accounting state.
+    pub const MAX_SHARES_PER_WITHDRAW: i128 = 1_000_000_000_000_000_000;
+
+    /// Guarded liquidity deposit (issue #271).
+    ///
+    /// Transfers `amount` of the pool's accepted token from `provider` into the
+    /// contract and mints liquidity shares in return.
+    ///
+    /// # Authorization
+    /// `provider` must sign the transaction (`require_auth`). Any address may
+    /// provide liquidity — there is no role requirement — but the pool must be
+    /// open for liquidity: `Active`, before `end_time`, and not paused.
+    ///
+    /// # Validation
+    /// - Contract must not be paused.
+    /// - Pool must exist and be `Active` (not Locked/Resolved/Canceled/Disputed).
+    /// - Current ledger time must be within `[start_time, end_time)`.
+    /// - `amount` must be `> 0` and within `[min_stake, max_stake]` bounds
+    ///   (where `max_stake == 0` means "no per-deposit cap").
+    /// - The resulting `total_liabilities` must not exceed the pool's
+    ///   `max_total_stake` cap (when non-zero) nor the contract-level
+    ///   aggregate ceiling.
+    ///
+    /// # Effects
+    /// The token transfer happens *before* any storage mutation. If the
+    /// transfer fails the whole transaction reverts, leaving reserves and
+    /// shares untouched (atomic rollback). On success, reserves and shares are
+    /// updated together and a canonical [`LiquidityDepositedEvent`] is emitted.
+    ///
+    /// # Errors
+    /// - [`PredifiError::ContractPaused`]
+    /// - [`PredifiError::PoolNotFound`]
+    /// - [`PredifiError::InvalidPoolState`]
+    /// - [`PredifiError::InvalidAmount`] for zero/negative or out-of-bounds amounts
+    /// - [`PredifiError::MaxAggregateStakeExceeded`] when a cap would be breached
+    pub fn deposit_liquidity(
+        env: Env,
+        provider: Address,
+        pool_id: u64,
+        amount: i128,
+    ) -> Result<i128, PredifiError> {
+        Self::require_not_paused(&env)?;
+        provider.require_auth();
+
+        let pool_key = DataKey::Pool(pool_id);
+        let mut pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &pool_key);
+
+        // Lifecycle: only Active pools accept liquidity, and only before the
+        // staking deadline. Disputed/Locked/Resolved/Canceled are rejected.
+        if !Self::is_pool_active(&pool) {
+            return Err(PredifiError::InvalidPoolState);
+        }
+        let now = env.ledger().timestamp();
+        if now < pool.start_time || now >= pool.end_time {
+            return Err(PredifiError::InvalidPoolState);
+        }
+
+        // Zero-value rejection.
+        if amount <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        // Per-deposit bounds reuse the pool's stake limits: `min_stake` is the
+        // minimum meaningful liquidity unit and `max_stake == 0` means no cap.
+        if amount < pool.min_stake {
+            return Err(PredifiError::InvalidAmount);
+        }
+        if pool.max_stake > 0 && amount > pool.max_stake {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        // Load current accounting state.
+        let mut acct = Self::load_liquidity_accounting(&env, pool_id);
+
+        // Cap checks: liabilities must stay within the per-pool cap and the
+        // contract-level aggregate ceiling.
+        let new_liabilities = acct
+            .total_liabilities
+            .checked_add(amount)
+            .ok_or(PredifiError::InvalidAmount)?;
+        if pool.max_total_stake > 0 && new_liabilities > pool.max_total_stake {
+            return Err(PredifiError::MaxAggregateStakeExceeded);
+        }
+        if new_liabilities > MAX_AGGREGATE_STAKE_PER_POOL {
+            return Err(PredifiError::MaxAggregateStakeExceeded);
+        }
+
+        // Compute shares to mint *before* any mutation (rounding down).
+        let shares = Self::shares_for_deposit(&env, &acct, amount)?;
+        if shares <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        // Transfer first: if this fails the transaction reverts and no state
+        // is mutated (atomic rollback on transfer failure).
+        let token_client = token::Client::new(&env, &pool.token);
+        token_client.transfer(&provider, env.current_contract_address(), &amount);
+
+        // Atomically update reserves and shares.
+        acct.total_escrow = acct
+            .total_escrow
+            .checked_add(amount)
+            .ok_or(PredifiError::InvalidAmount)?;
+        acct.total_liabilities = new_liabilities;
+        acct.total_shares = acct
+            .total_shares
+            .checked_add(shares)
+            .ok_or(PredifiError::InvalidAmount)?;
+
+        let provider_shares = Self::load_provider_shares(&env, pool_id, &provider);
+        let new_provider_shares = provider_shares
+            .checked_add(shares)
+            .ok_or(PredifiError::InvalidAmount)?;
+        Self::store_provider_shares(&env, pool_id, &provider, new_provider_shares);
+
+        Self::assert_liquidity_solvency(&env, &acct);
+        Self::store_liquidity_accounting(&env, pool_id, &acct);
+
+        // Keep the pool's escrow view in sync with the accounting ledger.
+        pool.total_stake = acct.total_escrow;
+        env.storage().persistent().set(&pool_key, &pool);
+        Self::extend_persistent(&env, &pool_key);
+
+        LiquidityDepositedEvent {
+            version: crate::LIQUIDITY_EVENT_VERSION,
+            pool_id,
+            provider,
+            amount,
+            shares_minted: shares,
+            total_shares: acct.total_shares,
+            total_liabilities: acct.total_liabilities,
+            total_escrow: acct.total_escrow,
+        }
+        .publish(&env);
+
+        Ok(shares)
+    }
+
+    /// Bounded liquidity withdrawal with explicit lock rules (issue #272).
+    ///
+    /// Burns `shares` from `provider` and returns the corresponding amount of
+    /// the pool's token.
+    ///
+    /// # Lifecycle conditions
+    /// Withdrawals are permitted only while the pool is `Active` and before
+    /// `end_time`. Once staking closes (or the pool is Locked/Disputed/
+    /// Resolved/Canceled) provider capital is locked until settlement so that
+    /// resolution and payouts observe a stable escrow balance.
+    ///
+    /// # Bounds
+    /// - `shares` must be `> 0` and `<= MAX_SHARES_PER_WITHDRAW` (per-call work cap).
+    /// - `shares` must not exceed the provider's current share balance.
+    ///
+    /// # Effects
+    /// The exact payout is computed *before* any state mutation. Shares are
+    /// burned, reserves reduced, and only then is the token transferred. The
+    /// solvency invariant is re-asserted on every path.
+    ///
+    /// # Errors
+    /// - [`PredifiError::ContractPaused`]
+    /// - [`PredifiError::PoolNotFound`]
+    /// - [`PredifiError::InvalidPoolState`]
+    /// - [`PredifiError::InvalidAmount`] for zero/negative/oversized shares
+    /// - [`PredifiError::InsufficientBalance`] when the provider lacks shares
+    pub fn withdraw_liquidity(
+        env: Env,
+        provider: Address,
+        pool_id: u64,
+        shares: i128,
+    ) -> Result<i128, PredifiError> {
+        Self::require_not_paused(&env)?;
+        provider.require_auth();
+
+        let pool_key = DataKey::Pool(pool_id);
+        let mut pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &pool_key);
+
+        // Lifecycle lock: withdrawals only while Active and before end_time.
+        if !Self::is_pool_active(&pool) {
+            return Err(PredifiError::InvalidPoolState);
+        }
+        let now = env.ledger().timestamp();
+        if now < pool.start_time || now >= pool.end_time {
+            return Err(PredifiError::InvalidPoolState);
+        }
+
+        // Zero-value rejection and per-call work cap.
+        if shares <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+        if shares > Self::MAX_SHARES_PER_WITHDRAW {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let mut acct = Self::load_liquidity_accounting(&env, pool_id);
+
+        let provider_shares = Self::load_provider_shares(&env, pool_id, &provider);
+        if shares > provider_shares {
+            return Err(PredifiError::InsufficientBalance);
+        }
+
+        // Compute the exact payout before mutating any state (rounding down).
+        let payout = Self::amount_for_withdraw(&env, &acct, shares)?;
+        if payout <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+        if payout > acct.total_escrow {
+            // Defensive: rounding must never let a withdrawal exceed escrow.
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        // Burn shares and reduce reserves atomically.
+        acct.total_shares = acct
+            .total_shares
+            .checked_sub(shares)
+            .ok_or(PredifiError::InvalidAmount)?;
+        acct.total_liabilities = acct
+            .total_liabilities
+            .checked_sub(payout)
+            .ok_or(PredifiError::InvalidAmount)?;
+        acct.total_escrow = acct
+            .total_escrow
+            .checked_sub(payout)
+            .ok_or(PredifiError::InvalidAmount)?;
+
+        let new_provider_shares = provider_shares - shares;
+        Self::store_provider_shares(&env, pool_id, &provider, new_provider_shares);
+
+        Self::assert_liquidity_solvency(&env, &acct);
+        Self::store_liquidity_accounting(&env, pool_id, &acct);
+
+        pool.total_stake = acct.total_escrow;
+        env.storage().persistent().set(&pool_key, &pool);
+        Self::extend_persistent(&env, &pool_key);
+
+        // Transfer after state is consistent; a failure reverts everything.
+        let token_client = token::Client::new(&env, &pool.token);
+        token_client.transfer(&env.current_contract_address(), &provider, &payout);
+
+        LiquidityWithdrawnEvent {
+            version: crate::LIQUIDITY_EVENT_VERSION,
+            pool_id,
+            provider,
+            amount: payout,
+            shares_burned: shares,
+            total_shares: acct.total_shares,
+            total_liabilities: acct.total_liabilities,
+            total_escrow: acct.total_escrow,
+        }
+        .publish(&env);
+
+        Ok(payout)
+    }
+
+    /// Read-only view of a provider's liquidity share balance.
+    pub fn get_liquidity_shares(env: Env, pool_id: u64, provider: Address) -> i128 {
+        Self::load_provider_shares(&env, pool_id, &provider)
+    }
+
+    /// Read-only view of the pool's aggregate liquidity accounting.
+    pub fn get_liquidity_accounting(env: Env, pool_id: u64) -> LiquidityAccounting {
+        Self::load_liquidity_accounting(&env, pool_id)
+    }
+
+    // --- internal liquidity accounting helpers -----------------------------
+
+    /// Load the pool's aggregate liquidity accounting, defaulting to the
+    /// pool's seeded initial liquidity when no deposits have occurred yet.
+    fn load_liquidity_accounting(env: &Env, pool_id: u64) -> LiquidityAccounting {
+        let key = DataKey::LiquidityAccounting(pool_id);
+        if let Some(acct) = env.storage().persistent().get::<_, LiquidityAccounting>(&key) {
+            Self::extend_persistent(env, &key);
+            return acct;
+        }
+
+        // Bootstrap from the pool's initial liquidity: the creator's seed is
+        // treated as the first provider's contribution, minted 1:1.
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(pool_id))
+            .expect("Pool not found");
+        let seed = pool.initial_liquidity.max(0);
+        LiquidityAccounting {
+            total_shares: seed,
+            total_liabilities: seed,
+            total_escrow: seed,
+        }
+    }
+
+    fn store_liquidity_accounting(env: &Env, pool_id: u64, acct: &LiquidityAccounting) {
+        let key = DataKey::LiquidityAccounting(pool_id);
+        env.storage().persistent().set(&key, acct);
+        Self::extend_persistent(env, &key);
+    }
+
+    fn load_provider_shares(env: &Env, pool_id: u64, provider: &Address) -> i128 {
+        let key = DataKey::LiquidityShares(pool_id, provider.clone());
+        let shares = env.storage().persistent().get::<_, i128>(&key).unwrap_or(0);
+        if shares > 0 {
+            Self::extend_persistent(env, &key);
+        }
+        shares
+    }
+
+    fn store_provider_shares(env: &Env, pool_id: u64, provider: &Address, shares: i128) {
+        let key = DataKey::LiquidityShares(pool_id, provider.clone());
+        if shares > 0 {
+            env.storage().persistent().set(&key, &shares);
+            Self::extend_persistent(env, &key);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+    }
+
+    /// Shares minted for a deposit. First deposit mints 1:1; later deposits
+    /// mint `amount * total_shares / total_liabilities`, rounding down.
+    fn shares_for_deposit(
+        env: &Env,
+        acct: &LiquidityAccounting,
+        amount: i128,
+    ) -> Result<i128, PredifiError> {
+        if acct.total_shares == 0 || acct.total_liabilities == 0 {
+            return Ok(amount);
+        }
+        let numerator = amount
+            .checked_mul(acct.total_shares)
+            .ok_or(PredifiError::InvalidAmount)?;
+        let _ = env;
+        Ok(numerator / acct.total_liabilities)
+    }
+
+    /// Amount returned for burning `shares`, rounding down.
+    fn amount_for_withdraw(
+        env: &Env,
+        acct: &LiquidityAccounting,
+        shares: i128,
+    ) -> Result<i128, PredifiError> {
+        if acct.total_shares == 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+        let numerator = shares
+            .checked_mul(acct.total_liabilities)
+            .ok_or(PredifiError::InvalidAmount)?;
+        let _ = env;
+        Ok(numerator / acct.total_shares)
+    }
+
+    /// Assert the core solvency invariant: liabilities never exceed escrow.
+    fn assert_liquidity_solvency(env: &Env, acct: &LiquidityAccounting) {
+        if acct.total_liabilities > acct.total_escrow
+            || acct.total_shares < 0
+            || acct.total_liabilities < 0
+            || acct.total_escrow < 0
+        {
+            soroban_sdk::panic_with_error!(env, PredifiError::InvalidAmount);
+        }
+    }
 }

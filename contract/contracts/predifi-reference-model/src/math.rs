@@ -175,6 +175,200 @@ pub fn dynamic_fee(total_stake: i128, base_fee_bps: u32, tiers: &[FeeTier]) -> u
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Liquidity-share accounting (mirrors the contract's liquidity module)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The approved model is a proportional ("constant NAV") share model:
+//
+//   shares = assets * total_shares / total_assets
+//
+// with every division floored. Rounding remainders are always retained inside
+// the pool (they are never minted as shares nor paid out), so the invariant
+//
+//   total_assets >= total_liabilities
+//
+// holds after every transition. Deposits floor the minted shares (the pool
+// keeps the dust); withdrawals floor the assets returned (the pool keeps the
+// dust). Both directions therefore favour solvency, never the provider.
+
+/// Compute shares minted for a deposit.
+///
+/// # Rounding: floor (remainder retained in the pool)
+/// `shares = assets * total_shares / total_assets`
+///
+/// The first deposit into an empty pool mints `assets` shares 1:1.
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+/// Returns `Err(MathError::ZeroAmount)` when `assets == 0`.
+/// Returns `Err(MathError::Overflow)` on i128 overflow.
+/// Returns `Err(MathError::InvariantViolated)` when the pool has shares but no
+/// assets (a state that must never be reachable).
+pub fn shares_for_deposit(
+    assets: i128,
+    total_assets: i128,
+    total_shares: i128,
+) -> Result<i128, MathError> {
+    if assets < 0 || total_assets < 0 || total_shares < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    if assets == 0 {
+        return Err(MathError::ZeroAmount);
+    }
+    if total_shares == 0 {
+        // Empty pool: bootstrap 1:1.
+        return Ok(assets);
+    }
+    if total_assets == 0 {
+        return Err(MathError::InvariantViolated(
+            "LIQ-1: shares outstanding with zero assets",
+        ));
+    }
+    let numerator = assets.checked_mul(total_shares).ok_or(MathError::Overflow)?;
+    Ok(numerator / total_assets) // floor division
+}
+
+/// Compute assets returned for burning shares.
+///
+/// # Rounding: floor (remainder retained in the pool)
+/// `assets = shares * total_assets / total_shares`
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+/// Returns `Err(MathError::ZeroAmount)` when `shares == 0`.
+/// Returns `Err(MathError::Overflow)` on i128 overflow.
+/// Returns `Err(MathError::InvariantViolated)` when `shares > total_shares`.
+pub fn assets_for_withdrawal(
+    shares: i128,
+    total_assets: i128,
+    total_shares: i128,
+) -> Result<i128, MathError> {
+    if shares < 0 || total_assets < 0 || total_shares < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    if shares == 0 {
+        return Err(MathError::ZeroAmount);
+    }
+    if total_shares == 0 {
+        return Err(MathError::InvariantViolated(
+            "LIQ-2: withdrawal with no shares outstanding",
+        ));
+    }
+    if shares > total_shares {
+        return Err(MathError::InvariantViolated(
+            "LIQ-3: burn exceeds shares outstanding",
+        ));
+    }
+    let numerator = shares.checked_mul(total_assets).ok_or(MathError::Overflow)?;
+    Ok(numerator / total_shares) // floor division
+}
+
+/// Solvency check: total liabilities must never exceed escrowed assets.
+///
+/// Returns `Ok(())` when `total_liabilities <= total_assets`, otherwise
+/// `Err(MathError::InvariantViolated("LIQ-4: liabilities exceed escrow"))`.
+pub fn assert_solvent(total_assets: i128, total_liabilities: i128) -> Result<(), MathError> {
+    if total_assets < 0 || total_liabilities < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    if total_liabilities > total_assets {
+        return Err(MathError::InvariantViolated("LIQ-4: liabilities exceed escrow"));
+    }
+    Ok(())
+}
+
+/// Deterministic market quote for a liquidity pool.
+///
+/// Produces a reproducible estimate of the outcome shares a client would
+/// receive, the price impact of the trade, the fee charged and the timestamp
+/// the quote was produced at. The same inputs always yield the same output,
+/// which lets the backend mirror the contract reference implementation.
+///
+/// # Pricing model
+/// Constant-product style impact on the pool reserves:
+///   - `fee = floor(input_units * fee_bps / 10_000)`
+///   - `net_in = input_units - fee`
+///   - `output = floor(net_in * reserve_out / (reserve_in + net_in))`
+///   - `price_impact_bps = floor((output_before_fee - output) * 10_000 / output_before_fee)`
+///     where `output_before_fee` is the same formula applied to the gross input.
+///
+/// # Rounding: floor everywhere (protocol-favouring)
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+/// Returns `Err(MathError::ZeroAmount)` when `input_units == 0`.
+/// Returns `Err(MathError::InvalidFeeBps)` when `fee_bps > 10_000`.
+/// Returns `Err(MathError::StalePoolState)` when `quote_timestamp` is older
+/// than `max_age_seconds` relative to `now`.
+/// Returns `Err(MathError::UnsupportedPoolState)` when either reserve is zero.
+/// Returns `Err(MathError::Overflow)` on i128 overflow.
+pub fn quote(
+    input_units: i128,
+    reserve_in: i128,
+    reserve_out: i128,
+    fee_bps: i128,
+    quote_timestamp: u64,
+    now: u64,
+    max_age_seconds: u64,
+) -> Result<Quote, MathError> {
+    if input_units < 0 || reserve_in < 0 || reserve_out < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    if input_units == 0 {
+        return Err(MathError::ZeroAmount);
+    }
+    if fee_bps < 0 || fee_bps > MAX_BPS {
+        return Err(MathError::InvalidFeeBps);
+    }
+    if reserve_in == 0 || reserve_out == 0 {
+        return Err(MathError::UnsupportedPoolState);
+    }
+    if quote_timestamp > now || now - quote_timestamp > max_age_seconds {
+        return Err(MathError::StalePoolState);
+    }
+
+    let fee = protocol_fee(input_units, fee_bps)?;
+    let net_in = input_units.checked_sub(fee).ok_or(MathError::Overflow)?;
+
+    let output = constant_product_out(net_in, reserve_in, reserve_out)?;
+    let output_before_fee = constant_product_out(input_units, reserve_in, reserve_out)?;
+
+    let price_impact_bps = if output_before_fee == 0 {
+        0
+    } else {
+        let diff = output_before_fee
+            .checked_sub(output)
+            .ok_or(MathError::Overflow)?;
+        let numerator = diff.checked_mul(MAX_BPS).ok_or(MathError::Overflow)?;
+        numerator / output_before_fee // floor division
+    };
+
+    Ok(Quote {
+        input_units,
+        output_estimate: output,
+        price_impact_bps,
+        fee,
+        quote_timestamp,
+    })
+}
+
+/// Constant-product output: `floor(amount_in * reserve_out / (reserve_in + amount_in))`.
+fn constant_product_out(
+    amount_in: i128,
+    reserve_in: i128,
+    reserve_out: i128,
+) -> Result<i128, MathError> {
+    if amount_in == 0 {
+        return Ok(0);
+    }
+    let denominator = reserve_in.checked_add(amount_in).ok_or(MathError::Overflow)?;
+    let numerator = amount_in
+        .checked_mul(reserve_out)
+        .ok_or(MathError::Overflow)?;
+    Ok(numerator / denominator) // floor division
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Supporting types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -186,6 +380,21 @@ pub struct PayoutBreakdown {
     pub winnings: i128,
 }
 
+/// Deterministic quote returned by [`quote`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quote {
+    /// Input units the client would spend.
+    pub input_units: i128,
+    /// Estimated output units (floored).
+    pub output_estimate: i128,
+    /// Price impact in basis points (floored).
+    pub price_impact_bps: i128,
+    /// Fee charged on the input, in input units (floored).
+    pub fee: i128,
+    /// Timestamp the quote was produced at.
+    pub quote_timestamp: u64,
+}
+
 /// Arithmetic error variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MathError {
@@ -193,6 +402,9 @@ pub enum MathError {
     NegativeInput,
     InvalidFeeBps,
     DivisionByZero,
+    ZeroAmount,
+    StalePoolState,
+    UnsupportedPoolState,
     InvariantViolated(&'static str),
 }
 
@@ -336,5 +548,106 @@ mod tests {
         let w2 = winner_share(1, winning_stake, pool).unwrap();
         let w3 = winner_share(1, winning_stake, pool).unwrap();
         assert!(w1 + w2 + w3 <= pool, "sum of shares must not exceed pool");
+    }
+
+    // ── Liquidity-share accounting ──────────────────────────────────────────
+
+    #[test]
+    fn first_deposit_mints_one_to_one() {
+        assert_eq!(shares_for_deposit(1_000, 0, 0).unwrap(), 1_000);
+    }
+
+    #[test]
+    fn deposit_floors_shares() {
+        // 1 * 3 / 2 = 1.5 → floor → 1
+        assert_eq!(shares_for_deposit(1, 2, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn deposit_rejects_zero() {
+        assert_eq!(shares_for_deposit(0, 10, 10), Err(MathError::ZeroAmount));
+    }
+
+    #[test]
+    fn withdrawal_floors_assets() {
+        // 1 * 3 / 2 = 1.5 → floor → 1
+        assert_eq!(assets_for_withdrawal(1, 3, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn withdrawal_rejects_zero_and_overburn() {
+        assert_eq!(assets_for_withdrawal(0, 10, 10), Err(MathError::ZeroAmount));
+        assert!(matches!(
+            assets_for_withdrawal(11, 10, 10),
+            Err(MathError::InvariantViolated(_))
+        ));
+    }
+
+    #[test]
+    fn deposit_withdraw_round_trip_never_gains() {
+        let (mut assets, mut shares) = (0i128, 0i128);
+        let deposit = 1_000i128;
+        let minted = shares_for_deposit(deposit, assets, shares).unwrap();
+        assets += deposit;
+        shares += minted;
+        let out = assets_for_withdrawal(minted, assets, shares).unwrap();
+        assert!(out <= deposit, "provider must not gain from round trip");
+    }
+
+    #[test]
+    fn solvency_helper() {
+        assert!(assert_solvent(100, 100).is_ok());
+        assert!(assert_solvent(100, 99).is_ok());
+        assert!(matches!(
+            assert_solvent(100, 101),
+            Err(MathError::InvariantViolated(_))
+        ));
+    }
+
+    // ── Deterministic quotes ────────────────────────────────────────────────
+
+    #[test]
+    fn quote_is_deterministic() {
+        let a = quote(1_000, 10_000, 10_000, 30, 100, 100, 60).unwrap();
+        let b = quote(1_000, 10_000, 10_000, 30, 100, 100, 60).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn quote_returns_fee_and_impact() {
+        let q = quote(1_000, 10_000, 10_000, 30, 100, 100, 60).unwrap();
+        assert_eq!(q.fee, 3); // floor(1000 * 30 / 10000)
+        assert_eq!(q.input_units, 1_000);
+        assert_eq!(q.quote_timestamp, 100);
+        assert!(q.output_estimate > 0);
+        assert!(q.price_impact_bps >= 0);
+    }
+
+    #[test]
+    fn quote_rejects_stale_state() {
+        assert_eq!(
+            quote(1_000, 10_000, 10_000, 30, 100, 200, 60),
+            Err(MathError::StalePoolState)
+        );
+    }
+
+    #[test]
+    fn quote_rejects_unsupported_state() {
+        assert_eq!(
+            quote(1_000, 0, 10_000, 30, 100, 100, 60),
+            Err(MathError::UnsupportedPoolState)
+        );
+        assert_eq!(
+            quote(1_000, 10_000, 0, 30, 100, 100, 60),
+            Err(MathError::UnsupportedPoolState)
+        );
+    }
+
+    #[test]
+    fn quote_rejects_zero_input() {
+        assert_eq!(
+            quote(0, 10_000, 10_000, 30, 100, 100, 60),
+            Err(MathError::ZeroAmount)
+        );
     }
 }

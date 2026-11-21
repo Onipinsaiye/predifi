@@ -93,6 +93,74 @@ pub type PageOffset = BoundedI64<0, { crate::constants::MAX_PAGE_OFFSET }>;
 /// [`crate::constants::MAX_TEMPLATE_SECONDS`].
 pub type TemplateSeconds = BoundedI64<1, { crate::constants::MAX_TEMPLATE_SECONDS }>;
 
+// ── QuoteAmount ───────────────────────────────────────────────────────────────
+
+/// A strictly positive, bounded input amount (in the pool's smallest unit)
+/// for a market quote. Rejects zero, negatives, and values above
+/// [`crate::constants::MAX_QUOTE_INPUT_AMOUNT`] at deserialization time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct QuoteAmount(i64);
+
+impl QuoteAmount {
+    pub fn new(n: i64) -> Result<Self, ValidationError> {
+        if n <= 0 {
+            Err(ValidationError("amount must be greater than zero".to_string()))
+        } else if n > crate::constants::MAX_QUOTE_INPUT_AMOUNT {
+            Err(ValidationError(format!(
+                "amount must be at most {}",
+                crate::constants::MAX_QUOTE_INPUT_AMOUNT
+            )))
+        } else {
+            Ok(Self(n))
+        }
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for QuoteAmount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<'de> Deserialize<'de> for QuoteAmount {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let n = i64::deserialize(de)?;
+        QuoteAmount::new(n).map_err(serde::de::Error::custom)
+    }
+}
+
+// ── Market quote request / response ──────────────────────────────────────────
+
+/// Query parameters for the read-only market quote endpoint.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct QuoteRequest {
+    /// Input amount in the pool's smallest unit; must be positive and bounded.
+    pub amount: QuoteAmount,
+    /// Optional client-supplied quote timestamp (Unix seconds). When present,
+    /// the handler rejects the request if the pool state is older than this.
+    #[serde(default)]
+    pub quote_timestamp: Option<i64>,
+}
+
+/// Deterministic quote returned by the read-only quote endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuoteResponse {
+    /// Echo of the validated input amount, in the pool's smallest unit.
+    pub input_amount: i64,
+    /// Estimated output shares, in the pool's smallest unit.
+    pub output_estimate: i64,
+    /// Price impact in basis points (0 = no impact).
+    pub price_impact_bps: i64,
+    /// Fee charged for the swap, in the pool's smallest unit.
+    pub fee: i64,
+    /// Unix timestamp (seconds) of the pool state the quote was computed from.
+    pub quote_timestamp: i64,
+}
+
 // ── StellarAddress ────────────────────────────────────────────────────────────
 
 /// RFC4648 base32 alphabet (no padding), as used by Stellar's strkey encoding.
@@ -582,5 +650,43 @@ mod tests {
         assert!(TemplateSeconds::new(max).is_ok());
         assert!(TemplateSeconds::new(max + 1).is_err());
         assert!(TemplateSeconds::new(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn quote_amount_rejects_non_positive_and_oversized() {
+        let max = crate::constants::MAX_QUOTE_INPUT_AMOUNT;
+        assert!(QuoteAmount::new(0).is_err());
+        assert!(QuoteAmount::new(-1).is_err());
+        assert!(QuoteAmount::new(1).is_ok());
+        assert!(QuoteAmount::new(max).is_ok());
+        assert!(QuoteAmount::new(max + 1).is_err());
+        assert!(QuoteAmount::new(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn quote_amount_deserialize_rejects_invalid() {
+        let result: Result<QuoteAmount, _> = serde_json::from_str("0");
+        assert!(result.is_err());
+        let result: Result<QuoteAmount, _> = serde_json::from_str("-5");
+        assert!(result.is_err());
+        let ok: QuoteAmount = serde_json::from_str("42").unwrap();
+        assert_eq!(ok.get(), 42);
+    }
+
+    #[test]
+    fn quote_request_deserializes_with_optional_timestamp() {
+        let req: QuoteRequest = serde_json::from_str(r#"{"amount":100}"#).unwrap();
+        assert_eq!(req.amount.get(), 100);
+        assert_eq!(req.quote_timestamp, None);
+
+        let req: QuoteRequest =
+            serde_json::from_str(r#"{"amount":100,"quote_timestamp":1700000000}"#).unwrap();
+        assert_eq!(req.quote_timestamp, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn quote_request_rejects_invalid_amount() {
+        let result: Result<QuoteRequest, _> = serde_json::from_str(r#"{"amount":0}"#);
+        assert!(result.is_err());
     }
 }
