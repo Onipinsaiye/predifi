@@ -10,13 +10,12 @@
 //! inherit the same trace id.
 
 use crate::config::Config;
-use crate::contract_identity::{self, ContractIdentityStatus};
 use crate::metrics::{Metrics, SharedMetrics};
 use crate::request_logger::LoggingLayer;
 use crate::shutdown;
 use axum::{
     extract::State,
-    middleware::{from_fn_with_state, Next},
+    middleware::{from_fn, from_fn_with_state, Next},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -278,13 +277,18 @@ async fn contract_identity(
     State(state): State<crate::routes::v1::AppState>,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    let status = state.contract_identity.status();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let status = state.config.verify_contract_identity(now);
     let body = json!({
-        "status": status.label(),
+        "status": status.diagnostic_code(),
         "verified": status.is_verified(),
-        "mutations_enabled": status.mutations_enabled(),
-        "diagnostic": status.diagnostic(),
+        "mutations_enabled": !status.mutations_disabled(),
+        "diagnostic": status.diagnostic_message(),
     });
 
     let code = if status.is_verified() {
@@ -392,8 +396,6 @@ pub fn build_router_with_rate_limit(
         std::process::exit(1);
     }));
 
-    let identity = contract_identity::ContractIdentity::from_config(&config);
-
     let state = crate::routes::v1::AppState {
         config: Arc::new(config.clone()),
         cache: cache.clone(),
@@ -405,7 +407,7 @@ pub fn build_router_with_rate_limit(
         db: None,
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
-        contract_identity: identity.clone(),
+        abuse: std::sync::Arc::new(crate::abuse::AbuseController::from_config(&config)),
     };
 
     let router = Router::new()
@@ -449,8 +451,6 @@ fn build_router_with_db(
     event_bus: crate::ws::EventBus,
     prometheus_metrics: SharedMetrics,
 ) -> Router {
-    let identity = contract_identity::ContractIdentity::from_config(&config);
-
     let state = crate::routes::v1::AppState {
         config: Arc::new(config.clone()),
         cache: cache.clone(),
@@ -462,7 +462,7 @@ fn build_router_with_db(
         db: Some(pool.clone()),
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
-        contract_identity: identity.clone(),
+        abuse: std::sync::Arc::new(crate::abuse::AbuseController::from_config(&config)),
     };
 
     let router = Router::new()
@@ -555,37 +555,32 @@ where
     // Record process start so readiness probes honour the startup grace period.
     PROCESS_START.get_or_init(Instant::now);
 
-    // Fail fast on unsafe database connection budgets before any pool is
-    // created or the listener is bound. Independent service pools multiplied
-    // by the maximum replica count must stay within the PostgreSQL connection
-    // limit, leaving headroom for administration.
-    if let Err(error) = crate::connection_budget::validate(&config) {
-        error!(
-            error = %error,
-            "unsafe database connection budget; refusing to start. Reduce pool sizes or \
-             replica counts, or raise the database connection limit."
-        );
-        std::process::exit(1);
-    }
+    // Unsafe database connection budgets (independent service pools multiplied
+    // by the maximum replica count exceeding the PostgreSQL connection limit)
+    // are already rejected by `Config::validate`, which every entry point
+    // calls before reaching this function.
 
     // Verify the configured contract identity against the pinned deployment
     // manifest before serving any traffic. A mismatch disables mutations but
     // keeps read-only endpoints available, and surfaces a diagnostic on
     // `/contract-identity` and in the logs.
-    let identity = contract_identity::ContractIdentity::from_config(&config);
-    let identity_status = identity.status();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let identity_status = config.verify_contract_identity(now_unix);
     if identity_status.is_verified() {
         info!(
             contract_id = %config.contract_id,
-            network = %config.network,
+            network = %config.network_passphrase,
             "contract identity verified against pinned deployment manifest"
         );
     } else {
         error!(
             contract_id = %config.contract_id,
-            network = %config.network,
-            status = identity_status.label(),
-            diagnostic = identity_status.diagnostic().unwrap_or("unknown"),
+            network = %config.network_passphrase,
+            status = identity_status.diagnostic_code(),
+            diagnostic = %identity_status.diagnostic_message(),
             "contract identity verification failed; mutation endpoints are disabled"
         );
     }
@@ -791,62 +786,9 @@ mod tests {
         assert_ne!(cfg_a.cors_allowed_origins, cfg_b.cors_allowed_origins);
     }
 
-    // ── Contract identity ────────────────────────────────────────────────────
-
-    fn identity_config(contract_id: &str, network: &str) -> Config {
-        let mut cfg = Config::default_for_test();
-        cfg.contract_id = contract_id.to_string();
-        cfg.network = network.to_string();
-        cfg
-    }
-
-    #[test]
-    fn contract_identity_matching_manifest_verifies() {
-        let cfg = identity_config("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM", "testnet");
-        let identity = contract_identity::ContractIdentity::from_config(&cfg);
-        let status = identity.status();
-        assert!(status.is_verified(), "diagnostic: {:?}", status.diagnostic());
-        assert!(status.mutations_enabled());
-    }
-
-    #[test]
-    fn contract_identity_mismatched_contract_disables_mutations() {
-        let cfg = identity_config("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "testnet");
-        let identity = contract_identity::ContractIdentity::from_config(&cfg);
-        let status = identity.status();
-        assert!(!status.is_verified());
-        assert!(!status.mutations_enabled());
-        assert!(status.diagnostic().is_some());
-    }
-
-    #[test]
-    fn contract_identity_unavailable_manifest_disables_mutations() {
-        let mut cfg = identity_config("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM", "testnet");
-        cfg.contract_manifest_path = Some("/nonexistent/manifest.json".to_string());
-        let identity = contract_identity::ContractIdentity::from_config(&cfg);
-        let status = identity.status();
-        assert!(!status.is_verified());
-        assert!(!status.mutations_enabled());
-        assert!(status.diagnostic().is_some());
-    }
-
-    #[test]
-    fn contract_identity_stale_manifest_disables_mutations() {
-        let mut cfg = identity_config("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM", "testnet");
-        cfg.contract_manifest_max_age_secs = Some(0);
-        let identity = contract_identity::ContractIdentity::from_config(&cfg);
-        let status = identity.status();
-        assert!(!status.is_verified());
-        assert!(!status.mutations_enabled());
-        assert!(status.diagnostic().is_some());
-    }
-
-    #[test]
-    fn contract_identity_never_falls_back_to_unverified_contract() {
-        // A mismatch must never silently resolve to the configured contract.
-        let cfg = identity_config("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "testnet");
-        let identity = contract_identity::ContractIdentity::from_config(&cfg);
-        assert_eq!(identity.status(), ContractIdentityStatus::Mismatched);
-        assert!(!identity.status().mutations_enabled());
-    }
+    // Contract-identity verification itself (manifest matching, staleness,
+    // mismatch handling) is implemented and tested in `crate::config`
+    // (`ContractIdentityConfig::verify`, `Config::verify_contract_identity`);
+    // this module only wires that status into the `/contract-identity`
+    // diagnostic route, so it has no duplicate coverage here.
 }

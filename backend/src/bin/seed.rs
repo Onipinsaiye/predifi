@@ -166,18 +166,10 @@ fn env_flag(name: &str) -> bool {
 
 /// Best-effort detection of a production-configured environment.
 ///
-/// Considers `PREDIFI_ENV`/`APP_ENV`/`ENVIRONMENT` set to `production`/`prod`.
+/// Delegates to [`Config::is_production`], which reads the configured
+/// `app_env`.
 fn is_production(config: &Config) -> bool {
-    let from_config = config.environment.as_deref();
-    let from_env = std::env::var("PREDIFI_ENV")
-        .ok()
-        .or_else(|| std::env::var("APP_ENV").ok())
-        .or_else(|| std::env::var("ENVIRONMENT").ok());
-    let value = from_config
-        .map(|s| s.to_string())
-        .or(from_env)
-        .unwrap_or_default();
-    matches!(value.to_ascii_lowercase().as_str(), "production" | "prod")
+    config.is_production()
 }
 
 /// Replace the password portion of a postgres URL with `***` for logging.

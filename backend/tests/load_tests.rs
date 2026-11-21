@@ -212,7 +212,10 @@ async fn capacity_load_test() {
     ];
 
     for (phase_name, concurrency, duration) in phases {
-        println!("\n--- Phase: {} ({} concurrent users) ---", phase_name, concurrency);
+        println!(
+            "\n--- Phase: {} ({} concurrent users) ---",
+            phase_name, concurrency
+        );
         run_phase(client.clone(), concurrency, duration).await;
     }
 }
@@ -279,7 +282,10 @@ async fn abuse_market_creation_is_bounded() {
         quota
     );
     // Transparent rejection: excess requests are rejected, not silently dropped.
-    assert!(rejected >= attempts - quota, "expected excess requests to be rejected");
+    assert!(
+        rejected >= attempts - quota,
+        "expected excess requests to be rejected"
+    );
     // Rejections should be transparent (Retry-After) so clients can back off.
     assert!(
         rejected_with_retry_after > 0,
@@ -348,7 +354,10 @@ async fn abuse_wallet_actions_are_bounded() {
         accepted,
         quota
     );
-    assert!(rejected >= attempts - quota, "expected excess wallet actions to be rejected");
+    assert!(
+        rejected >= attempts - quota,
+        "expected excess wallet actions to be rejected"
+    );
     assert!(
         elapsed < Duration::from_secs(30),
         "abuse burst took too long, backend may be saturated: {:?}",
@@ -434,11 +443,11 @@ async fn run_phase(client: Client, concurrency: usize, duration: Duration) {
     for worker_id in 0..concurrency {
         let client = client.clone();
         let metrics = metrics.clone();
-        
+
         set.spawn(async move {
             // Fake IP to bypass the strict single-IP rate limits in governor
             let fake_ip = format!("10.0.{}.{}", worker_id % 255, worker_id / 255);
-            
+
             while start_time.elapsed() < duration {
                 let workflow_dice = (start_time.elapsed().as_micros() % 100) as u8;
                 let req_start = Instant::now();
@@ -446,18 +455,26 @@ async fn run_phase(client: Client, concurrency: usize, duration: Duration) {
 
                 if workflow_dice < 45 {
                     // Workflow 1: Market Reads (45%)
-                    if let Ok(res) = client.get(format!("{}/pools?status=active&limit=20", BASE_URL))
+                    if let Ok(res) = client
+                        .get(format!("{}/pools?status=active&limit=20", BASE_URL))
                         .header("X-Forwarded-For", &fake_ip)
-                        .send().await 
+                        .send()
+                        .await
                     {
                         success = res.status().is_success();
                     }
                 } else if workflow_dice < 75 {
                     // Workflow 2: Prediction Prep (30%) - concurrent pool details + odds
                     let pool_id = (worker_id % 10) + 1; // Hitting seeded pools 1-10
-                    let p1 = client.get(format!("{}/pools/{}", BASE_URL, pool_id)).header("X-Forwarded-For", &fake_ip).send();
-                    let p2 = client.get(format!("{}/markets/{}/predictions", BASE_URL, pool_id)).header("X-Forwarded-For", &fake_ip).send();
-                    
+                    let p1 = client
+                        .get(format!("{}/pools/{}", BASE_URL, pool_id))
+                        .header("X-Forwarded-For", &fake_ip)
+                        .send();
+                    let p2 = client
+                        .get(format!("{}/markets/{}/predictions", BASE_URL, pool_id))
+                        .header("X-Forwarded-For", &fake_ip)
+                        .send();
+
                     if let (Ok(r1), Ok(r2)) = tokio::join!(p1, p2) {
                         success = r1.status().is_success() && r2.status().is_success();
                     }
@@ -469,10 +486,12 @@ async fn run_phase(client: Client, concurrency: usize, duration: Duration) {
                         "outcome": 1,
                         "amount": 100000000
                     });
-                    if let Ok(res) = client.post(format!("{}/indexer/prediction-placed", BASE_URL))
+                    if let Ok(res) = client
+                        .post(format!("{}/indexer/prediction-placed", BASE_URL))
                         .header("X-Forwarded-For", &fake_ip)
                         .json(&payload)
-                        .send().await
+                        .send()
+                        .await
                     {
                         success = res.status().is_success();
                     }
@@ -483,10 +502,12 @@ async fn run_phase(client: Client, concurrency: usize, duration: Duration) {
                         "user_address": TEST_ADDRESS,
                         "amount_paid": 50000000
                     });
-                    if let Ok(res) = client.post(format!("{}/indexer/claim", BASE_URL))
+                    if let Ok(res) = client
+                        .post(format!("{}/indexer/claim", BASE_URL))
                         .header("X-Forwarded-For", &fake_ip)
                         .json(&payload)
-                        .send().await
+                        .send()
+                        .await
                     {
                         success = res.status().is_success();
                     }

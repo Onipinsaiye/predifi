@@ -1,6 +1,8 @@
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use predifi_backend::{build_router, config::Config, price_cache::PriceCache, redis_cache::RedisCache, ws};
+use predifi_backend::{
+    build_router, config::Config, price_cache::PriceCache, redis_cache::RedisCache, ws,
+};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -34,14 +36,15 @@ async fn root_returns_documented_shape() {
     let body: Value = serde_json::from_slice(&bytes).expect("body must be valid json");
 
     let object = body.as_object().expect("body must be a json object");
-    assert_eq!(object.len(), 2, "body must have exactly two keys, got: {body}");
+    assert_eq!(
+        object.len(),
+        2,
+        "body must have exactly two keys, got: {body}"
+    );
 
     assert_eq!(
         object.get("message").and_then(Value::as_str),
         Some("Welcome to the PrediFi backend")
     );
-    assert_eq!(
-        object.get("api").and_then(Value::as_str),
-        Some("/api/v1")
-    );
+    assert_eq!(object.get("api").and_then(Value::as_str), Some("/api/v1"));
 }

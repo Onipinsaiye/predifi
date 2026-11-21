@@ -261,6 +261,47 @@ async fn claim_event_key(
     Ok(claimed.rows_affected() == 1)
 }
 
+/// Record a wallet-attributable activity row in the same transaction as the
+/// domain write (#309). `ON CONFLICT DO NOTHING` makes this idempotent
+/// alongside the dedupe claim above: a retried/overlapping batch never
+/// duplicates a wallet's activity entry.
+#[allow(clippy::too_many_arguments)]
+async fn record_activity(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &EventKey,
+    event_type: &str,
+    user_address: &str,
+    pool_id: Option<i64>,
+    counterparty: Option<&str>,
+    outcome: Option<i32>,
+    amount: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO portfolio_activity_ledger
+            (network, contract_id, ledger, tx_hash, event_index, event_type,
+             user_address, pool_id, counterparty, outcome, amount)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (network, contract_id, ledger, tx_hash, event_index, user_address)
+        DO NOTHING
+        "#,
+    )
+    .bind(&key.network)
+    .bind(&key.contract_id)
+    .bind(key.ledger as i64)
+    .bind(&key.tx_hash)
+    .bind(key.event_index as i32)
+    .bind(event_type)
+    .bind(user_address)
+    .bind(pool_id)
+    .bind(counterparty)
+    .bind(outcome)
+    .bind(amount)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Project one event inside the caller's transaction.
 ///
 /// Returns `true` if the projection was applied, `false` if the event key had
@@ -276,8 +317,34 @@ pub async fn project_event_tx(
     }
 
     match &event.event {
-        ProjectedEvent::PoolCreated(e) => insert_pool_from_event_tx(tx, e).await?,
-        ProjectedEvent::PredictionPlaced(e) => insert_prediction_from_event(tx, e).await?,
+        ProjectedEvent::PoolCreated(e) => {
+            insert_pool_from_event_tx(tx, e).await?;
+            record_activity(
+                tx,
+                &event.key,
+                "pool_created",
+                &e.creator,
+                Some(e.pool_id as i64),
+                Some(&e.creator),
+                None,
+                None,
+            )
+            .await?;
+        }
+        ProjectedEvent::PredictionPlaced(e) => {
+            insert_prediction_from_event(tx, e).await?;
+            record_activity(
+                tx,
+                &event.key,
+                "prediction_placed",
+                &e.user_address,
+                Some(e.pool_id as i64),
+                None,
+                Some(e.outcome),
+                Some(e.amount),
+            )
+            .await?;
+        }
         ProjectedEvent::PoolResolved {
             pool_id,
             winning_outcome,
@@ -290,7 +357,35 @@ pub async fn project_event_tx(
             .fetch_all(&mut **tx)
             .await?;
             for user in &users {
+                record_activity(
+                    tx,
+                    &event.key,
+                    "pool_resolved",
+                    user,
+                    Some(*pool_id as i64),
+                    None,
+                    Some(*winning_outcome),
+                    None,
+                )
+                .await?;
                 enqueue_notification_for_event(
+                    tx,
+                    user,
+                    NotifType::PoolResolved,
+                    "Pool resolved",
+                    &format!("Pool #{pool_id} has been resolved. Check your result."),
+                    *pool_id as i64,
+                    &event.key.canonical(),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Project a batch of events atomically. Safe to call repeatedly with the same
+/// or overlapping batches: al
                     tx,
                     user,
                     NotifType::PoolResolved,
@@ -388,10 +483,10 @@ mod tests {
         let pool_created = ProjectedEvent::PoolCreated(PoolCreatedEvent {
             pool_id: 1,
             creator: "GABC".into(),
-            question: "q".into(),
-            options: vec!["a".into(), "b".into()],
-            deadline: 0,
-            created_at: 0,
+            end_time: 0,
+            token: "CTOKEN".into(),
+            category: "Crypto".into(),
+            description: "q".into(),
         });
         assert_eq!(pool_created.event_type(), "pool_created");
 

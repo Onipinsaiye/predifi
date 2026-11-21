@@ -137,7 +137,9 @@ fn validate_contract(spec: &serde_json::Value) -> Result<(), Vec<String>> {
                 continue;
             };
             for (code, response) in responses {
-                let has_body = response["content"].as_object().is_some_and(|c| !c.is_empty());
+                let has_body = response["content"]
+                    .as_object()
+                    .is_some_and(|c| !c.is_empty());
                 if code.starts_with(['4', '5']) && !has_body {
                     problems.push(format!("{label} response {code} has no body schema"));
                 }

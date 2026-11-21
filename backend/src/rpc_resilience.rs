@@ -974,6 +974,19 @@ impl std::fmt::Debug for RpcQuotaManager {
 }
 
 impl RpcQuotaManager {
+    /// Build a manager with a small, permissive policy for unit/route tests
+    /// that need an `RpcQuotaManager` but don't exercise quota/failover
+    /// behavior directly.
+    pub fn default_for_test() -> Self {
+        let policy = NetworkPolicy::new(
+            "testnet",
+            RequestBudget::new(1_000, 1_000),
+            vec!["https://soroban-testnet.stellar.org".to_string()],
+            RetryPolicy::default(),
+        );
+        Self::new(policy, Arc::new(SystemClock::default()))
+    }
+
     /// Build a manager for `policy`, creating an HTTP transport and a shared
     /// circuit breaker per provider URL.
     pub fn new(policy: NetworkPolicy, clock: Arc<dyn Clock>) -> Self {

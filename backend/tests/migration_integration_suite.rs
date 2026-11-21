@@ -9,8 +9,8 @@
 
 use predifi_backend::migration_checks::{
     evaluate_populated_schema_risk, get_known_migration_catalog, DataImpact,
-    InterruptedMigrationDiagnosis, LockImpact, LockLevel, MigrationChecker,
-    RollbackStrategy, TableStat,
+    InterruptedMigrationDiagnosis, LockImpact, LockLevel, MigrationChecker, RollbackStrategy,
+    TableStat,
 };
 
 #[test]
@@ -148,19 +148,27 @@ fn test_interrupted_migration_diagnosis_and_safe_resumption_plan() {
     // 4. Verify database consistency
     let step_actions: Vec<&str> = plan.steps.iter().map(|s| s.action.as_str()).collect();
     assert!(
-        step_actions.iter().any(|a| a.contains("Drop invalid index")),
+        step_actions
+            .iter()
+            .any(|a| a.contains("Drop invalid index")),
         "Plan must include dropping invalid leftover indexes"
     );
     assert!(
-        step_actions.iter().any(|a| a.contains("Clear failed migration state")),
+        step_actions
+            .iter()
+            .any(|a| a.contains("Clear failed migration state")),
         "Plan must clear failed migration state from _sqlx_migrations"
     );
     assert!(
-        step_actions.iter().any(|a| a.contains("Resume and re-apply")),
+        step_actions
+            .iter()
+            .any(|a| a.contains("Resume and re-apply")),
         "Plan must include re-applying migration"
     );
     assert!(
-        step_actions.iter().any(|a| a.contains("Verify database consistency")),
+        step_actions
+            .iter()
+            .any(|a| a.contains("Verify database consistency")),
         "Plan must include post-resumption verification"
     );
 }
@@ -265,7 +273,10 @@ mod live_db_tests {
             .expect("check populated schema");
 
         assert!(
-            report.tables.iter().any(|t| t.table_name == "predictions" && t.is_large),
+            report
+                .tables
+                .iter()
+                .any(|t| t.table_name == "predictions" && t.is_large),
             "predictions table must be identified as populated"
         );
 

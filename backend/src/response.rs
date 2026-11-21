@@ -153,6 +153,8 @@ pub mod error_codes {
     pub const API_VERSION_SUNSET: &str = "API_VERSION_SUNSET";
     pub const NOTIFICATION_DEAD: &str = "NOTIFICATION_DEAD";
     pub const NOTIFICATION_NOT_FOUND: &str = "NOTIFICATION_NOT_FOUND";
+    /// A resource (e.g. a portfolio export artifact) existed but has expired.
+    pub const RESOURCE_EXPIRED: &str = "RESOURCE_EXPIRED";
 }
 
 /// Whether a request that failed with `code` may succeed if retried unchanged.

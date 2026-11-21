@@ -17,7 +17,11 @@ async fn connection() -> Option<ConnectionManager> {
         return None;
     };
     let client = redis::Client::open(url).expect("valid REDIS_URL");
-    Some(ConnectionManager::new(client).await.expect("connect to Redis"))
+    Some(
+        ConnectionManager::new(client)
+            .await
+            .expect("connect to Redis"),
+    )
 }
 
 fn config() -> CoalesceConfig {
@@ -50,7 +54,9 @@ async fn load(calls: Arc<AtomicUsize>, delay_ms: u64) -> Result<String, String> 
 /// the wait bound.
 #[tokio::test]
 async fn simultaneous_misses_across_replicas_refresh_once_per_key() {
-    let Some(conn) = connection().await else { return };
+    let Some(conn) = connection().await else {
+        return;
+    };
     let caches = replicas(&conn, 4, config());
     let calls: Vec<_> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
 
@@ -75,17 +81,27 @@ async fn simultaneous_misses_across_replicas_refresh_once_per_key() {
         }
     }
     for (pool, counter) in calls.iter().enumerate() {
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "pool {pool} refreshed more than once");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "pool {pool} refreshed more than once"
+        );
     }
     assert_eq!(refreshed, 3);
-    assert!(started.elapsed() < config().max_wait, "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < config().max_wait,
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// A replica killed mid-refresh leaves its lock behind; another replica
 /// takes over once the lock expires instead of waiting forever.
 #[tokio::test]
 async fn refresh_owner_failure_recovers_after_lock_expiry() {
-    let Some(conn) = connection().await else { return };
+    let Some(conn) = connection().await else {
+        return;
+    };
     let caches = replicas(&conn, 2, config());
     let calls = Arc::new(AtomicUsize::new(0));
 
@@ -115,7 +131,9 @@ async fn refresh_owner_failure_recovers_after_lock_expiry() {
 /// give up with `WaitTimeout` and do not call the upstream themselves.
 #[tokio::test]
 async fn waiters_are_bounded_by_max_wait() {
-    let Some(conn) = connection().await else { return };
+    let Some(conn) = connection().await else {
+        return;
+    };
     let mut cfg = config();
     cfg.max_wait = Duration::from_millis(150);
     let caches = replicas(&conn, 2, cfg);
@@ -140,7 +158,9 @@ async fn waiters_are_bounded_by_max_wait() {
 /// A slow refresh of one pool does not delay reads of another.
 #[tokio::test]
 async fn unrelated_keys_are_not_blocked() {
-    let Some(conn) = connection().await else { return };
+    let Some(conn) = connection().await else {
+        return;
+    };
     let caches = replicas(&conn, 2, config());
     let calls = Arc::new(AtomicUsize::new(0));
 
@@ -163,7 +183,9 @@ async fn unrelated_keys_are_not_blocked() {
 /// stale window ends.
 #[tokio::test]
 async fn stale_reads_are_bounded_during_upstream_degradation() {
-    let Some(conn) = connection().await else { return };
+    let Some(conn) = connection().await else {
+        return;
+    };
     let mut cfg = config();
     cfg.fresh_ttl = Duration::from_millis(100);
     cfg.stale_window = Duration::from_millis(500);
@@ -179,7 +201,10 @@ async fn stale_reads_are_bounded_during_upstream_degradation() {
         .get_or_refresh::<String, _, _, _>("pool:1", || async { Err("db down".to_string()) })
         .await
         .unwrap();
-    assert_eq!((degraded.value.as_str(), degraded.source), ("v1", Source::Stale));
+    assert_eq!(
+        (degraded.value.as_str(), degraded.source),
+        ("v1", Source::Stale)
+    );
 
     tokio::time::sleep(Duration::from_millis(550)).await;
     let gone = caches[1]

@@ -22,16 +22,11 @@
 /// exceed the budget.  The reported numbers are printed with the reproducible
 /// context (concurrency, total requests, and the budget) so a failure can be
 /// reproduced locally.
-
 use axum::http::Request;
 use http_body_util::BodyExt;
-use predifi_backend{
-    build_router_with_db,
-    config::Config,
-    metrics::Metrics,
-    price_cache::PriceCache,
-    redis_cache::RedisCache,
-    ws,
+use predifi_backend::{
+    build_router_with_db, config::Config, metrics::Metrics, price_cache::PriceCache,
+    redis_cache::RedisCache, ws,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
@@ -143,12 +138,11 @@ async fn drive_load(
     // Measure the average number of SQL statements executed per request.
     // `pg_stat_statements()` counts every statement executed by this
     // backend, including those issued by the application pool.
-    let statements: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(sum(statements), 0)::bigint FROM pg_stat_statements()",
-    )
-    .execute(&pool)
-    .await
-    .expect("read pg_stat_statements");
+    let statements: i64 =
+        sqlx::query_scalar("SELECT COALESCE(sum(statements), 0)::bigint FROM pg_stat_statements()")
+            .execute(&pool)
+            .await
+            .expect("read pg_stat_statements");
     let avg_db_round_trips = statements as f64 / TOTAL_REQUESTS as f64;
 
     LoadResult {
@@ -211,12 +205,10 @@ fn report_and_assert(
 /// Seeds a minimal pool and a prediction so the detail and history reads
 /// have real rows to return.
 async fn seed_data(pool: &sqlx::PgPool<sqlx::Postgres>) -> (i64, i64) {
-    let user_id: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(id), 0)::bigint FROM users",
-    )
-    .execute(&pool)
-    .await
-    .expect("read users");
+    let user_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0)::bigint FROM users")
+        .execute(&pool)
+        .await
+        .expect("read users");
 
     let pool_id: i64 = sqlx::query_scalar(
         "INSERT INTO pools (name, description, creator_id, total_stake, status)

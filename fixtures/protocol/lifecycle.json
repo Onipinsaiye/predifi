@@ -1,0 +1,24 @@
+{
+  "schema": "predifi.protocol.fixtures",
+  "version": 1,
+  "source": "backend/src/openapi_tests.rs",
+  "description": "Shared, language-neutral fixture for one pool's full lifecycle (created -> predicted -> resolved -> claimed), so the Rust backend and any TypeScript/contract conformance tests decode the same fixed values instead of each hand-rolling their own.",
+  "pool": {
+    "id": "1",
+    "contract": "CDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    "ledger": 1000000
+  },
+  "event": {
+    "id": "1000000-0",
+    "ledger": 1000000
+  },
+  "amount": {
+    "stroops": "5000000"
+  },
+  "lifecycle": {
+    "state": "settled",
+    "amount": {
+      "stroops": "5000000"
+    }
+  }
+}

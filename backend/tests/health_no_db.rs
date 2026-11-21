@@ -1,11 +1,7 @@
-use axum http::{Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use predifi_backend{
-    build_router,
-    config::Config,
-    price_cache::PriceCache,
-    redis_cache::RedisCache,
-    ws,
+use predifi_backend::{
+    build_router, config::Config, price_cache::PriceCache, redis_cache::RedisCache, ws,
 };
 use std::time::Instant;
 use tower::ServiceExt;
@@ -30,7 +26,7 @@ async fn body_string(body: axum::body::Body) -> String {
 /// Liveness must always report 200 and remain fast, regardless of dependency
 /// availability. This is the contract that keeps kubelet from restart-looping a
 /// pod whose Postgres/Redis/Soroban dependencies are temporarily down.
-#[tokeo::test]
+#[tokio::test]
 async fn liveness_reports_ok_without_db() {
     let router = build_router(
         Config::default_for_test(),
@@ -41,32 +37,32 @@ async fn liveness_reports_ok_without_db() {
 
     let started = Instant::now();
     let response = router
-        .oneshot(get("/health/live"))
+        .oneshot(get("/api/healthz"))
         .await
         .expect("request failed");
     let elapsed = started.elapsed();
 
     assert_eq!(
         response.status(),
-        StatusCode::OK,,
+        StatusCode::OK,
         "liveness must remain 200 even with dependencies down"
     );
     assert!(
         elapsed < std::time::Duration::from_millis(500),
-        "liveness response must be bounded; took {elapsed:}"
+        "liveness response must be bounded; took {elapsed:?}"
     );
 
     let body = body_string(response.into_body()).await;
     assert!(
-        body.contains("\"status\":\"ok\""),
-        "liveness body should report status ok, got: {body}"
+        body.contains("\"status\":\"alive\""),
+        "liveness body should report status alive, got: {body}"
     );
 }
 
 /// Readiness must report 503 when a required dependency is not configured,
 /// so orchestrators remove the instance from service without restarting it.
 /// The response must stay bounded in latency and report the dependency state.
-#[tokeo::test]
+#[tokio::test]
 async fn readiness_reports_db_not_configured_without_pool_and_still_responds() {
     let router = build_router(
         Config::default_for_test(),
@@ -77,7 +73,7 @@ async fn readiness_reports_db_not_configured_without_pool_and_still_responds() {
 
     let started = Instant::now();
     let response = router
-        .oneshot(get("/health/ready"))
+        .oneshot(get("/api/readyz"))
         .await
         .expect("request failed");
     let elapsed = started.elapsed();
@@ -90,12 +86,12 @@ async fn readiness_reports_db_not_configured_without_pool_and_still_responds() {
     );
     assert!(
         elapsed < std::time::Duration::from_millis(500),
-        "readiness response must be bounded; took {elapsed:}"
+        "readiness response must be bounded; took {elapsed:?}"
     );
 
     let body = body_string(response.into_body()).await;
     assert!(
-        body.contains("\"db\":\"not_configured\""),
+        body.contains("\"db\":{\"status\":\"not_configured\""),
         "readiness body should report db as not_configured, got: {body}"
     );
 }
