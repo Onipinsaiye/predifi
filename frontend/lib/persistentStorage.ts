@@ -1,6 +1,15 @@
 const FALLBACK_PREFIX = "predifi:";
 const DEFAULT_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 
+/**
+ * Storage key for the read-only demo-mode flag. Demo state is intentionally
+ * unscoped (not tied to a network or wallet) so it survives reloads and can be
+ * cleared in one place when the user exits to live data.
+ */
+export const DEMO_MODE_STORAGE_KEY = "demo-mode";
+const DEMO_MODE_SCOPE = "demo";
+const DEMO_MODE_VALUE = "1";
+
 function canUseBrowserStorage(): boolean {
   return typeof window !== "undefined" && typeof document !== "undefined";
 }
@@ -111,4 +120,37 @@ export function removePersistedValue(key: string, scope?: string | null): void {
   } catch {
     // Storage can be unavailable in strict privacy contexts.
   }
+}
+
+/**
+ * Returns true when the user has opted into the read-only demo mode. The flag
+ * is stored under a dedicated demo scope so it never collides with live,
+ * network- or account-scoped preferences.
+ */
+export function isDemoModePersisted(): boolean {
+  return (
+    getPersistedValue(DEMO_MODE_STORAGE_KEY, DEMO_MODE_SCOPE) ===
+    DEMO_MODE_VALUE
+  );
+}
+
+/**
+ * Persists the demo-mode flag so the read-only state survives reloads.
+ * Returns true when the flag was stored successfully.
+ */
+export function persistDemoMode(): boolean {
+  return setPersistedValue(
+    DEMO_MODE_STORAGE_KEY,
+    DEMO_MODE_VALUE,
+    DEFAULT_MAX_AGE_SECONDS,
+    DEMO_MODE_SCOPE,
+  );
+}
+
+/**
+ * Clears the demo-mode flag. Called when exiting to live data so no demo
+ * state lingers in cookies or localStorage.
+ */
+export function clearDemoMode(): void {
+  removePersistedValue(DEMO_MODE_STORAGE_KEY, DEMO_MODE_SCOPE);
 }
