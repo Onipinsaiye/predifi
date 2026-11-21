@@ -37,6 +37,7 @@ import {
 } from "@/components/ui";
 import { useDemoMode } from "@/lib/demo/DemoModeProvider";
 import { demoPoolDetail } from "@/lib/demo/fixtures";
+import { useMarketEvents, type MarketEvent } from "@/lib/hooks/useMarketEvents";
 
 const SITE_URL = "https://predifi.app";
 
@@ -46,6 +47,33 @@ function formatStake(amount: number, token: string): string {
 
 function outcomeLabel(outcome: number, labels?: string[]): string {
   return labels?.[outcome] ?? `Outcome ${outcome + 1}`;
+}
+
+const EVENT_LABELS: Record<MarketEvent["type"], string> = {
+  creation: "Market created",
+  trade: "Trade",
+  close: "Market closed",
+  resolution: "Market resolved",
+  claim: "Winnings claimed",
+};
+
+function formatEventTimestamp(timestamp: string | number | undefined): string {
+  if (timestamp === undefined || timestamp === null || timestamp === "") {
+    return "Timestamp unavailable";
+  }
+  const date =
+    typeof timestamp === "number" ? new Date(timestamp) : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return "Timestamp unavailable";
+  }
+  return date.toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+function eventKey(event: MarketEvent): string {
+  return event.id;
 }
 
 export interface PoolDetailClientProps {
@@ -107,6 +135,13 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
     // Restore focus to the triggering control after the dialog unmounts.
     trigger?.focus();
   }, [activeDialog]);
+
+  const {
+    events,
+    isLoading: eventsLoading,
+    error: eventsError,
+    mutate: mutateEvents,
+  } = useMarketEvents(poolId);
 
   const pool = isDemoMode
     ? demoPoolDetail(poolId)
@@ -308,6 +343,86 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
             </div>
           </div>
         )}
+
+        <section
+          aria-labelledby="pool-activity-heading"
+          className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-3"
+        >
+          <h2
+            id="pool-activity-heading"
+            className="text-sm font-semibold text-white uppercase tracking-wide"
+          >
+            Activity
+          </h2>
+          {eventsLoading && events.length === 0 ? (
+            <p role="status" className="text-sm text-zinc-400">
+              Loading activity…
+            </p>
+          ) : eventsError && events.length === 0 ? (
+            <div role="alert" className="space-y-2">
+              <p className="text-sm text-zinc-400">
+                Couldn&apos;t load this market&apos;s activity.
+              </p>
+              <button
+                type="button"
+                onClick={() => void mutateEvents()}
+                className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-800/50 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
+              >
+                Retry activity
+              </button>
+            </div>
+          ) : events.length === 0 ? (
+            <p className="text-sm text-zinc-400">
+              No activity has been recorded for this market yet.
+            </p>
+          ) : (
+            <ol className="space-y-2">
+              {events.map((event) => (
+                <li
+                  key={eventKey(event)}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-800 bg-zinc-800/40 px-4 py-3"
+                >
+                  <div className="space-y-0.5">
+                    <p className="text-sm text-zinc-200">
+                      {EVENT_LABELS[event.type] ?? event.type}
+                      {event.outcome != null && (
+                        <span className="ml-2 text-xs text-zinc-400">
+                          {outcomeLabel(
+                            event.outcome,
+                            pool.outcome_descriptions,
+                          )}
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-xs text-zinc-500">
+                      <time dateTime={event.timestamp || undefined}>
+                        {formatEventTimestamp(event.timestamp)}
+                      </time>
+                    </p>
+                  </div>
+                  {event.txHash ? (
+                    <a
+                      href={`https://stellar.expert/explorer/public/tx/${event.txHash}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs font-medium text-[#7DE3EC] underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7DE3EC] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0A0A] rounded"
+                    >
+                      View transaction
+                      <span className="sr-only">
+                        {" "}
+                        for {EVENT_LABELS[event.type] ?? event.type}
+                      </span>
+                    </a>
+                  ) : (
+                    <span className="text-xs text-zinc-500">
+                      Transaction unavailable
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
 
         <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-3">
           <h2 className="text-sm font-semibold text-white uppercase tracking-wide">
