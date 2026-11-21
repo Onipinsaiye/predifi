@@ -1962,5 +1962,3 @@ fn test_transfer_role_removes_expiring_grant() {
     assert!(client.get_expiring_role(&from, &Role::Operator).is_none());
     assert!(client.get_expiring_role(&to, &Role::Operator).is_none());
 }
-
-}
