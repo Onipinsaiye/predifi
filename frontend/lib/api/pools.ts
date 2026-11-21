@@ -108,6 +108,8 @@ export interface PoolsQuery {
   status?: "active" | "closed" | "settled";
   limit?: number;
   offset?: number;
+  /** Filter by pool creator (Stellar address). */
+  creator?: string;
 }
 
 /**
@@ -124,6 +126,7 @@ export function poolsUrl(query: PoolsQuery = {}): string {
   if (query.status) params.set("status", query.status);
   if (query.limit != null) params.set("limit", String(query.limit));
   if (query.offset != null) params.set("offset", String(query.offset));
+  if (query.creator) params.set("creator", query.creator);
 
   const qs = params.toString();
   return `${API_BASE_URL}/api/v1/pools${qs ? `?${qs}` : ""}`;
