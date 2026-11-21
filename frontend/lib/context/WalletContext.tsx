@@ -43,6 +43,7 @@ import {
   type WalletConnectionState,
 } from "@/lib/hooks/useWalletConnection";
 import { removePersistedStellarTransaction } from "@/lib/stellar/pendingTransactions";
+import { useDemoMode } from "@/lib/context/DemoModeContext";
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,42 @@ import { removePersistedStellarTransaction } from "@/lib/stellar/pendingTransact
 export interface WalletContextValue extends WalletConnectionState {
   identityKey: string | null;
   generation: number;
+  /**
+   * False while the read-only demo mode is active. Consumers must not request
+   * wallet signatures when this is false; `connect` is also refused.
+   */
+  signingAllowed: boolean;
+   * Explicitly selected read-only wallet addresses used for the aggregated
+   * portfolio view. These are NEVER used for signing — every mutation must
+   * go through the active signing wallet (`address`).
+   *
+   * Normalized (trimmed + uppercased) and deduplicated. The active signing
+   * address is never included here.
+   */
+  readOnlyAddresses: string[];
+  /** Add a read-only address to the aggregated portfolio view. */
+  addReadOnlyAddress: (address: string) => void;
+  /** Remove a read-only address from the aggregated portfolio view. */
+  removeReadOnlyAddress: (address: string) => void;
+  /** Clear all read-only addresses. */
+  clearReadOnlyAddresses: () => void;
+  /** True when `address` is the active signing wallet (normalized compare). */
+  isActiveSigningAddress: (address: string | null | undefined) => boolean;
+  /**
+   * Returns the active signing address or throws when no wallet is connected.
+   * Mutations must call this so they can never sign from a read-only account.
+   */
+  requireActiveSigningAddress: () => string;
+}
+
+/**
+ * Normalize a Stellar address for comparison/aggregation: trim surrounding
+ * whitespace and uppercase (Stellar StrKey is case-insensitive in practice
+ * for our comparison purposes). Returns an empty string for non-strings.
+ */
+export function normalizeWalletAddress(address: string): string {
+  if (typeof address !== "string") return "";
+  return address.trim().toUpperCase();
 }
 
 /**
@@ -76,6 +113,10 @@ WalletContext.displayName = "WalletContext";
 export function WalletProvider({ children }: { children: ReactNode }) {
   const wallet = useWalletConnection();
   const { mutate } = useSWRConfig();
+  const { isDemoMode } = useDemoMode();
+
+  // Demo mode is strictly read-only: no wallet extension calls, no signing.
+  const signingAllowed = !isDemoMode;
 
   // Identity = network + address. `null` when no wallet is connected.
   const identityKey = wallet.identityKey;
@@ -83,6 +124,62 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   // Bumped on every identity change so in-flight async work can detect that
   // it belongs to a previous identity and discard its result.
   const [generation, setGeneration] = useState(0);
+
+  // Explicitly selected read-only addresses for the aggregated portfolio view.
+  // Stored normalized + deduplicated; never used for signing.
+  const [readOnlyAddresses, setReadOnlyAddresses] = useState<string[]>([]);
+
+  const activeAddress = wallet.address;
+
+  const addReadOnlyAddress = useCallback(
+    (address: string) => {
+      const normalized = normalizeWalletAddress(address);
+      if (normalized === "") return;
+      // The active signing wallet is always included implicitly; never store
+      // it as a read-only entry (avoids duplicate attribution).
+      if (
+        activeAddress !== null &&
+        normalizeWalletAddress(activeAddress) === normalized
+      ) {
+        return;
+      }
+      setReadOnlyAddresses((prev) =>
+        prev.includes(normalized) ? prev : [...prev, normalized],
+      );
+    },
+    [activeAddress],
+  );
+
+  const removeReadOnlyAddress = useCallback((address: string) => {
+    const normalized = normalizeWalletAddress(address);
+    if (normalized === "") return;
+    setReadOnlyAddresses((prev) => prev.filter((a) => a !== normalized));
+  }, []);
+
+  const clearReadOnlyAddresses = useCallback(() => {
+    setReadOnlyAddresses([]);
+  }, []);
+
+  const isActiveSigningAddress = useCallback(
+    (address: string | null | undefined) => {
+      if (activeAddress === null || address == null) return false;
+      const normalized = normalizeWalletAddress(address);
+      return (
+        normalized !== "" &&
+        normalized === normalizeWalletAddress(activeAddress)
+      );
+    },
+    [activeAddress],
+  );
+
+  const requireActiveSigningAddress = useCallback(() => {
+    if (activeAddress === null) {
+      throw new Error(
+        "No active signing wallet connected. Connect a wallet to sign transactions.",
+      );
+    }
+    return activeAddress;
+  }, [activeAddress]);
 
   // Track the previous identity/address so we can detect transitions.
   const prevIdentityRef = useRef<string | null>(identityKey);
@@ -101,6 +198,11 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       // 1. Bump the generation so stale in-flight responses are ignored.
       setGeneration((g) => g + 1);
 
+      // 1b. Drop read-only selections on identity change. Aggregation is
+      //     scoped to the current session/account; keeping stale addresses
+      //     would silently mix portfolios across accounts.
+      setReadOnlyAddresses([]);
+
       // 2. Drop every cached SWR entry. Keys are identity-scoped, so nothing
       //    from the previous account/network can be reused.
       void mutate(() => true, undefined, { revalidate: false });
@@ -115,12 +217,22 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     prevAddressRef.current = currAddress;
   }, [identityKey, wallet.address, mutate]);
 
+  // Refuse wallet connection while demo mode is active so no extension call
+  // is ever made from demo state.
+  const connect = useCallback(() => {
+    if (!signingAllowed) {
+      return;
+    }
+    wallet.connect();
+  }, [signingAllowed, wallet]);
+
   // Wrap disconnect to also clear the cache immediately on user action,
   // without waiting for the useEffect to run on the next render cycle.
   const disconnect = useCallback(() => {
     const prevAddress = wallet.address;
     wallet.disconnect();
     setGeneration((g) => g + 1);
+    setReadOnlyAddresses([]);
     void mutate(() => true, undefined, { revalidate: false });
     if (prevAddress !== null) {
       removePersistedStellarTransaction(prevAddress);
@@ -135,11 +247,18 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       isConnecting: wallet.isConnecting,
       error: wallet.error,
       requiredNetworkLabel: wallet.requiredNetworkLabel,
-      connect: wallet.connect,
+      connect,
       disconnect,
       clearError: wallet.clearError,
       identityKey,
       generation,
+      readOnlyAddresses,
+      addReadOnlyAddress,
+      removeReadOnlyAddress,
+      clearReadOnlyAddresses,
+      isActiveSigningAddress,
+      requireActiveSigningAddress,
+      signingAllowed,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -147,11 +266,18 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       wallet.isConnecting,
       wallet.error,
       wallet.requiredNetworkLabel,
-      wallet.connect,
+      connect,
       disconnect,
       wallet.clearError,
       identityKey,
       generation,
+      readOnlyAddresses,
+      addReadOnlyAddress,
+      removeReadOnlyAddress,
+      clearReadOnlyAddresses,
+      isActiveSigningAddress,
+      requireActiveSigningAddress,
+      signingAllowed,
     ],
   );
 
@@ -203,6 +329,47 @@ export function useWalletIdentity(): {
 export function useWalletAddress(): string | undefined {
   const { address } = useWallet();
   return address ?? undefined;
+}
+
+/**
+ * usePortfolioAddresses — returns the addresses to aggregate for the
+ * portfolio view: the active signing wallet (if connected) plus any
+ * explicitly selected read-only addresses.
+ *
+ * The active address is always first so consumers can attribute it as the
+ * signing wallet. Read-only addresses are normalized + deduplicated and never
+ * include the active address.
+ */
+export function usePortfolioAddresses(): {
+  activeAddress: string | null;
+  readOnlyAddresses: string[];
+  allAddresses: string[];
+} {
+  const { address, readOnlyAddresses } = useWallet();
+  const activeAddress = address ?? null;
+  const allAddresses = useMemo(() => {
+    const list = activeAddress ? [activeAddress] : [];
+    for (const addr of readOnlyAddresses) {
+      if (activeAddress && normalizeWalletAddress(addr) === normalizeWalletAddress(activeAddress)) {
+        continue;
+      }
+      list.push(addr);
+    }
+    return list;
+  }, [activeAddress, readOnlyAddresses]);
+  return { activeAddress, readOnlyAddresses, allAddresses };
+}
+
+/**
+ * useWalletSigningAllowed — returns whether wallet signing is permitted.
+ *
+ * False while demo mode is active. Signing flows should check this and show a
+ * clear "exit demo mode" message instead of invoking the wallet extension.
+ */
+export function useWalletSigningAllowed(): boolean {
+  const { signingAllowed } = useWallet();
+  return signingAllowed;
+}
 }
 
 // Re-export the state type so consumers don't need to import from the hook.

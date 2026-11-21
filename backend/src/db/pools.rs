@@ -112,6 +112,33 @@ pub struct PoolWithOdds {
     pub odds: Vec<OutcomeOdds>,
 }
 
+/// Reserve / share state required to produce a deterministic market quote.
+///
+/// This is the raw snapshot the quote handler needs: the per-outcome reserves
+/// (stakes), the total shares outstanding, the pool lifecycle status, and the
+/// timestamp the snapshot was last updated. The handler is responsible for
+/// rejecting stale (`last_updated` too old) or unsupported (`status` not
+/// `"active"`) snapshots before computing a quote.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolQuoteState {
+    pub pool_id: i64,
+    /// Per-outcome reserves, ordered by `outcome`.
+    pub reserves: Vec<OutcomeReserve>,
+    /// Total shares outstanding across all outcomes.
+    pub total_shares: i64,
+    /// Pool lifecycle status (`"active"`, `"closed"`, `"settled"`).
+    pub status: String,
+    /// When the reserve/share snapshot was last updated.
+    pub last_updated: DateTime<Utc>,
+}
+
+/// A single outcome's reserve within a [`PoolQuoteState`] snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutcomeReserve {
+    pub outcome: i32,
+    pub reserve: i64,
+}
+
 /// Aggregate creator reputation / reward-eligibility metrics.
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
 pub struct CreatorStats {
@@ -154,6 +181,14 @@ pub struct PoolCreatedEvent {
 struct OutcomeStakeRow {
     outcome: i32,
     total_stake: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct PoolQuoteStateRow {
+    pool_id: i64,
+    state: String,
+    total_stake: i64,
+    updated_at: DateTime<Utc>,
 }
 
 // ── Column list shared by template queries ────────────────────────────────────
@@ -300,6 +335,58 @@ pub async fn get_pool_outcome_stakes(
         .collect())
 }
 
+/// Fetch the reserve / share snapshot needed to produce a deterministic quote.
+///
+/// Returns `None` when the pool does not exist. The returned snapshot carries
+/// the per-outcome reserves, the total shares outstanding, the pool lifecycle
+/// status, and the timestamp the snapshot was last updated. Callers (the quote
+/// handler) must reject snapshots whose `status` is not `"active"` or whose
+/// `last_updated` is older than the configured staleness window.
+///
+/// The total shares are resolved the same way as [`get_pool_with_odds`]: the
+/// derived sum from `predictions` wins when it exceeds the denormalised
+/// `pools.total_stake` cache, so quotes agree with displayed odds.
+pub async fn get_pool_quote_state(
+    pool: &PgPool,
+    pool_id: i64,
+) -> Result<Option<PoolQuoteState>, sqlx::Error> {
+    let started = Instant::now();
+
+    let row = sqlx::query_as::<_, PoolQuoteStateRow>(
+        r#"
+        SELECT pool_id, state, total_stake, updated_at
+        FROM pools
+        WHERE pool_id = $1
+        "#,
+    )
+    .bind(pool_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let outcome_stakes = get_pool_outcome_stakes(pool, pool_id).await?;
+    let calculated_total: i64 = outcome_stakes.iter().map(|(_, s)| s).sum();
+    let total_shares = std::cmp::max(row.total_stake, calculated_total);
+
+    let reserves = outcome_stakes
+        .into_iter()
+        .map(|(outcome, reserve)| OutcomeReserve { outcome, reserve })
+        .collect();
+
+    observe_read_budget("pools.quote", 2, started.elapsed().as_millis() as u64);
+
+    Ok(Some(PoolQuoteState {
+        pool_id: row.pool_id,
+        reserves,
+        total_shares,
+        status: row.state,
+        last_updated: row.updated_at,
+    }))
+}
+
 /// Fetch a pool's full detail joined with real-time odds for each outcome.
 ///
 /// Returns `None` when the pool does not exist.
@@ -333,6 +420,129 @@ pub async fn get_pool_with_odds(
         result: details.result,
         odds,
     }))
+}
+
+// ── Portfolio export queries (#265) ──────────────────────────────────────────
+//
+// These back the versioned JSON portfolio export. They are additive: the CSV
+// export paths are untouched. Both queries are bounded and cursor-paginated so
+// the caller can emit explicit truncation / continuation metadata.
+
+/// A single position row for the portfolio JSON export, including the source
+/// references (pool, originating event, transaction) and the calculation
+/// metadata (stake, payout, fee, rounding) needed to reproduce the numbers.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct PortfolioPositionExportRow {
+    pub position_id: i64,
+    pub pool_id: i64,
+    pub outcome: i32,
+    pub stake: i64,
+    pub payout: i64,
+    pub fee: i64,
+    pub rounding: i64,
+    pub source_event_id: Option<i64>,
+    pub tx_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A single ledger entry row for the portfolio JSON export.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct PortfolioLedgerExportRow {
+    pub entry_id: i64,
+    pub pool_id: Option<i64>,
+    pub entry_type: String,
+    pub amount: i64,
+    pub fee: i64,
+    pub rounding: i64,
+    pub source_event_id: Option<i64>,
+    pub tx_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Fetch one bounded page of a wallet's positions for the JSON export.
+///
+/// Cursor pagination is by ascending `position_id`: pass `after_id = None` for
+/// the first page, then the last returned `position_id` for subsequent pages.
+/// At most `limit` rows are returned; callers detect truncation by comparing
+/// the returned length against `limit` (or by fetching `limit + 1`).
+#[instrument(skip(pool), name = "db.get_portfolio_positions_for_export",
+    fields(wallet = %wallet, limit = limit, after_id = ?after_id))]
+pub async fn get_portfolio_positions_for_export(
+    pool: &PgPool,
+    wallet: &str,
+    limit: i64,
+    after_id: Option<i64>,
+) -> Result<Vec<PortfolioPositionExportRow>, sqlx::Error> {
+    sqlx::query_as::<_, PortfolioPositionExportRow>(
+        r#"
+        SELECT position_id, pool_id, outcome, stake, payout, fee, rounding,
+               source_event_id, tx_hash, created_at
+        FROM positions
+        WHERE wallet = $1
+          AND ($2::bigint IS NULL OR position_id > $2)
+        ORDER BY position_id ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(wallet)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Fetch one bounded page of a wallet's ledger entries for the JSON export.
+///
+/// Cursor pagination is by ascending `entry_id`, mirroring
+/// [`get_portfolio_positions_for_export`].
+#[instrument(skip(pool), name = "db.get_portfolio_ledger_for_export",
+    fields(wallet = %wallet, limit = limit, after_id = ?after_id))]
+pub async fn get_portfolio_ledger_for_export(
+    pool: &PgPool,
+    wallet: &str,
+    limit: i64,
+    after_id: Option<i64>,
+) -> Result<Vec<PortfolioLedgerExportRow>, sqlx::Error> {
+    sqlx::query_as::<_, PortfolioLedgerExportRow>(
+        r#"
+        SELECT entry_id, pool_id, entry_type, amount, fee, rounding,
+               source_event_id, tx_hash, created_at
+        FROM ledger_entries
+        WHERE wallet = $1
+          AND ($2::bigint IS NULL OR entry_id > $2)
+        ORDER BY entry_id ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(wallet)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Total number of positions and ledger entries for a wallet.
+///
+/// Returned as `(positions, ledger_entries)` so the export can state whether a
+/// bounded page was truncated and how much remains.
+#[instrument(skip(pool), name = "db.count_portfolio_export_rows", fields(wallet = %wallet))]
+pub async fn count_portfolio_export_rows(
+    pool: &PgPool,
+    wallet: &str,
+) -> Result<(i64, i64), sqlx::Error> {
+    let positions: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM positions WHERE wallet = $1")
+            .bind(wallet)
+            .fetch_one(pool)
+            .await?;
+
+    let ledger: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM ledger_entries WHERE wallet = $1")
+            .bind(wallet)
+            .fetch_one(pool)
+            .await?;
+
+    Ok((positions.0, ledger.0))
 }
 
 // ── Write queries ─────────────────────────────────────────────────────────────
@@ -948,5 +1158,52 @@ mod tests {
         details.result = Some("1".to_string());
         assert_eq!(details.state, "settled");
         assert_eq!(details.result.as_deref(), Some("1"));
+    }
+
+    // ── Portfolio JSON export rows (#265) ─────────────────────────────────────
+
+    #[test]
+    fn portfolio_position_export_row_serializes_source_and_calculation_metadata() {
+        let row = PortfolioPositionExportRow {
+            position_id: 7,
+            pool_id: 42,
+            outcome: 1,
+            stake: 1_000,
+            payout: 2_000,
+            fee: 20,
+            rounding: -1,
+            source_event_id: Some(99),
+            tx_hash: Some("abc123".to_string()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&row).expect("row must serialize");
+        assert_eq!(json["pool_id"], 42);
+        assert_eq!(json["source_event_id"], 99);
+        assert_eq!(json["tx_hash"], "abc123");
+        assert_eq!(json["stake"], 1_000);
+        assert_eq!(json["payout"], 2_000);
+        assert_eq!(json["fee"], 20);
+        assert_eq!(json["rounding"], -1);
+    }
+
+    #[test]
+    fn portfolio_ledger_export_row_serializes_source_and_calculation_metadata() {
+        let row = PortfolioLedgerExportRow {
+            entry_id: 3,
+            pool_id: None,
+            entry_type: "deposit".to_string(),
+            amount: 500,
+            fee: 0,
+            rounding: 0,
+            source_event_id: None,
+            tx_hash: Some("def456".to_string()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&row).expect("row must serialize");
+        assert_eq!(json["entry_type"], "deposit");
+        assert!(json["pool_id"].is_null());
+        assert!(json["source_event_id"].is_null());
+        assert_eq!(json["tx_hash"], "def456");
+        assert_eq!(json["amount"], 500);
     }
 }

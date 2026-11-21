@@ -4,6 +4,8 @@ import { DM_Mono } from "next/font/google";
 import "./globals.css";
 import { SWRProvider } from "@/components/providers/SWRProvider";
 import { NetworkGuardProvider } from "@/components/providers/NetworkGuardProvider";
+import { DemoModeProvider } from "@/components/providers/DemoModeProvider";
+import { OnboardingWalkthrough } from "@/components/onboarding/OnboardingWalkthrough";
 import { ToastProvider, SkipLink, LiveRegionProvider } from "@/components/ui";
 import { WalletProvider, ThemeProvider } from "@/lib/context";
 
@@ -90,7 +92,12 @@ export default async function RootLayout({
             <ThemeProvider>
               <NetworkGuardProvider>
                 <LiveRegionProvider>
-                  <ToastProvider>{children}</ToastProvider>
+                  <DemoModeProvider>
+                    <ToastProvider>{children}</ToastProvider>
+                    {/* First-visit walkthrough: sample data only, never
+                        requests a wallet connection or signs anything. */}
+                    <OnboardingWalkthrough />
+                  </DemoModeProvider>
                 </LiveRegionProvider>
               </NetworkGuardProvider>
             </ThemeProvider>

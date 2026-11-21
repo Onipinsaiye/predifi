@@ -159,6 +159,16 @@ pub const CLAIM_WINDOW_LEDGERS: u32 = 90 * DAY_IN_LEDGERS;
 /// **Used for:** Setting the TTL on temporary storage entries.
 pub const TEMPORARY_ENTRY_TTL_LEDGERS: u32 = DAY_IN_LEDGERS;
 
+/// Post-resolution retention window for claimable pool data, in seconds.
+///
+/// After a pool reaches a terminal state (`Resolved`, `Canceled`, or
+/// `NoContest`) its persistent entries (pool record, outcome stakes, claim
+/// flags) are kept alive for at least this long so participants can still claim
+/// winnings or refunds during the promised window. After it elapses the
+/// entries become eligible for archival/TTL expiry. Matches the default
+/// claim window (`Config.claim_window_seconds`, 30 days).
+pub const RETENTION_CLAIM_WINDOW: u64 = 2_592_000;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // POOL CONFIGURATION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -895,6 +905,140 @@ pub const MAX_CHALLENGE_WINDOW: u64 = 604_800;
 /// Maximum byte length of a challenge `evidence_uri`.
 pub const MAX_EVIDENCE_URI_LEN: u32 = 512;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// LIQUIDITY SHARE ACCOUNTING CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## Share model
+//
+// Liquidity providers hold integer `shares` of a market's liquidity pool. The
+// mapping between contributed assets and shares is the standard proportional
+// (ERC-4626 style) model:
+//
+//   * First deposit: `shares = assets * SHARE_SCALE` (bootstrap).
+//   * Subsequent deposits: `shares = floor(assets * total_shares / total_assets)`.
+//   * Withdrawals: `assets = floor(shares * total_assets / total_shares)`.
+//
+// All divisions round **down** in favour of the pool, so the invariant
+// `total_assets >= ceil(total_shares * price)` is never violated by rounding
+// and the sum of all provider claims can never exceed escrowed assets.
+// Rounding remainders stay in the pool and accrue to remaining providers.
+//
+// ## Solvency invariant
+//
+// At every accounting transition the contract MUST maintain:
+//
+//     total_assets >= sum(provider_claims) + retained_remainder
+//
+// and the pool's tracked liabilities MUST remain bounded by the escrowed
+// token balance held by the contract for that market.
+
+/// Fixed-point scaling factor applied to shares minted on the first deposit.
+///
+/// **Units:** Dimensionless multiplier (shares per base unit of asset)
+/// **Value:** 1,000,000,000 (1e9)
+///
+/// **Rationale:** The very first deposit has no prior `total_shares` to divide
+/// by, so shares are minted as `assets * SHARE_SCALE`. A large scale factor
+/// gives sub-base-unit share precision, so later proportional deposits and
+/// partial withdrawals do not lose meaningful precision to integer division.
+/// It also makes share balances comfortably larger than asset balances,
+/// reducing the chance that a dust deposit mints zero shares.
+///
+/// **Impact of changes:**
+/// - Increasing this value increases share precision but raises the risk of
+///   `shares * total_assets` overflowing `i128` for very large pools; the
+///   multiplication is checked and rejected on overflow.
+/// - Decreasing this value reduces precision and increases rounding dust that
+///   is retained by the pool on proportional deposits.
+/// - Must be a power of ten so off-chain tooling can convert shares to assets
+///   with exact decimal arithmetic.
+///
+/// **Used for:** Minting shares on the first liquidity deposit.
+pub const SHARE_SCALE: i128 = 1_000_000_000;
+
+/// Minimum liquidity deposit accepted by `deposit_liquidity`.
+///
+/// **Units:** Token base units (stroops for native XLM)
+/// **Value:** 1 base unit
+///
+/// **Rationale:** A deposit of zero (or a negative amount) is meaningless and
+/// would let callers spam events and storage writes without contributing
+/// capital. Requiring at least one base unit rejects zero-value deposits while
+/// keeping the protocol permissionless for small providers. Per-market minimums
+/// may be configured higher via market configuration.
+///
+/// **Impact of changes:**
+/// - Increasing this value would reject dust deposits globally, reducing spam
+///   but excluding small providers.
+/// - Decreasing this value is not possible (cannot go below 1).
+/// - Must be `<= MAX_LIQUIDITY_DEPOSIT` or no deposit could ever succeed.
+///
+/// **Used for:** Rejecting zero-value deposits (`ZeroLiquidityAmount`).
+pub const MIN_LIQUIDITY_DEPOSIT: i128 = 1;
+
+/// Maximum liquidity deposit accepted in a single `deposit_liquidity` call.
+///
+/// **Units:** Token base units (stroops for native XLM)
+/// **Value:** 100,000,000,000,000 base units
+/// **Equivalent:** 100,000,000 tokens at 7 decimal places
+///
+/// **Rationale:** Bounds the size of a single deposit so that the share-mint
+/// arithmetic (`assets * total_shares`) stays far below `i128::MAX` and so that
+/// no single transaction can dominate a market's liquidity. It matches
+/// `MAX_INITIAL_LIQUIDITY`, keeping the bootstrap and top-up paths consistent.
+///
+/// **Impact of changes:**
+/// - Increasing this value allows larger single deposits but shrinks the
+///   overflow headroom of the share-mint multiplication.
+/// - Decreasing this value forces large providers to split deposits across
+///   multiple transactions.
+/// - Must be `>= MIN_LIQUIDITY_DEPOSIT`.
+///
+/// **Used for:** Rejecting oversized deposits (`LiquidityDepositTooLarge`).
+pub const MAX_LIQUIDITY_DEPOSIT: i128 = 100_000_000_000_000;
+
+/// Maximum number of share lots processed in a single `withdraw_liquidity` call.
+///
+/// **Units:** Count (dimensionless)
+/// **Value:** 1 (single provider position per call)
+///
+/// **Rationale:** Withdrawals are executed against a single provider position,
+/// so the work per call is already O(1). This constant pins that bound so that
+/// any future batching of withdrawals must be introduced deliberately, with a
+/// re-run of the liquidity benchmarks, rather than by silently growing the
+/// per-transaction work of the existing entry point.
+///
+/// **Impact of changes:**
+/// - Increasing this value would allow batched withdrawals but raises the
+///   per-transaction CPU/memory cost and the number of token transfers.
+/// - Must remain `>= 1` so a single withdrawal is always possible.
+///
+/// **Used for:** Capping execution work in `withdraw_liquidity`.
+pub const MAX_WITHDRAW_SHARE_LOTS: u32 = 1;
+
+/// Maximum age, in seconds, of a liquidity quote used for deposit/withdraw sizing.
+///
+/// **Units:** Seconds
+/// **Value:** 300 seconds (5 minutes)
+///
+/// **Rationale:** Off-chain quotes that estimate shares for a given asset
+/// amount can go stale as other providers deposit or withdraw. Rejecting quotes
+/// older than this window prevents users from acting on materially outdated
+/// share prices while still allowing normal client latency and ledger close
+/// times. It is intentionally short relative to pool durations.
+///
+/// **Impact of changes:**
+/// - Increasing this value tolerates slower clients but increases the chance
+///   that a quote no longer reflects the pool's current share price.
+/// - Decreasing this value tightens freshness but may reject legitimate
+///   transactions during network congestion.
+/// - Must be greater than zero.
+///
+/// **Used for:** Validating quote freshness on liquidity operations
+/// (`StaleLiquidityQuote`).
+pub const LIQUIDITY_QUOTE_STALENESS_SECONDS: u64 = 300;
+
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 mod tests {
@@ -1067,6 +1211,36 @@ mod tests {
     #[test]
     fn test_no_contest_fee_bps_within_bounds() {
         assert!(NO_CONTEST_FEE_BPS <= MAX_TOLERANCE);
+    }
+
+    #[test]
+    fn test_liquidity_deposit_bounds_are_consistent() {
+        assert!(MIN_LIQUIDITY_DEPOSIT > 0);
+        assert!(MAX_LIQUIDITY_DEPOSIT >= MIN_LIQUIDITY_DEPOSIT);
+        // A single deposit must never exceed the aggregate pool cap.
+        assert!(MAX_LIQUIDITY_DEPOSIT <= MAX_AGGREGATE_STAKE_PER_POOL);
+    }
+
+    #[test]
+    fn test_share_scale_is_power_of_ten() {
+        assert!(SHARE_SCALE > 0);
+        let mut v = SHARE_SCALE;
+        while v > 1 {
+            assert_eq!(v % 10, 0);
+            v /= 10;
+        }
+        assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn test_withdraw_share_lots_is_bounded() {
+        assert!(MAX_WITHDRAW_SHARE_LOTS >= 1);
+        assert!(MAX_WITHDRAW_SHARE_LOTS <= 100);
+    }
+
+    #[test]
+    fn test_liquidity_quote_staleness_is_positive() {
+        assert!(LIQUIDITY_QUOTE_STALENESS_SECONDS > 0);
     }
 
     #[test]
