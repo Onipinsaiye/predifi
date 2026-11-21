@@ -6,7 +6,8 @@
 //! rejection handling.
 
 use crate::constants::{
-    MAX_INTERESTS_PER_USER, MAX_INTEREST_LEN, MAX_NOTIFICATION_IDS, MAX_TAGS_PER_POOL, MAX_TAG_LEN,
+    MAX_INTERESTS_PER_USER, MAX_INTEREST_LEN, MAX_NOTIFICATION_IDS, MAX_PORTFOLIO_WALLETS,
+    MAX_TAGS_PER_POOL, MAX_TAG_LEN,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -239,6 +240,183 @@ impl<'de> Deserialize<'de> for StellarAddress {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let s = String::deserialize(de)?;
         StellarAddress::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+// ── PortfolioWalletList ───────────────────────────────────────────────────────
+
+/// A bounded, normalized, de-duplicated list of read-only wallet addresses
+/// selected for a consolidated portfolio view.
+///
+/// Addresses are normalized to canonical uppercase StrKey form and duplicates
+/// (including case/whitespace variants of the same address) are collapsed,
+/// preserving first-seen order. These wallets are read-only: they are never
+/// used to authorize mutations, which always require the active signing wallet.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PortfolioWalletList(Vec<StellarAddress>);
+
+impl PortfolioWalletList {
+    /// Build a validated wallet list from raw address strings.
+    pub fn new<I, S>(addresses: I) -> Result<Self, ValidationError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut wallets: Vec<StellarAddress> = Vec::new();
+        for raw in addresses {
+            let normalized = normalize_wallet_address(raw.as_ref())?;
+            if wallets.iter().any(|w| w.as_str() == normalized) {
+                continue;
+            }
+            if wallets.len() >= MAX_PORTFOLIO_WALLETS {
+                return Err(ValidationError(format!(
+                    "too many wallets: at most {MAX_PORTFOLIO_WALLETS} allowed"
+                )));
+            }
+            wallets.push(StellarAddress(normalized));
+        }
+        Ok(Self(wallets))
+    }
+
+    /// The normalized, de-duplicated addresses in first-seen order.
+    pub fn as_slice(&self) -> &[StellarAddress] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `address` (any case/whitespace variant) is part of this view.
+    pub fn contains(&self, address: &str) -> bool {
+        match normalize_wallet_address(address) {
+            Ok(normalized) => self.0.iter().any(|w| w.as_str() == normalized),
+            Err(_) => false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PortfolioWalletList {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = Vec::<String>::deserialize(de)?;
+        PortfolioWalletList::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Per-wallet attribution entry in a consolidated portfolio response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortfolioWalletSummary {
+    /// The wallet this entry's figures belong to (canonical StrKey form).
+    pub address: StellarAddress,
+    /// Number of pools this wallet participates in.
+    pub pool_count: i64,
+    /// Total contributed amount attributed to this wallet, in stroops.
+    pub contributed_stroops: i64,
+    /// Total amount this wallet has received back, in stroops.
+    pub received_stroops: i64,
+}
+
+/// Aggregated multi-wallet portfolio response with per-wallet attribution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortfolioAggregateResponse {
+    /// The active signing wallet; the only account permitted to authorize
+    /// mutations. May or may not be part of `wallets`.
+    pub active_wallet: StellarAddress,
+    /// Per-wallet attribution, in the order the wallets were selected.
+    pub wallets: Vec<PortfolioWalletSummary>,
+    /// Sum of `pool_count` across all wallets.
+    pub total_pool_count: i64,
+    /// Sum of `contributed_stroops` across all wallets.
+    pub total_contributed_stroops: i64,
+    /// Sum of `received_stroops` across all wallets.
+    pub total_received_stroops: i64,
+}
+
+// ── Account data export / deletion ───────────────────────────────────────────
+
+/// Scope of an account data export or deletion request.
+///
+/// Only off-chain private records are eligible; on-chain history is immutable
+/// and is never exported or deleted by these flows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountDataScope {
+    /// Off-chain profile fields (display name, bio, interests, …).
+    Profile,
+    /// Off-chain notification records and preferences.
+    Notifications,
+    /// All eligible off-chain private records.
+    All,
+}
+
+impl AccountDataScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountDataScope::Profile => "profile",
+            AccountDataScope::Notifications => "notifications",
+            AccountDataScope::All => "all",
+        }
+    }
+
+    /// Whether this scope includes off-chain profile fields.
+    pub fn includes_profile(self) -> bool {
+        matches!(self, AccountDataScope::Profile | AccountDataScope::All)
+    }
+
+    /// Whether this scope includes off-chain notification records.
+    pub fn includes_notifications(self) -> bool {
+        matches!(self, AccountDataScope::Notifications | AccountDataScope::All)
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountDataScope {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        match s.as_str() {
+            "profile" => Ok(AccountDataScope::Profile),
+            "notifications" => Ok(AccountDataScope::Notifications),
+            "all" => Ok(AccountDataScope::All),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid scope '{other}': must be one of profile, notifications, all"
+            ))),
+        }
+    }
+}
+
+/// Request body for exporting a user's off-chain account data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountDataExportRequest {
+    /// Which off-chain records to include in the export.
+    pub scope: AccountDataScope,
+}
+
+/// Request body for deleting a user's off-chain account data.
+///
+/// Deletion is destructive, so the caller must echo back the exact
+/// confirmation token issued for the request; a mismatch is rejected before
+/// any record is touched.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountDataDeletionRequest {
+    /// Which off-chain records to delete.
+    pub scope: AccountDataScope,
+    /// Confirmation token that must match the issued token exactly.
+    pub confirmation_token: NonEmptyString,
+}
+
+impl AccountDataDeletionRequest {
+    /// Verify that the supplied confirmation token matches the expected one.
+    pub fn verify_confirmation(&self, expected: &str) -> Result<(), ValidationError> {
+        if self.confirmation_token.as_str() == expected {
+            Ok(())
+        } else {
+            Err(ValidationError(
+                "confirmation token does not match".to_string(),
+            ))
+        }
     }
 }
 
@@ -582,5 +760,64 @@ mod tests {
         assert!(TemplateSeconds::new(max).is_ok());
         assert!(TemplateSeconds::new(max + 1).is_err());
         assert!(TemplateSeconds::new(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn portfolio_wallet_list_normalizes_and_dedupes() {
+        let a = valid_strkey(STRKEY_VERSION_ACCOUNT_ID, 0x11);
+        let b = valid_strkey(STRKEY_VERSION_ACCOUNT_ID, 0x22);
+        let list = PortfolioWalletList::new([
+            format!("  {}  ", a.to_ascii_lowercase()),
+            a.clone(),
+            b.clone(),
+        ])
+        .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.as_slice()[0].as_str(), a);
+        assert_eq!(list.as_slice()[1].as_str(), b);
+        assert!(list.contains(&a.to_ascii_lowercase()));
+        assert!(!list.contains(&valid_strkey(STRKEY_VERSION_ACCOUNT_ID, 0x33)));
+    }
+
+    #[test]
+    fn portfolio_wallet_list_rejects_invalid_and_oversized() {
+        assert!(PortfolioWalletList::new(["not-an-address"]).is_err());
+        let addrs: Vec<String> = (0..=MAX_PORTFOLIO_WALLETS)
+            .map(|i| valid_strkey(STRKEY_VERSION_ACCOUNT_ID, i as u8))
+            .collect();
+        assert!(PortfolioWalletList::new(addrs).is_err());
+    }
+
+    #[test]
+    fn portfolio_wallet_list_deserializes_from_json() {
+        let a = valid_strkey(STRKEY_VERSION_ACCOUNT_ID, 0x44);
+        let json = format!("[\"{}\",\"{}\"]", a, a.to_ascii_lowercase());
+        let list: PortfolioWalletList = serde_json::from_str(&json).unwrap();
+        assert_eq!(list.len(), 1);
+        let bad: Result<PortfolioWalletList, _> = serde_json::from_str("[\"nope\"]");
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn account_data_scope_parses_and_reports_inclusions() {
+        let v: AccountDataScope = serde_json::from_str("\"all\"").unwrap();
+        assert_eq!(v, AccountDataScope::All);
+        assert!(v.includes_profile() && v.includes_notifications());
+        let p: AccountDataScope = serde_json::from_str("\"profile\"").unwrap();
+        assert!(p.includes_profile() && !p.includes_notifications());
+        assert!(serde_json::from_str::<AccountDataScope>("\"chain\"").is_err());
+    }
+
+    #[test]
+    fn account_data_deletion_requires_matching_confirmation() {
+        let req: AccountDataDeletionRequest = serde_json::from_str(
+            "{\"scope\":\"profile\",\"confirmation_token\":\"tok-123\"}",
+        )
+        .unwrap();
+        assert!(req.verify_confirmation("tok-123").is_ok());
+        assert!(req.verify_confirmation("tok-999").is_err());
+        let blank: Result<AccountDataDeletionRequest, _> =
+            serde_json::from_str("{\"scope\":\"profile\",\"confirmation_token\":\"  \"}");
+        assert!(blank.is_err());
     }
 }
