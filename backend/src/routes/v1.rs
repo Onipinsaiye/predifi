@@ -2311,6 +2311,109 @@ pub async fn reset_notification_preferences_handler(
     }
 }
 
+/// Query parameters for `GET /api/v1/notifications/digest/unsubscribe`.
+#[derive(Debug, Deserialize)]
+pub struct DigestUnsubscribeQuery {
+    /// Signed, single-use unsubscribe token from the digest email footer.
+    pub token: String,
+}
+
+/// `GET /api/v1/notifications/digest/unsubscribe?token=...` — one-click
+/// opt-out from the weekly market digest.
+///
+/// The token is signed with the server secret and bound to the wallet, so it
+/// can be redeemed without a bearer token (mail clients cannot send one).
+/// Redemption is single-use: once consumed the token is rejected, and expired
+/// tokens are rejected before any state is touched. On success the wallet's
+/// digest preference is disabled and a confirmation is returned.
+pub async fn digest_unsubscribe_handler(
+    State(state): State<AppState>,
+    Query(params): Query<DigestUnsubscribeQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let claims = match crate::notifications::verify_digest_unsubscribe_token(
+        &params.token,
+        &state.config.secret_key,
+        now,
+    ) {
+        Ok(claims) => claims,
+        Err(crate::notifications::DigestTokenError::Expired) => {
+            return ApiResponse::<()>::error(
+                StatusCode::GONE,
+                error_codes::INVALID_INPUT,
+                "unsubscribe link has expired",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::DigestTokenError::Invalid) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "invalid unsubscribe token",
+            )
+            .into_response()
+        }
+    };
+
+    // Single-use enforcement: the token id is recorded in the revocation
+    // store, so a replayed link fails closed even across replicas.
+    let store = crate::token_revocation::RevocationStore::new(state.db.clone(), state.redis.clone());
+    match store.consume_digest_unsubscribe_token(&claims.jti, claims.exp, now).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return ApiResponse::<()>::error(
+                StatusCode::GONE,
+                error_codes::INVALID_INPUT,
+                "unsubscribe link has already been used",
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "digest unsubscribe token check failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to redeem unsubscribe token",
+            )
+            .into_response();
+        }
+    }
+
+    match crate::notifications::disable_digest_for_wallet(db, &claims.sub).await {
+        Ok(preferences) => ApiResponse::success(json!({
+            "status": "unsubscribed",
+            "address": claims.sub,
+            "digest": preferences.digest,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "digest unsubscribe failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to update digest preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
 /// `PUT /api/v1/notifications/:address/push-subscription` — create or rotate
 /// a browser push subscription after proving ownership of the wallet.
 pub async fn put_push_subscription_handler(
@@ -2647,6 +2750,10 @@ pub fn router(
                     )),
             )
             .route("/notifications/:address", get(list_notifications_handler))
+            .route(
+                "/notifications/digest/unsubscribe",
+                get(digest_unsubscribe_handler),
+            )
             .route(
                 "/notifications/:address/push-subscription",
                 put(put_push_subscription_handler)

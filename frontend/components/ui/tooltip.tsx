@@ -44,20 +44,48 @@ export interface TooltipProps {
   side?: "top" | "right" | "bottom" | "left";
   delayDuration?: number;
   showArrow?: boolean;
+  /**
+   * When true, the tooltip content is also exposed as an accessible
+   * description of the trigger via `aria-describedby`, so screen readers
+   * announce it on focus (not just on hover). Keyboard focus opens the
+   * tooltip, and the content remains reachable without a pointer.
+   */
+  asDescription?: boolean;
+  /** Optional id for the description element (auto-generated if omitted). */
+  descriptionId?: string;
 }
 
 const Tooltip = React.forwardRef<HTMLButtonElement, TooltipProps>(
   (
-    { content, children, side = "top", delayDuration = 200, showArrow = true },
+    {
+      content,
+      children,
+      side = "top",
+      delayDuration = 200,
+      showArrow = true,
+      asDescription = false,
+      descriptionId,
+    },
     ref
   ) => {
+    const generatedId = React.useId();
+    const contentId = descriptionId ?? `tooltip-${generatedId}`;
+
+    const trigger = asDescription ? (
+      <TooltipTrigger ref={ref} asChild aria-describedby={contentId}>
+        {children}
+      </TooltipTrigger>
+    ) : (
+      <TooltipTrigger ref={ref} asChild>
+        {children}
+      </TooltipTrigger>
+    );
+
     return (
       <TooltipProvider delayDuration={delayDuration}>
         <TooltipRoot>
-          <TooltipTrigger ref={ref} asChild>
-            {children}
-          </TooltipTrigger>
-          <TooltipContent side={side}>
+          {trigger}
+          <TooltipContent side={side} id={asDescription ? contentId : undefined}>
             {content}
             {showArrow && <TooltipArrow />}
           </TooltipContent>
