@@ -159,6 +159,16 @@ pub const CLAIM_WINDOW_LEDGERS: u32 = 90 * DAY_IN_LEDGERS;
 /// **Used for:** Setting the TTL on temporary storage entries.
 pub const TEMPORARY_ENTRY_TTL_LEDGERS: u32 = DAY_IN_LEDGERS;
 
+/// Post-resolution retention window for claimable pool data, in seconds.
+///
+/// After a pool reaches a terminal state (`Resolved`, `Canceled`, or
+/// `NoContest`) its persistent entries (pool record, outcome stakes, claim
+/// flags) are kept alive for at least this long so participants can still claim
+/// winnings or refunds during the promised window. After it elapses the
+/// entries become eligible for archival/TTL expiry. Matches the default
+/// claim window (`Config.claim_window_seconds`, 30 days).
+pub const RETENTION_CLAIM_WINDOW: u64 = 2_592_000;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // POOL CONFIGURATION CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════

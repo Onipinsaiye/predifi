@@ -1556,8 +1556,8 @@ impl PredifiContract {
         Self::extend_persistent(&env, &pool_key);
 
         match pool.state {
-            MarketState::Active | MarketState::Locked | MarketState::Disputed => None,
-            MarketState::Resolved | MarketState::Canceled => {
+            MarketState::Active | MarketState::Disputed => None,
+            MarketState::Resolved | MarketState::Canceled | MarketState::NoContest => {
                 let base = pool.resolution_timestamp.unwrap_or(pool.end_time);
                 Some(base.saturating_add(crate::RETENTION_CLAIM_WINDOW))
             }
