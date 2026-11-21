@@ -206,6 +206,133 @@ pub struct FeeTier {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Liquidity-provider accounting (RFC #268)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Share model: an LP pool holds `total_assets` (tokens) and `total_shares`.
+// A deposit of `amount` mints `floor(amount * total_shares / total_assets)`
+// shares (or `amount` shares when the pool is empty). A withdrawal of `shares`
+// returns `floor(shares * total_assets / total_shares)` tokens.
+//
+// Conservation invariants (see RFC #268):
+//   LP-1  Σ minted shares == total_shares
+//   LP-2  Σ withdrawn tokens ≤ total_assets
+//   LP-3  total_assets == deposits - withdrawals + fees_accrued - losses
+//   LP-4  every rounding step floors, so the pool never pays out more than it
+//         holds (dust accrues to remaining LPs, never to the protocol).
+
+/// Shares minted for a deposit into an LP pool.
+///
+/// # Rounding: floor (favors the pool / existing LPs)
+/// `shares = amount * total_shares / total_assets`
+///
+/// When the pool is empty (`total_assets == 0` or `total_shares == 0`) the
+/// deposit is 1:1 and `shares == amount`.
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+/// Returns `Err(MathError::Overflow)` on i128 overflow.
+pub fn lp_shares_for_deposit(
+    amount: i128,
+    total_assets: i128,
+    total_shares: i128,
+) -> Result<i128, MathError> {
+    if amount < 0 || total_assets < 0 || total_shares < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    if amount == 0 {
+        return Ok(0);
+    }
+    if total_assets == 0 || total_shares == 0 {
+        return Ok(amount); // bootstrap: 1:1
+    }
+    let numerator = amount.checked_mul(total_shares).ok_or(MathError::Overflow)?;
+    Ok(numerator / total_assets) // floor division
+}
+
+/// Tokens returned for burning `shares` from an LP pool.
+///
+/// # Rounding: floor (favors the pool / remaining LPs)
+/// `assets = shares * total_assets / total_shares`
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+/// Returns `Err(MathError::DivisionByZero)` when `total_shares == 0` and
+/// `shares > 0`.
+/// Returns `Err(MathError::Overflow)` on i128 overflow.
+pub fn lp_assets_for_withdrawal(
+    shares: i128,
+    total_assets: i128,
+    total_shares: i128,
+) -> Result<i128, MathError> {
+    if shares < 0 || total_assets < 0 || total_shares < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    if shares == 0 {
+        return Ok(0);
+    }
+    if total_shares == 0 {
+        return Err(MathError::DivisionByZero);
+    }
+    let numerator = shares.checked_mul(total_assets).ok_or(MathError::Overflow)?;
+    Ok(numerator / total_shares) // floor division
+}
+
+/// Accrue a fee into the LP pool, increasing assets without minting shares.
+///
+/// # Rounding: exact (no new rounding)
+/// `new_total_assets = total_assets + fee`
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+/// Returns `Err(MathError::Overflow)` on i128 overflow.
+pub fn lp_accrue_fee(total_assets: i128, fee: i128) -> Result<i128, MathError> {
+    if total_assets < 0 || fee < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    total_assets.checked_add(fee).ok_or(MathError::Overflow)
+}
+
+/// Allocate a loss across the LP pool by reducing `total_assets`.
+///
+/// Losses are socialised pro-rata via the share price: `total_shares` is
+/// unchanged, so each share is worth less. A loss larger than the pool is
+/// clamped to the pool balance (LPs cannot lose more than they deposited).
+///
+/// # Rounding: exact (no new rounding)
+/// `new_total_assets = max(total_assets - loss, 0)`
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+pub fn lp_allocate_loss(total_assets: i128, loss: i128) -> Result<i128, MathError> {
+    if total_assets < 0 || loss < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    Ok((total_assets - loss).max(0))
+}
+
+/// Share price in basis points: assets per share scaled by `MAX_BPS`.
+///
+/// # Rounding: floor
+/// `price_bps = total_assets * 10_000 / total_shares`
+///
+/// Returns `MAX_BPS` (1.0) for an empty pool.
+///
+/// # Errors
+/// Returns `Err(MathError::NegativeInput)` on negative inputs.
+/// Returns `Err(MathError::Overflow)` on i128 overflow.
+pub fn lp_share_price_bps(total_assets: i128, total_shares: i128) -> Result<i128, MathError> {
+    if total_assets < 0 || total_shares < 0 {
+        return Err(MathError::NegativeInput);
+    }
+    if total_shares == 0 {
+        return Ok(MAX_BPS);
+    }
+    let numerator = total_assets.checked_mul(MAX_BPS).ok_or(MathError::Overflow)?;
+    Ok(numerator / total_shares) // floor division
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Unit tests for the math primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -336,5 +463,128 @@ mod tests {
         let w2 = winner_share(1, winning_stake, pool).unwrap();
         let w3 = winner_share(1, winning_stake, pool).unwrap();
         assert!(w1 + w2 + w3 <= pool, "sum of shares must not exceed pool");
+    }
+
+    // ── LP accounting tests (RFC #268) ──────────────────────────────────────
+
+    #[test]
+    fn lp_deposit_bootstrap_is_one_to_one() {
+        assert_eq!(lp_shares_for_deposit(1_000, 0, 0).unwrap(), 1_000);
+    }
+
+    #[test]
+    fn lp_deposit_proportional() {
+        // Pool: 1_000 assets / 1_000 shares. Deposit 500 → 500 shares.
+        assert_eq!(lp_shares_for_deposit(500, 1_000, 1_000).unwrap(), 500);
+    }
+
+    #[test]
+    fn lp_deposit_floors() {
+        // 1 * 3 / 2 = 1.5 → floor → 1
+        assert_eq!(lp_shares_for_deposit(1, 2, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn lp_withdrawal_proportional() {
+        assert_eq!(lp_assets_for_withdrawal(500, 1_000, 1_000).unwrap(), 500);
+    }
+
+    #[test]
+    fn lp_withdrawal_floors() {
+        // 1 * 10 / 3 = 3.333… → floor → 3
+        assert_eq!(lp_assets_for_withdrawal(1, 10, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn lp_withdrawal_empty_pool_errors() {
+        assert_eq!(
+            lp_assets_for_withdrawal(1, 0, 0),
+            Err(MathError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn lp_fee_accrual_increases_share_price() {
+        let assets = lp_accrue_fee(1_000, 100).unwrap();
+        assert_eq!(assets, 1_100);
+        // 1_100 / 1_000 shares = 1.1 → 11_000 bps
+        assert_eq!(lp_share_price_bps(assets, 1_000).unwrap(), 11_000);
+    }
+
+    #[test]
+    fn lp_loss_allocation_reduces_assets() {
+        assert_eq!(lp_allocate_loss(1_000, 250).unwrap(), 750);
+    }
+
+    #[test]
+    fn lp_loss_allocation_clamps_at_zero() {
+        assert_eq!(lp_allocate_loss(100, 250).unwrap(), 0);
+    }
+
+    #[test]
+    fn lp_share_price_empty_pool_is_one() {
+        assert_eq!(lp_share_price_bps(0, 0).unwrap(), MAX_BPS);
+    }
+
+    #[test]
+    fn lp_negative_inputs_rejected() {
+        assert_eq!(
+            lp_shares_for_deposit(-1, 1_000, 1_000),
+            Err(MathError::NegativeInput)
+        );
+        assert_eq!(
+            lp_assets_for_withdrawal(-1, 1_000, 1_000),
+            Err(MathError::NegativeInput)
+        );
+        assert_eq!(lp_accrue_fee(-1, 1), Err(MathError::NegativeInput));
+        assert_eq!(lp_allocate_loss(-1, 1), Err(MathError::NegativeInput));
+        assert_eq!(lp_share_price_bps(-1, 1), Err(MathError::NegativeInput));
+    }
+
+    /// LP-2: a single withdrawal never returns more than the pool holds.
+    #[test]
+    fn lp_withdrawal_never_exceeds_assets() {
+        for shares in 0..50i128 {
+            for assets in 0..50i128 {
+                for total_shares in 1..50i128 {
+                    let out = lp_assets_for_withdrawal(shares, assets, total_shares).unwrap();
+                    assert!(out <= assets, "withdrawal {out} > assets {assets}");
+                }
+            }
+        }
+    }
+
+    /// LP-1/LP-2: depositing then immediately withdrawing never yields more
+    /// than was deposited (rounding dust stays in the pool).
+    #[test]
+    fn lp_deposit_then_withdraw_never_profits() {
+        for amount in 0..50i128 {
+            for assets in 0..50i128 {
+                for shares in 0..50i128 {
+                    let minted = lp_shares_for_deposit(amount, assets, shares).unwrap();
+                    let new_assets = assets + amount;
+                    let new_shares = shares + minted;
+                    if new_shares == 0 {
+                        continue;
+                    }
+                    let back =
+                        lp_assets_for_withdrawal(minted, new_assets, new_shares).unwrap();
+                    assert!(back <= amount, "round-trip {back} > deposit {amount}");
+                }
+            }
+        }
+    }
+
+    /// LP-3: assets evolve consistently through fee accrual and loss.
+    #[test]
+    fn lp_conservation_through_fees_and_losses() {
+        let mut assets = 1_000i128;
+        let shares = 1_000i128;
+        assets = lp_accrue_fee(assets, 100).unwrap();
+        assets = lp_allocate_loss(assets, 50).unwrap();
+        // 1_000 + 100 - 50 = 1_050
+        assert_eq!(assets, 1_050);
+        // share price = 1_050 / 1_000 = 1.05 → 10_500 bps
+        assert_eq!(lp_share_price_bps(assets, shares).unwrap(), 10_500);
     }
 }

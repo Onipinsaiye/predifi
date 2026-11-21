@@ -61,3 +61,82 @@ export function useWalletIdentity(): WalletIdentity {
 
   return { network, address, identityKey };
 }
+
+/**
+ * Normalize a Stellar address for comparison purposes.
+ *
+ * Stellar account IDs are case-sensitive base32 (StrKey), so we only trim
+ * surrounding whitespace. We deliberately do NOT lowercase — doing so would
+ * silently merge distinct addresses and could misattribute portfolio data.
+ */
+export function normalizeWalletAddress(
+  address: string | null | undefined,
+): string | undefined {
+  if (typeof address !== "string") return undefined;
+  const trimmed = address.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export interface MultiWalletPortfolio {
+  /** The active signing wallet address, if connected. */
+  activeAddress: string | undefined;
+  /**
+   * Normalized, de-duplicated read-only addresses selected for aggregation.
+   * Never includes the active signing wallet.
+   */
+  readOnlyAddresses: string[];
+  /**
+   * All addresses to aggregate (read-only selections plus the active wallet
+   * when connected), in stable order: read-only first, then active.
+   */
+  allAddresses: string[];
+  /**
+   * Returns true when `address` is the active signing wallet. Mutation paths
+   * must use this (or `activeAddress`) to authorize writes; read-only
+   * selections are never allowed to sign.
+   */
+  isActiveWallet: (address: string | null | undefined) => boolean;
+}
+
+/**
+ * useMultiWalletPortfolio — resolves the explicitly selected read-only wallet
+ * addresses alongside the active signing wallet for the consolidated
+ * portfolio view (issue #266).
+ *
+ * Guarantees:
+ *   - Addresses are normalized (trimmed) and de-duplicated.
+ *   - The active signing wallet is never included in `readOnlyAddresses`.
+ *   - `isActiveWallet` lets mutation paths refuse to sign from a non-active
+ *     account.
+ *
+ * Falls back to an empty selection when WalletProvider is not mounted.
+ */
+export function useMultiWalletPortfolio(
+  selectedAddresses: ReadonlyArray<string | null | undefined> = [],
+): MultiWalletPortfolio {
+  const ctx = useContext(WalletContext);
+  const activeAddress = normalizeWalletAddress(ctx?.address);
+
+  const readOnlyAddresses: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of selectedAddresses) {
+    const normalized = normalizeWalletAddress(candidate);
+    if (normalized === undefined) continue;
+    if (normalized === activeAddress) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    readOnlyAddresses.push(normalized);
+  }
+
+  const allAddresses =
+    activeAddress === undefined
+      ? readOnlyAddresses
+      : [...readOnlyAddresses, activeAddress];
+
+  const isActiveWallet = (address: string | null | undefined): boolean => {
+    const normalized = normalizeWalletAddress(address);
+    return normalized !== undefined && normalized === activeAddress;
+  };
+
+  return { activeAddress, readOnlyAddresses, allAddresses, isActiveWallet };
+}

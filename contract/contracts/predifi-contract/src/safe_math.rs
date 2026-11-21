@@ -316,6 +316,222 @@ impl SafeMath {
     pub fn safe_mul(a: i128, b: i128) -> Result<i128, PrediFiError> {
         a.checked_mul(b).ok_or(PrediFiError::InvalidAmount)
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LIQUIDITY-PROVIDER ACCOUNTING HELPERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // These helpers back the LP accounting RFC. They implement the share model,
+    // deposit/withdrawal conversions, fee accrual and loss allocation with
+    // explicit rounding directions so that conservation holds:
+    //
+    //   - Deposits round shares DOWN (protocol-favor) so a depositor can never
+    //     mint more shares than their contribution is worth.
+    //   - Withdrawals round assets DOWN (protocol-favor) so a withdrawer can
+    //     never remove more assets than their shares are worth.
+    //   - Fee accrual rounds DOWN so the credited fees never exceed the fees
+    //     actually collected; the dust remains in the pool.
+    //   - Loss allocation rounds DOWN per LP so the sum of allocated losses
+    //     never exceeds the loss being distributed.
+
+    /// Convert a deposit amount into LP shares.
+    ///
+    /// Shares are minted as `(deposit * total_shares) / total_assets`, rounded
+    /// down so the depositor cannot receive more shares than their deposit
+    /// entitles them to.
+    ///
+    /// # Bootstrap
+    /// When `total_shares == 0` (first deposit) the shares are minted 1:1 with
+    /// the deposit, i.e. `shares = deposit`.
+    ///
+    /// # Arguments
+    /// * `deposit`      - Assets being contributed (must be >= 0).
+    /// * `total_assets` - Pool assets before the deposit (must be >= 0).
+    /// * `total_shares` - Outstanding shares before the deposit (must be >= 0).
+    pub fn lp_shares_for_deposit(
+        deposit: i128,
+        total_assets: i128,
+        total_shares: i128,
+    ) -> Result<i128, PrediFiError> {
+        if deposit < 0 || total_assets < 0 || total_shares < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if deposit == 0 {
+            return Ok(0);
+        }
+        // Bootstrap: first deposit mints shares 1:1.
+        if total_shares == 0 {
+            return Ok(deposit);
+        }
+        // An empty pool with outstanding shares is an inconsistent state.
+        if total_assets == 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+
+        let product = deposit
+            .checked_mul(total_shares)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        Self::divide_with_rounding(product, total_assets, RoundingMode::ProtocolFavor)
+    }
+
+    /// Convert LP shares into a withdrawal amount.
+    ///
+    /// Assets are returned as `(shares * total_assets) / total_shares`, rounded
+    /// down so the withdrawer cannot remove more assets than their shares are
+    /// worth.
+    ///
+    /// # Arguments
+    /// * `shares`       - Shares being burned (must be >= 0).
+    /// * `total_assets` - Pool assets before the withdrawal (must be >= 0).
+    /// * `total_shares` - Outstanding shares before the withdrawal (must be > 0
+    ///   when `shares > 0`).
+    pub fn lp_assets_for_withdrawal(
+        shares: i128,
+        total_assets: i128,
+        total_shares: i128,
+    ) -> Result<i128, PrediFiError> {
+        if shares < 0 || total_assets < 0 || total_shares < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if shares == 0 || total_assets == 0 {
+            return Ok(0);
+        }
+        if total_shares == 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if shares > total_shares {
+            return Err(PrediFiError::ArithmeticError);
+        }
+
+        let product = shares
+            .checked_mul(total_assets)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        Self::divide_with_rounding(product, total_shares, RoundingMode::ProtocolFavor)
+    }
+
+    /// Accrue a fee to a single LP based on their share of the pool.
+    ///
+    /// Computes `(lp_shares * fee_amount) / total_shares`, rounded down so the
+    /// sum of credited fees never exceeds `fee_amount`.
+    ///
+    /// # Arguments
+    /// * `lp_shares`    - The LP's shares (must be >= 0 and <= `total_shares`).
+    /// * `total_shares` - Total outstanding shares (must be > 0 when
+    ///   `fee_amount > 0`).
+    /// * `fee_amount`   - Fees collected to distribute (must be >= 0).
+    pub fn lp_fee_accrual(
+        lp_shares: i128,
+        total_shares: i128,
+        fee_amount: i128,
+    ) -> Result<i128, PrediFiError> {
+        if lp_shares < 0 || total_shares < 0 || fee_amount < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if lp_shares == 0 || fee_amount == 0 {
+            return Ok(0);
+        }
+        if total_shares == 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if lp_shares > total_shares {
+            return Err(PrediFiError::ArithmeticError);
+        }
+
+        let product = lp_shares
+            .checked_mul(fee_amount)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        Self::divide_with_rounding(product, total_shares, RoundingMode::ProtocolFavor)
+    }
+
+    /// Allocate a loss to a single LP based on their share of the pool.
+    ///
+    /// Computes `(lp_shares * loss_amount) / total_shares`, rounded down so the
+    /// sum of allocated losses never exceeds `loss_amount`.
+    ///
+    /// # Arguments
+    /// * `lp_shares`    - The LP's shares (must be >= 0 and <= `total_shares`).
+    /// * `total_shares` - Total outstanding shares (must be > 0 when
+    ///   `loss_amount > 0`).
+    /// * `loss_amount`  - Loss to distribute (must be >= 0).
+    pub fn lp_loss_allocation(
+        lp_shares: i128,
+        total_shares: i128,
+        loss_amount: i128,
+    ) -> Result<i128, PrediFiError> {
+        if lp_shares < 0 || total_shares < 0 || loss_amount < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if lp_shares == 0 || loss_amount == 0 {
+            return Ok(0);
+        }
+        if total_shares == 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if lp_shares > total_shares {
+            return Err(PrediFiError::ArithmeticError);
+        }
+
+        let product = lp_shares
+            .checked_mul(loss_amount)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        Self::divide_with_rounding(product, total_shares, RoundingMode::ProtocolFavor)
+    }
+
+    /// Distribute a fee or loss amount across a set of LP shares.
+    ///
+    /// Each LP receives `(shares_i * amount) / total_shares` rounded down; the
+    /// final LP receives the remaining dust so the distributed total equals
+    /// `amount` exactly (conservation). This mirrors `multi_proportion` but is
+    /// available outside of tests.
+    ///
+    /// # Arguments
+    /// * `lp_shares`    - Individual LP shares.
+    /// * `total_shares` - Sum of all LP shares (must be > 0 when non-empty).
+    /// * `amount`       - Fee or loss amount to distribute (must be >= 0).
+    pub fn lp_distribute(
+        lp_shares: &[i128],
+        total_shares: i128,
+        amount: i128,
+    ) -> Result<Vec<i128>, PrediFiError> {
+        if lp_shares.is_empty() {
+            return Ok(Vec::new());
+        }
+        if total_shares <= 0 || amount < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+
+        let mut results = Vec::with_capacity(lp_shares.len());
+        let mut distributed = 0i128;
+
+        for (i, &shares) in lp_shares.iter().enumerate() {
+            if shares < 0 || shares > total_shares {
+                return Err(PrediFiError::ArithmeticError);
+            }
+
+            if i == lp_shares.len() - 1 {
+                // Last LP absorbs the rounding dust to preserve conservation.
+                let remaining = amount
+                    .checked_sub(distributed)
+                    .ok_or(PrediFiError::ArithmeticError)?;
+                results.push(remaining);
+            } else {
+                let share = Self::lp_fee_accrual(shares, total_shares, amount)?;
+                distributed = distributed
+                    .checked_add(share)
+                    .ok_or(PrediFiError::ArithmeticError)?;
+                results.push(share);
+            }
+        }
+
+        let total_distributed = results.iter().try_fold(0i128, |acc, &value| {
+            acc.checked_add(value).ok_or(PrediFiError::InvalidAmount)
+        })?;
+        if total_distributed != amount {
+            return Err(PrediFiError::RewardError);
+        }
+
+        Ok(results)
+    }
 }
 
 /// # Payout Rounding Precision Audit
@@ -781,6 +997,171 @@ mod tests {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LIQUIDITY-PROVIDER ACCOUNTING TESTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_lp_shares_for_deposit_bootstrap() {
+        // First deposit mints shares 1:1.
+        assert_eq!(SafeMath::lp_shares_for_deposit(1000, 0, 0).unwrap(), 1000);
+        // Zero deposit mints nothing.
+        assert_eq!(SafeMath::lp_shares_for_deposit(0, 500, 500).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_lp_shares_for_deposit_proportional() {
+        // Pool: 1000 assets / 1000 shares. Deposit 500 → 500 shares.
+        assert_eq!(
+            SafeMath::lp_shares_for_deposit(500, 1000, 1000).unwrap(),
+            500
+        );
+        // Deposit 1 into 3 assets / 3 shares → floor(1*3/3) = 1.
+        assert_eq!(SafeMath::lp_shares_for_deposit(1, 3, 3).unwrap(), 1);
+        // Deposit 1 into 3 assets / 1 share → floor(1*1/3) = 0 (rounds down).
+        assert_eq!(SafeMath::lp_shares_for_deposit(1, 3, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_lp_shares_for_deposit_invalid() {
+        assert_eq!(
+            SafeMath::lp_shares_for_deposit(-1, 1000, 1000),
+            Err(PrediFiError::ArithmeticError)
+        );
+        // Empty pool with outstanding shares is inconsistent.
+        assert_eq!(
+            SafeMath::lp_shares_for_deposit(100, 0, 1000),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn test_lp_assets_for_withdrawal() {
+        // 500 of 1000 shares in a 1000-asset pool → 500 assets.
+        assert_eq!(
+            SafeMath::lp_assets_for_withdrawal(500, 1000, 1000).unwrap(),
+            500
+        );
+        // 1 of 3 shares in a 10-asset pool → floor(10/3) = 3.
+        assert_eq!(SafeMath::lp_assets_for_withdrawal(1, 10, 3).unwrap(), 3);
+        // Zero shares → zero assets.
+        assert_eq!(SafeMath::lp_assets_for_withdrawal(0, 1000, 1000).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_lp_assets_for_withdrawal_invalid() {
+        assert_eq!(
+            SafeMath::lp_assets_for_withdrawal(1001, 1000, 1000),
+            Err(PrediFiError::ArithmeticError)
+        );
+        assert_eq!(
+            SafeMath::lp_assets_for_withdrawal(100, 1000, 0),
+            Err(PrediFiError::ArithmeticError)
+        );
+        assert_eq!(
+            SafeMath::lp_assets_for_withdrawal(-1, 1000, 1000),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn test_lp_fee_accrual() {
+        // 300 of 1000 shares on 100 fees → 30.
+        assert_eq!(SafeMath::lp_fee_accrual(300, 1000, 100).unwrap(), 30);
+        // Rounding down: 1 of 3 shares on 10 fees → 3.
+        assert_eq!(SafeMath::lp_fee_accrual(1, 3, 10).unwrap(), 3);
+        // Zero cases.
+        assert_eq!(SafeMath::lp_fee_accrual(0, 1000, 100).unwrap(), 0);
+        assert_eq!(SafeMath::lp_fee_accrual(300, 1000, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_lp_fee_accrual_invalid() {
+        assert_eq!(
+            SafeMath::lp_fee_accrual(1001, 1000, 100),
+            Err(PrediFiError::ArithmeticError)
+        );
+        assert_eq!(
+            SafeMath::lp_fee_accrual(100, 0, 100),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn test_lp_loss_allocation() {
+        // 300 of 1000 shares on 100 loss → 30.
+        assert_eq!(SafeMath::lp_loss_allocation(300, 1000, 100).unwrap(), 30);
+        // Rounding down: 1 of 3 shares on 10 loss → 3.
+        assert_eq!(SafeMath::lp_loss_allocation(1, 3, 10).unwrap(), 3);
+        assert_eq!(SafeMath::lp_loss_allocation(0, 1000, 100).unwrap(), 0);
+        assert_eq!(SafeMath::lp_loss_allocation(300, 1000, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_lp_distribute_conserves() {
+        let shares = vec![300, 500, 200];
+        let results = SafeMath::lp_distribute(&shares, 1000, 1000).unwrap();
+        assert_eq!(results, vec![300, 500, 200]);
+        assert_eq!(results.iter().sum::<i128>(), 1000);
+    }
+
+    #[test]
+    fn test_lp_distribute_rounding_dust() {
+        // 1/3 each of 10 → 3, 3, remainder 4.
+        let shares = vec![1, 1, 1];
+        let results = SafeMath::lp_distribute(&shares, 3, 10).unwrap();
+        assert_eq!(results, vec![3, 3, 4]);
+        assert_eq!(results.iter().sum::<i128>(), 10);
+    }
+
+    #[test]
+    fn test_lp_distribute_edge_cases() {
+        assert_eq!(
+            SafeMath::lp_distribute(&[], 1000, 100).unwrap(),
+            Vec::<i128>::new()
+        );
+        assert_eq!(
+            SafeMath::lp_distribute(&[100], 100, 100).unwrap(),
+            vec![100]
+        );
+        assert_eq!(
+            SafeMath::lp_distribute(&[100, 200], 0, 100),
+            Err(PrediFiError::ArithmeticError)
+        );
+        assert_eq!(
+            SafeMath::lp_distribute(&[100, -200], 1000, 100),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn test_lp_reference_numerical_example() {
+        // Reference example from the RFC:
+        //   LP A deposits 1_000 into an empty pool → 1_000 shares.
+        //   LP B deposits 1_000 into the pool (1_000 assets / 1_000 shares)
+        //     → 1_000 shares. Total: 2_000 assets / 2_000 shares.
+        //   Fees of 200 are collected and distributed pro-rata.
+        let a_shares = SafeMath::lp_shares_for_deposit(1_000, 0, 0).unwrap();
+        assert_eq!(a_shares, 1_000);
+
+        let b_shares = SafeMath::lp_shares_for_deposit(1_000, 1_000, 1_000).unwrap();
+        assert_eq!(b_shares, 1_000);
+
+        let total_shares = a_shares + b_shares;
+        let total_assets = 2_000 + 200; // deposits + fees
+
+        let a_fee = SafeMath::lp_fee_accrual(a_shares, total_shares, 200).unwrap();
+        let b_fee = SafeMath::lp_fee_accrual(b_shares, total_shares, 200).unwrap();
+        assert_eq!(a_fee, 100);
+        assert_eq!(b_fee, 100);
+        assert_eq!(a_fee + b_fee, 200);
+
+        // LP A withdraws all shares: (1000 * 2200) / 2000 = 1100.
+        let a_assets =
+            SafeMath::lp_assets_for_withdrawal(a_shares, total_assets, total_shares).unwrap();
+        assert_eq!(a_assets, 1_100);
+    }
+
     #[test]
     fn test_safe_arithmetic() {
         // Addition
@@ -1162,6 +1543,114 @@ mod tests {
                 prop_assert_eq!(results.len(), stakes.len());
                 prop_assert_eq!(results.iter().sum::<i128>(), pool_balance);
                 prop_assert!(results.iter().all(|result| *result >= 0));
+            }
+
+            // ── LP accounting conservation properties (RFC backing) ──────────
+
+            #[test]
+            fn lp_deposit_never_mints_more_than_proportional(
+                deposit in 0i128..=1_000_000i128,
+                total_assets in 0i128..=1_000_000i128,
+                total_shares in 0i128..=1_000_000i128,
+            ) {
+                prop_assume!(total_shares == 0 || total_assets > 0);
+                let shares = SafeMath::lp_shares_for_deposit(deposit, total_assets, total_shares).unwrap();
+                prop_assert!(shares >= 0);
+                if total_shares == 0 {
+                    prop_assert_eq!(shares, deposit);
+                } else {
+                    // shares <= deposit * total_shares / total_assets (floor)
+                    let exact = deposit * total_shares;
+                    prop_assert!(shares * total_assets <= exact);
+                    prop_assert!((shares + 1) * total_assets > exact);
+                }
+            }
+
+            #[test]
+            fn lp_withdrawal_never_exceeds_proportional(
+                shares in 0i128..=1_000_000i128,
+                total_assets in 0i128..=1_000_000i128,
+                total_shares in 1i128..=1_000_000i128,
+            ) {
+                prop_assume!(shares <= total_shares);
+                let assets = SafeMath::lp_assets_for_withdrawal(shares, total_assets, total_shares).unwrap();
+                prop_assert!(assets >= 0);
+                prop_assert!(assets <= total_assets);
+                // assets <= shares * total_assets / total_shares (floor)
+                prop_assert!(assets * total_shares <= shares * total_assets);
+            }
+
+            #[test]
+            fn lp_fee_accrual_conserves(
+                shares in prop::collection::vec(0i128..=1_000_000i128, 1..8),
+                extra_total in 0i128..=1_000_000i128,
+                fee_amount in 0i128..=1_000_000i128,
+            ) {
+                let share_total: i128 = shares.iter().sum();
+                let total_shares = share_total + extra_total;
+                prop_assume!(total_shares > 0);
+
+                let results = SafeMath::lp_distribute(&shares, total_shares, fee_amount).unwrap();
+                prop_assert_eq!(results.len(), shares.len());
+                prop_assert_eq!(results.iter().sum::<i128>(), fee_amount);
+                prop_assert!(results.iter().all(|r| *r >= 0));
+            }
+
+            #[test]
+            fn lp_loss_allocation_conserves(
+                shares in prop::collection::vec(0i128..=1_000_000i128, 1..8),
+                extra_total in 0i128..=1_000_000i128,
+                loss_amount in 0i128..=1_000_000i128,
+            ) {
+                let share_total: i128 = shares.iter().sum();
+                let total_shares = share_total + extra_total;
+                prop_assume!(total_shares > 0);
+
+                let results = SafeMath::lp_distribute(&shares, total_shares, loss_amount).unwrap();
+                prop_assert_eq!(results.len(), shares.len());
+                prop_assert_eq!(results.iter().sum::<i128>(), loss_amount);
+                prop_assert!(results.iter().all(|r| *r >= 0));
+            }
+
+            #[test]
+            fn lp_individual_fee_accrual_never_exceeds_amount(
+                lp_shares in 0i128..=1_000_000i128,
+                extra_total in 0i128..=1_000_000i128,
+                fee_amount in 0i128..=1_000_000i128,
+            ) {
+                let total_shares = lp_shares + extra_total;
+                prop_assume!(total_shares > 0);
+                let accrued = SafeMath::lp_fee_accrual(lp_shares, total_shares, fee_amount).unwrap();
+                prop_assert!(accrued >= 0);
+                prop_assert!(accrued <= fee_amount);
+            }
+
+            #[test]
+            fn lp_individual_loss_allocation_never_exceeds_amount(
+                lp_shares in 0i128..=1_000_000i128,
+                extra_total in 0i128..=1_000_000i128,
+                loss_amount in 0i128..=1_000_000i128,
+            ) {
+                let total_shares = lp_shares + extra_total;
+                prop_assume!(total_shares > 0);
+                let allocated = SafeMath::lp_loss_allocation(lp_shares, total_shares, loss_amount).unwrap();
+                prop_assert!(allocated >= 0);
+                prop_assert!(allocated <= loss_amount);
+            }
+
+            #[test]
+            fn lp_deposit_withdraw_round_trip_never_profits(
+                deposit in 1i128..=1_000_000i128,
+                total_assets in 0i128..=1_000_000i128,
+                total_shares in 1i128..=1_000_000i128,
+            ) {
+                // Deposit then immediately withdraw the minted shares; the
+                // withdrawer must never receive more than they deposited.
+                let shares = SafeMath::lp_shares_for_deposit(deposit, total_assets, total_shares).unwrap();
+                let new_assets = total_assets + deposit;
+                let new_shares = total_shares + shares;
+                let withdrawn = SafeMath::lp_assets_for_withdrawal(shares, new_assets, new_shares).unwrap();
+                prop_assert!(withdrawn <= deposit);
             }
         }
     }

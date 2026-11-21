@@ -488,6 +488,155 @@ pub struct DeletePushSubscriptionRequestDoc {
     pub endpoint: Option<String>,
 }
 
+/// A single position inside a portfolio JSON export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioPositionDoc {
+    pub pool_id: i64,
+    pub pool_name: String,
+    pub outcome: i32,
+    pub amount: i64,
+    pub created_at: String,
+    /// Current pool state at export time.
+    pub pool_state: String,
+    pub pool_result: Option<String>,
+}
+
+/// A single ledger entry inside a portfolio JSON export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioLedgerEntryDoc {
+    /// Stable ledger row id.
+    pub id: i64,
+    pub pool_id: i64,
+    /// `prediction`, `claim`, `refund` or `referral`.
+    pub entry_type: String,
+    /// Signed amount in stroops (negative for outgoing stakes).
+    pub amount: i64,
+    pub created_at: String,
+}
+
+/// Provenance reference for a market or event used to build the export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioSourceRefDoc {
+    /// `market` or `event`.
+    pub kind: String,
+    /// On-chain identifier (pool id or ledger/event id).
+    pub id: String,
+    /// Ledger sequence the reference was observed at, when known.
+    pub ledger: Option<i64>,
+    /// Transaction hash the reference was observed in, when known.
+    pub tx_hash: Option<String>,
+}
+
+/// Calculation metadata describing how the export was produced.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioCalculationMetadataDoc {
+    /// Version of the calculation logic, e.g. `portfolio.calc.v1`.
+    pub calculator_version: String,
+    /// RFC 3339 time the export was generated.
+    pub generated_at: String,
+    /// Total staked across all positions in the export (stroops).
+    pub total_staked: i64,
+    /// Total claimed/refunded across all ledger entries in the export (stroops).
+    pub total_returned: i64,
+    /// Net result (`total_returned - total_staked`) in stroops.
+    pub net_result: i64,
+}
+
+/// Truncation and continuation information for a bounded export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioExportBoundsDoc {
+    /// Whether the export was truncated because a bound was reached.
+    pub truncated: bool,
+    /// Maximum number of positions requested (or applied default).
+    pub position_limit: i64,
+    /// Maximum number of ledger entries requested (or applied default).
+    pub ledger_limit: i64,
+    /// Opaque cursor to pass as `?after=<value>` to continue the export.
+    /// `null` when the export is complete.
+    pub next_cursor: Option<String>,
+}
+
+/// Versioned JSON export of a complete portfolio record (`portfolio.export.v1`).
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioExportDoc {
+    /// Export schema version; currently `portfolio.export.v1`.
+    pub schema_version: String,
+    pub address: String,
+    pub positions: Vec<PortfolioPositionDoc>,
+    pub ledger_entries: Vec<PortfolioLedgerEntryDoc>,
+    pub sources: Vec<PortfolioSourceRefDoc>,
+    pub calculation: PortfolioCalculationMetadataDoc,
+    pub bounds: PortfolioExportBoundsDoc,
+}
+
+/// Off-chain private profile fields included in an account data export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct AccountProfileDataDoc {
+    pub address: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub interests: Vec<String>,
+    pub notification_preferences: Option<NotificationPreferencesDoc>,
+    /// Push subscription metadata; endpoints are never returned.
+    pub push_subscriptions: Vec<AccountPushSubscriptionDoc>,
+}
+
+/// Push subscription metadata included in an account data export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct AccountPushSubscriptionDoc {
+    pub created_at: String,
+    pub expires_at: Option<String>,
+}
+
+/// Versioned account data export (`account.export.v1`).
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct AccountExportDoc {
+    /// Export schema version; currently `account.export.v1`.
+    pub schema_version: String,
+    pub address: String,
+    /// RFC 3339 time the export was generated.
+    pub generated_at: String,
+    /// Off-chain private records eligible for export and deletion.
+    pub profile: AccountProfileDataDoc,
+    /// Off-chain notification records.
+    pub notifications: Vec<AccountNotificationDoc>,
+    /// Explanation of immutable on-chain records that are not exported or deleted.
+    pub on_chain_notice: String,
+}
+
+/// A single off-chain notification record in an account data export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct AccountNotificationDoc {
+    pub id: i64,
+    pub kind: String,
+    pub read: bool,
+    pub created_at: String,
+}
+
+/// Result of an account data deletion request.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct AccountDeletionResultDoc {
+    pub address: String,
+    /// Whether any private records were removed by this request.
+    pub deleted: bool,
+    /// Number of private records removed (0 on an idempotent replay).
+    pub records_deleted: i64,
+    /// Minimum audit evidence retained by policy.
+    pub audit_retained: AccountDeletionAuditDoc,
+    /// Explanation of immutable on-chain records that are preserved.
+    pub on_chain_notice: String,
+}
+
+/// Minimum audit evidence retained after an account data deletion.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct AccountDeletionAuditDoc {
+    /// RFC 3339 time the deletion was recorded.
+    pub deleted_at: String,
+    /// Opaque audit reference retained for compliance.
+    pub audit_id: String,
+}
+=======
+
 // ── OpenAPI spec ──────────────────────────────────────────────────────────────
 
 #[derive(OpenApi)]
@@ -524,6 +673,9 @@ pub struct DeletePushSubscriptionRequestDoc {
         api_mark_notifications_read,
         api_put_push_subscription,
         api_delete_push_subscription,
+        api_get_portfolio_export,
+        api_get_account_export,
+        api_delete_account_data,
         api_get_market_predictions,
         api_get_referrals,
         api_get_referral_estimate,
@@ -586,6 +738,18 @@ pub struct DeletePushSubscriptionRequestDoc {
         NotificationPreferencesDoc,
         PushSubscriptionRequestDoc,
         DeletePushSubscriptionRequestDoc,
+        PortfolioPositionDoc,
+        PortfolioLedgerEntryDoc,
+        PortfolioSourceRefDoc,
+        PortfolioCalculationMetadataDoc,
+        PortfolioExportBoundsDoc,
+        PortfolioExportDoc,
+        AccountProfileDataDoc,
+        AccountPushSubscriptionDoc,
+        AccountNotificationDoc,
+        AccountExportDoc,
+        AccountDeletionResultDoc,
+        AccountDeletionAuditDoc,
     )),
     tags(
         (name = "health", description = "Service liveness and dependency checks"),
@@ -1007,6 +1171,57 @@ async fn api_put_push_subscription() {}
     description = "Requires Authorization: Bearer <access-token> for the wallet in the path. An omitted body revokes all endpoints for that wallet."
 )]
 async fn api_delete_push_subscription() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/users/{address}/portfolio/export", tag = "predictions",
+    params(
+        ("address" = String, Path, description = "Stellar account address (G...)"),
+        ("format" = Option<String>, Query, description = "Export format; only `json` is supported (default json)"),
+        ("position_limit" = Option<i64>, Query, description = "Max positions to include (default 1000, max 5000)"),
+        ("ledger_limit" = Option<i64>, Query, description = "Max ledger entries to include (default 1000, max 5000)"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from a previous export's `bounds.next_cursor` to continue"),
+    ),
+    responses(
+        (status = 200, description = "Versioned portfolio JSON export (`portfolio.export.v1`) with positions, ledger entries, source references, calculation metadata and truncation/continuation info", body = PortfolioExportDoc),
+        (status = 400, description = "Invalid address, format or query parameter", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_get_portfolio_export() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/users/{address}/account/export", tag = "users",
+    params(("address" = String, Path, description = "Wallet address bound to the bearer access token")),
+    responses(
+        (status = 200, description = "Versioned account data export (`account.export.v1`) of eligible off-chain private records", body = AccountExportDoc),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another wallet", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database or token store unavailable", body = ServiceUnavailableResponse),
+    ),
+    description = "Requires Authorization: Bearer <access-token> for the wallet in the path. Exports only off-chain profile and notification data; on-chain history is immutable and not included."
+)]
+async fn api_get_account_export() {}
+
+#[allow(dead_code)]
+#[utoipa::path(delete, path = "/api/v1/users/{address}/account", tag = "users",
+    params(("address" = String, Path, description = "Wallet address bound to the bearer access token")),
+    responses(
+        (status = 200, description = "Eligible off-chain private records deleted; idempotent on replay", body = AccountDeletionResultDoc),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid access token", body = ErrorResponse),
+        (status = 403, description = "Token belongs to another wallet", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database or token store unavailable", body = ServiceUnavailableResponse),
+    ),
+    description = "Requires Authorization: Bearer <access-token> for the wallet in the path. Deletes only eligible off-chain profile and notification data, retains minimum audit evidence, and never deletes immutable on-chain records."
+)]
+async fn api_delete_account_data() {}
 
 #[allow(dead_code)]
 #[utoipa::path(get, path = "/api/v1/markets/{market_id}/predictions", tag = "predictions",
