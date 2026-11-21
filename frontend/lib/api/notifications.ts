@@ -333,6 +333,115 @@ export function digestUnsubscribeUrl(token: string): string {
   return `${API_BASE_URL}/api/v1/digest/unsubscribe?token=${encodeURIComponent(token)}`;
 }
 
+// ── Browser push subscriptions (#288) ────────────────────────────────────────
+
+/** Request body to register a new push subscription. */
+export interface PushSubscriptionRequest {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  expires_at?: string;
+  /** Previous endpoint to revoke atomically when the browser rotates keys. */
+  previous_endpoint?: string;
+}
+
+/** Minimal summary returned after a successful subscription save. */
+export interface PushSubscriptionSummary {
+  id: number;
+  expires_at: string;
+}
+
+function isPushSubscriptionSummary(obj: unknown): obj is PushSubscriptionSummary {
+  if (!obj || typeof obj !== "object") return false;
+  const s = obj as Record<string, unknown>;
+  return typeof s.id === "number" && typeof s.expires_at === "string";
+}
+
+export function pushSubscriptionUrl(address: string): string {
+  return `${API_BASE_URL}/api/v1/users/${encodeURIComponent(address)}/push-subscriptions`;
+}
+
+/**
+ * Register a push subscription for `address`.
+ * Binds the subscription to the wallet so revocation is wallet-scoped.
+ * Sends `previous_endpoint` when the browser rotated keys so the old
+ * subscription is atomically replaced.
+ */
+export async function savePushSubscription(
+  address: string,
+  request: PushSubscriptionRequest,
+): Promise<PushSubscriptionSummary> {
+  const res = await fetch(pushSubscriptionUrl(address), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(request),
+  });
+
+  if (!res.ok) {
+    throw new ApiError(
+      `Failed to save push subscription (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+
+  const body = await res.json();
+  const data =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  if (!isPushSubscriptionSummary(data)) {
+    throw new ApiError("Invalid push subscription response shape", 500);
+  }
+
+  return data;
+}
+
+/**
+ * Revoke the push subscription for `address`.
+ * Pass `endpoint` to revoke a specific subscription, or omit to revoke all.
+ */
+export async function revokePushSubscription(
+  address: string,
+  endpoint?: string,
+): Promise<void> {
+  const url = endpoint
+    ? `${pushSubscriptionUrl(address)}?endpoint=${encodeURIComponent(endpoint)}`
+    : pushSubscriptionUrl(address);
+
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: { Accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    throw new ApiError(
+      `Failed to revoke push subscription (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+}
+
+/**
+/**
+ * Convert a browser `PushSubscription` object into the API request shape.
+ * Keeps sensitive keys out of logs by never logging the returned object.
+ */
+export function pushSubscriptionToRequest(
+  sub: PushSubscription,
+  previousEndpoint?: string,
+): PushSubscriptionRequest {
+  const json = sub.toJSON();
+  const keys = json.keys ?? {};
+  return {
+    endpoint: sub.endpoint,
+    p256dh: keys.p256dh ?? "",
+    auth: keys.auth ?? "",
+    expires_at: sub.expirationTime
+      ? new Date(sub.expirationTime).toISOString()
+      : undefined,
+    previous_endpoint: previousEndpoint,
+  };
+}
+
 // ── Per-wallet notification preferences by event type and channel (#286) ──────
 
 /** Event types the backend supports. Maps 1-to-1 with the backend enum. */
