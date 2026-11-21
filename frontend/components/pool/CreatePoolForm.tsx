@@ -4,6 +4,10 @@ import React, { useState, useId, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { CheckCircle2, Info, Plus, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  checkMarketDraftDuplicates,
+  type DuplicateMarketCheckResult,
+} from "@/lib/api/marketDrafts";
 import { Button, Input, StakeInput, Checkbox, SupportedTokensPicker } from "@/components/ui";
 import type { Token } from "@/components/ui";
 import {
@@ -22,6 +26,9 @@ const INITIAL_VALUES: CreatePoolFormValues = {
   name: "",
   description: "",
   category: "",
+  source: "",
+  eventWindowStart: "",
+  eventWindowEnd: "",
   outcomes: ["", ""],
   minStake: "",
   maxStake: "",
@@ -56,7 +63,6 @@ function FormSection({
       <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-3 sm:p-5 space-y-4 sm:space-y-5 min-w-0">
         {children}
       </div>
-      <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-5">{children}</div>
     </section>
   );
 }
@@ -295,15 +301,17 @@ function SuccessState({ onCreateAnother }: { onCreateAnother: () => void }) {
         <CheckCircle2 className="h-8 w-8 text-[#37B7C3]" aria-hidden="true" />
       </div>
       <div className="space-y-2">
-        <h2 className="text-xl font-semibold text-white">Pool Created Successfully</h2>
+        <div role="status" aria-live="polite" aria-atomic="true">
+          <h2 className="text-xl font-semibold text-white">Market Proposal Submitted</h2>
+        </div>
         <p className="max-w-sm text-sm text-zinc-400">
-          Your prediction pool has been submitted. It will appear in the market once confirmed on
-          the Stellar network.
+          Your proposal has been saved for review. It can be turned into a market after the review
+          process is complete.
         </p>
       </div>
       <div className="flex flex-col sm:flex-row gap-3">
         <Button variant="primary" size="medium" onClick={() => router.push("/user/pool-market")}>
-          View Pool Market
+          View Market
         </Button>
         <Button variant="tertiary" size="medium" onClick={onCreateAnother}>
           Create Another Pool
@@ -325,6 +333,9 @@ export function CreatePoolForm() {
   const descriptionId = useId();
   const categoryId = useId();
   const closeTimeId = useId();
+  const sourceId = useId();
+  const eventWindowStartId = useId();
+  const eventWindowEndId = useId();
   const outcomesSectionId = useId();
   const outcomesErrorId = useId();
 
@@ -332,6 +343,10 @@ export function CreatePoolForm() {
   const [errors, setErrors] = useState<CreatePoolFormErrors>({});
   const [status, setStatus] = useState<"idle" | "submitting" | "success">("idle");
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [proposalId, setProposalId] = useState<string | null>(null);
+  const [duplicateCheck, setDuplicateCheck] =
+    useState<DuplicateMarketCheckResult | null>(null);
+  const [distinctionNote, setDistinctionNote] = useState("");
 
   // ── Focus management for dynamic outcome rows ──────────────────────────────
   /**
@@ -377,6 +392,8 @@ export function CreatePoolForm() {
       setErrors((prev) => ({ ...prev, [field]: undefined }));
     }
     setSubmitError(null);
+    setDuplicateCheck(null);
+    setDistinctionNote("");
   }
 
   function setOutcome(index: number, value: string) {
@@ -395,6 +412,8 @@ export function CreatePoolForm() {
       };
     });
     setSubmitError(null);
+    setDuplicateCheck(null);
+    setDistinctionNote("");
   }
 
   function addOutcome() {
@@ -410,6 +429,8 @@ export function CreatePoolForm() {
         outcomes: updatedErrors.outcomes,
       };
     });
+    setDuplicateCheck(null);
+    setDistinctionNote("");
     setFocusAction({ type: "added", index: values.outcomes.length });
   }
 
@@ -426,6 +447,8 @@ export function CreatePoolForm() {
         outcomes: updatedErrors.outcomes,
       };
     });
+    setDuplicateCheck(null);
+    setDistinctionNote("");
     setFocusAction({ type: "removed", index });
   }
 
@@ -458,6 +481,9 @@ export function CreatePoolForm() {
         { key: "name", id: "name" },
         { key: "description", id: descriptionId },
         { key: "category", id: categoryId },
+        { key: "source", id: sourceId },
+        { key: "eventWindowStart", id: eventWindowStartId },
+        { key: "eventWindowEnd", id: eventWindowEndId },
         { key: "tags", id: "tags" },
         {
           key: "outcomeErrors",
@@ -492,12 +518,27 @@ export function CreatePoolForm() {
     setSubmitError(null);
 
     try {
-      // TODO: replace with actual contract / API call
-      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
-      setStatus("success");
-    } catch {
+      const currentProposalId = proposalId ?? crypto.randomUUID();
+      setProposalId(currentProposalId);
+      const result = await checkMarketDraftDuplicates({
+        proposal_id: currentProposalId,
+        question: values.name.trim(),
+        event_window_start: new Date(values.eventWindowStart).toISOString(),
+        event_window_end: new Date(values.eventWindowEnd).toISOString(),
+        source: values.source.trim(),
+        outcomes: values.outcomes.map((outcome) => outcome.trim()),
+        distinction_note: distinctionNote.trim() || undefined,
+      });
+      setProposalId(result.proposal_id);
+      setDuplicateCheck(result);
+      setStatus(result.submitted ? "success" : "idle");
+    } catch (error) {
       setStatus("idle");
-      setSubmitError("Something went wrong submitting your pool. Please try again.");
+      setSubmitError(
+        error instanceof Error
+          ? error.message
+          : "Something went wrong checking for similar markets. Please try again.",
+      );
     }
   }
 
@@ -506,6 +547,9 @@ export function CreatePoolForm() {
     setErrors({});
     setStatus("idle");
     setSubmitError(null);
+    setProposalId(null);
+    setDuplicateCheck(null);
+    setDistinctionNote("");
   }
 
   // ── Success screen ──────────────────────────────────────────────────────────
@@ -523,6 +567,10 @@ export function CreatePoolForm() {
       aria-label="Create prediction pool"
       className="space-y-8 w-full max-w-full min-w-0 overflow-x-hidden"
     >
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {isSubmitting ? "Checking for duplicate market proposals." : ""}
+      </div>
+
       {/* ── 1. Pool Details ── */}
       <FormSection
         title="Pool Details"
@@ -565,6 +613,40 @@ export function CreatePoolForm() {
           error={errors.category}
           disabled={isSubmitting}
         />
+
+        <Input
+          id={sourceId}
+          label="Resolution Source"
+          placeholder="e.g. https://www.federalreserve.gov/"
+          value={values.source}
+          onChange={(e) => setField("source", e.target.value)}
+          error={errors.source}
+          helperText="The authoritative source used to determine the outcome."
+          disabled={isSubmitting}
+          autoComplete="url"
+        />
+
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <DateTimeField
+            id={eventWindowStartId}
+            label="Event Window Start"
+            value={values.eventWindowStart}
+            onChange={(value) => setField("eventWindowStart", value)}
+            error={errors.eventWindowStart}
+            helperText="When the event being predicted begins."
+            disabled={isSubmitting}
+          />
+          <DateTimeField
+            id={eventWindowEndId}
+            label="Event Window End"
+            value={values.eventWindowEnd}
+            onChange={(value) => setField("eventWindowEnd", value)}
+            min={values.eventWindowStart || undefined}
+            error={errors.eventWindowEnd}
+            helperText="When the event being predicted concludes."
+            disabled={isSubmitting}
+          />
+        </div>
 
         <Input
           id="tags"
@@ -651,7 +733,7 @@ export function CreatePoolForm() {
         description="Set the token and stake limits for pool participants."
       >
         {/* Token picker row */}
-       <div className="flex flex-col gap-3 rounded-lg border border-zinc-700/50 bg-zinc-800/40 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4 min-w-0">
+        <div className="flex flex-col gap-3 rounded-lg border border-zinc-700/50 bg-zinc-800/40 px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4 min-w-0">
           <div className="space-y-0.5 min-w-0">
             <p className="text-sm font-medium text-zinc-200">Staking Token</p>
             <p className="text-xs text-zinc-500">Participants will stake in this token.</p>
@@ -664,12 +746,6 @@ export function CreatePoolForm() {
               className="w-full sm:w-auto"
             />
           </div>
-        </div>
-          <SupportedTokensPicker
-            value={values.token}
-            onChange={handleTokenChange}
-            disabled={isSubmitting}
-          />
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -756,6 +832,42 @@ export function CreatePoolForm() {
         </div>
       )}
 
+      {duplicateCheck?.requires_distinction && (
+        <section
+          aria-label="Similar market proposals"
+          className="space-y-4 rounded-xl border border-amber-700/60 bg-amber-950/20 p-4"
+        >
+          <div>
+            <h2 className="font-semibold text-amber-200">Similar proposals found</h2>
+            <p className="mt-1 text-sm text-amber-100/80">
+              Review these candidates. If yours is genuinely distinct, explain why to continue.
+              Duplicate detection is advisory.
+            </p>
+          </div>
+          <ul className="space-y-2" aria-label="Duplicate candidates">
+            {duplicateCheck.candidates.map((candidate) => (
+              <li key={candidate.proposal_id} className="rounded-lg border border-amber-900/70 p-3">
+                <p className="font-medium text-zinc-100">{candidate.question}</p>
+                <p className="mt-1 text-xs text-zinc-400">
+                  Proposal {candidate.proposal_id} · similarity {candidate.score}%
+                </p>
+              </li>
+            ))}
+          </ul>
+          <TextareaField
+            id="distinction-note"
+            label="Explain the distinction"
+            value={distinctionNote}
+            onChange={setDistinctionNote}
+            placeholder="Describe how the event scope, time window, source, or outcome criteria differ."
+            maxLength={500}
+            rows={3}
+            helperText="Required to submit when likely matches are listed."
+            disabled={isSubmitting}
+          />
+        </section>
+      )}
+
       {/* ── Review summary (before wallet / submit) ── */}
       <section
         aria-label="Review pool before creating"
@@ -818,9 +930,17 @@ export function CreatePoolForm() {
           variant="primary"
           size="medium"
           loading={isSubmitting}
+          disabled={
+            isSubmitting ||
+            (duplicateCheck?.requires_distinction === true && !distinctionNote.trim())
+          }
           className="sm:min-w-[160px] bg-[#37B7C3] text-black hover:bg-[#2aa0ac] font-semibold"
         >
-          {isSubmitting ? "Creating Pool…" : "Create Pool"}
+          {isSubmitting
+            ? "Checking proposals…"
+            : duplicateCheck?.requires_distinction
+              ? "Submit with distinction"
+              : "Check and submit proposal"}
         </Button>
       </div>
     </form>

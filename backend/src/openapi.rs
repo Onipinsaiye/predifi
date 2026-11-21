@@ -337,6 +337,11 @@ success_envelope!(
     PricesEnvelope,
     Vec<AssetPriceDoc>
 );
+success_envelope!(
+    /// Success envelope for market draft duplicate checks.
+    MarketDraftDuplicateEnvelope,
+    MarketDraftDuplicateResultDoc
+);
 
 // ── Request / response bodies ─────────────────────────────────────────────────
 
@@ -488,6 +493,36 @@ pub struct DeletePushSubscriptionRequestDoc {
     pub endpoint: Option<String>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct MarketDraftDuplicateRequestDoc {
+    pub proposal_id: String,
+    pub question: String,
+    pub event_window_start: String,
+    pub event_window_end: String,
+    pub source: String,
+    pub outcomes: Vec<String>,
+    pub distinction_note: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct DuplicateMarketCandidateDoc {
+    pub proposal_id: String,
+    pub question: String,
+    pub event_window_start: String,
+    pub event_window_end: String,
+    pub source: String,
+    pub outcomes: Vec<String>,
+    pub score: u8,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct MarketDraftDuplicateResultDoc {
+    pub proposal_id: String,
+    pub candidates: Vec<DuplicateMarketCandidateDoc>,
+    pub requires_distinction: bool,
+    pub submitted: bool,
+}
+
 // ── OpenAPI spec ──────────────────────────────────────────────────────────────
 
 #[derive(OpenApi)]
@@ -529,6 +564,7 @@ pub struct DeletePushSubscriptionRequestDoc {
         api_get_referral_estimate,
         api_get_user_referral_earnings,
         api_get_creator_stats,
+        api_check_market_draft_duplicates,
         api_refresh_tokens,
         api_logout,
         api_ingest_pool_created,
@@ -569,6 +605,7 @@ pub struct DeletePushSubscriptionRequestDoc {
         UserPredictionsEnvelope,
         MarketPredictionsEnvelope,
         IndexerOkEnvelope,
+        MarketDraftDuplicateEnvelope,
         PricesEnvelope,
         AssetPriceDoc,
         ApiVersionDoc,
@@ -586,10 +623,14 @@ pub struct DeletePushSubscriptionRequestDoc {
         NotificationPreferencesDoc,
         PushSubscriptionRequestDoc,
         DeletePushSubscriptionRequestDoc,
+        MarketDraftDuplicateRequestDoc,
+        DuplicateMarketCandidateDoc,
+        MarketDraftDuplicateResultDoc,
     )),
     tags(
         (name = "health", description = "Service liveness and dependency checks"),
         (name = "pools", description = "Prediction market pools"),
+        (name = "markets", description = "Market proposal checks"),
         (name = "stats", description = "Protocol-wide statistics"),
         (name = "leaderboard", description = "User rankings"),
         (name = "predictions", description = "User prediction history"),
@@ -1107,6 +1148,22 @@ async fn api_refresh_tokens() {}
     )
 )]
 async fn api_logout() {}
+
+#[allow(dead_code)]
+#[utoipa::path(post, path = "/api/v1/market-drafts/duplicates", tag = "markets",
+    request_body = MarketDraftDuplicateRequestDoc,
+    responses(
+        (status = 200, description = "Draft saved or submitted with ranked likely-duplicate candidates", body = MarketDraftDuplicateEnvelope),
+        (status = 400, description = "Invalid proposal fields", body = ErrorResponse),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database or stored proposal error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_check_market_draft_duplicates() {}
 
 #[allow(dead_code)]
 #[utoipa::path(post, path = "/api/v1/indexer/pool-created", tag = "indexer",

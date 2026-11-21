@@ -11,6 +11,7 @@ pub mod cache_coalesce;
 pub mod config;
 pub mod constants;
 pub mod cors;
+pub mod duplicate_markets;
 pub mod db;
 pub mod errors;
 pub mod idempotency;

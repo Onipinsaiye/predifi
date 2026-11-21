@@ -1294,6 +1294,231 @@ pub struct PoolCreatedPayload {
     pub description: NonEmptyString,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MarketDraftDuplicateCheck {
+    pub proposal_id: String,
+    pub question: NonEmptyString,
+    pub event_window_start: chrono::DateTime<chrono::Utc>,
+    pub event_window_end: chrono::DateTime<chrono::Utc>,
+    pub source: NonEmptyString,
+    pub outcomes: Vec<NonEmptyString>,
+    pub distinction_note: Option<String>,
+}
+
+/// `POST /api/v1/market-drafts/duplicates` — save/update a draft and return
+/// likely duplicates. Candidates are advisory; a distinction note permits
+/// submission when a similar proposal has a legitimate scope difference.
+pub async fn check_market_draft_duplicates(
+    State(state): State<AppState>,
+    Json(payload): Json<MarketDraftDuplicateCheck>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use sqlx::Row;
+    use std::collections::HashSet;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let proposal_id = match uuid::Uuid::parse_str(&payload.proposal_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "proposal_id must be a UUID",
+            )
+            .into_response();
+        }
+    };
+    let question = payload.question.as_str().trim();
+    let source = payload.source.as_str().trim();
+    let normalized_outcomes = payload
+        .outcomes
+        .iter()
+        .map(|outcome| crate::duplicate_markets::normalize_text(outcome.as_str()))
+        .collect::<HashSet<_>>();
+    if question.is_empty()
+        || source.is_empty()
+        || question.len() > 200
+        || source.len() > 512
+        || payload.event_window_end < payload.event_window_start
+        || payload.outcomes.len() < 2
+        || payload.outcomes.len() > 100
+        || payload
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.as_str().trim().is_empty() || outcome.as_str().len() > 128)
+        || normalized_outcomes.len() != payload.outcomes.len()
+        || normalized_outcomes.contains("")
+        || payload
+            .distinction_note
+            .as_ref()
+            .is_some_and(|note| note.len() > 500)
+    {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "invalid market draft fields",
+        )
+        .into_response();
+    }
+
+    let outcomes = payload
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.as_str().trim())
+        .collect::<Vec<_>>();
+    let outcomes_json = match serde_json::to_string(&outcomes) {
+        Ok(json) => json,
+        Err(error) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                error.to_string(),
+            )
+            .into_response();
+        }
+    };
+    let distinction_note = payload
+        .distinction_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+
+    if let Err(error) = sqlx::query(
+        r#"
+        INSERT INTO market_proposals (
+            proposal_id, question, event_window_start, event_window_end,
+            source, outcomes, distinction_note, status
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7, 'draft')
+        ON CONFLICT (proposal_id) DO UPDATE SET
+            question = EXCLUDED.question,
+            event_window_start = EXCLUDED.event_window_start,
+            event_window_end = EXCLUDED.event_window_end,
+            source = EXCLUDED.source,
+            outcomes = EXCLUDED.outcomes,
+            distinction_note = EXCLUDED.distinction_note,
+            status = 'draft',
+            updated_at = NOW()
+        "#,
+    )
+    .bind(proposal_id.to_string())
+    .bind(question)
+    .bind(payload.event_window_start)
+    .bind(payload.event_window_end)
+    .bind(source)
+    .bind(outcomes_json)
+    .bind(distinction_note)
+    .execute(db)
+    .await
+    {
+        return ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            error.to_string(),
+        )
+        .into_response();
+    }
+
+    let existing = match sqlx::query(
+        r#"
+        SELECT proposal_id::text AS proposal_id, question, event_window_start,
+               event_window_end, source, outcomes::text AS outcomes
+        FROM market_proposals
+        WHERE proposal_id <> $1::uuid
+          AND updated_at >= NOW() - INTERVAL '90 days'
+        ORDER BY updated_at DESC, proposal_id ASC
+        LIMIT 5000
+        "#,
+    )
+    .bind(proposal_id.to_string())
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                error.to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    let proposals = existing
+        .iter()
+        .map(|row| {
+            let outcomes_json: String = row.get("outcomes");
+            Ok::<_, serde_json::Error>(crate::duplicate_markets::Proposal {
+                proposal_id: row.get("proposal_id"),
+                question: row.get("question"),
+                event_window_start: row.get("event_window_start"),
+                event_window_end: row.get("event_window_end"),
+                source: row.get("source"),
+                outcomes: serde_json::from_str(&outcomes_json)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let proposals = match proposals {
+        Ok(proposals) => proposals,
+        Err(error) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                format!("invalid stored market proposal: {error}"),
+            )
+            .into_response();
+        }
+    };
+    let current = crate::duplicate_markets::Proposal {
+        proposal_id: proposal_id.to_string(),
+        question: question.to_string(),
+        event_window_start: payload.event_window_start,
+        event_window_end: payload.event_window_end,
+        source: source.to_string(),
+        outcomes: outcomes
+            .iter()
+            .map(|outcome| (*outcome).to_string())
+            .collect(),
+    };
+    let candidates = crate::duplicate_markets::rank_candidates(&current, &proposals);
+    let submitted = candidates.is_empty() || distinction_note.is_some();
+
+    if submitted {
+        if let Err(error) = sqlx::query(
+            "UPDATE market_proposals SET status = 'submitted', updated_at = NOW() WHERE proposal_id = $1::uuid",
+        )
+        .bind(proposal_id.to_string())
+        .execute(db)
+        .await
+        {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                error.to_string(),
+            )
+            .into_response();
+        }
+    }
+
+    ApiResponse::success(serde_json::json!({
+        "proposal_id": proposal_id,
+        "candidates": candidates,
+        "requires_distinction": !candidates.is_empty() && distinction_note.is_none(),
+        "submitted": submitted,
+    }))
+    .into_response()
+}
+
 /// `POST /api/v1/indexer/pool-created` — ingest a decoded `PoolCreated` event
 /// and persist the new pool to the database.
 pub async fn ingest_pool_created(
@@ -2669,6 +2894,11 @@ pub fn router(
     // Write tier — indexer ingest (typically internal, strictest limit).
     let write = with_distributed_rate_limit(
         Router::new()
+            .route(
+                "/market-drafts/duplicates",
+                post(check_market_draft_duplicates)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_CREATED)),
+            )
             .route(
                 "/indexer/pool-created",
                 idempotent(
