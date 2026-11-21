@@ -30,6 +30,7 @@ pub mod pool_cache;
 pub mod price_cache;
 pub mod creator_profile;
 pub mod profile;
+pub mod watchlist;
 pub mod rate_limit;
 pub mod redis_cache;
 pub mod referrals;

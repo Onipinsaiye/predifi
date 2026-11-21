@@ -2619,9 +2619,439 @@ pub async fn put_creator_profile_handler(
     }
 }
 
-// ── Pool tags ─────────────────────────────────────────────────────────────────
+// ── Market watchlists (Issue #280) ────────────────────────────────────────────
 
-/// `GET /api/v1/categories` — governed category registry, including aliases
+/// Helper: authenticate `address` ownership via bearer token. Returns `Err(response)`
+/// to reject the request or `Ok(())` to allow it.
+async fn authenticate_watchlist_owner(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    address: &str,
+) -> Result<(), axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+        .ok_or_else(|| {
+            ApiResponse::<()>::error(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "missing bearer token",
+            )
+            .into_response()
+        })?;
+
+    let claims = crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    )
+    .map_err(|_| {
+        ApiResponse::<()>::error(
+            StatusCode::UNAUTHORIZED,
+            error_codes::UNAUTHORIZED,
+            "invalid bearer token",
+        )
+        .into_response()
+    })?;
+
+    if claims.sub != address {
+        return Err(ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "access token belongs to a different wallet",
+        )
+        .into_response());
+    }
+
+    Ok(())
+}
+
+/// `GET /api/v1/users/:address/watchlists`
+/// Returns all watchlists owned by `address` (authenticated).
+pub async fn list_watchlists_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::list_watchlists(db, address.as_str()).await {
+        Ok(lists) => ApiResponse::success(lists).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, address = %address, "list_watchlists failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to list watchlists",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/users/:address/watchlists`
+/// Create a new watchlist for `address` (authenticated).
+pub async fn create_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<crate::watchlist::CreateWatchlistInput>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::create_watchlist(db, address.as_str(), &body).await {
+        Ok(wl) => (axum::http::StatusCode::CREATED, Json(ApiResponse::success(wl))).into_response(),
+        Err(crate::watchlist::WatchlistError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, address = %address, "create_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to create watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /api/v1/users/:address/watchlists/:watchlist_id`
+/// Fetch one watchlist by ID for the authenticated owner.
+pub async fn get_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::get_watchlist(db, watchlist_id, address.as_str()).await {
+        Ok(wl) => ApiResponse::success(wl).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::Forbidden) => ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "not the watchlist owner",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "get_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to fetch watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `PATCH /api/v1/users/:address/watchlists/:watchlist_id`
+/// Update a watchlist's name, description, or public visibility.
+/// Setting `public: false` immediately revokes the share link.
+pub async fn update_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+    Json(body): Json<crate::watchlist::UpdateWatchlistInput>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::update_watchlist(db, watchlist_id, address.as_str(), &body).await {
+        Ok(wl) => ApiResponse::success(wl).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::Forbidden) => ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "not the watchlist owner",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "update_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to update watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/users/:address/watchlists/:watchlist_id`
+/// Delete a watchlist and all its market entries.
+pub async fn delete_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::delete_watchlist(db, watchlist_id, address.as_str()).await {
+        Ok(()) => ApiResponse::success(serde_json::json!({ "deleted": true })).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "delete_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to delete watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/users/:address/watchlists/:watchlist_id/markets`
+/// Add a pool to the watchlist.
+pub async fn add_watchlist_market_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let pool_id = body
+        .get("pool_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                "pool_id is required and must be a number",
+            )
+            .into_response()
+        });
+    let pool_id = match pool_id {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::watchlist::add_market(db, watchlist_id, address.as_str(), pool_id).await {
+        Ok(()) => ApiResponse::success(serde_json::json!({ "added": true })).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "add_watchlist_market failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to add market to watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/users/:address/watchlists/:watchlist_id/markets/:pool_id`
+/// Remove a pool from the watchlist.
+pub async fn remove_watchlist_market_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id, pool_id)): Path<(StellarAddress, i64, i64)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::remove_market(db, watchlist_id, address.as_str(), pool_id).await {
+        Ok(()) => ApiResponse::success(serde_json::json!({ "removed": true })).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "remove_watchlist_market failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to remove market from watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /api/v1/watchlists/public/:slug`
+/// Unauthenticated read of a public watchlist by its opaque share token.
+/// Returns only market IDs — never the owner address.
+pub async fn get_public_watchlist_handler(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if slug.trim().is_empty() || slug.len() > 64 {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "invalid slug",
+        )
+        .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::watchlist::get_watchlist_by_slug(db, &slug).await {
+        Ok(Some(wl)) => ApiResponse::success(wl).into_response(),
+        Ok(None) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found or no longer public",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, slug = %slug, "get_public_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to fetch public watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+// ── Pool tags ───────────────────────────────────────────────────────────────── — governed category registry, including aliases
 /// and deprecated categories retained for historic discovery.
 pub async fn list_categories_handler(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;
@@ -3846,6 +4276,32 @@ pub fn router(
                 get(get_creator_profile_handler)
                     .put(put_creator_profile_handler)
                     .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists",
+                get(list_watchlists_handler)
+                    .post(create_watchlist_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists/:watchlist_id",
+                get(get_watchlist_handler)
+                    .patch(update_watchlist_handler)
+                    .delete(delete_watchlist_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists/:watchlist_id/markets",
+                post(add_watchlist_market_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists/:watchlist_id/markets/:pool_id",
+                axum::routing::delete(remove_watchlist_market_handler),
+            )
+            .route(
+                "/watchlists/public/:slug",
+                get(get_public_watchlist_handler),
             )
             .route(
                 "/users/:address/portfolio/export",
