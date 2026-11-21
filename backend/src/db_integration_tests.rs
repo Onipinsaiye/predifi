@@ -278,6 +278,284 @@ mod tests {
         drop(container);
     }
 
+    // ------------------------------------------------------------------
+    // #261 — Portfolio exposure by market and outcome
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn portfolio_exposure_aggregates_repeated_positions_and_flags_missing_prices() {
+        let (pool, container) = setup().await;
+
+        // Open market with a price, closed market, and a market with no price.
+        sqlx::query(
+            "INSERT INTO pools (pool_id, name, end_time, state) VALUES \
+             (801, 'open', NOW() + INTERVAL '1 day', 'active'), \
+             (802, 'closed', NOW() - INTERVAL '1 day', 'closed'), \
+             (803, 'unpriced', NOW() + INTERVAL '1 day', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert pools");
+
+        // Repeated positions in the same market/outcome must be summed.
+        for (pool_id, outcome, amount) in [
+            (801_i64, 0_i32, 100_i64),
+            (801, 0, 50),
+            (801, 1, 25),
+            (802, 0, 40),
+            (803, 0, 10),
+        ] {
+            sqlx::query(
+                "INSERT INTO predictions (pool_id, user_address, outcome, amount) \
+                 VALUES ($1, 'GEXPOSURE', $2, $3)",
+            )
+            .bind(pool_id)
+            .bind(outcome)
+            .bind(amount)
+            .execute(&pool)
+            .await
+            .expect("insert prediction");
+        }
+
+        let rows = crate::db::get_portfolio_exposure(&pool, "GEXPOSURE")
+            .await
+            .expect("portfolio exposure");
+
+        let open_outcome_0 = rows
+            .iter()
+            .find(|r| r.pool_id == 801 && r.outcome == 0)
+            .expect("aggregated open outcome 0");
+        assert_eq!(open_outcome_0.amount, 150, "repeated positions are summed");
+
+        let open_outcome_1 = rows
+            .iter()
+            .find(|r| r.pool_id == 801 && r.outcome == 1)
+            .expect("aggregated open outcome 1");
+        assert_eq!(open_outcome_1.amount, 25);
+
+        // Shares are expressed against the whole indexed portfolio.
+        let total: i64 = rows.iter().map(|r| r.amount).sum();
+        assert_eq!(total, 225);
+        assert!((open_outcome_0.share - 150.0 / 225.0).abs() < 1e-9);
+
+        // Closed markets are reported but marked as not open.
+        let closed = rows
+            .iter()
+            .find(|r| r.pool_id == 802)
+            .expect("closed market position");
+        assert!(!closed.is_open, "closed market must be flagged");
+
+        // Missing price data yields an estimate of `None`, never a fake zero.
+        let unpriced = rows
+            .iter()
+            .find(|r| r.pool_id == 803)
+            .expect("unpriced market position");
+        assert!(unpriced.estimated_value.is_none());
+
+        pool.close().await;
+        drop(container);
+    }
+
+    // ------------------------------------------------------------------
+    // #262 — Claimable-rewards work queue
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn claimable_rewards_queue_mixes_eligibility_and_survives_partial_failures() {
+        let (pool, container) = setup().await;
+
+        sqlx::query(
+            "INSERT INTO pools (pool_id, name, end_time, state) VALUES \
+             (811, 'eligible', NOW() - INTERVAL '1 day', 'closed'), \
+             (812, 'ineligible', NOW() + INTERVAL '1 day', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert pools");
+
+        for pool_id in [811_i64, 812_i64] {
+            sqlx::query(
+                "INSERT INTO predictions (pool_id, user_address, outcome, amount) \
+                 VALUES ($1, 'GCLAIM', 0, 100)",
+            )
+            .bind(pool_id)
+            .execute(&pool)
+            .await
+            .expect("insert prediction");
+        }
+
+        let queue = crate::db::get_claimable_rewards(&pool, "GCLAIM", 10)
+            .await
+            .expect("claimable rewards");
+        assert!(queue.iter().any(|c| c.pool_id == 811 && c.eligible));
+        assert!(queue.iter().any(|c| c.pool_id == 812 && !c.eligible));
+
+        // Bounded selection: requesting one row returns at most one.
+        let bounded = crate::db::get_claimable_rewards(&pool, "GCLAIM", 1)
+            .await
+            .expect("bounded claimable rewards");
+        assert_eq!(bounded.len(), 1);
+
+        // A partial batch failure must not mark the failed claim complete.
+        let batch = crate::db::simulate_claim_batch(&pool, "GCLAIM", &[811, 812])
+            .await
+            .expect("simulate claim batch");
+        assert!(batch.iter().any(|r| r.pool_id == 811 && r.simulated));
+        assert!(batch.iter().any(|r| r.pool_id == 812 && !r.simulated));
+
+        let status: String = sqlx::query(
+            "SELECT status FROM claim_queue WHERE user_address = 'GCLAIM' AND pool_id = 812",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("failed claim status")
+        .get(0);
+        assert_eq!(status, "pending", "simulation failure must not complete a claim");
+
+        // Status refresh after confirmation flips the claim to confirmed.
+        crate::db::mark_claim_confirmed(&pool, "GCLAIM", 811, "tx-claim-811")
+            .await
+            .expect("mark claim confirmed");
+        let confirmed: String = sqlx::query(
+            "SELECT status FROM claim_queue WHERE user_address = 'GCLAIM' AND pool_id = 811",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("confirmed claim status")
+        .get(0);
+        assert_eq!(confirmed, "confirmed");
+
+        pool.close().await;
+        drop(container);
+    }
+
+    // ------------------------------------------------------------------
+    // #263 — Claim reconciliation
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn claim_reconciliation_is_idempotent_under_retries_and_reordering() {
+        let (pool, container) = setup().await;
+
+        sqlx::query(
+            "INSERT INTO pools (pool_id, name, end_time, state) VALUES \
+             (821, 'settled', NOW() - INTERVAL '1 day', 'closed')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert pool");
+
+        sqlx::query(
+            "INSERT INTO predictions (pool_id, user_address, outcome, amount) \
+             VALUES (821, 'GRECON', 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert prediction");
+
+        // Claim event arrives before the settlement event is indexed.
+        crate::db::record_claim_event(&pool, "GRECON", 821, 0, "tx-recon-1", 100)
+            .await
+            .expect("record claim event");
+
+        let pending = crate::db::get_claim_reconciliation(&pool, "GRECON", "tx-recon-1")
+            .await
+            .expect("reconciliation status");
+        assert_eq!(pending.status, "pending", "delayed indexing must be surfaced");
+
+        // Settlement event is indexed afterwards (reordering).
+        crate::db::record_settlement_event(&pool, 821, 0, "settle-821")
+            .await
+            .expect("record settlement event");
+
+        // Retrying the same claim event must not duplicate ledger credits.
+        for _ in 0..3 {
+            crate::db::record_claim_event(&pool, "GRECON", 821, 0, "tx-recon-1", 100)
+                .await
+                .expect("retry claim event");
+        }
+
+        let reconciled = crate::db::get_claim_reconciliation(&pool, "GRECON", "tx-recon-1")
+            .await
+            .expect("reconciled status");
+        assert_eq!(reconciled.status, "reconciled");
+        assert_eq!(reconciled.payout, 100);
+        assert_eq!(reconciled.source_event, "settle-821");
+
+        let credits: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM claim_ledger WHERE user_address = 'GRECON' AND tx_hash = 'tx-recon-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count ledger credits")
+        .get(0);
+        assert_eq!(credits, 1, "retries must not duplicate ledger credits");
+
+        pool.close().await;
+        drop(container);
+    }
+
+    // ------------------------------------------------------------------
+    // #264 — CSV export
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn portfolio_csv_export_preserves_decimals_escapes_formulas_and_orders_deterministically(
+    ) {
+        let (pool, container) = setup().await;
+
+        sqlx::query(
+            "INSERT INTO pools (pool_id, name, end_time, state) VALUES \
+             (831, 'export', NOW() - INTERVAL '1 day', 'closed')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert pool");
+
+        // Untrusted text that would be interpreted as a formula by spreadsheet apps.
+        sqlx::query(
+            "INSERT INTO predictions (pool_id, user_address, outcome, amount) \
+             VALUES (831, '=cmd|'' /C calc''!A0', 0, 100)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert prediction");
+
+        let export = crate::db::export_portfolio_activity_csv(&pool, "=cmd|'' /C calc''!A0", 100)
+            .await
+            .expect("csv export");
+
+        assert_eq!(export.schema_version, "1");
+        assert_eq!(export.network, "testnet");
+
+        // Exact decimal preservation: no float rounding of the amount column.
+        assert!(
+            export.csv.contains("100"),
+            "amount must be preserved exactly; got:\n{}",
+            export.csv
+        );
+
+        // Formula injection is neutralised with a leading apostrophe.
+        assert!(
+            export.csv.contains("'=cmd"),
+            "untrusted cell must be escaped; got:\n{}",
+            export.csv
+        );
+
+        // Deterministic ordering across repeated exports.
+        let again = crate::db::export_portfolio_activity_csv(&pool, "=cmd|'' /C calc''!A0", 100)
+            .await
+            .expect("csv export again");
+        assert_eq!(export.csv, again.csv, "export ordering must be deterministic");
+
+        pool.close().await;
+        drop(container);
+    }
+
     #[tokio::test]
     #[ignore = "Requires Docker container for Postgres"]
     async fn market_prediction_cursor_is_stable_across_duplicate_times_and_inserts() {
