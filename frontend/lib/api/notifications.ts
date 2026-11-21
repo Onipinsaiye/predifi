@@ -273,3 +273,161 @@ export async function updateDigestPreferences(
 export function digestUnsubscribeUrl(token: string): string {
   return `${API_BASE_URL}/api/v1/digest/unsubscribe?token=${encodeURIComponent(token)}`;
 }
+
+// ── Per-wallet notification preferences by event type and channel (#286) ──────
+
+/** Event types the backend supports. Maps 1-to-1 with the backend enum. */
+export type NotificationEventType =
+  | "pool_ending_soon"
+  | "pool_resolved"
+  | "claim_expiring"
+  | "new_pool_match";
+
+/** Delivery channels the backend supports. */
+export type NotificationChannel = "in_app" | "push" | "email";
+
+export const NOTIFICATION_EVENT_TYPES: NotificationEventType[] = [
+  "pool_ending_soon",
+  "pool_resolved",
+  "claim_expiring",
+  "new_pool_match",
+];
+
+export const NOTIFICATION_CHANNELS: NotificationChannel[] = [
+  "in_app",
+  "push",
+  "email",
+];
+
+/** Human-readable labels for each event type. */
+export const EVENT_TYPE_LABELS: Record<NotificationEventType, string> = {
+  pool_ending_soon: "Pool ending soon",
+  pool_resolved: "Pool resolved",
+  claim_expiring: "Claim window expiring",
+  new_pool_match: "New pool matching interests",
+};
+
+/** Human-readable labels for each channel. */
+export const CHANNEL_LABELS: Record<NotificationChannel, string> = {
+  in_app: "In-app",
+  push: "Browser push",
+  email: "Email",
+};
+
+/**
+ * Versioned per-wallet preferences as returned by the backend.
+ * Default is all-off (default-deny).
+ */
+export interface BackendNotificationPreferences {
+  schema_version: number;
+  channels: Record<NotificationChannel, boolean>;
+  events: Record<NotificationEventType, boolean>;
+}
+
+function isBackendNotificationPreferences(
+  obj: unknown,
+): obj is BackendNotificationPreferences {
+  if (!obj || typeof obj !== "object") return false;
+  const p = obj as Record<string, unknown>;
+  if (typeof p.schema_version !== "number") return false;
+  if (!p.channels || typeof p.channels !== "object") return false;
+  if (!p.events || typeof p.events !== "object") return false;
+  const channels = p.channels as Record<string, unknown>;
+  const events = p.events as Record<string, unknown>;
+  return (
+    NOTIFICATION_CHANNELS.every((c) => typeof channels[c] === "boolean") &&
+    NOTIFICATION_EVENT_TYPES.every((e) => typeof events[e] === "boolean")
+  );
+}
+
+export function notificationPreferencesUrl(address: string): string {
+  return `${API_BASE_URL}/api/v1/users/${encodeURIComponent(address)}/notification-preferences`;
+}
+
+/** Fetch the current per-event-type and per-channel preferences for `address`. */
+export async function fetchNotificationPreferences(
+  address: string,
+): Promise<BackendNotificationPreferences> {
+  const res = await fetch(notificationPreferencesUrl(address), {
+    headers: { Accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    throw new ApiError(
+      `Failed to load notification preferences (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+
+  const body = await res.json();
+  const data =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  if (!isBackendNotificationPreferences(data)) {
+    throw new ApiError("Invalid notification preferences response shape", 500);
+  }
+
+  return data;
+}
+
+/**
+ * Save updated preferences for `address`.
+ * Returns the normalised preferences as confirmed by the backend.
+ */
+export async function saveNotificationPreferences(
+  address: string,
+  prefs: BackendNotificationPreferences,
+): Promise<BackendNotificationPreferences> {
+  const res = await fetch(notificationPreferencesUrl(address), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(prefs),
+  });
+
+  if (!res.ok) {
+    throw new ApiError(
+      `Failed to save notification preferences (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+
+  const body = await res.json();
+  const data =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  if (!isBackendNotificationPreferences(data)) {
+    throw new ApiError("Invalid notification preferences response shape", 500);
+  }
+
+  return data;
+}
+
+/**
+ * Reset preferences for `address` to the backend default (all-off).
+ * Returns the default preferences.
+ */
+export async function resetNotificationPreferences(
+  address: string,
+): Promise<BackendNotificationPreferences> {
+  const res = await fetch(notificationPreferencesUrl(address), {
+    method: "DELETE",
+    headers: { Accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    throw new ApiError(
+      `Failed to reset notification preferences (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+
+  const body = await res.json();
+  const data =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  if (!isBackendNotificationPreferences(data)) {
+    throw new ApiError("Invalid notification preferences response shape", 500);
+  }
+
+  return data;
+}
