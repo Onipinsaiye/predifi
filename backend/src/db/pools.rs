@@ -30,9 +30,21 @@ pub struct ReadBudget {
 
 /// Budgets for the core read paths covered by this issue.
 pub const READ_BUDGETS: &[ReadBudget] = &[
-    ReadBudget { query_group: "pools.list", p95_latency_ms: 120, max_round_trips: 2 },
-    ReadBudget { query_group: "pools.detail", p95_latency_ms: 80, max_round_trips: 2 },
-    ReadBudget { query_group: "predictions.history", p95_latency_ms: 150, max_round_trips: 1 },
+    ReadBudget {
+        query_group: "pools.list",
+        p95_latency_ms: 120,
+        max_round_trips: 2,
+    },
+    ReadBudget {
+        query_group: "pools.detail",
+        p95_latency_ms: 80,
+        max_round_trips: 2,
+    },
+    ReadBudget {
+        query_group: "predictions.history",
+        p95_latency_ms: 150,
+        max_round_trips: 1,
+    },
 ];
 
 /// Emit a budget observation for a read group. `round_trips` is the number of
@@ -53,6 +65,7 @@ pub struct PoolRow {
     pub pool_id: i64,
     pub name: String,
     pub category: String,
+    pub category_id: Option<String>,
     pub total_stake: i64,
     pub end_time: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -64,6 +77,7 @@ pub struct PoolDetails {
     pub pool_id: i64,
     pub name: String,
     pub category: String,
+    pub category_id: Option<String>,
     pub total_stake: i64,
     pub end_time: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -87,6 +101,7 @@ pub struct PoolWithOdds {
     pub pool_id: i64,
     pub name: String,
     pub category: String,
+    pub category_id: Option<String>,
     pub total_stake: i64,
     pub end_time: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -95,6 +110,33 @@ pub struct PoolWithOdds {
     pub token: String,
     pub result: Option<String>,
     pub odds: Vec<OutcomeOdds>,
+}
+
+/// Reserve / share state required to produce a deterministic market quote.
+///
+/// This is the raw snapshot the quote handler needs: the per-outcome reserves
+/// (stakes), the total shares outstanding, the pool lifecycle status, and the
+/// timestamp the snapshot was last updated. The handler is responsible for
+/// rejecting stale (`last_updated` too old) or unsupported (`status` not
+/// `"active"`) snapshots before computing a quote.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolQuoteState {
+    pub pool_id: i64,
+    /// Per-outcome reserves, ordered by `outcome`.
+    pub reserves: Vec<OutcomeReserve>,
+    /// Total shares outstanding across all outcomes.
+    pub total_shares: i64,
+    /// Pool lifecycle status (`"active"`, `"closed"`, `"settled"`).
+    pub status: String,
+    /// When the reserve/share snapshot was last updated.
+    pub last_updated: DateTime<Utc>,
+}
+
+/// A single outcome's reserve within a [`PoolQuoteState`] snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutcomeReserve {
+    pub outcome: i32,
+    pub reserve: i64,
 }
 
 /// Aggregate creator reputation / reward-eligibility metrics.
@@ -129,6 +171,7 @@ pub struct PoolCreatedEvent {
     pub end_time: u64,
     pub token: String,
     pub category: String,
+    pub category_id: String,
     pub description: String,
 }
 
@@ -140,10 +183,17 @@ struct OutcomeStakeRow {
     total_stake: i64,
 }
 
+#[derive(sqlx::FromRow)]
+struct PoolQuoteStateRow {
+    pool_id: i64,
+    state: String,
+    total_stake: i64,
+    updated_at: DateTime<Utc>,
+}
+
 // ── Column list shared by template queries ────────────────────────────────────
 
-const POOL_TEMPLATE_COLUMNS: &str =
-    "id, creator, name, category, description, token, \
+const POOL_TEMPLATE_COLUMNS: &str = "id, creator, name, category, description, token, \
      duration_seconds, recurrence_interval_seconds, next_run_at, active";
 
 // ── Read queries ──────────────────────────────────────────────────────────────
@@ -182,9 +232,9 @@ pub async fn get_pools_with_filters(
 ) -> Result<Vec<PoolRow>, sqlx::Error> {
     let started = Instant::now();
     let order_clause = match sort_by {
-        "popular"     => "total_stake DESC",
+        "popular" => "total_stake DESC",
         "ending_soon" => "end_time ASC",
-        _             => "created_at DESC", // "new" and default
+        _ => "created_at DESC", // "new" and default
     };
 
     let valid_status = match status {
@@ -194,10 +244,10 @@ pub async fn get_pools_with_filters(
 
     let sql = format!(
         r#"
-        SELECT pool_id, name, category, total_stake, end_time, created_at
+        SELECT pool_id, name, category, category_id, total_stake, end_time, created_at
         FROM pools
         WHERE state = $1
-          AND ($2::text IS NULL OR category = $2)
+          AND ($2::text IS NULL OR category_id = $2)
         ORDER BY {order_clause}
         LIMIT $3 OFFSET $4
         "#
@@ -232,7 +282,7 @@ pub async fn count_pools_with_filters(
         SELECT COUNT(*)
         FROM pools
         WHERE state = $1
-          AND ($2::text IS NULL OR category = $2)
+          AND ($2::text IS NULL OR category_id = $2)
         "#,
     )
     .bind(valid_status)
@@ -250,7 +300,7 @@ pub async fn get_pool_by_id(
 ) -> Result<Option<PoolDetails>, sqlx::Error> {
     sqlx::query_as::<_, PoolDetails>(
         r#"
-        SELECT pool_id, name, category, total_stake, end_time, created_at,
+        SELECT pool_id, name, category, category_id, total_stake, end_time, created_at,
                state, creator, token, result
         FROM pools
         WHERE pool_id = $1
@@ -279,7 +329,62 @@ pub async fn get_pool_outcome_stakes(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|r| (r.outcome, r.total_stake)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.outcome, r.total_stake))
+        .collect())
+}
+
+/// Fetch the reserve / share snapshot needed to produce a deterministic quote.
+///
+/// Returns `None` when the pool does not exist. The returned snapshot carries
+/// the per-outcome reserves, the total shares outstanding, the pool lifecycle
+/// status, and the timestamp the snapshot was last updated. Callers (the quote
+/// handler) must reject snapshots whose `status` is not `"active"` or whose
+/// `last_updated` is older than the configured staleness window.
+///
+/// The total shares are resolved the same way as [`get_pool_with_odds`]: the
+/// derived sum from `predictions` wins when it exceeds the denormalised
+/// `pools.total_stake` cache, so quotes agree with displayed odds.
+pub async fn get_pool_quote_state(
+    pool: &PgPool,
+    pool_id: i64,
+) -> Result<Option<PoolQuoteState>, sqlx::Error> {
+    let started = Instant::now();
+
+    let row = sqlx::query_as::<_, PoolQuoteStateRow>(
+        r#"
+        SELECT pool_id, state, total_stake, updated_at
+        FROM pools
+        WHERE pool_id = $1
+        "#,
+    )
+    .bind(pool_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let outcome_stakes = get_pool_outcome_stakes(pool, pool_id).await?;
+    let calculated_total: i64 = outcome_stakes.iter().map(|(_, s)| s).sum();
+    let total_shares = std::cmp::max(row.total_stake, calculated_total);
+
+    let reserves = outcome_stakes
+        .into_iter()
+        .map(|(outcome, reserve)| OutcomeReserve { outcome, reserve })
+        .collect();
+
+    observe_read_budget("pools.quote", 2, started.elapsed().as_millis() as u64);
+
+    Ok(Some(PoolQuoteState {
+        pool_id: row.pool_id,
+        reserves,
+        total_shares,
+        status: row.state,
+        last_updated: row.updated_at,
+    }))
 }
 
 /// Fetch a pool's full detail joined with real-time odds for each outcome.
@@ -305,6 +410,7 @@ pub async fn get_pool_with_odds(
         pool_id: details.pool_id,
         name: details.name,
         category: details.category,
+        category_id: details.category_id,
         total_stake,
         end_time: details.end_time,
         created_at: details.created_at,
@@ -314,6 +420,129 @@ pub async fn get_pool_with_odds(
         result: details.result,
         odds,
     }))
+}
+
+// ── Portfolio export queries (#265) ──────────────────────────────────────────
+//
+// These back the versioned JSON portfolio export. They are additive: the CSV
+// export paths are untouched. Both queries are bounded and cursor-paginated so
+// the caller can emit explicit truncation / continuation metadata.
+
+/// A single position row for the portfolio JSON export, including the source
+/// references (pool, originating event, transaction) and the calculation
+/// metadata (stake, payout, fee, rounding) needed to reproduce the numbers.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct PortfolioPositionExportRow {
+    pub position_id: i64,
+    pub pool_id: i64,
+    pub outcome: i32,
+    pub stake: i64,
+    pub payout: i64,
+    pub fee: i64,
+    pub rounding: i64,
+    pub source_event_id: Option<i64>,
+    pub tx_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A single ledger entry row for the portfolio JSON export.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct PortfolioLedgerExportRow {
+    pub entry_id: i64,
+    pub pool_id: Option<i64>,
+    pub entry_type: String,
+    pub amount: i64,
+    pub fee: i64,
+    pub rounding: i64,
+    pub source_event_id: Option<i64>,
+    pub tx_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Fetch one bounded page of a wallet's positions for the JSON export.
+///
+/// Cursor pagination is by ascending `position_id`: pass `after_id = None` for
+/// the first page, then the last returned `position_id` for subsequent pages.
+/// At most `limit` rows are returned; callers detect truncation by comparing
+/// the returned length against `limit` (or by fetching `limit + 1`).
+#[instrument(skip(pool), name = "db.get_portfolio_positions_for_export",
+    fields(wallet = %wallet, limit = limit, after_id = ?after_id))]
+pub async fn get_portfolio_positions_for_export(
+    pool: &PgPool,
+    wallet: &str,
+    limit: i64,
+    after_id: Option<i64>,
+) -> Result<Vec<PortfolioPositionExportRow>, sqlx::Error> {
+    sqlx::query_as::<_, PortfolioPositionExportRow>(
+        r#"
+        SELECT position_id, pool_id, outcome, stake, payout, fee, rounding,
+               source_event_id, tx_hash, created_at
+        FROM positions
+        WHERE wallet = $1
+          AND ($2::bigint IS NULL OR position_id > $2)
+        ORDER BY position_id ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(wallet)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Fetch one bounded page of a wallet's ledger entries for the JSON export.
+///
+/// Cursor pagination is by ascending `entry_id`, mirroring
+/// [`get_portfolio_positions_for_export`].
+#[instrument(skip(pool), name = "db.get_portfolio_ledger_for_export",
+    fields(wallet = %wallet, limit = limit, after_id = ?after_id))]
+pub async fn get_portfolio_ledger_for_export(
+    pool: &PgPool,
+    wallet: &str,
+    limit: i64,
+    after_id: Option<i64>,
+) -> Result<Vec<PortfolioLedgerExportRow>, sqlx::Error> {
+    sqlx::query_as::<_, PortfolioLedgerExportRow>(
+        r#"
+        SELECT entry_id, pool_id, entry_type, amount, fee, rounding,
+               source_event_id, tx_hash, created_at
+        FROM ledger_entries
+        WHERE wallet = $1
+          AND ($2::bigint IS NULL OR entry_id > $2)
+        ORDER BY entry_id ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(wallet)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Total number of positions and ledger entries for a wallet.
+///
+/// Returned as `(positions, ledger_entries)` so the export can state whether a
+/// bounded page was truncated and how much remains.
+#[instrument(skip(pool), name = "db.count_portfolio_export_rows", fields(wallet = %wallet))]
+pub async fn count_portfolio_export_rows(
+    pool: &PgPool,
+    wallet: &str,
+) -> Result<(i64, i64), sqlx::Error> {
+    let positions: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM positions WHERE wallet = $1")
+            .bind(wallet)
+            .fetch_one(pool)
+            .await?;
+
+    let ledger: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM ledger_entries WHERE wallet = $1")
+            .bind(wallet)
+            .fetch_one(pool)
+            .await?;
+
+    Ok((positions.0, ledger.0))
 }
 
 // ── Write queries ─────────────────────────────────────────────────────────────
@@ -332,14 +561,15 @@ pub async fn insert_pool_from_event_tx(
     let inserted = sqlx::query(
         r#"
         INSERT INTO pools
-            (pool_id, name, category, total_stake, end_time, state, creator, token, created_at)
-        VALUES ($1, $2, $3, 0, to_timestamp($4), 'active', $5, $6, NOW())
+            (pool_id, name, category, category_id, total_stake, end_time, state, creator, token, created_at)
+        VALUES ($1, $2, $3, $4, 0, to_timestamp($5), 'active', $6, $7, NOW())
         ON CONFLICT (pool_id) DO NOTHING
         "#,
     )
     .bind(event.pool_id as i64)
     .bind(&event.description)
     .bind(&event.category)
+    .bind(&event.category_id)
     .bind(event.end_time as f64)
     .bind(&event.creator)
     .bind(&event.token)
@@ -392,10 +622,7 @@ where
 
 /// Mark a pool as closed (cancelled on-chain).
 #[instrument(skip(executor), name = "db.cancel_pool_in_db", fields(pool_id = pool_id))]
-pub async fn cancel_pool_in_db<'e, E>(
-    executor: E,
-    pool_id: u64,
-) -> Result<(), sqlx::Error>
+pub async fn cancel_pool_in_db<'e, E>(executor: E, pool_id: u64) -> Result<(), sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
@@ -499,10 +726,7 @@ pub async fn get_creator_stats(
 
 /// Return `true` when a pool has met its minimum participation threshold and
 /// its creator reward has not yet been paid.
-pub async fn is_creator_reward_eligible(
-    pool: &PgPool,
-    pool_id: i64,
-) -> Result<bool, sqlx::Error> {
+pub async fn is_creator_reward_eligible(pool: &PgPool, pool_id: i64) -> Result<bool, sqlx::Error> {
     let row: Option<(bool,)> = sqlx::query_as(
         r#"
         SELECT (total_stake >= min_participation_threshold AND NOT creator_reward_paid)
@@ -554,11 +778,8 @@ pub async fn pay_creator_incentive(
             .fetch_one(pool)
             .await?;
 
-    let amount = calculate_creator_incentive(
-        details.total_stake,
-        treasury_fee_bps,
-        creator_reward_bps,
-    );
+    let amount =
+        calculate_creator_incentive(details.total_stake, treasury_fee_bps, creator_reward_bps);
 
     // Atomic CAS-style update: only succeeds when reward has not yet been paid.
     let updated = sqlx::query(
@@ -671,7 +892,9 @@ pub async fn get_due_pool_templates(pool: &PgPool) -> Result<Vec<PoolTemplate>, 
         "#
     );
 
-    sqlx::query_as::<_, PoolTemplate>(&sql).fetch_all(pool).await
+    sqlx::query_as::<_, PoolTemplate>(&sql)
+        .fetch_all(pool)
+        .await
 }
 
 /// Advance a template's `next_run_at` by one recurrence interval.
@@ -724,7 +947,10 @@ mod tests {
         let stakes = vec![(0i32, 500i64), (1, 500)];
         let odds = calculate_odds(&stakes, 1_000);
         for o in &odds {
-            assert!((o.odds - 2.0).abs() < 1e-9, "50/50 split must yield 2.0 odds");
+            assert!(
+                (o.odds - 2.0).abs() < 1e-9,
+                "50/50 split must yield 2.0 odds"
+            );
         }
     }
 
@@ -777,7 +1003,10 @@ mod tests {
             "idx_predictions_pool_user",
             "idx_predictions_amount_desc",
         ] {
-            assert!(sql.contains(name), "migration 009 must define index '{name}'");
+            assert!(
+                sql.contains(name),
+                "migration 009 must define index '{name}'"
+            );
         }
     }
 
@@ -786,7 +1015,10 @@ mod tests {
         let sql = include_str!("../../migrations/009_add_predictions_indexes.sql");
         let total = sql.matches("CREATE INDEX").count();
         let idempotent = sql.matches("CREATE INDEX IF NOT EXISTS").count();
-        assert_eq!(total, idempotent, "every CREATE INDEX must use IF NOT EXISTS");
+        assert_eq!(
+            total, idempotent,
+            "every CREATE INDEX must use IF NOT EXISTS"
+        );
     }
 
     // ── Read budgets ──────────────────────────────────────────────────────────
@@ -803,7 +1035,11 @@ mod tests {
     fn read_budgets_are_positive() {
         for b in READ_BUDGETS {
             assert!(b.p95_latency_ms > 0, "{} p95 must be > 0", b.query_group);
-            assert!(b.max_round_trips > 0, "{} round-trips must be > 0", b.query_group);
+            assert!(
+                b.max_round_trips > 0,
+                "{} round-trips must be > 0",
+                b.query_group
+            );
         }
     }
 
@@ -826,6 +1062,7 @@ mod tests {
             pool_id: 1,
             name: "Will it rain?".to_string(),
             category: "weather".to_string(),
+            category_id: Some("legacy_weather".to_string()),
             total_stake: cached_total,
             end_time: Utc::now(),
             created_at: Utc::now(),
@@ -898,6 +1135,7 @@ mod tests {
             pool_id: details.pool_id,
             name: details.name,
             category: details.category,
+            category_id: details.category_id,
             total_stake: details.total_stake,
             end_time: details.end_time,
             created_at: details.created_at,
@@ -920,5 +1158,52 @@ mod tests {
         details.result = Some("1".to_string());
         assert_eq!(details.state, "settled");
         assert_eq!(details.result.as_deref(), Some("1"));
+    }
+
+    // ── Portfolio JSON export rows (#265) ─────────────────────────────────────
+
+    #[test]
+    fn portfolio_position_export_row_serializes_source_and_calculation_metadata() {
+        let row = PortfolioPositionExportRow {
+            position_id: 7,
+            pool_id: 42,
+            outcome: 1,
+            stake: 1_000,
+            payout: 2_000,
+            fee: 20,
+            rounding: -1,
+            source_event_id: Some(99),
+            tx_hash: Some("abc123".to_string()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&row).expect("row must serialize");
+        assert_eq!(json["pool_id"], 42);
+        assert_eq!(json["source_event_id"], 99);
+        assert_eq!(json["tx_hash"], "abc123");
+        assert_eq!(json["stake"], 1_000);
+        assert_eq!(json["payout"], 2_000);
+        assert_eq!(json["fee"], 20);
+        assert_eq!(json["rounding"], -1);
+    }
+
+    #[test]
+    fn portfolio_ledger_export_row_serializes_source_and_calculation_metadata() {
+        let row = PortfolioLedgerExportRow {
+            entry_id: 3,
+            pool_id: None,
+            entry_type: "deposit".to_string(),
+            amount: 500,
+            fee: 0,
+            rounding: 0,
+            source_event_id: None,
+            tx_hash: Some("def456".to_string()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&row).expect("row must serialize");
+        assert_eq!(json["entry_type"], "deposit");
+        assert!(json["pool_id"].is_null());
+        assert!(json["source_event_id"].is_null());
+        assert_eq!(json["tx_hash"], "def456");
+        assert_eq!(json["amount"], 500);
     }
 }

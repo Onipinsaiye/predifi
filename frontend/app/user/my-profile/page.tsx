@@ -24,7 +24,13 @@ export const metadata: Metadata = {
 };
 
 import { PredictionHistoryClient } from "./PredictionHistoryClient";
+import { MultiWalletPortfolio } from "./MultiWalletPortfolio";
 
 export default function Page() {
-  return <PredictionHistoryClient />;
+  return (
+    <>
+      <MultiWalletPortfolio />
+      <PredictionHistoryClient />
+    </>
+  );
 }

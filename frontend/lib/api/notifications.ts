@@ -161,3 +161,115 @@ export async function setInterests(address: string, interests: string[]): Promis
     throw new ApiError(`Failed to save interests (HTTP ${res.status})`, res.status);
   }
 }
+
+/** Supported weekly digest cadences. */
+export type DigestSchedule = "weekly" | "biweekly" | "off";
+
+/** Digest delivery preferences for a user. */
+export interface DigestPreferences {
+  address: string;
+  enabled: boolean;
+  schedule: DigestSchedule;
+  /** IANA timezone name, e.g. "America/New_York". */
+  timezone: string;
+  /** ISO timestamp of the next scheduled send, or null when disabled. */
+  next_send_at: string | null;
+}
+
+/** Payload accepted when updating digest preferences. */
+export interface DigestPreferencesUpdate {
+  enabled: boolean;
+  schedule: DigestSchedule;
+  timezone: string;
+}
+
+const DIGEST_SCHEDULES: readonly DigestSchedule[] = ["weekly", "biweekly", "off"];
+
+/** Type guard to validate DigestPreferences shape. */
+function isDigestPreferences(obj: unknown): obj is DigestPreferences {
+  if (!obj || typeof obj !== "object") return false;
+  const prefs = obj as Record<string, unknown>;
+  return (
+    typeof prefs.address === "string" &&
+    typeof prefs.enabled === "boolean" &&
+    typeof prefs.schedule === "string" &&
+    DIGEST_SCHEDULES.includes(prefs.schedule as DigestSchedule) &&
+    typeof prefs.timezone === "string" &&
+    prefs.timezone.length > 0 &&
+    (prefs.next_send_at === null || typeof prefs.next_send_at === "string")
+  );
+}
+
+export function digestPreferencesUrl(address: string): string {
+  return `${API_BASE_URL}/api/v1/users/${encodeURIComponent(address)}/digest`;
+}
+
+export async function fetchDigestPreferences(
+  address: string,
+): Promise<DigestPreferences> {
+  const res = await fetch(digestPreferencesUrl(address), {
+    headers: { Accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    throw new ApiError(
+      `Failed to load digest preferences (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+
+  const body = await res.json();
+
+  // Handle both wrapped and unwrapped responses
+  const data =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  // Validate response shape at boundary
+  if (!isDigestPreferences(data)) {
+    throw new ApiError("Invalid digest preferences response shape", 500);
+  }
+
+  return data;
+}
+
+export async function updateDigestPreferences(
+  address: string,
+  update: DigestPreferencesUpdate,
+): Promise<DigestPreferences> {
+  const res = await fetch(digestPreferencesUrl(address), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(update),
+  });
+
+  if (!res.ok) {
+    throw new ApiError(
+      `Failed to save digest preferences (HTTP ${res.status})`,
+      res.status,
+    );
+  }
+
+  const body = await res.json();
+
+  // Handle both wrapped and unwrapped responses
+  const data =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  // Validate response shape at boundary
+  if (!isDigestPreferences(data)) {
+    throw new ApiError("Invalid digest preferences response shape", 500);
+  }
+
+  return data;
+}
+
+/**
+ * Build the one-click unsubscribe URL embedded in digest emails.
+ *
+ * The token is issued by the backend and is single-purpose (digest
+ * unsubscribe only); it may expire, in which case the backend responds with
+ * an error and the user must unsubscribe from the settings UI instead.
+ */
+export function digestUnsubscribeUrl(token: string): string {
+  return `${API_BASE_URL}/api/v1/digest/unsubscribe?token=${encodeURIComponent(token)}`;
+}

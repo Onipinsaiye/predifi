@@ -8,6 +8,7 @@
 pub mod api_versioning;
 pub mod abuse;
 pub mod cache_coalesce;
+pub mod categories;
 pub mod config;
 pub mod constants;
 pub mod cors;

@@ -36,6 +36,13 @@ export type StellarTxStatus = "idle" | "running" | "confirmed" | "ambiguous" | "
 export interface UseStellarTransactionOptions<TParams> {
   /** Connected source account, or null when disconnected. */
   address: string | null;
+  /**
+   * The wallet that is currently authorized to sign. In a multi-wallet
+   * portfolio view, read-only addresses may be aggregated, but every
+   * mutation must originate from this active signing account. Defaults to
+   * `address` when omitted.
+   */
+  activeSigningAddress?: string | null;
   /** Network the wallet is connected to; scopes persisted state. */
   network?: string;
   /** Build, sign and broadcast the intent. Throw `TransactionSubmitError`. */
@@ -100,6 +107,45 @@ export function useStellarTransaction<TParams>(
     persistTransaction = true,
   } = options;
   const refreshAccountState = options.refreshAccountState ?? refreshAccountSequence;
+
+  // The active signing wallet. When not explicitly provided, the connected
+  // `address` is the only signer.
+  const activeSigningAddress =
+    options.activeSigningAddress !== undefined
+      ? options.activeSigningAddress
+      : address;
+  const activeSigningAddressRef = useRef(activeSigningAddress);
+  activeSigningAddressRef.current = activeSigningAddress;
+
+  /**
+   * Refuse to sign from any account other than the active signing wallet.
+   * Returns a `WalletError` describing the refusal, or `null` when the
+   * requested source is authorized to sign.
+   */
+  const checkSigningAuthorization = useCallback(
+    (requestedAddress: string | null | undefined): WalletError | null => {
+      const active = activeSigningAddressRef.current;
+      if (!active) {
+        return {
+          code: "WALLET_NOT_CONNECTED",
+          title: "No active signing wallet",
+          message: "Connect the wallet you want to sign with before submitting.",
+          recoveryAction: "Connect the active signing wallet and try again.",
+        };
+      }
+      if (!requestedAddress || requestedAddress !== active) {
+        return {
+          code: "SIGNING_WALLET_MISMATCH",
+          title: "Wrong signing wallet",
+          message:
+            "This transaction must be signed by the active wallet. Switch to the active signing wallet to continue.",
+          recoveryAction: "Switch to the active signing wallet and retry.",
+        };
+      }
+      return null;
+    },
+    [],
+  );
 
   // Contract identity guard: a mismatch (or unavailable/stale manifest)
   // disables mutations and surfaces a diagnostic through `error`.
@@ -203,6 +249,24 @@ export function useStellarTransaction<TParams>(
       txIntent: TransactionIntent<TParams>,
       userConfirmedRetry: boolean,
     ): Promise<TransactionRunResult<TParams>> => {
+      // Refuse to sign from any account other than the active signing wallet.
+      const authorizationError = checkSigningAuthorization(address);
+      if (authorizationError) {
+        const refused: TransactionRunResult<TParams> = {
+          status: "failed",
+          intent: txIntent,
+          error: authorizationError,
+          requiresUserConfirmation: false,
+          accountState: null,
+        };
+        if (mountedRef.current) {
+          setStatus("failed");
+          setError(authorizationError);
+          setRequiresUserConfirmation(false);
+        }
+        return refused;
+      }
+
       // Refuse to submit while the contract identity is unverified.
       if (mutationsDisabledRef.current) {
         const diagnostic = identityDiagnosticRef.current;
@@ -276,7 +340,15 @@ export function useStellarTransaction<TParams>(
 
       return result;
     },
-    [address, identityKey, submit, refreshAccountState, maxAutoRetries, persistResult],
+    [
+      address,
+      identityKey,
+      submit,
+      refreshAccountState,
+      maxAutoRetries,
+      persistResult,
+      checkSigningAuthorization,
+    ],
   );
 
   const startExecution = useCallback(
@@ -321,6 +393,17 @@ export function useStellarTransaction<TParams>(
         return Promise.reject(new Error("Connect your wallet before submitting."));
       }
 
+      // Block mutations that would be signed by a non-active account.
+      const authorizationError = checkSigningAuthorization(address);
+      if (authorizationError) {
+        setError(authorizationError);
+        return Promise.reject(
+          Object.assign(new Error(authorizationError.message), {
+            walletError: authorizationError,
+          }),
+        );
+      }
+
       // Block new mutations when the contract identity is unverified.
       if (mutationsDisabled) {
         const diagnostic = identityDiagnostic;
@@ -339,7 +422,15 @@ export function useStellarTransaction<TParams>(
       const txIntent = (createIntent ?? defaultIntent)(params);
       return startExecution(txIntent, false);
     },
-    [address, status, createIntent, startExecution, mutationsDisabled, identityDiagnostic],
+    [
+      address,
+      status,
+      createIntent,
+      startExecution,
+      mutationsDisabled,
+      identityDiagnostic,
+      checkSigningAuthorization,
+    ],
   );
 
   const confirmRetry = useCallback(() => {
@@ -353,6 +444,14 @@ export function useStellarTransaction<TParams>(
       return Promise.resolve(null);
     }
 
+    // A confirmed retry is still a mutation; it must be signed by the
+    // active wallet.
+    const authorizationError = checkSigningAuthorization(address);
+    if (authorizationError) {
+      setError(authorizationError);
+      return Promise.resolve(null);
+    }
+
     // A confirmed retry is still a mutation; block it on identity mismatch.
     if (mutationsDisabled) {
       const diagnostic = identityDiagnostic;
@@ -363,7 +462,14 @@ export function useStellarTransaction<TParams>(
     }
 
     return startExecution(txIntent, true);
-  }, [intent, startExecution, mutationsDisabled, identityDiagnostic]);
+  }, [
+    intent,
+    address,
+    startExecution,
+    mutationsDisabled,
+    identityDiagnostic,
+    checkSigningAuthorization,
+  ]);
 
   const reset = useCallback(() => {
     if (persistTransaction && address) {

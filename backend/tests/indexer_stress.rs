@@ -66,6 +66,7 @@ fn fixture_pool(pool_id: u64) -> PoolCreatedEvent {
         end_time: 2_000_000_000,
         token: "XLM".to_string(),
         category: "stress-fixture".to_string(),
+        category_id: "other".to_string(),
         description: format!("Fixture pool {pool_id}"),
     }
 }

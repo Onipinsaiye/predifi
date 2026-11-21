@@ -946,6 +946,265 @@ async fn health_503_response_includes_price_cache_dependency_details() {
 // crate — they could not compile. Removed rather than left as dead,
 // non-compiling test code; #348 has no other coverage here yet.
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Market Quote Simulation Tests (#269)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// The quote endpoint must be a deterministic, read-only estimate of the
+// outcome shares and price impact for a liquidity pool.  These tests compare
+// the HTTP response against the in-process reference pricing model over
+// boundary and randomized vectors, and verify that stale or unsupported pool
+// state is rejected.
+
+/// Build a POST request with a JSON body for the given path.
+fn post_json(path: &str, body: serde_json::Value) -> Request<axum::body::Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("failed to build request")
+}
+
+/// Parse a response body into a JSON value.
+async fn body_json(body: axum::body::Body) -> serde_json::Value {
+    let raw = body_string(body).await;
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("body is not valid JSON ({e}): {raw}"))
+}
+
+/// A pool state that is fresh and supported by the pricing model.
+fn fresh_pool_state() -> crate::market_quote::PoolState {
+    crate::market_quote::PoolState {
+        pool_id: "pool-1".to_string(),
+        reserve_a: 1_000_000,
+        reserve_b: 2_000_000,
+        fee_bps: 30,
+        updated_at: 1_700_000_000,
+        supported: true,
+    }
+}
+
+/// The quote endpoint must return every field required by the acceptance
+/// criteria: input units, output estimate, price impact, fee and timestamp.
+#[tokio::test]
+async fn quote_returns_all_required_fields() {
+    let state = fresh_pool_state();
+    let request = crate::market_quote::QuoteRequest {
+        pool: state.clone(),
+        amount_in: 10_000,
+        now: state.updated_at,
+    };
+
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response.into_body()).await;
+
+    assert_eq!(json["amount_in"], 10_000, "input units must be echoed");
+    assert!(
+        json["amount_out"].as_u64().unwrap_or(0) > 0,
+        "output estimate must be positive, got: {json}"
+    );
+    assert!(
+        json["price_impact_bps"].is_number(),
+        "price impact must be present, got: {json}"
+    );
+    assert!(json["fee"].is_number(), "fee must be present, got: {json}");
+    assert_eq!(
+        json["quoted_at"], state.updated_at,
+        "quote timestamp must be reported"
+    );
+}
+
+/// The endpoint output must match the reference pricing model exactly for a
+/// set of boundary vectors (zero-ish input, tiny input, large input, and an
+/// input equal to the reserve).
+#[tokio::test]
+async fn quote_matches_reference_on_boundary_vectors() {
+    let state = fresh_pool_state();
+    let boundaries = [1_u64, 2, 100, 1_000_000, 1_000_000 - 1];
+
+    for amount_in in boundaries {
+        let request = crate::market_quote::QuoteRequest {
+            pool: state.clone(),
+            amount_in,
+            now: state.updated_at,
+        };
+        let expected = crate::market_quote::quote(&request).expect("reference quote");
+
+        let response = build_router(
+            Config::default_for_test(),
+            PriceCache::new(),
+            RedisCache::disabled(),
+            crate::ws::EventBus::new(),
+        )
+        .oneshot(post_json(
+            "/api/v1/markets/quote",
+            serde_json::to_value(&request).unwrap(),
+        ))
+        .await
+        .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK, "amount_in={amount_in}");
+        let json = body_json(response.into_body()).await;
+
+        assert_eq!(json["amount_in"], expected.amount_in);
+        assert_eq!(json["amount_out"], expected.amount_out);
+        assert_eq!(json["fee"], expected.fee);
+        assert_eq!(json["price_impact_bps"], expected.price_impact_bps);
+        assert_eq!(json["quoted_at"], expected.quoted_at);
+    }
+}
+
+/// The endpoint output must match the reference pricing model over a set of
+/// deterministic pseudo-random vectors (no external RNG dependency).
+#[tokio::test]
+async fn quote_matches_reference_on_randomized_vectors() {
+    let state = fresh_pool_state();
+
+    // Simple deterministic LCG so the vectors are reproducible.
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed
+    };
+
+    for _ in 0..32 {
+        let amount_in = (next() % state.reserve_a) + 1;
+        let request = crate::market_quote::QuoteRequest {
+            pool: state.clone(),
+            amount_in,
+            now: state.updated_at,
+        };
+        let expected = crate::market_quote::quote(&request).expect("reference quote");
+
+        let response = build_router(
+            Config::default_for_test(),
+            PriceCache::new(),
+            RedisCache::disabled(),
+            crate::ws::EventBus::new(),
+        )
+        .oneshot(post_json(
+            "/api/v1/markets/quote",
+            serde_json::to_value(&request).unwrap(),
+        ))
+        .await
+        .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK, "amount_in={amount_in}");
+        let json = body_json(response.into_body()).await;
+
+        assert_eq!(json["amount_out"], expected.amount_out, "amount_in={amount_in}");
+        assert_eq!(json["fee"], expected.fee, "amount_in={amount_in}");
+        assert_eq!(
+            json["price_impact_bps"], expected.price_impact_bps,
+            "amount_in={amount_in}"
+        );
+    }
+}
+
+/// A pool whose state is older than the freshness window must be rejected
+/// with a client error rather than silently quoted.
+#[tokio::test]
+async fn quote_rejects_stale_pool_state() {
+    let mut state = fresh_pool_state();
+    state.updated_at = 1_700_000_000;
+    let request = crate::market_quote::QuoteRequest {
+        pool: state,
+        amount_in: 1_000,
+        // Far beyond the freshness window.
+        now: 1_700_000_000 + 86_400,
+    };
+
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "stale pool state must be rejected"
+    );
+}
+
+/// A pool whose state is flagged unsupported by the pricing model must be
+/// rejected with a client error.
+#[tokio::test]
+async fn quote_rejects_unsupported_pool_state() {
+    let mut state = fresh_pool_state();
+    state.supported = false;
+    let request = crate::market_quote::QuoteRequest {
+        pool: state.clone(),
+        amount_in: 1_000,
+        now: state.updated_at,
+    };
+
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported pool state must be rejected"
+    );
+}
+
+/// A zero input amount must be rejected as invalid.
+#[tokio::test]
+async fn quote_rejects_zero_amount() {
+    let state = fresh_pool_state();
+    let request = crate::market_quote::QuoteRequest {
+        pool: state.clone(),
+        amount_in: 0,
+        now: state.updated_at,
+    };
+
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 /// Test that /api/v1/health includes error details in the response.
 #[tokio::test]
 async fn api_v1_health_includes_error_details() {

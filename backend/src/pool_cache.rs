@@ -79,17 +79,63 @@ const DEFAULT_POOL_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 enum CacheEntry {
     /// A successfully fetched pool, valid for [`POOL_CACHE_TTL`].
-    Found { value: PoolWithOdds, cached_at: Instant },
+    Found {
+        value: PoolWithOdds,
+        /// The reserve/share snapshot captured alongside `value`, used by the
+        /// quote handler to price against the same state the pool detail
+        /// response reflects.
+        snapshot: PoolSnapshot,
+
+        cached_at: Instant,
+        cached_at: Instant,
+    },
     /// A confirmed "no such pool" result, valid for the cache's configured
     /// negative TTL (see [`PoolCache::negative_ttl`]).
     NotFound { cached_at: Instant },
 }
 
+/// The reserve/share state of a pool at the moment it was fetched, together
+/// with the wall-clock time of that fetch.
+///
+/// Quote requests price against this snapshot so that the estimate they return
+/// is reproducible and consistent with the pool detail data served from the
+/// same cache entry. [`PoolSnapshot::is_stale`] lets the quote handler reject
+/// snapshots that are too old to be a trustworthy basis for a signature.
+#[derive(Debug, Clone)]
+pub struct PoolSnapshot {
+    /// Total stake currently locked in the pool, in the pool's base units.
+    pub total_stake: i64,
+    /// Per-outcome stake, in the pool's base units, ordered by outcome index.
+    pub outcome_stakes: Vec<i64>,
+    /// Wall-clock time at which this snapshot was captured.
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PoolSnapshot {
+    /// Build a snapshot from a pool detail value, stamping it with `fetched_at`.
+    pub fn from_pool(pool: &PoolWithOdds, fetched_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            total_stake: pool.total_stake,
+            outcome_stakes: pool.odds.iter().map(|o| o.stake).collect(),
+            fetched_at,
+        }
+    }
+
+    /// Whether this snapshot is older than `max_age` relative to `now`.
+    ///
+    /// A snapshot stamped in the future (clock skew) is treated as fresh.
+    pub fn is_stale(&self, now: chrono::DateTime<chrono::Utc>, max_age: Duration) -> bool {
+        let age = now.signed_duration_since(self.fetched_at);
+        age.num_milliseconds() > max_age.as_millis() as i64
+    }
+}
+
 /// Outcome of a [`PoolCache::get`] lookup.
 #[derive(Debug, Clone)]
 pub enum CacheLookup {
-    /// A cached, unexpired pool detail value.
-    Found(PoolWithOdds),
+    /// A cached, unexpired pool detail value together with the reserve/share
+    /// snapshot it was fetched with.
+    Found(PoolWithOdds, PoolSnapshot),
     /// The pool ID is cached as confirmed nonexistent (negative cache hit);
     /// callers should respond 404 without touching the database.
     NotFound,
@@ -147,26 +193,50 @@ impl PoolCache {
             return CacheLookup::Miss;
         };
         match guard.get(&pool_id) {
-            Some(CacheEntry::Found { value, cached_at }) if cached_at.elapsed() < POOL_CACHE_TTL => {
-                CacheLookup::Found(value.clone())
+            Some(CacheEntry::Found {
+                value,
+                snapshot,
+                cached_at,
+            }) if cached_at.elapsed() < POOL_CACHE_TTL => {
+                CacheLookup::Found(value.clone(), snapshot.clone())
             }
-            Some(CacheEntry::NotFound { cached_at }) if cached_at.elapsed() < self.0.negative_ttl => {
+            Some(CacheEntry::NotFound { cached_at })
+                if cached_at.elapsed() < self.0.negative_ttl =>
+            {
                 CacheLookup::NotFound
             }
             _ => CacheLookup::Miss,
         }
     }
 
-    /// Store a freshly-fetched value for `pool_id`.
+    /// Store a freshly-fetched value for `pool_id`, capturing its reserve/share
+    /// snapshot stamped with the current time.
     pub fn set(&self, pool_id: i64, value: PoolWithOdds) {
+        let snapshot = PoolSnapshot::from_pool(&value, chrono::Utc::now());
+        self.set_with_snapshot(pool_id, value, snapshot);
+    }
+
+    /// Store a freshly-fetched value for `pool_id` together with an explicit
+    /// snapshot (e.g. one captured at the same instant as the database read).
+    pub fn set_with_snapshot(&self, pool_id: i64, value: PoolWithOdds, snapshot: PoolSnapshot) {
         if let Ok(mut guard) = self.0.entries.write() {
             guard.insert(
                 pool_id,
                 CacheEntry::Found {
                     value,
+                    snapshot,
                     cached_at: Instant::now(),
                 },
             );
+        }
+    }
+
+    /// Look up only the reserve/share snapshot for `pool_id`, if a fresh
+    /// positive entry exists.
+    pub fn get_snapshot(&self, pool_id: i64) -> Option<PoolSnapshot> {
+        match self.get(pool_id) {
+            CacheLookup::Found(_, snapshot) => Some(snapshot),
+            _ => None,
         }
     }
 
@@ -204,6 +274,7 @@ mod tests {
             pool_id,
             name: name.to_string(),
             category: "Sports".to_string(),
+            category_id: Some("sports".to_string()),
             total_stake: 1000,
             end_time: Utc::now(),
             created_at: Utc::now(),
@@ -231,12 +302,39 @@ mod tests {
         let pool = sample_pool(42, "Test Pool");
         cache.set(42, pool.clone());
         match cache.get(42) {
-            CacheLookup::Found(retrieved) => {
+            CacheLookup::Found(retrieved, snapshot) => {
                 assert_eq!(retrieved.pool_id, 42);
                 assert_eq!(retrieved.name, "Test Pool");
+                assert_eq!(snapshot.total_stake, 1000);
+                assert_eq!(snapshot.outcome_stakes, vec![500]);
             }
             other => panic!("expected Found, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_is_exposed_and_not_stale_when_fresh() {
+        let cache = PoolCache::new();
+        cache.set(7, sample_pool(7, "Snapshot Pool"));
+        let snapshot = cache.get_snapshot(7).expect("snapshot present");
+        assert!(!snapshot.is_stale(Utc::now(), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn snapshot_reports_stale_after_max_age() {
+        let cache = PoolCache::new();
+        let pool = sample_pool(8, "Old Pool");
+        let snapshot = PoolSnapshot::from_pool(&pool, Utc::now() - chrono::Duration::seconds(60));
+        cache.set_with_snapshot(8, pool, snapshot);
+        let snapshot = cache.get_snapshot(8).expect("snapshot present");
+        assert!(snapshot.is_stale(Utc::now(), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn snapshot_missing_for_negative_entry() {
+        let cache = PoolCache::new();
+        cache.set_missing(9);
+        assert!(cache.get_snapshot(9).is_none());
     }
 
     #[test]
@@ -252,7 +350,7 @@ mod tests {
         cache.set(1, sample_pool(1, "Original"));
         cache.set(1, sample_pool(1, "Replaced"));
         match cache.get(1) {
-            CacheLookup::Found(retrieved) => assert_eq!(retrieved.name, "Replaced"),
+            CacheLookup::Found(retrieved, _) => assert_eq!(retrieved.name, "Replaced"),
             other => panic!("expected Found, got {other:?}"),
         }
     }

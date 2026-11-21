@@ -490,7 +490,7 @@ impl Outbox {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO notification_outbox (job_id, kind, payload, ledger, attempts, available_at)
+            INSERT INTO background_job_outbox (job_id, kind, payload, ledger, attempts, available_at)
             VALUES ($1, $2, $3, $4, 0, NOW())
             ON CONFLICT (job_id) DO NOTHING
             "#,
@@ -514,7 +514,7 @@ impl Outbox {
         let rows = sqlx::query(
             r#"
             SELECT id, job_id, kind, payload, attempts, ledger
-            FROM notification_outbox
+            FROM background_job_outbox
             WHERE status = 'pending'
               AND available_at <= NOW()
               AND (locked_until IS NULL OR locked_until < NOW())
@@ -532,7 +532,7 @@ impl Outbox {
             let id: i64 = row.try_get("id")?;
             sqlx::query(
                 r#"
-                UPDATE notification_outbox
+                UPDATE background_job_outbox
                 SET status = 'in_flight',
                     locked_until = NOW() + ($2::bigint * INTERVAL '1 millisecond')
                 WHERE id = $1
@@ -560,7 +560,7 @@ impl Outbox {
     pub async fn mark_delivered(&self, id: i64) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            UPDATE notification_outbox
+            UPDATE background_job_outbox
             SET status = 'delivered', delivered_at = NOW(), locked_until = NULL
             WHERE id = $1
             "#,
@@ -585,7 +585,7 @@ impl Outbox {
             let delay = self.policy.delay_before_attempt(next_attempt + 1);
             sqlx::query(
                 r#"
-                UPDATE notification_outbox
+                UPDATE background_job_outbox
                 SET status = 'pending',
                     attempts = $2,
                     last_error = $3,
@@ -604,7 +604,7 @@ impl Outbox {
         } else {
             sqlx::query(
                 r#"
-                UPDATE notification_outbox
+                UPDATE background_job_outbox
                 SET status = 'failed',
                     attempts = $2,
                     last_error = $3,
@@ -626,7 +626,7 @@ impl Outbox {
     pub async fn reclaim_expired(&self) -> Result<u64, sqlx::Error> {
         let res = sqlx::query(
             r#"
-            UPDATE notification_outbox
+            UPDATE background_job_outbox
             SET status = 'pending', locked_until = NULL
             WHERE status = 'in_flight' AND locked_until < NOW()
             "#,

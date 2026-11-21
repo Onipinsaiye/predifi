@@ -92,6 +92,10 @@ pub enum AppError {
     UpstreamUnavailable(String),
     /// Upstream dependency did not answer within its deadline.
     UpstreamTimeout(String),
+    /// Liquidity pool state is stale (older than the quote freshness window).
+    StalePoolState(String),
+    /// Liquidity pool state is not supported by the adopted pricing model.
+    UnsupportedPoolState(String),
     ServiceUnavailable(String),
     Internal(String),
 }
@@ -122,6 +126,8 @@ impl fmt::Display for AppError {
             AppError::TokenStoreUnavailable => write!(f, "token store unavailable"),
             AppError::UpstreamUnavailable(msg) => write!(f, "upstream unavailable: {}", msg),
             AppError::UpstreamTimeout(msg) => write!(f, "upstream timeout: {}", msg),
+            AppError::StalePoolState(msg) => write!(f, "stale pool state: {}", msg),
+            AppError::UnsupportedPoolState(msg) => write!(f, "unsupported pool state: {}", msg),
             AppError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }
@@ -152,6 +158,8 @@ impl AppError {
             }
             AppError::UpstreamUnavailable(_) => (S::BAD_GATEWAY, c::UPSTREAM_UNAVAILABLE),
             AppError::UpstreamTimeout(_) => (S::GATEWAY_TIMEOUT, c::UPSTREAM_TIMEOUT),
+            AppError::StalePoolState(_) => (S::CONFLICT, c::STALE_POOL_STATE),
+            AppError::UnsupportedPoolState(_) => (S::UNPROCESSABLE_ENTITY, c::UNSUPPORTED_POOL_STATE),
             AppError::ServiceUnavailable(_) => (S::SERVICE_UNAVAILABLE, c::SERVICE_UNAVAILABLE),
             AppError::Internal(_) => (S::INTERNAL_SERVER_ERROR, c::INTERNAL_ERROR),
         }
@@ -263,6 +271,8 @@ impl axum::response::IntoResponse for AppError {
             | AppError::Forbidden(msg)
             | AppError::UpstreamUnavailable(msg)
             | AppError::UpstreamTimeout(msg)
+            | AppError::StalePoolState(msg)
+            | AppError::UnsupportedPoolState(msg)
             | AppError::ServiceUnavailable(msg)
             | AppError::Internal(msg) => ApiResponse::<()>::error(status, code, msg).into_response(),
             AppError::StepUpRequired(step_up) => {

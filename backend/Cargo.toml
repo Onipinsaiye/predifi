@@ -52,6 +52,7 @@ redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 sysinfo = "0.37"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+ring = "0.17"
 predifi-errors = { path = "../contract/contracts/predifi-errors", features = ["std"] }
 jsonwebtoken = "9"
 governor = "0.8"
