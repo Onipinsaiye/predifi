@@ -12,9 +12,19 @@
 use crate::config::Config;
 use http::HeaderValue;
 use std::task::{Context, Poll};
+use tower::{Layer, Service};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_layer::Layer;
-use tower_service::Service;
+
+/// A minimal shape check for a configured CORS origin entry: non-empty,
+/// no internal whitespace, and carrying a `scheme://` prefix. A misconfigured
+/// entry (e.g. one with embedded spaces) must never be forwarded into a
+/// `HeaderValue`/`AllowOrigin` list, where it could otherwise be reflected
+/// back verbatim to a request that happens to send that exact garbage value
+/// as its `Origin` header.
+fn is_well_formed_origin(origin: &str) -> bool {
+    let trimmed = origin.trim();
+    !trimmed.is_empty() && !trimmed.chars().any(char::is_whitespace) && trimmed.contains("://")
+}
 
 /// Returns true if the HTTP method and path constitute a public read route.
 pub fn is_public_read_route(method: &http::Method, path: &str) -> bool {
@@ -104,6 +114,7 @@ pub fn build_public_cors(config: &Config) -> CorsLayer {
     let origins: Vec<HeaderValue> = config
         .cors_allowed_origins
         .iter()
+        .filter(|origin| is_well_formed_origin(origin))
         .filter_map(|origin| origin.parse().ok())
         .collect();
 
@@ -135,6 +146,7 @@ pub fn build_credentialed_cors(config: &Config) -> CorsLayer {
             let o = origin.trim();
             o != "*" && !o.contains('*') && !o.eq_ignore_ascii_case("null")
         })
+        .filter(|origin| is_well_formed_origin(origin))
         .filter_map(|origin| origin.parse().ok())
         .collect();
 
@@ -164,6 +176,7 @@ pub fn build_cors(config: &Config) -> CorsLayer {
     let origins: Vec<HeaderValue> = config
         .cors_allowed_origins
         .iter()
+        .filter(|origin| is_well_formed_origin(origin))
         .filter_map(|origin| origin.parse().ok())
         .collect();
 

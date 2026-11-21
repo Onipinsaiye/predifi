@@ -5,10 +5,15 @@
 //! job is completed by exactly one valid holder and a crashed holder's job is
 //! redelivered a bounded number of times.
 //!
-//! [`retention`] classifies every user-linked field, defines its retention and
-//! deletion behavior, and provides the scheduled cleanup pass that enforces it.
-//! Public chain-derived history is immutable and is never purged by this
-//! worker; only private user records are subject to deletion.
+//! [`queue`] is the in-memory retry/DLQ queue (plus the transactional
+//! notification outbox) used by the Stellar listener worker, and
+//! [`stellar_listener`] drives the listener itself.
+//!
+//! Retention and deletion of private user-linked records (chain-derived
+//! history is immutable and never purged) is implemented by
+//! [`crate::profile::purge_expired_private_records`], not by a worker
+//! submodule.
 
 pub mod lease;
-pub mod retention;
+pub mod queue;
+pub mod stellar_listener;

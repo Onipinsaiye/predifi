@@ -218,12 +218,40 @@ impl From<crate::rpc_resilience::RpcError> for AppError {
     }
 }
 
+/// Build the standard error envelope with an extra top-level `details` object.
+///
+/// Used for structured rejections (step-up, abuse) that carry more than the
+/// field-level violations `ApiResponse::validation_error` supports. Built
+/// directly as JSON (never by draining an already-built response body) so
+/// this stays synchronous, as `IntoResponse::into_response` requires.
+fn error_response_with_details(
+    status: axum::http::StatusCode,
+    code: &'static str,
+    details: serde_json::Value,
+) -> axum::response::Response {
+    use crate::response::{current_request_id, is_retryable, safe_message, ERROR_ENVELOPE_VERSION};
+    use axum::response::IntoResponse;
+
+    let body = serde_json::json!({
+        "status": "error",
+        "error": {
+            "version": ERROR_ENVELOPE_VERSION,
+            "code": code,
+            "message": safe_message(code),
+            "request_id": current_request_id(),
+            "retryable": is_retryable(code),
+        },
+        "details": details,
+    });
+    (status, axum::Json(body)).into_response()
+}
+
 impl axum::response::IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         use crate::response::ApiResponse;
 
         let (status, code) = self.status_and_code();
-        let mut response = match self {
+        match self {
             AppError::Validation(details) => {
                 ApiResponse::<()>::validation_error("request validation failed", details)
                     .into_response()
@@ -238,32 +266,11 @@ impl axum::response::IntoResponse for AppError {
             | AppError::ServiceUnavailable(msg)
             | AppError::Internal(msg) => ApiResponse::<()>::error(status, code, msg).into_response(),
             AppError::StepUpRequired(step_up) => {
-                let mut details = serde_json::Map::new();
-                details.insert(
-                    "reason".to_string(),
-                    serde_json::Value::String(step_up.reason.to_string()),
-                );
-                details.insert(
-                    "action".to_string(),
-                    serde_json::Value::String(step_up.action.to_string()),
-                );
-                let resp = ApiResponse::<()>::error(
-                    status,
-                    code,
-                    crate::response::safe_message(code),
-                )
-                .into_response();
-                let (parts, body) = resp.into_parts();
-                let mut value = match axum::body::to_bytes(body, usize::MAX).await {
-                    Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    Err(_) => serde_json::json!({}),
-                };
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert("details".to_string(), serde_json::Value::Object(details));
-                }
-                let bytes = serde_json::to_vec(&value).unwrap_or_default();
-                axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+                let details = serde_json::json!({
+                    "reason": step_up.reason,
+                    "action": step_up.action,
+                });
+                error_response_with_details(status, code, details)
             }
             AppError::AbuseRejected(rejection) => {
                 let mut details = serde_json::Map::new();
@@ -285,34 +292,12 @@ impl axum::response::IntoResponse for AppError {
                         serde_json::Value::String(scope.clone()),
                     );
                 }
-                let mut resp = ApiResponse::<()>::error(
-                    status,
-                    code,
-                    crate::response::safe_message(code),
-                )
-                .into_response();
-                // Attach the structured details alongside the standard envelope.
-                let (mut parts, body) = resp.into_parts();
-                let mut value = match axum::body::to_bytes(body, usize::MAX).await {
-                    Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    Err(_) => serde_json::json!({}),
-                };
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert(
-                        "details".to_string(),
-                        serde_json::Value::Object(details),
-                    );
-                }
-                let bytes = serde_json::to_vec(&value).unwrap_or_default();
-                parts.headers.insert(
+                let mut resp =
+                    error_response_with_details(status, code, serde_json::Value::Object(details));
+                resp.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
                     axum::http::HeaderValue::from_str(&rejection.retry_after_secs.to_string())
                         .unwrap_or_else(|_| axum::http::HeaderValue::from_static("1")),
-                );
-                resp = axum::response::Response::from_parts(
-                    parts,
-                    axum::body::Body::from(bytes),
                 );
                 resp
             }
@@ -322,3 +307,7 @@ impl axum::response::IntoResponse for AppError {
             | AppError::TokenStoreUnavailable => {
                 ApiResponse::<()>::error(status, code, crate::response::safe_message(code))
                     .into_response()
+            }
+        }
+    }
+}

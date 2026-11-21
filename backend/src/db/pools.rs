@@ -122,7 +122,7 @@ pub struct PoolTemplate {
 }
 
 /// Decoded data from a `pool_created` contract event.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PoolCreatedEvent {
     pub pool_id: u64,
     pub creator: String,

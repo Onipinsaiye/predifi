@@ -674,7 +674,23 @@ mod tests {
     const SECRET: &str = "test-secret-key-that-is-long-enough-for-hs256-0123456789";
 
     fn token(wallet: &str) -> String {
-        crate::jwt::sign_jwt_for_test(wallet, SECRET)
+        crate::jwt::sign_jwt_for_test(&test_wallet_address(wallet), SECRET)
+    }
+
+    /// Map a short test mnemonic (`"GA"`, `"GB"`, ...) to a syntactically-
+    /// and checksum-valid Stellar `G…` address, so tokens built from it pass
+    /// `crate::validated_types::normalize_wallet_address` the same way a
+    /// real wallet's JWT subject would. Different mnemonics map to
+    /// different fill bytes, so they remain distinct wallets for the
+    /// wallet-binding tests below.
+    fn test_wallet_address(mnemonic: &str) -> String {
+        use crate::validated_types::{base32_encode, crc16_xmodem, STRKEY_VERSION_ACCOUNT_ID};
+        let fill: u8 = mnemonic.bytes().fold(0xA0_u8, |acc, b| acc.wrapping_add(b));
+        let mut bytes = vec![STRKEY_VERSION_ACCOUNT_ID];
+        bytes.extend(std::iter::repeat(fill).take(32));
+        let checksum = crc16_xmodem(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        base32_encode(&bytes)
     }
 
     fn scope(key: &str) -> Scope {

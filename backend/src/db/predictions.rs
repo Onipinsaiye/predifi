@@ -244,7 +244,7 @@ pub struct ProtocolStats {
 }
 
 /// Decoded data from a `prediction_placed` contract event.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PredictionPlacedEvent {
     pub pool_id: u64,
     pub user_address: String,
@@ -1088,6 +1088,7 @@ mod tests {
     #[test]
     fn balances_pool_total_stake_is_passed_through_verbatim() {
         let row = make_user_prediction_row(Some("0"), 0);
+        let is_winning_outcome = derive_is_winning_outcome(&row);
         let prediction = UserPrediction {
             prediction_id: row.prediction_id,
             pool_id: row.pool_id,
@@ -1100,7 +1101,7 @@ mod tests {
             user_outcome: row.user_outcome,
             user_amount: row.user_amount,
             prediction_created_at: row.prediction_created_at,
-            is_winning_outcome: derive_is_winning_outcome(&row),
+            is_winning_outcome,
         };
         assert_eq!(prediction.pool_total_stake, 1_000);
         assert_eq!(prediction.user_amount, 100);

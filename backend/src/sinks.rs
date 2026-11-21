@@ -393,6 +393,7 @@ pub fn enqueue_delivery(delivery: &OutboundDelivery) {
         payload: delivery.id.to_string(),
         attempts: delivery.attempts.max(0) as u32,
         ledger: None,
+        trace_context: None,
     };
     notification_queue().enqueue(job);
 }

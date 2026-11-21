@@ -673,7 +673,7 @@ impl Config {
         Self::from_map(&vars)
     }
 
-    fn from_map(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
+    pub fn from_map(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let host = get_string(vars, "PREDIFI_APP_HOST", DEFAULT_HOST);
         let port = get_u16(vars, "PREDIFI_APP_PORT", DEFAULT_PORT)?;
         let database_url = get_string(vars, "PREDIFI_DATABASE_URL", DEFAULT_DATABASE_URL);
@@ -1466,9 +1466,6 @@ impl Config {
                 reason: format!(
                     "must be < PREDIFI_DB_SERVER_MAX_CONNECTIONS ({}), got {}",
                     self.db_server_max_connections, self.db_admin_headroom_connections
-                ),
-            });
-        }
                 ),
             });
         }
@@ -2519,6 +2516,10 @@ mod tests {
                 String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
                 String::from("https://app.predifi.com,https://predifi.com"),
             ),
+            (
+                String::from("PREDIFI_CONTRACT_ID"),
+                String::from("CTESTCONTRACTID00000000000000000000000000000000000000"),
+            ),
         ]);
         let config = Config::from_map(&vars).expect("valid production origins must be accepted");
         assert_eq!(
@@ -3237,6 +3238,9 @@ mod tests {
         let config = Config {
             app_env: String::from("production"),
             secret_key: String::from(DEFAULT_SECRET_KEY),
+            // Isolate the secret-key check: use a non-default CORS origin so
+            // the production CORS-default check doesn't fire first.
+            cors_allowed_origins: vec!["https://app.predifi.com".to_string()],
             ..Config::default_for_test()
         };
         assert!(matches!(
@@ -3267,6 +3271,8 @@ mod tests {
             app_env: String::from("production"),
             secret_key: String::from("a-very-strong-production-secret-key-at-least-32-bytes"),
             allowed_ws_origins: vec!["https://app.predifi.com".to_string()],
+            cors_allowed_origins: vec!["https://app.predifi.com".to_string()],
+            contract_id: String::from("CTESTCONTRACTID00000000000000000000000000000000000000"),
             ..Config::default_for_test()
         };
         config
@@ -3280,6 +3286,9 @@ mod tests {
             app_env: String::from("production"),
             secret_key: String::from("a-very-strong-production-secret-key-at-least-32-bytes"),
             allowed_ws_origins: Vec::new(),
+            // Isolate the WS-origins check: use a non-default CORS origin so
+            // the production CORS-default check doesn't fire first.
+            cors_allowed_origins: vec!["https://app.predifi.com".to_string()],
             ..Config::default_for_test()
         };
         assert!(matches!(
@@ -3296,6 +3305,12 @@ mod tests {
         let vars = HashMap::from([
             (String::from("PREDIFI_APP_ENV"), String::from("production")),
             // Default secret key is not set, so from_map uses DEFAULT_SECRET_KEY.
+            // Isolate that check: use a non-default CORS origin so the
+            // production CORS-default check doesn't fire first.
+            (
+                String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
         ]);
         assert!(matches!(
             Config::from_map(&vars),
@@ -3825,20 +3840,6 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_empty_manifest_path() {
-        let vars = HashMap::from([(String::from(MANIFEST_PATH_ENV), String::new())]);
-        ass
-        )]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED",
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn db_budget_accepts_exact_limit() {
         // 9 replicas x 10 = 90 == 100 - 10 available.
         let config = Config {
@@ -3929,12 +3930,6 @@ mod tests {
     }
 
     #[test]
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn config_requires_contract_id_in_production() {
         let vars = HashMap::from([
             (String::from("PREDIFI_APP_ENV"), String::from("production")),
@@ -3979,44 +3974,4 @@ mod tests {
         let config = Config::from_map(&vars).expect("blank previous key should be ignored");
         assert_eq!(config.notification_provider_previous_key, None);
     }
-
-                ..
-            })
-        ));
-    }
-    #[test]
-    fn notification_provider_ignores_blank_previous_key() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("new-key"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
-                String::from("   "),
-            ),
-        ]);
-        let config = Config::from_map(&vars).unwrap();
-        assert!(config.notification_provider_previous_key.is_none());
-    }
-
-    #[test]
-    fn db_budget_rejects_non_numeric_replicas() {
-        let vars = HashMap::from([(
-            String::from("PREDIFI_DB_MAX_REPLICAS"),
-            String::from("many"),
-        )]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidNumber {
-                key: "PREDIFI_DB_MAX_REPLICAS",
-                ..
-            })
-        ));
-    }
-
 }

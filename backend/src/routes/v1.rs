@@ -1519,7 +1519,7 @@ mod abuse_quota_tests {
     use crate::abuse::AbuseAction;
 
     fn test_state() -> AppState {
-        let config = Arc::new(Config::default());
+        let config = Arc::new(Config::default_for_test());
         let redis = RedisCache::disabled();
         AppState {
             abuse: Arc::new(AbuseController::from_config(&config)),
@@ -1529,7 +1529,7 @@ mod abuse_quota_tests {
             market_reads: market_reads_cache(&redis),
             redis,
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
         }
     }
@@ -1924,6 +1924,22 @@ pub struct ClaimPayload {
     pub user_address: StellarAddress,
     /// Amount paid out by `claim_winnings` / `claim_refund` (0 for losers).
     pub amount_paid: i64,
+    /// Optional canonical on-chain coordinates for this claim event (#309).
+    /// When every one of these is present, the claim is also recorded in
+    /// the wallet activity ledger with its canonical transaction reference.
+    /// Omitted (or only partially supplied) fields keep today's behavior:
+    /// `predictions.claimed_amount` is updated either way, since that
+    /// remains the payout ground truth independent of the activity ledger.
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub contract_id: Option<String>,
+    #[serde(default)]
+    pub ledger: Option<u64>,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    #[serde(default)]
+    pub event_index: Option<u32>,
 }
 
 /// `POST /api/v1/indexer/claim` — ingest a decoded `WinningsClaimed` /
@@ -1961,6 +1977,48 @@ pub async fn ingest_claim_handler(
     .await
     {
         Ok(rows) => {
+            // Best-effort: record the claim in the wallet activity ledger
+            // (#309) when the payload carries full chain coordinates. This
+            // is not inside the same transaction as the claim update above
+            // (claims are not threaded through `project_event_tx`'s
+            // transactional dedupe today), so it is idempotent via
+            // `ON CONFLICT DO NOTHING` rather than atomic with it.
+            if let (Some(network), Some(contract_id), Some(ledger), Some(tx_hash), Some(event_index)) = (
+                &payload.network,
+                &payload.contract_id,
+                payload.ledger,
+                &payload.tx_hash,
+                payload.event_index,
+            ) {
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO portfolio_activity_ledger
+                        (network, contract_id, ledger, tx_hash, event_index, event_type,
+                         user_address, pool_id, amount)
+                    VALUES ($1, $2, $3, $4, $5, 'claim', $6, $7, $8)
+                    ON CONFLICT (network, contract_id, ledger, tx_hash, event_index, user_address)
+                    DO NOTHING
+                    "#,
+                )
+                .bind(network)
+                .bind(contract_id)
+                .bind(ledger as i64)
+                .bind(tx_hash)
+                .bind(event_index as i32)
+                .bind(payload.user_address.as_str())
+                .bind(payload.pool_id as i64)
+                .bind(payload.amount_paid)
+                .execute(db)
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        pool_id = payload.pool_id,
+                        "failed to record claim in wallet activity ledger (claim itself still succeeded)"
+                    );
+                }
+            }
+
             ApiResponse::success(json!({ "status": "ok", "rows_updated": rows })).into_response()
         }
         Err(e) => ApiResponse::<()>::error(
@@ -2266,6 +2324,18 @@ pub fn router(
                 get(referral_estimate_handler),
             )
             .route("/markets/:id/predictions", get(get_market_predictions))
+            .route(
+                "/wallets/:address/activity",
+                get(crate::routes::portfolio::get_wallet_activity_handler),
+            )
+            .route(
+                "/wallets/:address/pnl",
+                get(crate::routes::portfolio::get_wallet_pnl_handler),
+            )
+            .route(
+                "/wallets/:address/snapshot",
+                get(crate::routes::portfolio::get_wallet_snapshot_handler),
+            )
             .with_state(state.clone()),
         RateLimitTier::Read,
         state.redis.clone(),
@@ -2292,6 +2362,23 @@ pub fn router(
                 "/notifications/:address/read",
                 post(mark_notifications_read_handler)
                     .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_NOTIFICATIONS_READ)),
+            )
+            .route(
+                "/wallets/:address/exports",
+                post(crate::routes::portfolio::create_export_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_PORTFOLIO_EXPORT)),
+            )
+            .route(
+                "/portfolio/exports/:id",
+                get(crate::routes::portfolio::get_export_status_handler),
+            )
+            .route(
+                "/portfolio/exports/:id/download",
+                get(crate::routes::portfolio::download_export_handler),
+            )
+            .route(
+                "/portfolio/exports/:id/cancel",
+                post(crate::routes::portfolio::cancel_export_handler),
             )
             .with_state(state.clone()),
         RateLimitTier::User,
@@ -2980,15 +3067,15 @@ mod data_ownership_contract_tests {
         assert!(cache.get::<serde_json::Value>(&key).await.is_none());
 
         let state = AppState {
-            config: Arc::new(Config::default()),
+            config: Arc::new(Config::default_for_test()),
             cache: PriceCache::new(),
             pool_cache: PoolCache::default(),
             market_reads: market_reads_cache(&cache),
             redis: cache.clone(),
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
-            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
         };
         let response = get_stats(State(state), Query(StatsQuery { category: None, status: None }))
             .await;
@@ -3032,15 +3119,15 @@ mod data_ownership_contract_tests {
         );
 
         let state = AppState {
-            config: Arc::new(Config::default()),
+            config: Arc::new(Config::default_for_test()),
             cache,
             pool_cache: PoolCache::default(),
             market_reads: market_reads_cache(&RedisCache::disabled()),
             redis: RedisCache::disabled(),
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
-            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
         };
         let response = health(State(state)).await;
         assert_eq!(
@@ -3094,15 +3181,15 @@ mod data_ownership_contract_tests {
     #[tokio::test]
     async fn profiles_require_indexer_db() {
         let state = AppState {
-            config: Arc::new(Config::default()),
+            config: Arc::new(Config::default_for_test()),
             cache: PriceCache::new(),
             pool_cache: PoolCache::default(),
             market_reads: market_reads_cache(&RedisCache::disabled()),
             redis: RedisCache::disabled(),
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
-            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
         };
         let address: StellarAddress =
             serde_json::from_value(serde_json::json!(
@@ -3153,7 +3240,19 @@ mod data_ownership_contract_tests {
         let pool_id = 42;
         pool_cache.set(
             pool_id,
-            serde_json::json!({"id": pool_id, "status": "active"}),
+            crate::db::PoolWithOdds {
+                pool_id,
+                name: "test pool".to_string(),
+                category: "test".to_string(),
+                total_stake: 0,
+                end_time: chrono::Utc::now(),
+                created_at: chrono::Utc::now(),
+                state: "active".to_string(),
+                creator: "GCREATOR".to_string(),
+                token: "CTOKEN".to_string(),
+                result: None,
+                odds: Vec::new(),
+            },
         );
         assert!(matches!(
             pool_cache.get(pool_id),

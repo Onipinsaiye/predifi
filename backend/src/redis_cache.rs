@@ -126,6 +126,30 @@ pub fn sanitize_key_component(raw: &str) -> String {
     }
 }
 
+/// Build the cache-aside key for `GET /api/v1/pools`, scoped by every query
+/// parameter that affects the result set so distinct filter/sort/pagination
+/// combinations never collide.
+pub fn pools_cache_key(
+    sort_by: &str,
+    category: Option<&str>,
+    status: &str,
+    limit: i64,
+    offset: i64,
+) -> String {
+    let category = category
+        .map(sanitize_key_component)
+        .unwrap_or_else(|| "all".to_string());
+    format!("pools:{sort_by}:{category}:{status}:{limit}:{offset}")
+}
+
+/// Build the cache-aside key for `GET /api/v1/stats`, scoped by the optional
+/// category/status filters.
+pub fn stats_cache_key(category: Option<&str>, status: Option<&str>) -> String {
+    let category = category.map(sanitize_key_component).unwrap_or_default();
+    let status = status.map(sanitize_key_component).unwrap_or_default();
+    format!("stats:{category}:{status}")
+}
+
 /// Thread-safe Redis cache client with graceful fail-open behaviour.
 ///
 /// All operations silently no-op when Redis is unavailable so the application
@@ -479,7 +503,7 @@ impl RedisCache {
             None => return,
         };
 
-        if let Err(err) = conn.set_ex::<_, _, _>(&namespaced, data, ttl).await {
+        if let Err(err) = conn.set_ex::<_, _, ()>(&namespaced, data, ttl).await {
             if is_connection_error(err.kind()) {
                 warn!("Redis connection dropout on SET {}: {}", key, err);
             } else {
@@ -504,7 +528,7 @@ impl RedisCache {
 
         let mut conn = manager.clone();
 
-        if let Err(err) = conn.del::<_, _>(&namespaced).await {
+        if let Err(err) = conn.del::<_, ()>(&namespaced).await {
             if is_connection_error(err.kind()) {
                 warn!("Redis connection dropout on DEL {}: {}", key, err);
             } else {
@@ -556,7 +580,7 @@ impl RedisCache {
             return;
         }
 
-        if let Err(err) = conn.del::<_, _>(&scoped).await {
+        if let Err(err) = conn.del::<_, ()>(&scoped).await {
             if is_connection_error(err.kind()) {
                 warn!(
                     "Redis connection dropout on DEL (multi) for pattern {}: {}",
