@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 import { formatUtcDateTime } from "@/lib/date";
 import { formatChartValue } from "@/lib/stakeFilters";
@@ -17,6 +17,12 @@ import {
   SkeletonScreen,
 } from "@/components/ui";
 import type { ClaimStatus } from "@/lib/api/profile";
+import {
+  PORTFOLIO_EXPORT_SCHEMA_VERSION,
+  buildPortfolioExport,
+  downloadPortfolioJson,
+  type PortfolioExport,
+} from "@/lib/portfolioExport";
 
 type PredictionStatus = "Active" | "Won" | "Lost" | "Pending";
 
@@ -97,6 +103,37 @@ export function PredictionHistoryClient() {
   const address = useCurrentUserAddress();
   const { profile, isLoading, isError, isStale, refresh } = useProfile(address);
   const [activeTab, setActiveTab] = useState<Tab>("All");
+  const [exported, setExported] = useState<PortfolioExport | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const handleExportJson = useCallback(() => {
+    if (!address || !profile) {
+      setExportError("Connect your wallet and load your history before exporting.");
+      return;
+    }
+    try {
+      const result = buildPortfolioExport({
+        address,
+        claims: profile.claims ?? [],
+        stats: profile.stats ?? null,
+        performance: profile.performance ?? [],
+      });
+      setExportError(null);
+      setExported(result);
+      downloadPortfolioJson(result);
+    } catch (err) {
+      setExported(null);
+      setExportError(
+        err instanceof Error ? err.message : "Could not build the portfolio export.",
+      );
+    }
+  }, [address, profile]);
+
+  const handleFetchNextPage = useCallback(() => {
+    if (!exported?.continuation) return;
+    // The continuation cursor is opaque; the profile service resolves it.
+    refresh();
+  }, [exported, refresh]);
 
   const filtered = useMemo(() => {
     const claims = profile?.claims ?? [];
@@ -174,7 +211,56 @@ export function PredictionHistoryClient() {
 
           {/* Predictions history */}
           <div className="space-y-4">
-            <h2 className="text-base font-semibold text-white">Prediction History</h2>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <h2 className="text-base font-semibold text-white">Prediction History</h2>
+              <div className="flex flex-col items-start sm:items-end gap-1">
+                <button
+                  type="button"
+                  onClick={handleExportJson}
+                  disabled={!address || !profile}
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg border border-zinc-700 text-zinc-200 hover:border-[#37B7C3] hover:text-[#37B7C3] disabled:opacity-50 disabled:cursor-not-allowed transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#37B7C3]"
+                >
+                  Export portfolio JSON
+                </button>
+                <p className="text-[10px] text-zinc-500">
+                  Schema v{PORTFOLIO_EXPORT_SCHEMA_VERSION}
+                </p>
+              </div>
+            </div>
+
+            {exportError && (
+              <p role="alert" className="text-xs text-red-400">
+                {exportError}
+              </p>
+            )}
+
+            {exported && (
+              <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-3 space-y-2">
+                <p className="text-xs text-zinc-300">
+                  Exported {exported.positions.length} position
+                  {exported.positions.length === 1 ? "" : "s"} and{" "}
+                  {exported.ledger_entries.length} ledger entr
+                  {exported.ledger_entries.length === 1 ? "y" : "ies"} (schema v
+                  {exported.schema_version}).
+                </p>
+                {exported.truncated ? (
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                    <p className="text-xs text-yellow-400">
+                      Export was truncated — more records are available.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleFetchNextPage}
+                      className="px-3 py-1 text-xs font-medium rounded-lg border border-yellow-500/40 text-yellow-300 hover:bg-yellow-500/10 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400"
+                    >
+                      Fetch next page
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-xs text-emerald-400">Export is complete.</p>
+                )}
+              </div>
+            )}
 
             {/* Tabs */}
             <div

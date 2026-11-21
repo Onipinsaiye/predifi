@@ -1795,6 +1795,431 @@ impl PredifiContract {
         }
     }
 
+    /// Deposit liquidity into a pool and receive LP shares (issue #268).
+    ///
+    /// # LP accounting model
+    ///
+    /// Liquidity providers hold *shares* of the pool's LP ledger. Shares are
+    /// minted at the current share price so that no depositor can dilute or
+    /// be diluted by existing LPs:
+    ///
+    /// ```text
+    /// if total_shares == 0:
+    ///     shares_minted = amount
+    /// else:
+    ///     shares_minted = amount * total_shares / total_assets
+    /// ```
+    ///
+    /// where `total_assets` is the LP-owned asset balance (stake contributed
+    /// by LPs plus accrued fees minus allocated losses). Rounding is
+    /// protocol-favouring: the minted share count is floored, so a depositor
+    /// can never receive more shares than their contribution is worth.
+    ///
+    /// # Conservation invariant
+    ///
+    /// For every LP operation the contract maintains:
+    ///
+    /// ```text
+    /// sum(lp_shares) == total_shares
+    /// total_assets == sum(lp_principal) + accrued_fees - allocated_losses
+    /// ```
+    ///
+    /// and the pool's token balance always covers `total_assets` plus any
+    /// outstanding user stakes. Deposits are rejected if they would break
+    /// these invariants.
+    ///
+    /// # Errors
+    /// - `ContractPaused` – the contract is globally paused.
+    /// - `PoolNotFound` – no pool exists for `pool_id`.
+    /// - `InvalidPoolState` – the pool is `Canceled` (no new liquidity).
+    /// - `InvalidAmount` – `amount <= 0` or the deposit would mint zero shares.
+    pub fn deposit_liquidity(
+        env: Env,
+        provider: Address,
+        pool_id: u64,
+        amount: i128,
+    ) -> Result<i128, PredifiError> {
+        Self::require_not_paused(&env)?;
+        provider.require_auth();
+
+        if amount <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let pool_key = DataKey::Pool(pool_id);
+        let mut pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &pool_key);
+
+        // Canceled pools are closed to new liquidity; resolved pools may still
+        // accept deposits only while the claim window is open (handled by TTL).
+        if pool.state == MarketState::Canceled {
+            return Err(PredifiError::InvalidPoolState);
+        }
+
+        let ledger_key = DataKey::LpLedger(pool_id);
+        let mut ledger: crate::LpLedger = env
+            .storage()
+            .persistent()
+            .get(&ledger_key)
+            .unwrap_or_else(|| crate::LpLedger::empty(&env));
+
+        // Compute shares to mint at the current share price (floor rounding).
+        let shares_minted = if ledger.total_shares == 0 || ledger.total_assets <= 0 {
+            amount
+        } else {
+            amount
+                .checked_mul(ledger.total_shares)
+                .ok_or(PredifiError::InvalidAmount)?
+                / ledger.total_assets
+        };
+
+        if shares_minted <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        // Transfer the deposit into the contract before mutating accounting so
+        // a failed transfer aborts without leaving a phantom share balance.
+        let token_client = token::Client::new(&env, &pool.token);
+        token_client.transfer(&provider, env.current_contract_address(), &amount);
+
+        // Update per-provider share balance.
+        let share_key = DataKey::LpShares(pool_id, provider.clone());
+        let existing: i128 = env.storage().persistent().get(&share_key).unwrap_or(0);
+        let new_balance = existing
+            .checked_add(shares_minted)
+            .ok_or(PredifiError::InvalidAmount)?;
+        env.storage().persistent().set(&share_key, &new_balance);
+        Self::extend_persistent(&env, &share_key);
+
+        ledger.total_shares = ledger
+            .total_shares
+            .checked_add(shares_minted)
+            .ok_or(PredifiError::InvalidAmount)?;
+        ledger.total_assets = ledger
+            .total_assets
+            .checked_add(amount)
+            .ok_or(PredifiError::InvalidAmount)?;
+        ledger.lp_principal = ledger
+            .lp_principal
+            .checked_add(amount)
+            .ok_or(PredifiError::InvalidAmount)?;
+
+        // Conservation check: shares and assets must remain non-negative and
+        // the ledger must be internally consistent before persisting.
+        Self::assert_lp_conservation(&ledger);
+
+        env.storage().persistent().set(&ledger_key, &ledger);
+        Self::extend_persistent(&env, &ledger_key);
+
+        crate::LiquidityDepositedEvent {
+            pool_id,
+            provider,
+            amount,
+            shares_minted,
+            total_shares: ledger.total_shares,
+            total_assets: ledger.total_assets,
+        }
+        .publish(&env);
+
+        Ok(shares_minted)
+    }
+
+    /// Withdraw liquidity from a pool by burning LP shares (issue #268).
+    ///
+    /// Withdrawals are permitted while the market is open **and** during
+    /// market closure (after `end_time`, before resolution) so LPs are not
+    /// trapped by a stalled resolution. Once the pool is `Resolved` or
+    /// `Canceled`, LP shares are settled through the normal claim path and
+    /// direct withdrawal is rejected.
+    ///
+    /// The payout is computed at the current share price with floor rounding:
+    ///
+    /// ```text
+    /// assets_out = shares * total_assets / total_shares
+    /// ```
+    ///
+    /// Rounding favours the pool (remaining LPs) so a withdrawing provider can
+    /// never extract more than their pro-rata share.
+    ///
+    /// # Errors
+    /// - `ContractPaused` – the contract is globally paused.
+    /// - `PoolNotFound` – no pool exists for `pool_id`.
+    /// - `InvalidPoolState` – the pool is `Resolved` or `Canceled`.
+    /// - `InvalidAmount` – `shares <= 0` or exceeds the provider's balance.
+    pub fn withdraw_liquidity(
+        env: Env,
+        provider: Address,
+        pool_id: u64,
+        shares: i128,
+    ) -> Result<i128, PredifiError> {
+        Self::require_not_paused(&env)?;
+        provider.require_auth();
+
+        if shares <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let pool_key = DataKey::Pool(pool_id);
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &pool_key);
+
+        // Direct LP withdrawal is only meaningful while the pool is still
+        // unsettled. Resolved/Canceled pools settle LP positions via claims.
+        if pool.state == MarketState::Resolved || pool.state == MarketState::Canceled {
+            return Err(PredifiError::InvalidPoolState);
+        }
+
+        let ledger_key = DataKey::LpLedger(pool_id);
+        let mut ledger: crate::LpLedger = env
+            .storage()
+            .persistent()
+            .get(&ledger_key)
+            .ok_or(PredifiError::InvalidAmount)?;
+
+        let share_key = DataKey::LpShares(pool_id, provider.clone());
+        let balance: i128 = env.storage().persistent().get(&share_key).unwrap_or(0);
+        if shares > balance {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        if ledger.total_shares <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        // Floor rounding favours remaining LPs.
+        let assets_out = shares
+            .checked_mul(ledger.total_assets)
+            .ok_or(PredifiError::InvalidAmount)?
+            / ledger.total_shares;
+
+        if assets_out <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        // Burn shares and reduce ledger balances before transferring out.
+        let new_balance = balance - shares;
+        if new_balance == 0 {
+            env.storage().persistent().remove(&share_key);
+        } else {
+            env.storage().persistent().set(&share_key, &new_balance);
+            Self::extend_persistent(&env, &share_key);
+        }
+
+        ledger.total_shares -= shares;
+        ledger.total_assets -= assets_out;
+        // Principal is reduced proportionally, floored, so it never exceeds
+        // the assets actually withdrawn.
+        let principal_out = if ledger.lp_principal > 0 {
+            shares
+                .checked_mul(ledger.lp_principal)
+                .ok_or(PredifiError::InvalidAmount)?
+                / (ledger.total_shares + shares)
+        } else {
+            0
+        };
+        ledger.lp_principal = ledger.lp_principal.saturating_sub(principal_out);
+
+        Self::assert_lp_conservation(&ledger);
+
+        env.storage().persistent().set(&ledger_key, &ledger);
+        Self::extend_persistent(&env, &ledger_key);
+
+        let token_client = token::Client::new(&env, &pool.token);
+        token_client.transfer(&env.current_contract_address(), &provider, &assets_out);
+
+        crate::LiquidityWithdrawnEvent {
+            pool_id,
+            provider,
+            shares_burned: shares,
+            assets_out,
+            total_shares: ledger.total_shares,
+            total_assets: ledger.total_assets,
+        }
+        .publish(&env);
+
+        Ok(assets_out)
+    }
+
+    /// Accrue protocol fees to the LP ledger (issue #268).
+    ///
+    /// Called by the settlement path after a pool resolves. The fee amount is
+    /// added to `accrued_fees` and to `total_assets`, raising the share price
+    /// for all LPs pro-rata. The fee must already have been reserved from the
+    /// pool's stake; this hook only updates accounting.
+    ///
+    /// # Errors
+    /// - `PoolNotFound` – no pool exists for `pool_id`.
+    /// - `InvalidAmount` – `fee_amount < 0`.
+    pub fn accrue_lp_fees(
+        env: Env,
+        pool_id: u64,
+        fee_amount: i128,
+    ) -> Result<(), PredifiError> {
+        if fee_amount < 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+        if fee_amount == 0 {
+            return Ok(());
+        }
+
+        let pool_key = DataKey::Pool(pool_id);
+        let _pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &pool_key);
+
+        let ledger_key = DataKey::LpLedger(pool_id);
+        let mut ledger: crate::LpLedger = env
+            .storage()
+            .persistent()
+            .get(&ledger_key)
+            .unwrap_or_else(|| crate::LpLedger::empty(&env));
+
+        ledger.accrued_fees = ledger
+            .accrued_fees
+            .checked_add(fee_amount)
+            .ok_or(PredifiError::InvalidAmount)?;
+        ledger.total_assets = ledger
+            .total_assets
+            .checked_add(fee_amount)
+            .ok_or(PredifiError::InvalidAmount)?;
+
+        Self::assert_lp_conservation(&ledger);
+
+        env.storage().persistent().set(&ledger_key, &ledger);
+        Self::extend_persistent(&env, &ledger_key);
+
+        crate::LpFeesAccruedEvent {
+            pool_id,
+            fee_amount,
+            accrued_fees: ledger.accrued_fees,
+            total_assets: ledger.total_assets,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Allocate a loss to LPs (issue #268).
+    ///
+    /// When a pool resolves with a shortfall (winning payouts exceed the
+    /// non-LP stake), the deficit is socialised across LPs pro-rata by
+    /// reducing `total_assets`. `allocated_losses` records the cumulative
+    /// loss so conservation can be verified:
+    ///
+    /// ```text
+    /// total_assets == lp_principal + accrued_fees - allocated_losses
+    /// ```
+    ///
+    /// The loss is capped at the current `total_assets` so LP balances can
+    /// never go negative.
+    ///
+    /// # Errors
+    /// - `PoolNotFound` – no pool exists for `pool_id`.
+    /// - `InvalidAmount` – `loss_amount < 0`.
+    pub fn allocate_lp_loss(
+        env: Env,
+        pool_id: u64,
+        loss_amount: i128,
+    ) -> Result<i128, PredifiError> {
+        if loss_amount < 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let pool_key = DataKey::Pool(pool_id);
+        let _pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &pool_key);
+
+        let ledger_key = DataKey::LpLedger(pool_id);
+        let mut ledger: crate::LpLedger = env
+            .storage()
+            .persistent()
+            .get(&ledger_key)
+            .unwrap_or_else(|| crate::LpLedger::empty(&env));
+
+        // Cap the loss at the LP-owned assets so balances stay non-negative.
+        let effective_loss = core::cmp::min(loss_amount, ledger.total_assets);
+        if effective_loss == 0 {
+            return Ok(0);
+        }
+
+        ledger.total_assets -= effective_loss;
+        ledger.allocated_losses = ledger
+            .allocated_losses
+            .checked_add(effective_loss)
+            .ok_or(PredifiError::InvalidAmount)?;
+
+        Self::assert_lp_conservation(&ledger);
+
+        env.storage().persistent().set(&ledger_key, &ledger);
+        Self::extend_persistent(&env, &ledger_key);
+
+        crate::LpLossAllocatedEvent {
+            pool_id,
+            loss_amount: effective_loss,
+            allocated_losses: ledger.allocated_losses,
+            total_assets: ledger.total_assets,
+        }
+        .publish(&env);
+
+        Ok(effective_loss)
+    }
+
+    /// Read the LP ledger for a pool (issue #268).
+    pub fn get_lp_ledger(env: Env, pool_id: u64) -> crate::LpLedger {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LpLedger(pool_id))
+            .unwrap_or_else(|| crate::LpLedger::empty(&env))
+    }
+
+    /// Read a provider's LP share balance for a pool (issue #268).
+    pub fn get_lp_shares(env: Env, pool_id: u64, provider: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LpShares(pool_id, provider))
+            .unwrap_or(0)
+    }
+
+    /// Enforce the LP conservation invariant (issue #268).
+    ///
+    /// Panics if the ledger is internally inconsistent. This is the on-chain
+    /// counterpart to the property tests required by the RFC before
+    /// implementation approval.
+    fn assert_lp_conservation(ledger: &crate::LpLedger) {
+        assert!(ledger.total_shares >= 0, "LP invariant: negative total_shares");
+        assert!(ledger.total_assets >= 0, "LP invariant: negative total_assets");
+        assert!(ledger.lp_principal >= 0, "LP invariant: negative lp_principal");
+        assert!(ledger.accrued_fees >= 0, "LP invariant: negative accrued_fees");
+        assert!(
+            ledger.allocated_losses >= 0,
+            "LP invariant: negative allocated_losses"
+        );
+        // total_assets == lp_principal + accrued_fees - allocated_losses
+        let expected = ledger
+            .lp_principal
+            .saturating_add(ledger.accrued_fees)
+            .saturating_sub(ledger.allocated_losses);
+        assert!(
+            ledger.total_assets == expected,
+            "LP invariant: total_assets != lp_principal + accrued_fees - allocated_losses"
+        );
+    }
+
     /// Flag a pool as disputed. Only callable by a Moderator (role 2).
     ///
     /// Transitions the pool state from `Active` to `Disputed`, preventing

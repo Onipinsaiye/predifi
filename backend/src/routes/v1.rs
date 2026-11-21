@@ -2537,6 +2537,261 @@ pub async fn delete_push_subscription_handler(
     }
 }
 
+// ── Portfolio JSON export (#265) ─────────────────────────────────────────────
+
+/// Schema identifier emitted by the portfolio JSON export. Bump the suffix
+/// whenever the payload shape changes incompatibly.
+pub const PORTFOLIO_EXPORT_SCHEMA: &str = "portfolio.export.v1";
+
+/// Default number of positions/ledger entries returned by the export.
+pub const PORTFOLIO_EXPORT_DEFAULT_LIMIT: i64 = 100;
+/// Hard upper bound on the number of positions/ledger entries per export.
+pub const PORTFOLIO_EXPORT_MAX_LIMIT: i64 = 500;
+
+/// Query parameters for `GET /api/v1/users/:address/portfolio/export`.
+#[derive(Debug, Default, Deserialize)]
+pub struct PortfolioExportQuery {
+    /// Maximum number of positions (and ledger entries) to include.
+    pub limit: Option<i64>,
+    /// Opaque continuation cursor returned by a previous truncated export.
+    pub cursor: Option<String>,
+}
+
+/// A single open/closed position in the exported portfolio.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportPosition {
+    pub pool_id: i64,
+    pub outcome: i16,
+    pub amount: i64,
+    pub claimed: bool,
+    /// Provenance of the position record.
+    pub source: PortfolioExportSource,
+}
+
+/// A single ledger entry (stake, payout or refund) in the exported portfolio.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportLedgerEntry {
+    pub pool_id: i64,
+    pub kind: String,
+    pub amount: i64,
+    pub occurred_at: Option<String>,
+    pub source: PortfolioExportSource,
+}
+
+/// Reference to the authoritative source a record was derived from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportSource {
+    /// Logical source, e.g. `indexer_db` or `chain_event`.
+    pub kind: String,
+    /// Table or event name the record came from.
+    pub reference: String,
+}
+
+/// Metadata describing how the export was calculated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportCalculation {
+    /// Identifier of the calculation/assembly routine.
+    pub method: String,
+    /// Version of the calculation routine.
+    pub version: u32,
+    /// Whether the export was bounded (i.e. a limit was applied).
+    pub bounded: bool,
+    /// Limit that was applied to positions and ledger entries.
+    pub limit: i64,
+    /// Number of positions included in this page.
+    pub position_count: usize,
+    /// Number of ledger entries included in this page.
+    pub ledger_entry_count: usize,
+}
+
+/// Versioned, self-describing portfolio export document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExport {
+    /// Schema identifier — always [`PORTFOLIO_EXPORT_SCHEMA`].
+    pub schema: String,
+    /// Wallet the export belongs to.
+    pub address: String,
+    /// Positions included in this page.
+    pub positions: Vec<PortfolioExportPosition>,
+    /// Ledger entries included in this page.
+    pub ledger_entries: Vec<PortfolioExportLedgerEntry>,
+    /// Calculation metadata.
+    pub calculation: PortfolioExportCalculation,
+    /// True when more records exist beyond this page.
+    pub truncated: bool,
+    /// Cursor to pass as `cursor` to fetch the next page, if truncated.
+    #[serde(rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+    /// Total number of positions for the wallet (before truncation).
+    #[serde(rename = "totalCount")]
+    pub total_count: i64,
+}
+
+/// Resolve the effective export limit, clamping into bounds.
+fn resolve_portfolio_export_limit(limit: Option<i64>) -> i64 {
+    match limit {
+        Some(value) if value > 0 => value.min(PORTFOLIO_EXPORT_MAX_LIMIT),
+        _ => PORTFOLIO_EXPORT_DEFAULT_LIMIT,
+    }
+}
+
+/// Encode a continuation cursor as the id of the last exported position.
+fn encode_portfolio_cursor(last_pool_id: i64) -> String {
+    format!("v1:{last_pool_id}")
+}
+
+/// Decode a continuation cursor, returning `None` when it is malformed.
+fn decode_portfolio_cursor(cursor: &str) -> Option<i64> {
+    cursor.strip_prefix("v1:")?.parse::<i64>().ok()
+}
+
+/// Assemble a [`PortfolioExport`] from raw position rows.
+///
+/// Positions are ordered by `pool_id`; the cursor is the last exported
+/// `pool_id`, so a truncated export can be continued deterministically.
+fn build_portfolio_export(
+    address: &str,
+    mut positions: Vec<PortfolioExportPosition>,
+    limit: i64,
+    total_count: i64,
+) -> PortfolioExport {
+    positions.sort_by_key(|position| position.pool_id);
+    let truncated = positions.len() as i64 > limit;
+    positions.truncate(limit as usize);
+
+    let ledger_entries: Vec<PortfolioExportLedgerEntry> = positions
+        .iter()
+        .map(|position| PortfolioExportLedgerEntry {
+            pool_id: position.pool_id,
+            kind: if position.claimed {
+                "claim".to_string()
+            } else {
+                "stake".to_string()
+            },
+            amount: position.amount,
+            occurred_at: None,
+            source: position.source.clone(),
+        })
+        .collect();
+
+    let next_cursor = if truncated {
+        positions
+            .last()
+            .map(|position| encode_portfolio_cursor(position.pool_id))
+    } else {
+        None
+    };
+
+    PortfolioExport {
+        schema: PORTFOLIO_EXPORT_SCHEMA.to_string(),
+        address: address.to_string(),
+        calculation: PortfolioExportCalculation {
+            method: "portfolio_export".to_string(),
+            version: 1,
+            bounded: true,
+            limit,
+            position_count: positions.len(),
+            ledger_entry_count: ledger_entries.len(),
+        },
+        positions,
+        ledger_entries,
+        truncated,
+        next_cursor,
+        total_count,
+    }
+}
+
+/// `GET /api/v1/users/:address/portfolio/export` — versioned JSON export of a
+/// wallet's complete portfolio (positions, ledger entries, provenance and
+/// calculation metadata) with explicit truncation/continuation fields.
+pub async fn export_portfolio_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Query(params): Query<PortfolioExportQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let limit = resolve_portfolio_export_limit(params.limit);
+    let after_pool_id = match params.cursor.as_deref() {
+        Some(cursor) => match decode_portfolio_cursor(cursor) {
+            Some(value) => Some(value),
+            None => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "invalid portfolio export cursor",
+                )
+                .into_response()
+            }
+        },
+        None => None,
+    };
+
+    // Fetch one extra row so truncation can be detected without a second query.
+    let fetch_limit = limit.saturating_add(1);
+    let rows = match crate::db::predictions::list_portfolio_positions(
+        db,
+        address.as_str(),
+        after_pool_id,
+        fetch_limit,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(error = %error, "portfolio export query failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load portfolio export",
+            )
+            .into_response();
+        }
+    };
+
+    let total_count = match crate::db::predictions::count_portfolio_positions(db, address.as_str())
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(error = %error, "portfolio export count failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load portfolio export",
+            )
+            .into_response();
+        }
+    };
+
+    let positions: Vec<PortfolioExportPosition> = rows
+        .into_iter()
+        .map(|row| PortfolioExportPosition {
+            pool_id: row.pool_id,
+            outcome: row.outcome,
+            amount: row.amount,
+            claimed: row.claimed,
+            source: PortfolioExportSource {
+                kind: "indexer_db".to_string(),
+                reference: "predictions".to_string(),
+            },
+        })
+        .collect();
+
+    let export = build_portfolio_export(address.as_str(), positions, limit, total_count);
+    ApiResponse::success(export).into_response()
+}
+
 /// `GET /api/v1/users/:address/interests` — categories/tags a user follows
 /// for "new pool matching your interests" alerts.
 pub async fn get_user_interests_handler(
@@ -2730,6 +2985,10 @@ pub fn router(
             .route("/users/:address/history", get(get_user_history))
             .route("/users/:address/predictions", get(get_user_predictions))
             .route("/users/:address/profile", get(get_user_profile_handler))
+            .route(
+                "/users/:address/portfolio/export",
+                get(export_portfolio_handler),
+            )
             .route(
                 "/users/:address/referrals",
                 get(user_referral_earnings_handler),
@@ -3617,6 +3876,88 @@ mod data_ownership_contract_tests {
         // The stale entries must no longer be served.
         assert!(cache.get::<serde_json::Value>(&pool_key).await.is_none());
         assert!(cache.get::<serde_json::Value>(&stats_key).await.is_none());
+    }
+
+    /// Portfolio export (#265): the versioned document round-trips through
+    /// JSON for a large wallet fixture and carries explicit truncation and
+    /// continuation information.
+    #[test]
+    fn portfolio_export_round_trips_for_large_wallet_fixture() {
+        let limit = 100;
+        let fixture: Vec<PortfolioExportPosition> = (0..250)
+            .map(|index| PortfolioExportPosition {
+                pool_id: index,
+                outcome: (index % 2) as i16,
+                amount: 10 * (index + 1),
+                claimed: index % 3 == 0,
+                source: PortfolioExportSource {
+                    kind: "indexer_db".to_string(),
+                    reference: "predictions".to_string(),
+                },
+            })
+            .collect();
+
+        let export = build_portfolio_export(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            fixture,
+            limit,
+            250,
+        );
+
+        assert_eq!(export.schema, PORTFOLIO_EXPORT_SCHEMA);
+        assert!(export.truncated, "a 250-position wallet must truncate");
+        assert_eq!(export.total_count, 250);
+        assert_eq!(export.positions.len() as i64, limit);
+        assert_eq!(export.ledger_entries.len(), export.positions.len());
+        assert_eq!(export.calculation.position_count, export.positions.len());
+        assert_eq!(export.next_cursor, Some(encode_portfolio_cursor(limit - 1)));
+
+        // Round-trip: serialise, parse back, and compare the whole document.
+        let encoded = serde_json::to_string(&export).expect("export serialises");
+        let decoded: PortfolioExport = serde_json::from_str(&encoded).expect("export parses");
+        assert_eq!(decoded, export);
+
+        // The continuation cursor decodes back to the last exported pool id.
+        let cursor = decoded.next_cursor.expect("truncated export has a cursor");
+        assert_eq!(decode_portfolio_cursor(&cursor), Some(limit - 1));
+        assert_eq!(decode_portfolio_cursor("not-a-cursor"), None);
+    }
+
+    /// Portfolio export (#265): a wallet smaller than the limit is not
+    /// truncated and reports no continuation cursor.
+    #[test]
+    fn portfolio_export_is_not_truncated_when_it_fits() {
+        let fixture = vec![PortfolioExportPosition {
+            pool_id: 7,
+            outcome: 1,
+            amount: 42,
+            claimed: false,
+            source: PortfolioExportSource {
+                kind: "indexer_db".to_string(),
+                reference: "predictions".to_string(),
+            },
+        }];
+        let export = build_portfolio_export("GADDRESS", fixture, 100, 1);
+        assert!(!export.truncated);
+        assert_eq!(export.next_cursor, None);
+        assert_eq!(export.total_count, 1);
+        assert_eq!(export.positions.len(), 1);
+    }
+
+    /// Portfolio export (#265): limits are clamped into documented bounds.
+    #[test]
+    fn portfolio_export_limit_is_bounded() {
+        assert_eq!(
+            resolve_portfolio_export_limit(None),
+            PORTFOLIO_EXPORT_DEFAULT_LIMIT
+        );
+        assert_eq!(resolve_portfolio_export_limit(Some(0)), PORTFOLIO_EXPORT_DEFAULT_LIMIT);
+        assert_eq!(resolve_portfolio_export_limit(Some(-1)), PORTFOLIO_EXPORT_DEFAULT_LIMIT);
+        assert_eq!(resolve_portfolio_export_limit(Some(10)), 10);
+        assert_eq!(
+            resolve_portfolio_export_limit(Some(1_000_000)),
+            PORTFOLIO_EXPORT_MAX_LIMIT
+        );
     }
 
     /// Conflict behaviour: a stale pool-detail cache entry must be dropped

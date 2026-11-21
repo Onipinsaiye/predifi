@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS browser_push_subscriptions (
 CREATE INDEX IF NOT EXISTS idx_browser_push_subscriptions_active
     ON browser_push_subscriptions (user_address, expires_at);
 
+-- Account data export/deletion: enumerate every push subscription for a wallet
+-- so the export can be complete and deletion can be idempotent.
+CREATE INDEX IF NOT EXISTS idx_browser_push_subscriptions_user
+    ON browser_push_subscriptions (user_address, id);
+
 CREATE TABLE IF NOT EXISTS user_notification_outbox (
     id              BIGSERIAL   PRIMARY KEY,
     event_key       TEXT        NOT NULL,
@@ -66,6 +71,11 @@ CREATE INDEX IF NOT EXISTS idx_user_notification_outbox_due
 CREATE INDEX IF NOT EXISTS idx_user_notification_outbox_claimed
     ON user_notification_outbox (claimed_at)
     WHERE status = 'processing';
+
+-- Account data export/deletion: scan all inbox rows for a wallet in a stable
+-- order without relying on the (user_address, created_at) inbox index.
+CREATE INDEX IF NOT EXISTS idx_user_notification_outbox_user
+    ON user_notification_outbox (user_address, id);
 
 -- Preserve pending intents from the legacy table while moving the in-app
 -- notification worker onto its own schema. Terminal rows remain available in
@@ -100,6 +110,11 @@ ON CONFLICT (event_key, user_address) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_notifications_user_inbox
     ON notifications (user_address, created_at DESC, id DESC);
+
+-- Account data export/deletion: stable, complete enumeration of a wallet's
+-- inbox entries by primary key for export and idempotent deletion.
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id
+    ON notifications (user_address, id);
 
 -- The generic Stellar worker queue used to share the notification table name
 -- despite having a different payload and lease schema. Keep it separate.

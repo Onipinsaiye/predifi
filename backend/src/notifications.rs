@@ -1495,6 +1495,238 @@ pub async fn prune_expired_push_subscriptions(pool: &PgPool) -> Result<u64, sqlx
     Ok(result.rows_affected())
 }
 
+// ── Account data export and deletion (#267) ─────────────────────────────────
+//
+// Off-chain notification data linked to a wallet is exported and deleted here.
+// Only private, user-owned records are touched:
+//
+// * `notification_preferences` — private channel/event opt-ins.
+// * `notifications`            — delivered in-app inbox entries.
+// * `user_notification_outbox` — pending/terminal delivery intents.
+// * `user_interests`           — private interest tags used for matching.
+// * `browser_push_subscriptions` — encrypted push endpoints.
+//
+// Chain-derived history (pools, predictions, resolutions, claims) is public and
+// immutable; it is never read or written by these functions. Audit tables
+// (`credential_rotation_audit`) hold no personal data and are retained.
+
+/// One exported push subscription. The encrypted payload is decrypted so the
+/// user receives the endpoint and keys they registered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedPushSubscription {
+    pub id: i64,
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// One exported outbox intent (pending or terminal delivery record).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedOutboxEntry {
+    pub id: i64,
+    pub event_key: String,
+    pub notif_type: String,
+    pub title: String,
+    pub message: String,
+    pub pool_id: i64,
+    pub status: String,
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Complete export of a wallet's off-chain notification data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationDataExport {
+    pub user_address: String,
+    pub exported_at: DateTime<Utc>,
+    pub preferences: NotificationPreferences,
+    pub notifications: Vec<NotificationRow>,
+    pub outbox: Vec<ExportedOutboxEntry>,
+    pub interests: Vec<String>,
+    pub push_subscriptions: Vec<ExportedPushSubscription>,
+    /// Human-readable explanation of what is (and is not) included, so the
+    /// user understands that on-chain history is immutable and public.
+    pub on_chain_data_note: String,
+}
+
+/// Explanation attached to every export describing immutable on-chain data.
+pub const ON_CHAIN_DATA_NOTE: &str = "Public on-chain history (pools, predictions, \
+resolutions and claims) is immutable and is not part of this export or of account \
+deletion. Only private off-chain profile and notification data is exported or removed.";
+
+/// Export every off-chain notification record linked to `address`.
+///
+/// The read runs in a single repeatable-read transaction so the export is a
+/// consistent snapshot. Push subscription payloads are decrypted with `secret`.
+pub async fn export_notification_data(
+    pool: &PgPool,
+    address: &str,
+    secret: &str,
+) -> Result<NotificationDataExport, PushSubscriptionError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+
+    let preferences = get_notification_preferences(pool, address)
+        .await
+        .map_err(PushSubscriptionError::Database)?;
+
+    let notifications: Vec<NotificationRow> = sqlx::query_as(
+        r#"
+        SELECT id, user_address, notif_type, title, message, pool_id, read, created_at
+        FROM notifications
+        WHERE user_address = $1
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let outbox: Vec<ExportedOutboxEntry> = sqlx::query_as(
+        r#"
+        SELECT id, event_key, notif_type, title, message, pool_id,
+               status, attempts, created_at, updated_at
+        FROM user_notification_outbox
+        WHERE user_address = $1
+        ORDER BY id ASC
+        "#,
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let interests: Vec<String> = sqlx::query_as(
+        "SELECT interest FROM user_interests WHERE user_address = $1 ORDER BY interest",
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|(interest,)| interest)
+    .collect();
+
+    let push_rows = sqlx::query(
+        "SELECT id, encrypted_payload, expires_at FROM browser_push_subscriptions WHERE user_address = $1 ORDER BY id",
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut push_subscriptions = Vec::with_capacity(push_rows.len());
+    for row in push_rows {
+        let payload = decrypt_push_payload(
+            secret,
+            &row.try_get::<Vec<u8>, _>("encrypted_payload")
+                .map_err(PushSubscriptionError::Database)?,
+        )?;
+        let payload: PushSubscriptionPayload =
+            serde_json::from_slice(&payload).map_err(|_| PushSubscriptionError::Encryption)?;
+        push_subscriptions.push(ExportedPushSubscription {
+            id: row.try_get("id").map_err(PushSubscriptionError::Database)?,
+            endpoint: payload.endpoint,
+            p256dh: payload.p256dh,
+            auth: payload.auth,
+            expires_at: row
+                .try_get("expires_at")
+                .map_err(PushSubscriptionError::Database)?,
+        });
+    }
+
+    tx.commit().await?;
+
+    Ok(NotificationDataExport {
+        user_address: address.to_string(),
+        exported_at: Utc::now(),
+        preferences,
+        notifications,
+        outbox,
+        interests,
+        push_subscriptions,
+        on_chain_data_note: ON_CHAIN_DATA_NOTE.to_string(),
+    })
+}
+
+/// Counts of private records removed by [`delete_notification_data`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct NotificationDeletionReport {
+    pub preferences_deleted: u64,
+    pub notifications_deleted: u64,
+    pub outbox_deleted: u64,
+    pub interests_deleted: u64,
+    pub push_subscriptions_deleted: u64,
+}
+
+impl NotificationDeletionReport {
+    /// Total number of private rows removed.
+    pub fn total(&self) -> u64 {
+        self.preferences_deleted
+            + self.notifications_deleted
+            + self.outbox_deleted
+            + self.interests_deleted
+            + self.push_subscriptions_deleted
+    }
+}
+
+/// Delete every off-chain notification record linked to `address`.
+///
+/// Deletion is idempotent: running it again removes nothing and returns a
+/// zeroed report. Chain-derived tables are never touched. The whole operation
+/// runs in one transaction so a partial failure leaves no half-deleted state.
+pub async fn delete_notification_data(
+    pool: &PgPool,
+    address: &str,
+) -> Result<NotificationDeletionReport, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let preferences_deleted =
+        sqlx::query("DELETE FROM notification_preferences WHERE user_address = $1")
+            .bind(address)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+    let notifications_deleted = sqlx::query("DELETE FROM notifications WHERE user_address = $1")
+        .bind(address)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    let outbox_deleted =
+        sqlx::query("DELETE FROM user_notification_outbox WHERE user_address = $1")
+            .bind(address)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+    let interests_deleted = sqlx::query("DELETE FROM user_interests WHERE user_address = $1")
+        .bind(address)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    let push_subscriptions_deleted =
+        sqlx::query("DELETE FROM browser_push_subscriptions WHERE user_address = $1")
+            .bind(address)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+    tx.commit().await?;
+
+    let report = NotificationDeletionReport {
+        preferences_deleted,
+        notifications_deleted,
+        outbox_deleted,
+        interests_deleted,
+        push_subscriptions_deleted,
+    };
+    info!(?report, "notification data deleted for account");
+    Ok(report)
+}
+
 // ── Weekly market digest (#289) ──────────────────────────────────────────────
 
 /// How long an unsubscribe token remains redeemable after issuance.
@@ -1807,6 +2039,7 @@ pub async fn send_digest_if_due(
     }
     tx.commit().await?;
     Ok(delivered)
+}
 }
 
 // ── Sweep: generates notifications from current pool/prediction state ────────
@@ -2279,6 +2512,25 @@ mod tests {
         assert!(validate_push_endpoint("https://push.example.test/sub").is_ok());
         assert!(validate_push_endpoint("http://push.example.test/sub").is_err());
         assert!(validate_push_endpoint("https://user:pass@push.example.test/sub").is_err());
+    }
+
+    #[test]
+    fn deletion_report_total_sums_all_private_records() {
+        let report = NotificationDeletionReport {
+            preferences_deleted: 1,
+            notifications_deleted: 2,
+            outbox_deleted: 3,
+            interests_deleted: 4,
+            push_subscriptions_deleted: 5,
+        };
+        assert_eq!(report.total(), 15);
+        assert_eq!(NotificationDeletionReport::default().total(), 0);
+    }
+
+    #[test]
+    fn export_note_explains_immutable_on_chain_data() {
+        assert!(ON_CHAIN_DATA_NOTE.contains("immutable"));
+        assert!(ON_CHAIN_DATA_NOTE.contains("on-chain"));
     }
 
     // ── Weekly digest tests (#289) ──────────────────────────────────────────

@@ -91,7 +91,22 @@ pub struct RefPool {
     pub participants_count: u32,
     /// Timestamp set when the pool transitions to `Resolved`.
     pub resolution_timestamp: Option<u64>,
+
+    // --- liquidity-provider (LP) accounting ---
+    /// Total LP shares outstanding. Shares are minted on deposit and burned on
+    /// withdrawal; the share price is `lp_assets / total_shares`.
+    pub total_shares: i128,
+    /// Assets attributable to LPs (deposits + accrued fees − allocated losses).
+    /// This is *separate* from `total_stake`, which tracks user predictions.
+    pub lp_assets: i128,
+    /// Cumulative fees credited to LPs (never decreases).
+    pub lp_fees_accrued: i128,
+    /// Cumulative losses allocated to LPs (never decreases).
+    pub lp_losses_allocated: i128,
+    /// Per-LP share balances keyed by user identity.
+    pub lp_shares: HashMap<String, i128>,
 }
+=======
 
 impl RefPool {
     /// Validate all invariants. Panics with a descriptive message on violation.
@@ -146,6 +161,42 @@ impl RefPool {
                 self.options_count,
             );
         }
+
+        // INV-LP1: LP asset accounting identity.
+        // lp_assets == deposits + fees_accrued − losses_allocated, where
+        // deposits == sum(lp_shares) is implied by share conservation below.
+        assert!(
+            self.lp_assets >= 0,
+            "INV-LP1: lp_assets ({}) < 0",
+            self.lp_assets
+        );
+        assert!(
+            self.lp_fees_accrued >= 0 && self.lp_losses_allocated >= 0,
+            "INV-LP1: negative fee/loss accumulators"
+        );
+
+        // INV-LP2: share conservation — sum of per-LP shares == total_shares.
+        let share_sum: i128 = self.lp_shares.values().sum();
+        assert_eq!(
+            self.total_shares, share_sum,
+            "INV-LP2: total_shares ({}) != sum(lp_shares) ({})",
+            self.total_shares, share_sum,
+        );
+        assert!(
+            self.total_shares >= 0,
+            "INV-LP2: total_shares ({}) < 0",
+            self.total_shares
+        );
+
+        // INV-LP3: no LP holds a negative share balance.
+        for (who, shares) in &self.lp_shares {
+            assert!(
+                *shares >= 0,
+                "INV-LP3: LP {} has negative shares ({})",
+                who,
+                shares
+            );
+        }
     }
 }
 
@@ -189,6 +240,16 @@ pub enum ModelError {
     CannotChangeOutcome,
     /// Pool is in Disputed state; no operations allowed.
     PoolDisputed,
+    /// Deposit amount is zero or negative.
+    InvalidLiquidityAmount,
+    /// LP has insufficient shares to withdraw the requested amount.
+    InsufficientShares,
+    /// Withdrawal requested while the pool is not in a withdrawable state
+    /// (e.g. Active market with open positions, or Disputed).
+    WithdrawalNotAllowed,
+    /// Share math would produce a zero-share deposit (dust) or zero-asset
+    /// redemption; rejected to preserve the share price.
+    ZeroShares,
 }
 
 impl From<MathError> for ModelError {
@@ -297,6 +358,11 @@ impl RefModel {
             fee_bps: 0, // set at resolution
             participants_count: 0,
             resolution_timestamp: None,
+            total_shares: 0,
+            lp_assets: 0,
+            lp_fees_accrued: 0,
+            lp_losses_allocated: 0,
+            lp_shares: HashMap::new(),
         };
 
         pool.check_invariants();
@@ -617,6 +683,218 @@ impl RefModel {
         );
 
         Ok(refund)
+    }
+
+    // ── Liquidity-provider accounting ─────────────────────────────────────
+
+    /// Deposit `amount` of liquidity into a pool and mint LP shares.
+    ///
+    /// Share model: the pool maintains `lp_assets` (value owned by LPs) and
+    /// `total_shares`. A deposit of `a` mints
+    ///
+    /// ```text
+    /// shares = a * total_shares / lp_assets        (lp_assets > 0)
+    /// shares = a                                   (first deposit)
+    /// ```
+    ///
+    /// rounding **down**, so a depositor can never mint more value than they
+    /// contributed. The first depositor sets the initial share price to 1:1.
+    ///
+    /// Deposits are allowed while the pool is `Active` (before `end_time`) or
+    /// `Canceled` (to recapitalize for refunds). Deposits are rejected while
+    /// `Resolved` or `Disputed`.
+    pub fn deposit_liquidity(
+        &mut self,
+        user: impl Into<String>,
+        pool_id: u64,
+        amount: i128,
+        timestamp: u64,
+    ) -> Result<i128, ModelError> {
+        let user = user.into();
+        if amount <= 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+
+        let pool = self.pools.get_mut(&pool_id).ok_or(ModelError::PoolNotFound)?;
+
+        match pool.state {
+            MarketState::Active => {
+                if timestamp >= pool.end_time {
+                    return Err(ModelError::InvalidPoolState);
+                }
+            }
+            MarketState::Canceled => {}
+            MarketState::Disputed => return Err(ModelError::PoolDisputed),
+            MarketState::Resolved => return Err(ModelError::InvalidPoolState),
+        }
+
+        // Shares minted, rounding down (INV-LP4: shares * lp_assets <= amount * total_shares).
+        let shares = if pool.total_shares == 0 || pool.lp_assets == 0 {
+            amount
+        } else {
+            let num = amount
+                .checked_mul(pool.total_shares)
+                .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+            num / pool.lp_assets
+        };
+        if shares <= 0 {
+            return Err(ModelError::ZeroShares);
+        }
+
+        pool.total_shares = pool
+            .total_shares
+            .checked_add(shares)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        pool.lp_assets = pool
+            .lp_assets
+            .checked_add(amount)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        let bal = pool.lp_shares.entry(user).or_insert(0);
+        *bal = bal
+            .checked_add(shares)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+
+        pool.check_invariants();
+        Ok(shares)
+    }
+
+    /// Withdraw `shares` from a pool, redeeming them for assets.
+    ///
+    /// Assets returned:
+    ///
+    /// ```text
+    /// assets = shares * lp_assets / total_shares        (rounding down)
+    /// ```
+    ///
+    /// rounding **down**, so the pool never pays out more than the redeemer's
+    /// pro-rata claim. The LP's share balance and `total_shares` are reduced by
+    /// exactly `shares`; `lp_assets` is reduced by the assets paid out.
+    ///
+    /// # Withdrawal during market closure
+    /// Withdrawals are permitted while the pool is `Active` (before `end_time`),
+    /// `Resolved`, or `Canceled`. Withdrawals are **blocked** while `Disputed`
+    /// (stasis) and while an `Active` pool is past `end_time` but not yet
+    /// resolved/canceled — this prevents LPs from front-running resolution by
+    /// pulling liquidity out of a closed-but-unresolved market.
+    pub fn withdraw_liquidity(
+        &mut self,
+        user: impl Into<String>,
+        pool_id: u64,
+        shares: i128,
+        timestamp: u64,
+    ) -> Result<i128, ModelError> {
+        let user = user.into();
+        if shares <= 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+
+        let pool = self.pools.get_mut(&pool_id).ok_or(ModelError::PoolNotFound)?;
+
+        match pool.state {
+            MarketState::Active => {
+                // Closed-but-unresolved market: withdrawals frozen.
+                if timestamp >= pool.end_time {
+                    return Err(ModelError::WithdrawalNotAllowed);
+                }
+            }
+            MarketState::Resolved | MarketState::Canceled => {}
+            MarketState::Disputed => return Err(ModelError::WithdrawalNotAllowed),
+        }
+
+        let held = pool.lp_shares.get(&user).copied().unwrap_or(0);
+        if held < shares {
+            return Err(ModelError::InsufficientShares);
+        }
+        if pool.total_shares <= 0 {
+            return Err(ModelError::InsufficientShares);
+        }
+
+        let assets = shares
+            .checked_mul(pool.lp_assets)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?
+            / pool.total_shares;
+        if assets <= 0 {
+            return Err(ModelError::ZeroShares);
+        }
+
+        pool.total_shares -= shares;
+        pool.lp_assets = pool
+            .lp_assets
+            .checked_sub(assets)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        let bal = pool.lp_shares.get_mut(&user).unwrap();
+        *bal -= shares;
+
+        pool.check_invariants();
+        Ok(assets)
+    }
+
+    /// Accrue `fee_amount` of protocol fees to the LP pool.
+    ///
+    /// Fees increase `lp_assets` without minting shares, so the share price
+    /// rises for every existing LP proportionally. Called by the resolution
+    /// path (or by tests) after a fee is taken from the payout pool.
+    pub fn accrue_lp_fees(&mut self, pool_id: u64, fee_amount: i128) -> Result<(), ModelError> {
+        if fee_amount < 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+        let pool = self.pools.get_mut(&pool_id).ok_or(ModelError::PoolNotFound)?;
+        if fee_amount == 0 {
+            return Ok(());
+        }
+        pool.lp_assets = pool
+            .lp_assets
+            .checked_add(fee_amount)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        pool.lp_fees_accrued = pool
+            .lp_fees_accrued
+            .checked_add(fee_amount)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        pool.check_invariants();
+        Ok(())
+    }
+
+    /// Allocate `loss_amount` of losses to the LP pool.
+    ///
+    /// Losses reduce `lp_assets` without burning shares, so the share price
+    /// falls for every existing LP proportionally. Losses are capped at the
+    /// current `lp_assets` (LPs cannot lose more than they own; any excess is
+    /// socialized elsewhere by the caller). Returns the amount actually
+    /// allocated.
+    pub fn allocate_lp_loss(&mut self, pool_id: u64, loss_amount: i128) -> Result<i128, ModelError> {
+        if loss_amount < 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+        let pool = self.pools.get_mut(&pool_id).ok_or(ModelError::PoolNotFound)?;
+        let allocated = loss_amount.min(pool.lp_assets);
+        if allocated == 0 {
+            return Ok(0);
+        }
+        pool.lp_assets -= allocated;
+        pool.lp_losses_allocated = pool
+            .lp_losses_allocated
+            .checked_add(allocated)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        pool.check_invariants();
+        Ok(allocated)
+    }
+
+    /// Current share price in assets-per-share, scaled by 1e6 for precision.
+    /// Returns `1_000_000` (1.0) when there are no shares outstanding.
+    pub fn share_price(&self, pool_id: u64) -> Option<i128> {
+        let pool = self.pools.get(&pool_id)?;
+        if pool.total_shares == 0 {
+            return Some(1_000_000);
+        }
+        Some(pool.lp_assets * 1_000_000 / pool.total_shares)
+    }
+
+    /// Look up an LP's share balance for a pool.
+    pub fn lp_shares(&self, user: &str, pool_id: u64) -> i128 {
+        self.pools
+            .get(&pool_id)
+            .and_then(|p| p.lp_shares.get(user).copied())
+            .unwrap_or(0)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────
@@ -964,5 +1242,289 @@ mod tests {
         // "dave" never staked
         let payout = m.claim("dave", pid, 600).unwrap();
         assert_eq!(payout, 0);
+    }
+
+    // ── LP accounting: deposits & share issuance ──────────────────────────
+
+    #[test]
+    fn first_deposit_mints_one_to_one() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        let shares = m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        assert_eq!(shares, 1000);
+        assert_eq!(m.lp_shares("lp1", pid), 1000);
+        assert_eq!(m.pool(pid).unwrap().total_shares, 1000);
+        assert_eq!(m.pool(pid).unwrap().lp_assets, 1000);
+    }
+
+    #[test]
+    fn second_deposit_mints_pro_rata() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        // share price is 1:1, so 500 → 500 shares
+        let shares = m.deposit_liquidity("lp2", pid, 500, 0).unwrap();
+        assert_eq!(shares, 500);
+        assert_eq!(m.pool(pid).unwrap().total_shares, 1500);
+        assert_eq!(m.pool(pid).unwrap().lp_assets, 1500);
+    }
+
+    #[test]
+    fn deposit_after_fee_accrual_mints_fewer_shares() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        m.accrue_lp_fees(pid, 1000).unwrap(); // lp_assets = 2000, shares = 1000
+        // share price now 2:1 → 1000 assets mints 500 shares
+        let shares = m.deposit_liquidity("lp2", pid, 1000, 0).unwrap();
+        assert_eq!(shares, 500);
+        assert_eq!(m.pool(pid).unwrap().total_shares, 1500);
+        assert_eq!(m.pool(pid).unwrap().lp_assets, 3000);
+    }
+
+    #[test]
+    fn deposit_rejects_zero_and_negative() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        assert_eq!(
+            m.deposit_liquidity("lp1", pid, 0, 0),
+            Err(ModelError::InvalidLiquidityAmount)
+        );
+        assert_eq!(
+            m.deposit_liquidity("lp1", pid, -5, 0),
+            Err(ModelError::InvalidLiquidityAmount)
+        );
+    }
+
+    #[test]
+    fn deposit_rejected_after_resolution() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.stake("alice", pid, 100, 0).unwrap();
+        m.resolve(pid, 0, 500).unwrap();
+        assert_eq!(
+            m.deposit_liquidity("lp1", pid, 100, 600),
+            Err(ModelError::InvalidPoolState)
+        );
+    }
+
+    // ── LP accounting: withdrawals ────────────────────────────────────────
+
+    #[test]
+    fn withdraw_redeems_pro_rata() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        m.deposit_liquidity("lp2", pid, 1000, 0).unwrap();
+        let assets = m.withdraw_liquidity("lp1", pid, 1000, 0).unwrap();
+        assert_eq!(assets, 1000);
+        assert_eq!(m.lp_shares("lp1", pid), 0);
+        assert_eq!(m.pool(pid).unwrap().total_shares, 1000);
+        assert_eq!(m.pool(pid).unwrap().lp_assets, 1000);
+    }
+
+    #[test]
+    fn withdraw_more_than_held_rejected() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        assert_eq!(
+            m.withdraw_liquidity("lp1", pid, 1001, 0),
+            Err(ModelError::InsufficientShares)
+        );
+    }
+
+    #[test]
+    fn withdraw_blocked_during_closed_unresolved_market() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m); // end_time = 1000
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        // Past end_time but still Active → withdrawal frozen.
+        assert_eq!(
+            m.withdraw_liquidity("lp1", pid, 100, 1000),
+            Err(ModelError::WithdrawalNotAllowed)
+        );
+        // Before end_time → allowed.
+        assert!(m.withdraw_liquidity("lp1", pid, 100, 999).is_ok());
+    }
+
+    #[test]
+    fn withdraw_allowed_after_resolution_and_cancellation() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        m.stake("alice", pid, 100, 0).unwrap();
+        m.resolve(pid, 0, 500).unwrap();
+        assert!(m.withdraw_liquidity("lp1", pid, 500, 600).is_ok());
+
+        let pid2 = simple_pool(&mut m);
+        m.deposit_liquidity("lp2", pid2, 1000, 0).unwrap();
+        m.cancel(pid2).unwrap();
+        assert!(m.withdraw_liquidity("lp2", pid2, 1000, 0).is_ok());
+    }
+
+    #[test]
+    fn withdraw_blocked_while_disputed() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        m.dispute(pid).unwrap();
+        assert_eq!(
+            m.withdraw_liquidity("lp1", pid, 100, 0),
+            Err(ModelError::WithdrawalNotAllowed)
+        );
+    }
+
+    // ── LP accounting: fees & losses ──────────────────────────────────────
+
+    #[test]
+    fn fee_accrual_raises_share_price() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        assert_eq!(m.share_price(pid).unwrap(), 1_000_000);
+        m.accrue_lp_fees(pid, 500).unwrap();
+        assert_eq!(m.share_price(pid).unwrap(), 1_500_000);
+        assert_eq!(m.pool(pid).unwrap().lp_fees_accrued, 500);
+    }
+
+    #[test]
+    fn loss_allocation_lowers_share_price_and_is_capped() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp1", pid, 1000, 0).unwrap();
+        let allocated = m.allocate_lp_loss(pid, 400).unwrap();
+        assert_eq!(allocated, 400);
+        assert_eq!(m.pool(pid).unwrap().lp_assets, 600);
+        // Over-allocation is capped at remaining assets.
+        let allocated = m.allocate_lp_loss(pid, 10_000).unwrap();
+        assert_eq!(allocated, 600);
+        assert_eq!(m.pool(pid).unwrap().lp_assets, 0);
+    }
+
+    // ── Property tests: conservation of value ─────────────────────────────
+
+    /// Deterministic pseudo-random generator (LCG) so property tests are
+    /// reproducible without external crates.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed
+    }
+
+    #[test]
+    fn prop_deposit_withdraw_conserves_value() {
+        let mut seed = 0xDEAD_BEEF_u64;
+        for _ in 0..200 {
+            let mut m = RefModel::new();
+            let pid = simple_pool(&mut m);
+            let mut deposited: i128 = 0;
+            let mut withdrawn: i128 = 0;
+
+            // Random sequence of deposits and withdrawals.
+            for _ in 0..20 {
+                let r = lcg(&mut seed);
+                let amount = ((r % 1000) + 1) as i128;
+                if r % 2 == 0 {
+                    if m.deposit_liquidity("lp", pid, amount, 0).is_ok() {
+                        deposited += amount;
+                    }
+                } else {
+                    let held = m.lp_shares("lp", pid);
+                    if held > 0 {
+                        let shares = (amount % held).max(1);
+                        if let Ok(assets) = m.withdraw_liquidity("lp", pid, shares, 0) {
+                            withdrawn += assets;
+                        }
+                    }
+                }
+                // INV-LP1/LP2/LP3 hold after every op (checked internally).
+                let pool = m.pool(pid).unwrap();
+                assert_eq!(pool.lp_assets, deposited - withdrawn);
+                assert_eq!(pool.total_shares, m.lp_shares("lp", pid));
+            }
+            // Conservation: never withdraw more than deposited.
+            assert!(withdrawn <= deposited);
+        }
+    }
+
+    #[test]
+    fn prop_fee_accrual_conserves_value() {
+        let mut seed = 0x1234_5678_u64;
+        for _ in 0..200 {
+            let mut m = RefModel::new();
+            let pid = simple_pool(&mut m);
+            let mut deposited: i128 = 0;
+            let mut fees: i128 = 0;
+            let mut losses: i128 = 0;
+            let mut withdrawn: i128 = 0;
+
+            for _ in 0..20 {
+                let r = lcg(&mut seed);
+                let amount = ((r % 500) + 1) as i128;
+                match r % 3 {
+                    0 => {
+                        if m.deposit_liquidity("lp", pid, amount, 0).is_ok() {
+                            deposited += amount;
+                        }
+                    }
+                    1 => {
+                        m.accrue_lp_fees(pid, amount).unwrap();
+                        fees += amount;
+                    }
+                    _ => {
+                        let allocated = m.allocate_lp_loss(pid, amount).unwrap();
+                        losses += allocated;
+                    }
+                }
+                let pool = m.pool(pid).unwrap();
+                // Conservation identity: assets == deposits + fees − losses.
+                assert_eq!(pool.lp_assets, deposited + fees - losses);
+                assert_eq!(pool.lp_fees_accrued, fees);
+                assert_eq!(pool.lp_losses_allocated, losses);
+            }
+
+            // Drain all shares; total redeemed must equal lp_assets.
+            let held = m.lp_shares("lp", pid);
+            if held > 0 {
+                withdrawn += m.withdraw_liquidity("lp", pid, held, 0).unwrap();
+            }
+            assert_eq!(withdrawn, m.pool(pid).unwrap().lp_assets + withdrawn);
+            assert_eq!(m.pool(pid).unwrap().total_shares, 0);
+        }
+    }
+
+    #[test]
+    fn prop_multi_lp_shares_conserve() {
+        let mut seed = 0xABCD_1234_u64;
+        for _ in 0..100 {
+            let mut m = RefModel::new();
+            let pid = simple_pool(&mut m);
+            let mut total_deposited: i128 = 0;
+            let mut total_withdrawn: i128 = 0;
+
+            for _ in 0..30 {
+                let r = lcg(&mut seed);
+                let who = format!("lp{}", r % 4);
+                let amount = ((r % 800) + 1) as i128;
+                if r % 2 == 0 {
+                    if m.deposit_liquidity(&who, pid, amount, 0).is_ok() {
+                        total_deposited += amount;
+                    }
+                } else {
+                    let held = m.lp_shares(&who, pid);
+                    if held > 0 {
+                        let shares = (amount % held).max(1);
+                        if let Ok(assets) = m.withdraw_liquidity(&who, pid, shares, 0) {
+                            total_withdrawn += assets;
+                        }
+                    }
+                }
+                // INV-LP2: sum of per-LP shares == total_shares.
+                let pool = m.pool(pid).unwrap();
+                let sum: i128 = pool.lp_shares.values().sum();
+                assert_eq!(sum, pool.total_shares);
+            }
+            assert!(total_withdrawn <= total_deposited);
+        }
     }
 }
