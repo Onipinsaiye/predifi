@@ -26,6 +26,9 @@ This directory contains comprehensive documentation for the PrediFi prediction m
 | **[EVENT_SCHEMAS.md](./EVENT_SCHEMAS.md)** | Versioned contract event schema reference for external indexers | Current |
 | **[oracles.md](./oracles.md)** | Oracle integration documentation | Current |
 | **[resolution-challenge-window.md](./resolution-challenge-window.md)** | Post-resolution challenge window, bonds and state diagram | Current |
+| **[duplicate-market-proposals.md](./duplicate-market-proposals.md)** | Advisory duplicate checks for market drafts and distinction workflow | Current |
+| **[market-category-taxonomy.md](./market-category-taxonomy.md)** | Stable, governed market category IDs, aliases, and migration behavior | Current |
+| **[conditional-markets-rfc.md](./conditional-markets-rfc.md)** | Proposed conditional-market dependency, cancellation, and resolution semantics | Proposed |
 | **[whitelist-events.md](./whitelist-events.md)** | Token whitelist events documentation | Current |
 | **[rate-limiting.md](./rate-limiting.md)** | Rate limiting configuration and behavior | Current |
 | **[glossary.md](./glossary.md)** | Terminology and definitions | Current |

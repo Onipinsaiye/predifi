@@ -21,6 +21,7 @@ pub struct PoolListingRow {
     pub pool_id: i64,
     pub name: String,
     pub category: String,
+    pub category_id: Option<String>,
     pub tags: Vec<String>,
     pub total_stake: i64,
     pub end_time: DateTime<Utc>,
@@ -81,10 +82,10 @@ pub async fn list_pools_with_filters(
     // no raw user input reaches the format string.
     let sql = format!(
         r#"
-        SELECT pool_id, name, category, tags, total_stake, end_time, created_at, state, creator, result
+        SELECT pool_id, name, category, category_id, tags, total_stake, end_time, created_at, state, creator, result
         FROM pools
         WHERE state = $1
-          AND ($2::text IS NULL OR category = $2)
+          AND ($2::text IS NULL OR category_id = $2)
           AND ($3::text[] IS NULL OR tags && $3)
           AND ($4::text IS NULL OR creator = $4)
           AND ($5::timestamptz IS NULL OR end_time >= $5)
@@ -123,7 +124,7 @@ pub async fn count_pools_with_filters(
         SELECT COUNT(*)
         FROM pools
         WHERE state = $1
-          AND ($2::text IS NULL OR category = $2)
+          AND ($2::text IS NULL OR category_id = $2)
           AND ($3::text[] IS NULL OR tags && $3)
           AND ($4::text IS NULL OR creator = $4)
           AND ($5::timestamptz IS NULL OR end_time >= $5)

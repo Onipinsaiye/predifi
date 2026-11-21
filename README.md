@@ -119,10 +119,11 @@ PrediFi supports automated price-based resolution using external oracles (e.g., 
 
 ## 📁 Project Structure
 
-The repository is organized into two main workspaces:
+The repository contains two main workspaces plus a Rust client library:
 
 * `contract/`: Soroban smart contracts (Rust)
 * `frontend/`: Next.js app (TypeScript)
+* `clients/rust/predifi-client/`: read-only async Rust API client
 
 ### Smart Contracts (`contract/`)
 
@@ -137,6 +138,13 @@ Built with **Next.js**, **Tailwind CSS**, and **TypeScript**
 ---
 
 ## 🚀 Development
+
+### Rust API client
+
+Backend integrations can use the typed, read-only Rust client documented in
+[clients/rust/predifi-client/README.md](clients/rust/predifi-client/README.md).
+It supports market, prediction, portfolio, and leaderboard queries without
+wallet signing or private-key handling.
 
 ### ⚡ One-Command Full-Stack Environment (Docker)
 

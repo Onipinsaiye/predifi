@@ -37,6 +37,7 @@ const FIXTURE_CREATORS: &[&str] = &[
 ];
 
 const FIXTURE_CATEGORIES: &[&str] = &["Crypto", "Sports", "Politics", "Entertainment"];
+const FIXTURE_CATEGORY_IDS: &[&str] = &["crypto", "sports", "politics", "entertainment"];
 
 const FIXTURE_TAGS: &[&[&str]] = &[
     &["crypto", "btc", "price-prediction"],
@@ -73,15 +74,16 @@ pub async fn seed_market_dataset(pool: &PgPool, num_pools: usize) -> Result<(), 
         sqlx::query(
             r#"
             INSERT INTO pools (
-                pool_id, name, category, total_stake, end_time, state, creator, token, result, tags, created_at
+                pool_id, name, category, category_id, total_stake, end_time, state, creator, token, result, tags, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'native', $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'native', $9, $10, $11)
             ON CONFLICT (pool_id) DO NOTHING
             "#,
         )
         .bind(pool_id)
         .bind(format!("Market #{pool_id}"))
         .bind(category)
+        .bind(FIXTURE_CATEGORY_IDS[i % FIXTURE_CATEGORY_IDS.len()])
         .bind(total_stake)
         .bind(end_time)
         .bind(state)

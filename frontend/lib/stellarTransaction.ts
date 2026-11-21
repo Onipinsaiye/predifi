@@ -216,6 +216,15 @@ export interface RunTransactionOptions<TParams> {
   submit: SubmitFn<TParams>;
   /** Source account whose sequence may go stale. */
   address?: string | null;
+  /**
+   * The address of the wallet that is currently active for signing.
+   *
+   * When provided, the run refuses to build or sign a transaction whose source
+   * account (`address`) does not match this active signing wallet. This keeps
+   * per-wallet authorization intact even when the UI aggregates multiple
+   * read-only wallets: a mutation may only ever be signed by the active wallet.
+   */
+  activeSigningAddress?: string | null;
   /** Re-read account state before rebuilding. Required for stale-sequence recovery. */
   refreshAccountState?: (address: string) => Promise<AccountState>;
   /** Automatic retries allowed for DEFINITE failures. Default 1. */
@@ -227,7 +236,40 @@ export interface RunTransactionOptions<TParams> {
   userConfirmedRetry?: boolean;
 }
 
-export type RunStatus = "confirmed" | "ambiguous" | "failed";
+/**
+ * Normalize a Stellar account address for comparison.
+ *
+ * Stellar `G...` addresses are case-sensitive base32, so we only trim
+ * surrounding whitespace. Returns `null` for empty / non-string input.
+ */
+export function normalizeStellarAddress(
+  address: string | null | undefined
+): string | null {
+  if (typeof address !== "string") return null;
+  const trimmed = address.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * True when `sourceAddress` is the active signing wallet.
+ *
+ * Both addresses are normalized first. A missing source or active address is
+ * treated as a mismatch — we never assume authorization without proof.
+ */
+export function isActiveSigningSource(
+  sourceAddress: string | null | undefined,
+  activeSigningAddress: string | null | undefined
+): boolean {
+  const source = normalizeStellarAddress(sourceAddress);
+  const active = normalizeStellarAddress(activeSigningAddress);
+  return source !== null && active !== null && source === active;
+}
+
+export type RunStatus =
+  | "confirmed"
+  | "ambiguous"
+  | "failed"
+  | "source_mismatch";
 
 export interface TransactionRunResult<TParams> {
   status: RunStatus;
@@ -263,6 +305,7 @@ export async function runTransactionWithSequenceRecovery<TParams>(
     intent,
     submit,
     address = null,
+    activeSigningAddress = null,
     refreshAccountState,
     maxAutoRetries = 1,
   } = options;
@@ -290,6 +333,18 @@ export async function runTransactionWithSequenceRecovery<TParams>(
     attempts,
     accountState,
   });
+
+  // Refuse to build or sign when the source account is not the active signing
+  // wallet. This is checked BEFORE any submit (and therefore before any
+  // signing) so a read-only aggregated wallet can never authorize a mutation.
+  if (
+    activeSigningAddress !== null &&
+    !isActiveSigningSource(address, activeSigningAddress)
+  ) {
+    return buildResult("source_mismatch", undefined, {
+      requiresUserConfirmation: false,
+    });
+  }
 
   // Initial attempt + up to `maxAutoRetries` definite retries + one confirmed
   // ambiguous retry.

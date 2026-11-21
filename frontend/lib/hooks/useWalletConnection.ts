@@ -11,6 +11,7 @@ import {
   REQUIRED_STELLAR_NETWORK,
   STELLAR_NETWORK_LABELS,
 } from "@/lib/walletErrors";
+import { isDemoModeActive } from "@/lib/demoMode";
 
 export interface WalletConnectionState {
   address: string | null;
@@ -84,6 +85,12 @@ export function useWalletConnection(): WalletConnectionState {
   }, []);
 
   const connect = useCallback(async (): Promise<string | null> => {
+    // Demo mode is read-only: never prompt the wallet for access or keys.
+    if (isDemoModeActive()) {
+      setError(makeWalletError("DEMO_MODE_ACTIVE"));
+      return null;
+    }
+
     setIsConnecting(true);
     setError(null);
 

@@ -94,6 +94,11 @@
 //! | [`ResolutionEvidenceEvent`] | `resolution_evidence` | a price-feed resolution evidence commitment is recorded |
 //! | [`AddedToWhitelistEvent`] | `added_to_whitelist` | a participant is allowlisted |
 //! | [`RemovedFromWhitelistEvent`] | `removed_from_whitelist` | a participant is removed from the allowlist |
+//! | [`LiquidityDepositedEvent`] | `liquidity_deposited` | a liquidity provider deposits assets and is minted shares |
+//! | [`LiquidityWithdrawnEvent`] | `liquidity_withdrawn` | a liquidity provider burns shares and withdraws assets |
+//! | [`LiquiditySharesMintedEvent`] | `liquidity_shares_minted` | liquidity shares are minted to a provider |
+//! | [`LiquiditySharesBurnedEvent`] | `liquidity_shares_burned` | liquidity shares are burned from a provider |
+//! | [`LiquidityReservesUpdatedEvent`] | `liquidity_reserves_updated` | pool liquidity reserves change |
 
 use soroban_sdk::{contractevent, contracttype, Address, BytesN, String, Symbol, Vec};
 
@@ -176,6 +181,11 @@ pub const EVENT_SCHEMAS_V1: &[EventSchemaEntry] = &[
     EventSchemaEntry { topic: "resolution_evidence", field_count: 2 },
     EventSchemaEntry { topic: "added_to_whitelist", field_count: 2 },
     EventSchemaEntry { topic: "removed_from_whitelist", field_count: 2 },
+    EventSchemaEntry { topic: "liquidity_deposited", field_count: 9 },
+    EventSchemaEntry { topic: "liquidity_withdrawn", field_count: 9 },
+    EventSchemaEntry { topic: "liquidity_shares_minted", field_count: 7 },
+    EventSchemaEntry { topic: "liquidity_shares_burned", field_count: 7 },
+    EventSchemaEntry { topic: "liquidity_reserves_updated", field_count: 6 },
 ];
 
 /// Returns the pinned schema table for a supported version, or `None`.
@@ -2676,4 +2686,196 @@ pub struct OracleFreshnessBoundsSetEvent {
     pub min_freshness: u64,
     /// Maximum allowed freshness in seconds.
     pub max_freshness: u64,
+}
+
+// ── Liquidity Accounting Events ──────────────────────────────────────────────
+//
+// Every liquidity accounting transition emits exactly one of the events below.
+// Each payload carries `schema_version` (pinned to [`EVENT_SCHEMA_VERSION`]) so
+// indexers can decode historic vectors without guessing the layout, and the
+// post-transition reserve/share totals so solvency invariants
+// (`total_liabilities <= escrow`, `sum(shares) == total_shares`) can be
+// re-verified off-chain from the event stream alone.
+
+/// Emitted when a liquidity provider deposits assets into a pool and is minted
+/// liquidity shares.
+///
+/// # When Emitted
+/// Inside the guarded liquidity deposit path, after the market status, asset,
+/// deposit bounds and caller authorization checks pass and the asset transfer
+/// has succeeded. The pool reserves and provider share balance are updated
+/// atomically in the same invocation.
+///
+/// # Event Fields
+/// - `schema_version` - Pinned event schema version for this payload layout.
+/// - `pool_id` - Pool receiving the liquidity.
+/// - `provider` - Address of the liquidity provider.
+/// - `asset` - Token contract address deposited.
+/// - `amount` - Assets deposited (exact transferred amount).
+/// - `shares_minted` - Shares minted to the provider for this deposit.
+/// - `total_shares` - Total shares outstanding after the mint.
+/// - `reserve_after` - Pool liquidity reserve after the deposit.
+/// - `timestamp` - Ledger timestamp of the deposit.
+#[contractevent(topics = ["liquidity_deposited"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityDepositedEvent {
+    /// Pinned event schema version for this payload layout.
+    pub schema_version: u32,
+    /// Pool receiving the liquidity.
+    pub pool_id: u64,
+    /// Address of the liquidity provider.
+    pub provider: Address,
+    /// Token contract address deposited.
+    pub asset: Address,
+    /// Assets deposited (exact transferred amount).
+    pub amount: i128,
+    /// Shares minted to the provider for this deposit.
+    pub shares_minted: i128,
+    /// Total shares outstanding after the mint.
+    pub total_shares: i128,
+    /// Pool liquidity reserve after the deposit.
+    pub reserve_after: i128,
+    /// Ledger timestamp of the deposit.
+    pub timestamp: u64,
+}
+
+/// Emitted when a liquidity provider burns shares and withdraws assets.
+///
+/// # When Emitted
+/// Inside the bounded liquidity withdrawal path, after lifecycle/lock checks
+/// pass and the exact payout has been computed *before* state mutation. The
+/// payout is capped by the pool reserve so solvency is preserved on every path.
+///
+/// # Event Fields
+/// - `schema_version` - Pinned event schema version for this payload layout.
+/// - `pool_id` - Pool the liquidity is withdrawn from.
+/// - `provider` - Address of the liquidity provider.
+/// - `asset` - Token contract address withdrawn.
+/// - `shares_burned` - Shares burned from the provider for this withdrawal.
+/// - `amount` - Assets paid out to the provider.
+/// - `total_shares` - Total shares outstanding after the burn.
+/// - `reserve_after` - Pool liquidity reserve after the withdrawal.
+/// - `timestamp` - Ledger timestamp of the withdrawal.
+#[contractevent(topics = ["liquidity_withdrawn"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityWithdrawnEvent {
+    /// Pinned event schema version for this payload layout.
+    pub schema_version: u32,
+    /// Pool the liquidity is withdrawn from.
+    pub pool_id: u64,
+    /// Address of the liquidity provider.
+    pub provider: Address,
+    /// Token contract address withdrawn.
+    pub asset: Address,
+    /// Shares burned from the provider for this withdrawal.
+    pub shares_burned: i128,
+    /// Assets paid out to the provider.
+    pub amount: i128,
+    /// Total shares outstanding after the burn.
+    pub total_shares: i128,
+    /// Pool liquidity reserve after the withdrawal.
+    pub reserve_after: i128,
+    /// Ledger timestamp of the withdrawal.
+    pub timestamp: u64,
+}
+
+/// Emitted whenever liquidity shares are minted to a provider.
+///
+/// This is the low-level share-accounting transition; it is emitted in addition
+/// to [`LiquidityDepositedEvent`] so share-supply indexers can track mint events
+/// independently of the asset movement.
+///
+/// # Event Fields
+/// - `schema_version` - Pinned event schema version for this payload layout.
+/// - `pool_id` - Pool whose share supply grows.
+/// - `provider` - Address receiving the shares.
+/// - `shares` - Shares minted in this transition.
+/// - `total_shares` - Total shares outstanding after the mint.
+/// - `reserve_after` - Pool liquidity reserve at mint time.
+/// - `timestamp` - Ledger timestamp of the mint.
+#[contractevent(topics = ["liquidity_shares_minted"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquiditySharesMintedEvent {
+    /// Pinned event schema version for this payload layout.
+    pub schema_version: u32,
+    /// Pool whose share supply grows.
+    pub pool_id: u64,
+    /// Address receiving the shares.
+    pub provider: Address,
+    /// Shares minted in this transition.
+    pub shares: i128,
+    /// Total shares outstanding after the mint.
+    pub total_shares: i128,
+    /// Pool liquidity reserve at mint time.
+    pub reserve_after: i128,
+    /// Ledger timestamp of the mint.
+    pub timestamp: u64,
+}
+
+/// Emitted whenever liquidity shares are burned from a provider.
+///
+/// This is the low-level share-accounting transition; it is emitted in addition
+/// to [`LiquidityWithdrawnEvent`] so share-supply indexers can track burn events
+/// independently of the asset movement.
+///
+/// # Event Fields
+/// - `schema_version` - Pinned event schema version for this payload layout.
+/// - `pool_id` - Pool whose share supply shrinks.
+/// - `provider` - Address whose shares are burned.
+/// - `shares` - Shares burned in this transition.
+/// - `total_shares` - Total shares outstanding after the burn.
+/// - `reserve_after` - Pool liquidity reserve at burn time.
+/// - `timestamp` - Ledger timestamp of the burn.
+#[contractevent(topics = ["liquidity_shares_burned"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquiditySharesBurnedEvent {
+    /// Pinned event schema version for this payload layout.
+    pub schema_version: u32,
+    /// Pool whose share supply shrinks.
+    pub pool_id: u64,
+    /// Address whose shares are burned.
+    pub provider: Address,
+    /// Shares burned in this transition.
+    pub shares: i128,
+    /// Total shares outstanding after the burn.
+    pub total_shares: i128,
+    /// Pool liquidity reserve at burn time.
+    pub reserve_after: i128,
+    /// Ledger timestamp of the burn.
+    pub timestamp: u64,
+}
+
+/// Emitted when a pool's liquidity reserves change.
+///
+/// Captures the reserve delta and the resulting totals so indexers can verify
+/// the solvency invariant (`total_liabilities <= escrow`) after every
+/// accounting transition without replaying transfers.
+///
+/// # Event Fields
+/// - `schema_version` - Pinned event schema version for this payload layout.
+/// - `pool_id` - Pool whose reserves changed.
+/// - `reserve_before` - Reserve before the transition.
+/// - `reserve_after` - Reserve after the transition.
+/// - `total_shares` - Total shares outstanding after the transition.
+/// - `timestamp` - Ledger timestamp of the transition.
+#[contractevent(topics = ["liquidity_reserves_updated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityReservesUpdatedEvent {
+    /// Pinned event schema version for this payload layout.
+    pub schema_version: u32,
+    /// Pool whose reserves changed.
+    pub pool_id: u64,
+    /// Reserve before the transition.
+    pub reserve_before: i128,
+    /// Reserve after the transition.
+    pub reserve_after: i128,
+    /// Total shares outstanding after the transition.
+    pub total_shares: i128,
+    /// Ledger timestamp of the transition.
+    pub timestamp: u64,
 }

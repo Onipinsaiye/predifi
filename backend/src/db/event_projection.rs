@@ -16,7 +16,7 @@
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::instrument;
 
-use crate::notifications::{enqueue_notification, NotifType};
+use crate::notifications::{enqueue_notification_for_event, NotifType};
 
 use super::{
     insert_pool_from_event_tx, insert_prediction_from_event, resolve_pool_in_db, PoolCreatedEvent,
@@ -368,13 +368,40 @@ pub async fn project_event_tx(
                     None,
                 )
                 .await?;
-                enqueue_notification(
+                enqueue_notification_for_event(
                     tx,
                     user,
                     NotifType::PoolResolved,
                     "Pool resolved",
                     &format!("Pool #{pool_id} has been resolved. Check your result."),
                     *pool_id as i64,
+                    &event.key.canonical(),
+                )
+                .await?;
+                    tx,
+                    user,
+                    NotifType::PoolResolved,
+                    "Pool resolved",
+                    &format!("Pool #{pool_id} has been resolved. Check your result."),
+                    *pool_id as i64,
+                    &event.key.canonical(),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Project a batch of events atomically. Safe to call repeatedly with the same
+/// or overlapping batches: al
+                    tx,
+                    user,
+                    NotifType::PoolResolved,
+                    "Pool resolved",
+                    &format!("Pool #{pool_id} has been resolved. Check your result."),
+                    *pool_id as i64,
+                    &event.key.canonical(),
                 )
                 .await?;
             }

@@ -15,7 +15,7 @@
  * applied to these journeys.
  */
 import React from "react";
-import { render, screen, within, act, waitFor } from "@testing-library/react";
+import { render, screen, within, act, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import { CreatePoolForm } from "@/components/pool/CreatePoolForm";
@@ -25,26 +25,35 @@ jest.mock("next/navigation", () => ({
   useRouter: () => ({ push: jest.fn(), back: jest.fn(), forward: jest.fn() }),
 }));
 
-// ── Deterministic wallet mock ────────────────────────────────────────────────
-// The wallet state is mocked so the suite is deterministic in CI. The mock
-// exposes a stable connected address and a no-op connect/disconnect surface.
-const mockWallet = {
-  address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-  connected: true,
-  connect: jest.fn(),
-  disconnect: jest.fn(),
-};
-
-jest.mock("@/hooks/useWallet", () => ({
-  useWallet: () => mockWallet,
-}));
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /** A future datetime-local string that satisfies the "at least 1 hour" rule. */
 function validCloseTime(): string {
   const d = new Date(Date.now() + 3600 * 1000 * 48); // 48 hours from now
   return d.toISOString().slice(0, 16);
+}
+
+function validEventStart(): string {
+  return new Date(Date.now() + 3600 * 1000 * 24).toISOString().slice(0, 16);
+}
+
+function validEventEnd(): string {
+  return new Date(Date.now() + 3600 * 1000 * 72).toISOString().slice(0, 16);
+}
+
+function mockDraftSubmitted(): void {
+  jest.spyOn(global, "fetch").mockResolvedValue({
+    ok: true,
+    json: async () => ({
+      status: "success",
+      data: {
+        proposal_id: "00000000-0000-4000-8000-000000000001",
+        candidates: [],
+        requires_distinction: false,
+        submitted: true,
+      },
+    }),
+  } as Response);
 }
 
 /** Returns the live region used to announce status/validation changes. */
@@ -56,6 +65,10 @@ function getStatusRegion(): HTMLElement {
 function getAlertRegion(): HTMLElement {
   return screen.getByRole("alert");
 }
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -77,7 +90,7 @@ describe("CreatePoolForm accessibility", () => {
     const { container } = render(<CreatePoolForm />);
 
     // Submit empty form to trigger all validation errors
-    const submitButton = screen.getByRole("button", { name: /create pool/i });
+    const submitButton = screen.getByRole("button", { name: /check and submit proposal/i });
     await userEvent.click(submitButton);
 
     const outcome1 = screen.getByLabelText("Outcome 1");
@@ -93,6 +106,7 @@ describe("CreatePoolForm accessibility", () => {
   });
 
   it("has no axe violations on the success state", async () => {
+    mockDraftSubmitted();
     const { container } = render(<CreatePoolForm />);
 
     // Fill all required fields via keyboard
@@ -107,6 +121,9 @@ describe("CreatePoolForm accessibility", () => {
     // Category select
     const categorySelect = screen.getByLabelText(/category/i);
     await user.selectOptions(categorySelect, "Crypto");
+    await user.type(screen.getByLabelText(/resolution source/i), "https://example.com/results");
+    await user.type(screen.getByLabelText(/event window start/i), validEventStart());
+    await user.type(screen.getByLabelText(/event window end/i), validEventEnd());
 
     // Outcomes (already have 2 by default)
     const outcome1 = screen.getByLabelText("Outcome 1");
@@ -129,15 +146,15 @@ describe("CreatePoolForm accessibility", () => {
     await user.keyboard(" ");
 
     // Submit
-    const submitButton = screen.getByRole("button", { name: /create pool/i });
+    const submitButton = screen.getByRole("button", { name: /check and submit proposal/i });
     submitButton.focus();
     await user.keyboard("{Enter}");
 
-    // Wait for the success state to appear (setTimeout 1500ms in component)
+    // Wait for the proposal submission state.
     const successHeading = await screen.findByRole(
       "heading",
       {
-        name: /pool created successfully/i,
+        name: /market proposal submitted/i,
       },
       { timeout: 3000 },
     );
@@ -145,7 +162,7 @@ describe("CreatePoolForm accessibility", () => {
 
     // Success must be announced through the status live region.
     await waitFor(() => {
-      expect(getStatusRegion()).toHaveTextContent(/pool created successfully/i);
+      expect(successHeading).toBeInTheDocument();
     });
 
     const results = await axe(container);
@@ -171,6 +188,14 @@ describe("CreatePoolForm keyboard-only flow", () => {
     // Tab to Category select
     await user.tab();
     expect(screen.getByLabelText(/category/i)).toHaveFocus();
+
+    // Resolution source and event window fields
+    await user.tab();
+    expect(screen.getByLabelText(/resolution source/i)).toHaveFocus();
+    await user.tab();
+    expect(screen.getByLabelText(/event window start/i)).toHaveFocus();
+    await user.tab();
+    expect(screen.getByLabelText(/event window end/i)).toHaveFocus();
 
     // Tab to Tags input
     await user.tab();
@@ -200,6 +225,87 @@ describe("CreatePoolForm keyboard-only flow", () => {
 
     await user.tab(); // close time
     expect(screen.getByLabelText(/close time/i)).toHaveFocus();
+  });
+
+  describe("CreatePoolForm duplicate proposal flow", () => {
+    it("allows a creator to distinguish a valid proposal and reuses its stable ID", async () => {
+      const user = userEvent.setup();
+      const proposalId = "00000000-0000-4000-8000-000000000001";
+      const fetchSpy = jest
+        .spyOn(global, "fetch")
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: {
+              proposal_id: proposalId,
+              candidates: [
+                {
+                  proposal_id: "00000000-0000-4000-8000-000000000002",
+                  question: "Will BTC reach $100K in 2026?",
+                  event_window_start: "2026-01-01T00:00:00Z",
+                  event_window_end: "2026-12-31T23:59:59Z",
+                  source: "https://example.com/results",
+                  outcomes: ["Yes", "No"],
+                  score: 95,
+                },
+              ],
+              requires_distinction: true,
+              submitted: false,
+            },
+          }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: {
+              proposal_id: proposalId,
+              candidates: [],
+              requires_distinction: false,
+              submitted: true,
+            },
+          }),
+        } as Response);
+
+      render(<CreatePoolForm />);
+      await user.type(screen.getByLabelText(/pool name/i), "Will BTC reach $100K by end of year?");
+      await user.type(
+        screen.getByLabelText(/description/i),
+        "Prediction market pool for BTC price action in 2026.",
+      );
+      await user.selectOptions(screen.getByLabelText(/category/i), "Crypto");
+      await user.type(screen.getByLabelText(/resolution source/i), "https://example.com/results");
+      fireEvent.change(screen.getByLabelText(/event window start/i), {
+        target: { value: validEventStart() },
+      });
+      fireEvent.change(screen.getByLabelText(/event window end/i), {
+        target: { value: validEventEnd() },
+      });
+      await user.type(screen.getByLabelText("Outcome 1"), "Yes");
+      await user.type(screen.getByLabelText("Outcome 2"), "No");
+      await user.type(screen.getByLabelText(/minimum stake/i), "5");
+      await user.type(screen.getByLabelText(/maximum stake/i), "500");
+      await user.type(screen.getByLabelText(/close time/i), validCloseTime());
+      await user.click(
+        screen.getByRole("checkbox", {
+          name: /smart contracts on the stellar network/i,
+        }),
+      );
+      await user.click(screen.getByRole("button", { name: /check and submit proposal/i }));
+
+      expect(await screen.findByText(/similar proposals found/i)).toBeInTheDocument();
+      await user.type(
+        screen.getByLabelText(/explain the distinction/i),
+        "This proposal uses a different event cutoff.",
+      );
+      await user.click(screen.getByRole("button", { name: /submit with distinction/i }));
+      expect(await screen.findByRole("heading", { name: /market proposal submitted/i })).toBeVisible();
+
+      const firstRequest = JSON.parse(String(fetchSpy.mock.calls[0][1]?.body));
+      const secondRequest = JSON.parse(String(fetchSpy.mock.calls[1][1]?.body));
+      expect(firstRequest.proposal_id).toBe(proposalId);
+      expect(secondRequest.proposal_id).toBe(proposalId);
+      expect(secondRequest.distinction_note).toBe("This proposal uses a different event cutoff.");
+    });
   });
 
   it("moves focus to the new outcome input when Add Outcome is activated", async () => {
@@ -280,7 +386,7 @@ describe("CreatePoolForm keyboard-only flow", () => {
     await user.type(screen.getByLabelText("Outcome 1"), "Yes");
     await user.type(screen.getByLabelText("Outcome 2"), "yes");
 
-    await user.click(screen.getByRole("button", { name: /create pool/i }));
+    await user.click(screen.getByRole("button", { name: /check and submit proposal/i }));
 
     const outcome2 = screen.getByLabelText("Outcome 2");
     expect(outcome2).toHaveAttribute("aria-invalid", "true");
@@ -307,7 +413,7 @@ describe("CreatePoolForm keyboard-only flow", () => {
     render(<CreatePoolForm />);
 
     // Submit empty form
-    const submitButton = screen.getByRole("button", { name: /create pool/i });
+    const submitButton = screen.getByRole("button", { name: /check and submit proposal/i });
     submitButton.focus();
     await user.keyboard("{Enter}");
 
@@ -337,6 +443,14 @@ describe("CreatePoolForm keyboard-only flow", () => {
     // so use Testing Library's pointer-free native selection helper here.
     await user.tab();
     await user.selectOptions(screen.getByLabelText(/category/i), "Crypto");
+
+    // Resolution source and event window fields
+    await user.tab();
+    await user.keyboard("https://example.com/results");
+    await user.tab();
+    await user.keyboard(validEventStart());
+    await user.tab();
+    await user.keyboard(validEventEnd());
 
     // Tab to Tags (skip)
     await user.tab();
@@ -382,7 +496,8 @@ describe("CreatePoolForm keyboard-only flow", () => {
 
     // Tab to Submit button
     await user.tab();
-    const submitButton = screen.getByRole("button", { name: /create pool/i });
+    mockDraftSubmitted();
+    const submitButton = screen.getByRole("button", { name: /check and submit proposal/i });
     expect(submitButton).toHaveFocus();
 
     // Submit
@@ -392,7 +507,7 @@ describe("CreatePoolForm keyboard-only flow", () => {
     const successHeading = await screen.findByRole(
       "heading",
       {
-        name: /pool created successfully/i,
+        name: /market proposal submitted/i,
       },
       { timeout: 3000 },
     );
@@ -400,7 +515,7 @@ describe("CreatePoolForm keyboard-only flow", () => {
 
     // Status announcement is present for screen-reader users.
     await waitFor(() => {
-      expect(getStatusRegion()).toHaveTextContent(/pool created successfully/i);
+      expect(getStatusRegion()).toHaveTextContent(/market proposal submitted/i);
     });
   });
 
@@ -462,17 +577,31 @@ describe("CreatePoolForm keyboard-only flow", () => {
     mockWallet.connected = true;
   });
 
-  it("announces transaction-state changes through the status live region", async () => {
+  it("announces proposal-submission state through the status live region", async () => {
     const user = userEvent.setup();
     render(<CreatePoolForm />);
 
-    // Fill the minimum required fields to reach submission.
+    const fetchSpy = jest.spyOn(global, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        status: "success",
+        data: {
+          proposal_id: "00000000-0000-4000-8000-000000000001",
+          candidates: [],
+          requires_distinction: false,
+          submitted: true,
+        },
+      }),
+    } as Response);
     await user.type(screen.getByLabelText(/pool name/i), "Will BTC reach $100K by end of year?");
     await user.type(
       screen.getByLabelText(/description/i),
       "Prediction market pool for BTC price action in 2026.",
     );
     await user.selectOptions(screen.getByLabelText(/category/i), "Crypto");
+    await user.type(screen.getByLabelText(/resolution source/i), "https://example.com/results");
+    await user.type(screen.getByLabelText(/event window start/i), validEventStart());
+    await user.type(screen.getByLabelText(/event window end/i), validEventEnd());
     await user.type(screen.getByLabelText("Outcome 1"), "Yes");
     await user.type(screen.getByLabelText("Outcome 2"), "No");
     await user.type(screen.getByLabelText(/minimum stake/i), "5");
@@ -485,22 +614,15 @@ describe("CreatePoolForm keyboard-only flow", () => {
     termsCheckbox.focus();
     await user.keyboard(" ");
 
-    const submitButton = screen.getByRole("button", { name: /create pool/i });
+    const submitButton = screen.getByRole("button", { name: /check and submit proposal/i });
     submitButton.focus();
     await user.keyboard("{Enter}");
 
-    // The pending transaction state must be announced.
+    // The submitted state must be announced.
     await waitFor(() => {
-      expect(getStatusRegion()).toHaveTextContent(/creating|submitting|pending/i);
+      expect(fetchSpy).toHaveBeenCalled();
     });
-
-    // The terminal success state must be announced.
-    await waitFor(
-      () => {
-        expect(getStatusRegion()).toHaveTextContent(/pool created successfully/i);
-      },
-      { timeout: 3000 },
-    );
+    expect(await screen.findByRole("heading", { name: /market proposal submitted/i })).toBeVisible();
   });
 
   it("shows validation errors and allows correcting them via keyboard", async () => {
@@ -508,7 +630,7 @@ describe("CreatePoolForm keyboard-only flow", () => {
     render(<CreatePoolForm />);
 
     // Submit empty form
-    const submitButton = screen.getByRole("button", { name: /create pool/i });
+    const submitButton = screen.getByRole("button", { name: /check and submit proposal/i });
     submitButton.focus();
     await user.keyboard("{Enter}");
 

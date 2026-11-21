@@ -19,6 +19,18 @@ export const POOL_CATEGORIES = [
 
 export type PoolCategory = (typeof POOL_CATEGORIES)[number];
 
+/** Stable IDs paired with display labels for governed category taxonomy. */
+export const POOL_CATEGORY_IDS: Record<PoolCategory, string> = {
+  Sports: "sports",
+  Crypto: "crypto",
+  Politics: "politics",
+  Entertainment: "entertainment",
+  Technology: "technology",
+  Finance: "finance",
+  Science: "science",
+  Other: "other",
+};
+
 /** Minimum stake denominations per token (display units, not stroops).
  * Frontend UX constraint. The contract enforces pool.min_stake > 0 in `constants.rs`.
  */
@@ -53,6 +65,12 @@ export interface CreatePoolFormValues {
   description: string;
   /** Category bucket this pool belongs to. */
   category: PoolCategory | "";
+  /** Source that will determine the market's outcome. */
+  source: string;
+  /** Start of the event window used for duplicate checks. */
+  eventWindowStart: string;
+  /** End of the event window used for duplicate checks. */
+  eventWindowEnd: string;
   /**
    * Labels for each possible outcome (e.g. `["Yes", "No"]` or
    * `["Team A", "Team B", "Draw"]`). Must contain between
@@ -121,6 +139,23 @@ export function validateCreatePool(
   // ── category ──────────────────────────────────────────────────────────────
   if (!values.category) {
     errors.category = "Please select a category.";
+  }
+
+  if (!values.source.trim()) {
+    errors.source = "Resolution source is required.";
+  } else if (values.source.trim().length > 512) {
+    errors.source = "Resolution source must be 512 characters or fewer.";
+  }
+
+  const eventWindowStart = Date.parse(values.eventWindowStart);
+  const eventWindowEnd = Date.parse(values.eventWindowEnd);
+  if (!values.eventWindowStart || Number.isNaN(eventWindowStart)) {
+    errors.eventWindowStart = "Event window start is required.";
+  }
+  if (!values.eventWindowEnd || Number.isNaN(eventWindowEnd)) {
+    errors.eventWindowEnd = "Event window end is required.";
+  } else if (!Number.isNaN(eventWindowStart) && eventWindowEnd < eventWindowStart) {
+    errors.eventWindowEnd = "Event window end must be at or after its start.";
   }
 
   // ── outcomes ──────────────────────────────────────────────────────────────

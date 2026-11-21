@@ -8,9 +8,11 @@
 pub mod api_versioning;
 pub mod abuse;
 pub mod cache_coalesce;
+pub mod categories;
 pub mod config;
 pub mod constants;
 pub mod cors;
+pub mod duplicate_markets;
 pub mod db;
 pub mod errors;
 pub mod health;
