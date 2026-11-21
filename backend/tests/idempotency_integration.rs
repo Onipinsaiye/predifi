@@ -72,9 +72,17 @@ fn app(pool: PgPool, policy: IdempotencyPolicy) -> (Router, Arc<AtomicUsize>) {
             )
         }
     });
-    let idem = Idempotency::new(IdempotencyStore::postgres(pool), "predictions.create", SECRET, 0)
-        .with_policy(policy);
-    (Router::new().route("/predictions", idem.guard(handler)), calls)
+    let idem = Idempotency::new(
+        IdempotencyStore::postgres(pool),
+        "predictions.create",
+        SECRET,
+        0,
+    )
+    .with_policy(policy);
+    (
+        Router::new().route("/predictions", idem.guard(handler)),
+        calls,
+    )
 }
 
 #[derive(Debug)]
@@ -133,7 +141,11 @@ async fn same_key_different_payload_is_rejected() {
     send(&app, &key, "GALICE", r#"{"pool_id":1,"amount":10}"#).await;
     let conflict = send(&app, &key, "GALICE", r#"{"pool_id":1,"amount":99}"#).await;
     assert_eq!(conflict.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(conflict.body.contains(codes::KEY_REUSED), "{}", conflict.body);
+    assert!(
+        conflict.body.contains(codes::KEY_REUSED),
+        "{}",
+        conflict.body
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -145,7 +157,10 @@ async fn key_is_scoped_to_the_authenticated_wallet() {
     send(&app, &key, "GALICE", r#"{"pool_id":1}"#).await;
     let bob = send(&app, &key, "GBOB", r#"{"pool_id":1}"#).await;
     assert_eq!(bob.status, StatusCode::OK);
-    assert!(!bob.replayed, "a wallet must never receive another wallet's response");
+    assert!(
+        !bob.replayed,
+        "a wallet must never receive another wallet's response"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 

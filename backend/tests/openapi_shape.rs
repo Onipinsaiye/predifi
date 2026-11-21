@@ -69,15 +69,13 @@ fn openapi_document_has_required_shape() {
             "path {path} must declare at least one HTTP operation, got: {item:?}"
         );
         for (method, op) in operations {
-            let responses = op["responses"]
-                .as_object()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "operation {} {} must declare responses, got: {op:?}",
-                        method.to_uppercase(),
-                        path
-                    )
-                });
+            let responses = op["responses"].as_object().unwrap_or_else(|| {
+                panic!(
+                    "operation {} {} must declare responses, got: {op:?}",
+                    method.to_uppercase(),
+                    path
+                )
+            });
             assert!(
                 !responses.is_empty(),
                 "operation {} {} must declare at least one response, got: {op:?}",

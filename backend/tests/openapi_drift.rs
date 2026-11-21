@@ -43,7 +43,10 @@ fn source_routes() -> BTreeSet<(String, String)> {
     };
     let mut routes = scan_routes(&read("v1.rs"), "/api/v1");
     routes.extend(scan_routes(&read("mod.rs"), "/api"));
-    assert!(routes.len() > 20, "route scan found too few routes: {routes:?}");
+    assert!(
+        routes.len() > 20,
+        "route scan found too few routes: {routes:?}"
+    );
     routes
         .into_iter()
         .map(|(m, p)| (m, normalize_path(&p)))
@@ -94,11 +97,20 @@ fn documented_and_allowlisted_routes_exist() {
         .filter(|(_, path)| path.starts_with("/api/"))
         .filter(|r| !routes.contains(*r))
         .collect();
-    assert!(stale.is_empty(), "documented operations with no route: {stale:?}");
+    assert!(
+        stale.is_empty(),
+        "documented operations with no route: {stale:?}"
+    );
 
     for entry in allowlisted() {
-        assert!(routes.contains(&entry), "UNDOCUMENTED_ROUTES entry has no route: {entry:?}");
-        assert!(!documented.contains(&entry), "{entry:?} is documented; drop it from UNDOCUMENTED_ROUTES");
+        assert!(
+            routes.contains(&entry),
+            "UNDOCUMENTED_ROUTES entry has no route: {entry:?}"
+        );
+        assert!(
+            !documented.contains(&entry),
+            "{entry:?} is documented; drop it from UNDOCUMENTED_ROUTES"
+        );
     }
 }
 
@@ -146,7 +158,11 @@ fn operations_document_their_error_cases() {
             }
         }
     }
-    assert!(problems.is_empty(), "incomplete error documentation:\n{}", problems.join("\n"));
+    assert!(
+        problems.is_empty(),
+        "incomplete error documentation:\n{}",
+        problems.join("\n")
+    );
 }
 
 #[test]
@@ -209,21 +225,49 @@ fn cases() -> Vec<Case> {
         case("GET", "/api/v1/pools", "/api/v1/pools"),
         case("GET", "/api/v1/pools?limit=abc", "/api/v1/pools"),
         case("GET", "/api/v1/pools/1", "/api/v1/pools/{pool_id}"),
-        case("GET", "/api/v1/pools/not-a-number", "/api/v1/pools/{pool_id}"),
+        case(
+            "GET",
+            "/api/v1/pools/not-a-number",
+            "/api/v1/pools/{pool_id}",
+        ),
         case("GET", "/api/v1/stats", "/api/v1/stats"),
         case("GET", "/api/v1/leaderboard", "/api/v1/leaderboard"),
         case("GET", "/api/v1/tags", "/api/v1/tags"),
-        case("GET", "/api/v1/markets/1/predictions", "/api/v1/markets/{market_id}/predictions"),
-        case("GET", "/api/v1/markets/abc/predictions", "/api/v1/markets/{market_id}/predictions"),
-        case("GET", format!("/api/v1/referrals/{ADDRESS}"), "/api/v1/referrals/{address}"),
-        case("GET", "/api/v1/referrals/not-an-address", "/api/v1/referrals/{address}"),
-        case("GET", format!("/api/v1/users/{ADDRESS}/history"), "/api/v1/users/{address}/history"),
+        case(
+            "GET",
+            "/api/v1/markets/1/predictions",
+            "/api/v1/markets/{market_id}/predictions",
+        ),
+        case(
+            "GET",
+            "/api/v1/markets/abc/predictions",
+            "/api/v1/markets/{market_id}/predictions",
+        ),
+        case(
+            "GET",
+            format!("/api/v1/referrals/{ADDRESS}"),
+            "/api/v1/referrals/{address}",
+        ),
+        case(
+            "GET",
+            "/api/v1/referrals/not-an-address",
+            "/api/v1/referrals/{address}",
+        ),
+        case(
+            "GET",
+            format!("/api/v1/users/{ADDRESS}/history"),
+            "/api/v1/users/{address}/history",
+        ),
         case(
             "GET",
             format!("/api/v1/users/{ADDRESS}/predictions"),
             "/api/v1/users/{address}/predictions",
         ),
-        case("GET", format!("/api/v1/creators/{ADDRESS}/stats"), "/api/v1/creators/{address}/stats"),
+        case(
+            "GET",
+            format!("/api/v1/creators/{ADDRESS}/stats"),
+            "/api/v1/creators/{address}/stats",
+        ),
         post("/api/v1/indexer/pool-created", "{}"),
         post("/api/v1/indexer/prediction-placed", "{}"),
         post("/api/v1/indexer/claim", "{}"),
@@ -265,7 +309,8 @@ async fn live_responses_match_documented_shapes() {
             .await
             .unwrap();
 
-        let Some(documented) = documented_response(&spec, case.method, case.template, status) else {
+        let Some(documented) = documented_response(&spec, case.method, case.template, status)
+        else {
             failures.push(format!("{label}: status {status} is not documented"));
             continue;
         };
@@ -288,7 +333,9 @@ async fn live_responses_match_documented_shapes() {
             Value::String(String::from_utf8_lossy(&bytes).into_owned())
         };
         if let Err(e) = validate(&spec, &media["schema"], &body) {
-            failures.push(format!("{label}: {status} body does not match schema: {e}\nbody: {body}"));
+            failures.push(format!(
+                "{label}: {status} body does not match schema: {e}\nbody: {body}"
+            ));
         }
     }
 
