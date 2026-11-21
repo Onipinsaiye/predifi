@@ -1,6 +1,6 @@
 //! Portfolio routes: normalized wallet activity (#309), centralized P&L
-//! (#310), checkpoint-gated snapshots (#311), and bounded asynchronous
-//! exports (#312).
+//! (#310), checkpoint-gated snapshots (#311), bounded asynchronous exports
+//! (#312), and historical market-value time series (#313).
 //!
 //! Handlers here share [`crate::routes::v1::AppState`] with the rest of the
 //! v1 API; they are mounted from `crate::routes::v1::router`.
@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{
     calculate_portfolio_pnl, calculate_position_pnl, cancel_export, create_export,
-    generate_portfolio_snapshot, get_export_artifact, get_export_status, get_wallet_activity,
-    ActivityCursor, ArtifactResult, CancelOutcome, PoolLifecycle, PositionInputs, SnapshotError,
-    DEFAULT_ACTIVITY_PAGE_SIZE, MAX_ACTIVITY_PAGE_SIZE,
+    generate_portfolio_snapshot, get_export_artifact, get_export_status, get_market_history,
+    get_wallet_activity, ActivityCursor, ArtifactResult, BucketWidth, CancelOutcome,
+    MarketHistoryError, PoolLifecycle, PositionInputs, SnapshotError, DEFAULT_ACTIVITY_PAGE_SIZE,
+    MAX_ACTIVITY_PAGE_SIZE,
 };
 use crate::response::{error_codes, ApiResponse};
 use crate::routes::v1::AppState;
@@ -415,5 +416,94 @@ impl<T: Serialize> ApiResponseSuccess<T> {
             status: "success",
             data,
         }
+    }
+}
+
+// ── #313/#314: historical market values ──────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct MarketHistoryQuery {
+    /// Bucket width: `1m` | `5m` | `1h` | `1d`.
+    pub bucket: Option<String>,
+    /// Inclusive start of the range, RFC 3339.
+    pub from: Option<String>,
+    /// Exclusive end of the range, RFC 3339.
+    pub to: Option<String>,
+}
+
+fn parse_rfc3339_utc(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// `GET /v1/markets/:id/history` — bucketed historical market-value
+/// samples for a pool (#313), sourced from the canonical
+/// `portfolio_activity_ledger` projection, with transparent hot/cold tiered
+/// storage (#314). See `crate::db::market_history` for the bucket-width,
+/// timestamp and missing-sample contract.
+///
+/// Public: like the other market/pool read endpoints, historical market
+/// value is derived entirely from public on-chain activity.
+pub async fn get_market_history_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Query(params): Query<MarketHistoryQuery>,
+) -> Response {
+    let Some(width) = params.bucket.as_deref().and_then(BucketWidth::parse) else {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "bucket must be one of 1m, 5m, 1h, 1d",
+        )
+        .into_response();
+    };
+    let Some(from) = params.from.as_deref().and_then(parse_rfc3339_utc) else {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "from must be an RFC3339 timestamp",
+        )
+        .into_response();
+    };
+    let Some(to) = params.to.as_deref().and_then(parse_rfc3339_utc) else {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "to must be an RFC3339 timestamp",
+        )
+        .into_response();
+    };
+
+    let Some(db) = &state.db else {
+        return database_unavailable();
+    };
+
+    match get_market_history(db, pool_id, width, from, to).await {
+        Ok(page) => ApiResponse::success(page).into_response(),
+        Err(MarketHistoryError::InvalidRange) => ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "from must be before to",
+        )
+        .into_response(),
+        Err(MarketHistoryError::RangeTooLarge {
+            max_buckets,
+            requested_buckets,
+        }) => ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            format!(
+                "requested range spans {requested_buckets} buckets, exceeding the maximum of {max_buckets}"
+            ),
+        )
+        .into_response(),
+        Err(MarketHistoryError::CheckpointNotReady(reason)) => ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::SERVICE_UNAVAILABLE,
+            format!("indexer checkpoint not ready: {reason}"),
+        )
+        .into_response(),
+        Err(MarketHistoryError::Database(e)) => internal_error(e),
     }
 }

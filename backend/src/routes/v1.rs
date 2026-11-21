@@ -2325,6 +2325,10 @@ pub fn router(
             )
             .route("/markets/:id/predictions", get(get_market_predictions))
             .route(
+                "/markets/:id/history",
+                get(crate::routes::portfolio::get_market_history_handler),
+            )
+            .route(
                 "/wallets/:address/activity",
                 get(crate::routes::portfolio::get_wallet_activity_handler),
             )
