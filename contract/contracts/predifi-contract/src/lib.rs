@@ -1,6 +1,8 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
+extern crate alloc;
+
 #[cfg(test)]
 #[macro_use]
 extern crate std;
@@ -16,6 +18,7 @@ mod upgrade_migration_tests;
 mod boundary_edge_case_tests;
 pub mod bootstrap;
 mod constants;
+pub mod fee_allocation;
 mod gas_opt;
 mod oracle;
 #[cfg(test)]
@@ -87,6 +90,10 @@ use soroban_sdk::{
 
 pub use bootstrap::{validate_bootstrap_depth, BootstrapError};
 pub use constants::*;
+pub use fee_allocation::{
+    allocate_fees, claimable_for, total_allocated, FeeAllocation, FeeAllocationError,
+    ProviderInput,
+};
 pub use payouts::{
     calculate_claim_payout, calculate_odds_bps, calculate_protocol_fee, calculate_referral_amount,
     calculate_winnings, PayoutBreakdown, PayoutInput,
@@ -1343,6 +1350,18 @@ pub enum DataKey {
     /// provider based on their time-weighted share balance.  Updated whenever
     /// fees are accrued or the provider's share balance changes.
     ProviderFeeAccrued(u64, Address),
+    /// Deterministically allocated, currently claimable LP fees (issue #276):
+    /// `ProviderFeeClaimable(pool_id, provider)` -> `i128`.
+    ProviderFeeClaimable(u64, Address),
+    /// Canonical list of providers that have ever held shares in a pool:
+    /// `LpProviders(pool_id)` -> `Vec<Address>`.
+    ///
+    /// Appended on a provider's first deposit so fee allocation can enumerate
+    /// participants without relying on host iteration order.
+    LpProviders(u64),
+    /// Total fees allocated in the most recent deterministic allocation round:
+    /// `AllocatedLpFees(pool_id)` -> `i128`.
+    AllocatedLpFees(u64),
     /// Global LP fee basis points (issue #276):
     /// `LiquidityFeeBps` -> `u32`.
     ///

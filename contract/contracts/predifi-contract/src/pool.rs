@@ -10,18 +10,17 @@ use crate::gas_opt;
 // NB: a merge conflict once duplicated this whole `use` block (upstream #167/#163)
 // which made `cargo test` fail with E0252 name-collision errors; keep it merged.
 use crate::{
-    validate_bootstrap_depth, BootstrapError, Config, DataKey, FeeSchedule,
-    FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent, LiquidityAccounting,
-    LiquidityDepositedEvent, LiquidityWithdrawnEvent, LpFeeAttributedEvent, LpFeesAccruedEvent,
-    LpLedger, LpLossAllocatedEvent, MarketOracleConfig, MarketOracleConfiguredEvent, MarketState,
-    MaxTotalStakeIncreasedEvent, Pool, PoolCanceledEvent, PoolConfig, PoolCreatedEvent,
-    PoolDescriptionUpdatedEvent, PoolDisputedEvent, PoolReadyForResolutionEvent,
-    PoolResolvedDiagEvent, PoolResolvedEvent, PoolStats, PredifiContract, PredifiContractArgs,
-    PredifiContractClient, PredifiError, ProviderFeeRecord, ResolutionConflictEvent,
-    ResolutionVoteCastEvent, StakeLimitsUpdatedEvent, StakingClosedEvent, CANCELATION_DELAY,
-    DEFAULT_MIN_POOL_DURATION, EMERGENCY_CANCEL_MULTISIG_THRESHOLD,
-    INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_AGGREGATE_STAKE_PER_POOL, MAX_OPTIONS_COUNT,
-    MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
+    allocate_fees, total_allocated, validate_bootstrap_depth, BootstrapError, Config, DataKey,
+    FeeAllocationError, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
+    LiquidityAccounting, LiquidityDepositedEvent, LiquidityWithdrawnEvent, LpLedger,
+    MarketOracleConfig, MarketOracleConfiguredEvent, MarketState, MaxTotalStakeIncreasedEvent, Pool,
+    PoolCanceledEvent, PoolConfig, PoolCreatedEvent, PoolDescriptionUpdatedEvent,
+    PoolDisputedEvent, PoolReadyForResolutionEvent, PoolResolvedDiagEvent, PoolResolvedEvent,
+    PoolStats, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
+    ProviderInput, ResolutionConflictEvent, ResolutionVoteCastEvent, StakeLimitsUpdatedEvent,
+    StakingClosedEvent, CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION,
+    EMERGENCY_CANCEL_MULTISIG_THRESHOLD, INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS,
+    MAX_AGGREGATE_STAKE_PER_POOL, MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
 };
 
 #[contractimpl]
@@ -1909,6 +1908,10 @@ impl PredifiContract {
         }
         .publish(&env);
 
+        // Keep deterministic provider claimable amounts in sync with the
+        // newly accrued total (issue #276).
+        Self::allocate_lp_fees(env.clone(), pool_id)?;
+
         Ok(())
     }
 
@@ -1997,30 +2000,17 @@ impl PredifiContract {
             .unwrap_or(0)
     }
 
-    /// Attribute accrued LP fees deterministically to a provider (issue #276).
+    /// Attribute all accrued LP fees deterministically (issue #276).
     ///
-    /// When fees are accrued into the LP ledger (via `accrue_lp_fees`), they
-    /// raise the share price for *all* providers pro-rata.  This function
-    /// records exactly how much of the total accrued fee pool is attributable
-    /// to a specific provider, computed as:
+    /// Uses the pure largest-remainder allocator so the result depends only on
+    /// each provider's share balance and canonical address ordering — never on
+    /// iteration order.  The full accrued amount is allocated (no rounding
+    /// dust is leaked) and each provider's claimable amount is written to
+    /// storage.  Repeated calls for the same accrued total are idempotent.
     ///
-    /// ```text
-    /// attributed = total_accrued_fees * provider_shares / total_shares
-    /// ```
-    ///
-    /// The result is stored under `DataKey::ProviderFeeAccrued(pool_id, provider)`
-    /// so off-chain tooling and future settlement paths can read it without
-    /// recomputing the share-weighted proportion.  The function is idempotent:
-    /// calling it twice for the same state produces the same result.
-    ///
-    /// # Errors
-    /// - `PoolNotFound` – no pool exists for `pool_id`.
-    /// - `InvalidAmount` – arithmetic overflow computing the attribution.
-    pub fn attribute_lp_fees(
-        env: Env,
-        pool_id: u64,
-        provider: Address,
-    ) -> Result<i128, PredifiError> {
+    /// Returns the total amount allocated, which always equals the ledger's
+    /// `accrued_fees` when at least one provider holds shares.
+    pub fn allocate_lp_fees(env: Env, pool_id: u64) -> Result<i128, PredifiError> {
         let pool_key = DataKey::Pool(pool_id);
         let _pool: Pool = env
             .storage()
@@ -2029,64 +2019,99 @@ impl PredifiContract {
             .ok_or(PredifiError::PoolNotFound)?;
         Self::extend_persistent(&env, &pool_key);
 
-        let ledger_key = DataKey::LpLedger(pool_id);
         let ledger: LpLedger = env
             .storage()
             .persistent()
-            .get(&ledger_key)
+            .get(&DataKey::LpLedger(pool_id))
             .unwrap_or_else(|| LpLedger::empty(&env));
-
-        if ledger.total_shares == 0 || ledger.accrued_fees == 0 {
-            // No shares or no fees: attribution is zero; nothing to store.
+        let total_fees = ledger.accrued_fees;
+        if total_fees <= 0 {
             return Ok(0);
         }
 
-        let provider_shares: i128 = env
+        let providers: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::LpShares(pool_id, provider.clone()))
-            .unwrap_or(0);
+            .get(&DataKey::LpProviders(pool_id))
+            .unwrap_or_else(|| Vec::new(&env));
 
-        if provider_shares == 0 {
+        let mut inputs = alloc::vec::Vec::new();
+        for provider in providers.iter() {
+            let shares = Self::load_provider_shares(&env, pool_id, &provider);
+            if shares > 0 {
+                inputs.push(ProviderInput {
+                    key: provider,
+                    shares,
+                });
+            }
+        }
+        if inputs.is_empty() {
             return Ok(0);
         }
 
-        // attributed = floor(accrued_fees * provider_shares / total_shares)
-        // Using checked_mul to guard against overflow on large pools.
-        let attributed = ledger
-            .accrued_fees
-            .checked_mul(provider_shares)
-            .ok_or(PredifiError::InvalidAmount)?
-            / ledger.total_shares;
+        let allocations = allocate_fees(total_fees, &inputs).map_err(|e| match e {
+            FeeAllocationError::Overflow | FeeAllocationError::NoShares => {
+                PredifiError::InvalidAmount
+            }
+            FeeAllocationError::InvalidAmount => PredifiError::InvalidAmount,
+        })?;
 
-        // Write the attribution record.
-        let attr_key = DataKey::ProviderFeeAccrued(pool_id, provider.clone());
-        env.storage().persistent().set(&attr_key, &attributed);
-        Self::extend_persistent(&env, &attr_key);
+        for allocation in allocations.iter() {
+            let key = DataKey::ProviderFeeClaimable(pool_id, allocation.key.clone());
+            env.storage().persistent().set(&key, &allocation.amount);
+            Self::extend_persistent(&env, &key);
 
-        crate::LpFeeAttributedEvent {
-            pool_id,
-            provider: provider.clone(),
-            attributed_amount: attributed,
-            total_attributed: attributed,
-            provider_shares,
-            total_shares: ledger.total_shares,
+            crate::LpFeeAttributedEvent {
+                pool_id,
+                provider: allocation.key.clone(),
+                attributed_amount: allocation.amount,
+                total_attributed: allocation.amount,
+                provider_shares: Self::load_provider_shares(&env, pool_id, &allocation.key),
+                total_shares: ledger.total_shares,
+            }
+            .publish(&env);
         }
-        .publish(&env);
 
-        Ok(attributed)
-    }
-
-    /// Read the deterministically attributed LP fees for a provider (issue #276).
-    ///
-    /// Returns the value written by the most recent `attribute_lp_fees` call
-    /// for this `(pool_id, provider)` pair.  Returns 0 if no attribution has
-    /// been computed yet, or if the provider has no shares in the pool.
-    pub fn get_attributed_lp_fees(env: Env, pool_id: u64, provider: Address) -> i128 {
+        let total = total_allocated(&allocations);
         env.storage()
             .persistent()
-            .get(&DataKey::ProviderFeeAccrued(pool_id, provider))
+            .set(&DataKey::AllocatedLpFees(pool_id), &total);
+        Self::extend_persistent(&env, &DataKey::AllocatedLpFees(pool_id));
+        Ok(total)
+    }
+
+    /// Backwards-compatible single-provider attribution (issue #276).
+    ///
+    /// Delegates to the deterministic whole-pool allocation and returns the
+    /// provider's claimable amount from that result.
+    pub fn attribute_lp_fees(
+        env: Env,
+        pool_id: u64,
+        provider: Address,
+    ) -> Result<i128, PredifiError> {
+        Self::allocate_lp_fees(env.clone(), pool_id)?;
+        Ok(Self::get_lp_fee_claimable(env, pool_id, provider))
+    }
+
+    /// Read a provider's deterministically allocated, claimable LP fees (issue #276).
+    pub fn get_lp_fee_claimable(env: Env, pool_id: u64, provider: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProviderFeeClaimable(pool_id, provider))
             .unwrap_or(0)
+    }
+
+    /// Total fees allocated in the most recent allocation round (issue #276).
+    pub fn get_allocated_lp_fees(env: Env, pool_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllocatedLpFees(pool_id))
+            .unwrap_or(0)
+    }
+
+    /// Legacy attribution value, retained for existing indexers.
+    pub fn get_attributed_lp_fees(env: Env, pool_id: u64, provider: Address) -> i128 {
+        Self::get_lp_fee_claimable(env, pool_id, provider)
     }
 
     /// Set the global LP fee share in basis points (issue #276, admin-only).
@@ -2347,6 +2372,20 @@ impl PredifiContract {
             .checked_add(shares)
             .ok_or(PredifiError::InvalidAmount)?;
         Self::store_provider_shares(&env, pool_id, &provider, new_provider_shares);
+
+        // Issue #276 — record the provider once so fee allocation can
+        // enumerate participants independently of host iteration order.
+        if provider_shares == 0 {
+            let providers_key = DataKey::LpProviders(pool_id);
+            let mut providers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&providers_key)
+                .unwrap_or_else(|| Vec::new(&env));
+            providers.push_back(provider.clone());
+            env.storage().persistent().set(&providers_key, &providers);
+            Self::extend_persistent(&env, &providers_key);
+        }
 
         Self::assert_liquidity_solvency(&env, &acct);
         Self::store_liquidity_accounting(&env, pool_id, &acct);
