@@ -73,6 +73,65 @@ export function notificationsUrl(address: string, unreadOnly = false): string {
   return `${API_BASE_URL}/api/v1/notifications/${encodeURIComponent(address)}${qs ? `?${qs}` : ""}`;
 }
 
+// ── Cursor-paginated inbox (#287) ─────────────────────────────────────────────
+
+/**
+ * A single page of inbox notifications with a read-cursor for pagination and
+ * an unread count taken from the same consistent snapshot.
+ */
+export interface NotificationInboxPage {
+  notifications: Notification[];
+  unread_count: number;
+  /** Opaque cursor to pass as `?cursor=` on the next request, or null when exhausted. */
+  next_cursor: string | null;
+}
+
+function isNotificationInboxPage(obj: unknown): obj is NotificationInboxPage {
+  if (!obj || typeof obj !== "object") return false;
+  const p = obj as Record<string, unknown>;
+  return (
+    Array.isArray(p.notifications) &&
+    p.notifications.every(isNotification) &&
+    typeof p.unread_count === "number" &&
+    (p.next_cursor === null || typeof p.next_cursor === "string")
+  );
+}
+
+/**
+ * Build the URL for a cursor-paginated inbox page.
+ * The cursor is the opaque value returned in `next_cursor` from the previous page.
+ */
+export function inboxPageUrl(
+  address: string,
+  options?: { cursor?: string; limit?: number; unreadOnly?: boolean },
+): string {
+  const params = new URLSearchParams();
+  if (options?.cursor) params.set("cursor", options.cursor);
+  if (options?.limit) params.set("limit", String(options.limit));
+  if (options?.unreadOnly) params.set("unread_only", "true");
+  const qs = params.toString();
+  return `${API_BASE_URL}/api/v1/notifications/${encodeURIComponent(address)}/inbox${qs ? `?${qs}` : ""}`;
+}
+
+/** Fetch one page of the inbox. Used as an SWR fetcher. */
+export async function fetchInboxPage(url: string): Promise<NotificationInboxPage> {
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+
+  if (!res.ok) {
+    throw new ApiError(`Failed to load inbox (HTTP ${res.status})`, res.status);
+  }
+
+  const body = await res.json();
+  const data =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  if (!isNotificationInboxPage(data)) {
+    throw new ApiError("Invalid inbox page response shape", 500);
+  }
+
+  return data;
+}
+
 export async function fetchNotifications(url: string): Promise<NotificationsResponse> {
   const res = await fetch(url, { headers: { Accept: "application/json" } });
 
