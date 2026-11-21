@@ -67,7 +67,6 @@ mod update_pool_description_boundary_tests;
 #[cfg(test)]
 mod withdraw_treasury_boundary_tests;
 mod challenge;
-mod treasury;
 #[cfg(test)]
 mod fee_schedule_snapshot_tests;
 #[cfg(test)]
@@ -252,31 +251,72 @@ pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PredifiError {
     // ── Initialization (2) ──────────────────────────────────────────────────
+    /// Contract has not been initialized yet, or config not set.
     AlreadyInitializedOrConfigNotSet = 2,
     // ── Authorization (10) ──────────────────────────────────────────────────
+    /// The caller is not authorized to perform this action.
     Unauthorized = 10,
     // ── Pool state (20-27) ──────────────────────────────────────────────────
+    /// The specified pool was not found.
     PoolNotFound = 20,
+    /// The pool has not been resolved yet.
     PoolNotResolved = 22,
     /// Pool is in an invalid state for this operation, or has been cancelled.
     InvalidPoolState = 24,
+    /// The outcome value is invalid or out of bounds.
     InvalidOutcome = 25,
-    AlreadyClaimed = 60,
-    ResolutionDelayNotMet = 81,
-    /// Token is not on the allowed betting whitelist.
-    TokenNotWhitelisted = 91,
+    /// Pool has been flagged as disputed and cannot be modified.
+    PoolDisputed = 27,
+    // ── Prediction & balance (42-45) ────────────────────────────────────────
     /// Invalid amount provided (e.g., zero or negative).
     InvalidAmount = 42,
     /// Insufficient balance for the operation.
     InsufficientBalance = 44,
+    /// Stake amount is below the global protocol minimum.
+    InsufficientStake = 45,
+    // ── Claims (60) ─────────────────────────────────────────────────────────
+    /// The user has already claimed winnings for this pool.
+    AlreadyClaimed = 60,
+    // ── Time / pause (80-84) ────────────────────────────────────────────────
+    /// The provided timestamp is invalid (e.g., end_time too far in the future).
+    InvalidTimestamp = 80,
+    /// The resolution delay has not yet elapsed.
+    ResolutionDelayNotMet = 81,
+    /// Staking is still open for this pool.
+    StakingStillOpen = 82,
+    /// The contract is currently paused; all state-mutating operations are blocked.
+    ContractPaused = 83,
+    /// A time-window constraint (e.g. resolution window, claim window) is not met
+    /// for the requested operation.
+    TimeConstraintError = 84,
+    // ── Data / validation (90-97) ───────────────────────────────────────────
+    /// Generic invalid input data (e.g., a zero value where a positive value is required).
+    InvalidData = 90,
+    /// Token is not on the allowed betting whitelist.
+    TokenNotWhitelisted = 91,
+    /// The pagination offset + limit combination overflows u32 or is otherwise invalid.
+    InvalidPagination = 92,
+    /// The fee basis points exceed the maximum allowed value (10000).
+    InvalidFeeBps = 93,
+    /// The provided address or token is invalid.
+    InvalidAddressOrToken = 94,
+    /// A protocol fee change is already pending and cannot be overridden.
+    FeeChangePending = 95,
+    /// No protocol fee change is pending to apply or cancel.
+    NoFeeChangePending = 96,
+    /// The timelock for a pending operation has not yet expired.
+    TimelockNotExpired = 97,
+    /// The proposed fee exceeds the maximum allowed fee cap.
+    FeeExceedsCap = 98,
+    /// The proposed fee change delay is below the minimum required delay.
+    FeeDelayTooShort = 99,
+    // ── Oracle / price (100-116) ────────────────────────────────────────────
     /// Oracle not initialized.
     OracleNotInitialized = 100,
     /// Price feed not found.
     PriceFeedNotFound = 101,
-    /// Price data expired or invalid.
+    /// Price data is invalid, stale, missing, or confidence too wide.
     PriceDataInvalid = 102,
-    /// Price data is older than the configured `max_price_age`.
-    PriceStale = 113,
     /// Price condition not set for pool.
     PriceConditionNotSet = 103,
     /// Total pool stake cap reached or would be exceeded.
@@ -289,10 +329,14 @@ pub enum PredifiError {
     StakeBelowMinimum = 107,
     /// Stake amount exceeds the pool maximum.
     StakeAboveMaximum = 108,
-    /// Stake amount is below the global protocol minimum.
-    InsufficientStake = 45,
+    /// Metadata URL exceeds maximum length (512 bytes).
+    MetadataUrlInvalid = 109,
+    /// An arithmetic overflow, underflow, or division by zero occurred.
+    ArithmeticError = 110,
     /// User has exceeded the maximum number of predictions allowed per pool.
     MaxPredictionsExceeded = 111,
+    /// Price data is older than the configured `max_price_age`.
+    PriceStale = 113,
     /// A pool requested more outcomes than `MAX_OUTCOMES_PER_POOL`.
     MaxOutcomesExceeded = 114,
     /// A pool reached `MAX_PREDICTIONS_PER_POOL` distinct predictors.
@@ -300,147 +344,66 @@ pub enum PredifiError {
     /// Adding this stake would exceed `MAX_AGGREGATE_STAKE_PER_POOL`
     /// (or the aggregate addition would overflow `i128`).
     MaxAggregateStakeExceeded = 116,
-    /// The fee basis points exceed the maximum allowed value (10000).
-    InvalidFeeBps = 93,
-    /// Metadata URL exceeds maximum length (512 bytes).
-    MetadataUrlInvalid = 109,
-    /// An arithmetic overflow, underflow, or division by zero occurred.
-    ArithmeticError = 110,
-    /// required_resolutions exceeds the number of active operators; pool can never be resolved.
-    RequiredResolutionsExceedOperators = 200,
-    /// Rate limit exceeded, cooldown active, or suspicious activity detected.
-    RateLimitOrSuspiciousActivity = 190,
-    /// The pagination offset + limit combination overflows u32 or is otherwise invalid.
-    InvalidPagination = 92,
-    /// Generic invalid input data (e.g., a zero value where a positive value is required).
-    InvalidData = 90,
-    /// The provided timestamp is invalid (e.g., end_time too far in the future).
-    InvalidTimestamp = 80,
-    /// The proposed fee exceeds the maximum allowed fee cap.
-    FeeExceedsCap = 98,
-    /// The proposed fee change delay is below the minimum required delay.
-    FeeDelayTooShort = 99,
-    /// Pool has been flagged as disputed and cannot be modified.
-    PoolDisputed = 27,
-    // ── Prediction & balance (42-45) ────────────────────────────────────────
-    InvalidAmount = 42,
-    InsufficientBalance = 44,
-    InsufficientStake = 45,
-    // ── Claims (60) ─────────────────────────────────────────────────────────
-    AlreadyClaimed = 60,
-    // ── Time / pause (80-84) ────────────────────────────────────────────────
-    InvalidTimestamp = 80,
-    ResolutionDelayNotMet = 81,
-    StakingStillOpen = 82,
-    /// A time-window
-    PoolDisputed = 27,
-    // ── Prediction & balance (42-45) ────────────────────────────────────────
-    InvalidAmount = 42,
-    InsufficientBalance = 44,
-    InsufficientStake = 45,
-    // ── Claims (60) ─────────────────────────────────────────────────────────
-    AlreadyClaimed = 60,
-    // ── Time / pause (80-84) ────────────────────────────────────────────────
-    InvalidTimestamp = 80,
-    ResolutionDelayNotMet = 81,
-    StakingStillOpen = 82,
-    /// A time-window constraint (e.g. resolution window, claim window) is
-    /// not met for the requested operation.
-    TimeConstraintError = 84,
-    /// One of the `outcome_descriptions` exceeds `MAX_OUTCOME_DESCRIPTION_LEN`
-    /// (issue #1122).
+    // ── Outcome descriptions (130-131) ──────────────────────────────────────
+    /// One of the `outcome_descriptions` exceeds `MAX_OUTCOME_DESCRIPTION_LEN`.
     OutcomeDescriptionTooLong = 130,
     /// One of the `outcome_descriptions` is empty / shorter than
-    /// `MIN_OUTCOME_DESCRIPTION_LEN` (issue #1122).
+    /// `MIN_OUTCOME_DESCRIPTION_LEN`.
     OutcomeDescriptionEmpty = 131,
+    // ── Deadline & liquidity (132-133) ──────────────────────────────────────
     /// A timestamp that must be in the future is in the past or equal to
-    /// `env.ledger().timestamp()` (issue #1130).
+    /// `env.ledger().timestamp()`.
     DeadlineInPast = 132,
     /// `initial_liquidity` is less than the required safety margin
-    /// relative to `max_total_stake` (issue #1131).
+    /// relative to `max_total_stake`.
     InitialLiquidityBelowSafetyMargin = 133,
-    /// The caller has already approved this emergency-cancel proposal
-    /// (issue #1119).
-    EmergencyCancelAlreadyApproved = 135,
-    /// The contract is currently paused; all state-mutating operations are blocked.
-    ///
-    /// Callers should check `is_contract_paused()` before submitting a transaction,
-    /// or listen for `PauseEvent` / `UnpauseEvent` on-chain to stay in sync.
-    ///
-    /// NOTE: With scoped pause controls, this error is only returned for
-    /// operations whose pause scope is active. See [`PauseScope`] and
-    /// [`PredifiContract::is_operation_paused`] for the operation matrix.
-    ContractPaused = 83,
-    TimeConstraintError = 84,
-    // ── Data / validation (90-97) ───────────────────────────────────────────
-    /// Generic invalid input data. Also covers: invalid target price,
-    /// metadata URL too long, outcome description issues, liquidity margin,
-    /// token not whitelisted, and unknown recovery steps.
-    InvalidData = 90,
-    InvalidPagination = 92,
-    InvalidFeeBps = 93,
-    InvalidAddressOrToken = 94,
-    FeeChangePending = 95,
-    NoFeeChangePending = 96,
-    TimelockNotExpired = 97,
-    // ── Oracle / price (100-106) ─────────────────────────────────────────────
-    OracleNotInitialized = 100,
-    /// Price data is invalid, stale, missing, or confidence too wide.
-    /// Also covers: price condition not set, unsupported exponent.
-    PriceDataInvalid = 102,
-    MaxTotalStakeExceeded = 104,
-    ResolutionConflict = 105,
-    OracleAlreadyVoted = 106,
-    // ── Stake limits (107-108, 111, 116) ────────────────────────────────────
-    StakeBelowMinimum = 107,
-    StakeAboveMaximum = 108,
-    MaxPredictionsExceeded = 111,
-    MaxAggregateStakeExceeded = 116,
-    // ── Arithmetic (110) ────────────────────────────────────────────────────
-    ArithmeticError = 110,
     // ── Emergency cancel (134-135) ──────────────────────────────────────────
+    /// An emergency-cancel proposal is pending for this pool.
     EmergencyCancelPending = 134,
+    /// The caller has already approved this emergency-cancel proposal.
     EmergencyCancelAlreadyApproved = 135,
+    // ── Refunds (140-141) ────────────────────────────────────────────────────
+    /// The pool is not in a state that permits a refund claim.
+    RefundNotAvailable = 140,
+    /// A refund has already been claimed for this (user, pool) pair.
+    RefundAlreadyClaimed = 141,
+    // ── Schema (181-182) ────────────────────────────────────────────────────
+    /// The stored schema version is not supported by this contract binary.
+    UnsupportedSchemaVersion = 181,
+    /// `migrate_state` was called but the schema version already matches
+    /// `CURRENT_SCHEMA_VERSION`.
+    SchemaMigrationAlreadyRun = 182,
     // ── Rate limiting (190) ─────────────────────────────────────────────────
+    /// Rate limit exceeded, cooldown active, or suspicious activity detected.
     RateLimitOrSuspiciousActivity = 190,
-    // ── Pool configuration (200) ────────────────────────────────────────────
+    // ── Pool configuration (200-206) ────────────────────────────────────────
+    /// `required_resolutions` exceeds the number of active operators.
     RequiredResolutionsExceedOperators = 200,
-    // ── Recovery checklist (210-212) ────────────────────────────────────────
-    /// No recovery checklist has been configured; call `configure_recovery_checklist` before unpausing.
+    /// Feed identifier is not in the governed supported feeds list.
+    UnsupportedFeed = 202,
+    /// Freshness policy value is outside valid configuration bounds.
+    InvalidFreshness = 203,
+    /// Oracle configuration is immutable after market creation.
+    ConfigurationImmutable = 204,
+    /// The provider price exponent is outside the supported range, or the value
+    /// cannot be represented in `PRICE_DECIMALS` fixed-point.
+    UnsupportedPriceExponent = 205,
+    /// The oracle confidence interval is too wide to resolve on.
+    PriceConfidenceTooWide = 206,
+    // ── Recovery checklist (210-212) ───────────────────────────────────────
+    /// No recovery checklist has been configured; call
+    /// `configure_recovery_checklist` before unpause.
     RecoveryChecklistNotConfigured = 210,
     /// Not all required recovery attestations have been provided yet.
     RecoveryChecklistIncomplete = 211,
     /// This recovery step has already been attested in the current pause cycle.
     RecoveryStepAlreadyAttested = 212,
-    /// The stored schema version is not supported by this contract binary.
-    /// Emitted when `migrate_state` is called on a contract whose on-chain
-    /// schema version is ahead of (or otherwise incompatible with) the deployed
-    /// binary.  The deployer must upgrade to a compatible binary first.
-    UnsupportedSchemaVersion = 181,
-    /// `migrate_state` was called but the on-chain schema version already
-    /// matches `CURRENT_SCHEMA_VERSION`.  This is a no-op guard to prevent
-    /// accidental repeated migrations from corrupting state.
-    SchemaMigrationAlreadyRun = 182,
-    /// The pool is not in a state that permits a refund claim (e.g. it has
-    /// not been canceled/no-contested, or the refund window has closed).
-    RefundNotAvailable = 140,
-    /// A refund has already been claimed for this (user, pool) pair.
-    RefundAlreadyClaimed = 141,
-    /// Feed identifier is not in the governed supported feeds list.
-    UnsupportedFeed = 202,
-    /// Freshness policy value is outside valid configuration bounds.
-    InvalidFreshness = 203,
-    /// Oracle configuration is immutable after market creation and cannot be modified.
-    ConfigurationImmutable = 204,
-    /// The provider price exponent is outside
-    /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
-    /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
-    UnsupportedPriceExponent = 205,
-    /// The oracle confidence interval is too wide to resolve on: either
-    /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
-    /// interval crosses the price-condition boundary. Resolution is deferred
-    /// until a tighter price is published.
-    PriceConfidenceTooWide = 206,
+    // ── Recurring market series (220-221) ───────────────────────────────────
+    /// The referenced market series does not exist (issue #241).
+    SeriesNotFound = 220,
+    /// A child market window overlaps an existing sibling window and the series
+    /// template does not permit overlapping windows (issue #241).
+    SeriesWindowOverlap = 221,
 }
 
 /// Explicit matrix of operations that can be individually paused.
@@ -1020,7 +983,7 @@ pub struct ResolutionEvidence {
 /// - New variants added after the initial deployment use full PascalCase names
 ///   (e.g. `OracleConfig`, `PriceFeed`, `PriceCondition`).
 /// - All variants are documented with their storage type mapping.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone)]
 pub enum DataKey {
     // ── Pool data ────────────────────────────────────────────────────────────
