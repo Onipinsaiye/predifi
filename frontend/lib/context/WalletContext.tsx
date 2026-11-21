@@ -43,6 +43,7 @@ import {
   type WalletConnectionState,
 } from "@/lib/hooks/useWalletConnection";
 import { removePersistedStellarTransaction } from "@/lib/stellar/pendingTransactions";
+import { useDemoMode } from "@/lib/context/DemoModeContext";
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,11 @@ import { removePersistedStellarTransaction } from "@/lib/stellar/pendingTransact
 export interface WalletContextValue extends WalletConnectionState {
   identityKey: string | null;
   generation: number;
+  /**
+   * False while the read-only demo mode is active. Consumers must not request
+   * wallet signatures when this is false; `connect` is also refused.
+   */
+  signingAllowed: boolean;
 }
 
 /**
@@ -76,6 +82,10 @@ WalletContext.displayName = "WalletContext";
 export function WalletProvider({ children }: { children: ReactNode }) {
   const wallet = useWalletConnection();
   const { mutate } = useSWRConfig();
+  const { isDemoMode } = useDemoMode();
+
+  // Demo mode is strictly read-only: no wallet extension calls, no signing.
+  const signingAllowed = !isDemoMode;
 
   // Identity = network + address. `null` when no wallet is connected.
   const identityKey = wallet.identityKey;
@@ -115,6 +125,15 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     prevAddressRef.current = currAddress;
   }, [identityKey, wallet.address, mutate]);
 
+  // Refuse wallet connection while demo mode is active so no extension call
+  // is ever made from demo state.
+  const connect = useCallback(() => {
+    if (!signingAllowed) {
+      return;
+    }
+    wallet.connect();
+  }, [signingAllowed, wallet]);
+
   // Wrap disconnect to also clear the cache immediately on user action,
   // without waiting for the useEffect to run on the next render cycle.
   const disconnect = useCallback(() => {
@@ -135,11 +154,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       isConnecting: wallet.isConnecting,
       error: wallet.error,
       requiredNetworkLabel: wallet.requiredNetworkLabel,
-      connect: wallet.connect,
+      connect,
       disconnect,
       clearError: wallet.clearError,
       identityKey,
       generation,
+      signingAllowed,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -147,11 +167,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       wallet.isConnecting,
       wallet.error,
       wallet.requiredNetworkLabel,
-      wallet.connect,
+      connect,
       disconnect,
       wallet.clearError,
       identityKey,
       generation,
+      signingAllowed,
     ],
   );
 
@@ -203,6 +224,17 @@ export function useWalletIdentity(): {
 export function useWalletAddress(): string | undefined {
   const { address } = useWallet();
   return address ?? undefined;
+}
+
+/**
+ * useWalletSigningAllowed — returns whether wallet signing is permitted.
+ *
+ * False while demo mode is active. Signing flows should check this and show a
+ * clear "exit demo mode" message instead of invoking the wallet extension.
+ */
+export function useWalletSigningAllowed(): boolean {
+  const { signingAllowed } = useWallet();
+  return signingAllowed;
 }
 
 // Re-export the state type so consumers don't need to import from the hook.

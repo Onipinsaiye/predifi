@@ -63,6 +63,34 @@ PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 CONTRACT_ID_RE = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
 NUMERIC_LITERAL_RE = re.compile(r"(?<![\w.])-?\d+(?:[.,]\d+)?(?![\w.])")
 
+# Market lifecycle states that require a contextual explanation in the shared
+# catalog. Each state must document what actions remain possible, the next
+# expected transition, and the authoritative source for that transition.
+LIFECYCLE_STATES: Tuple[str, ...] = (
+    "draft",
+    "scheduled",
+    "open",
+    "paused",
+    "closed",
+    "resolving",
+    "resolved",
+    "disputed",
+    "settled",
+    "cancelled",
+    "expired",
+)
+
+# Required explanation fields for each lifecycle state.
+LIFECYCLE_EXPLANATION_FIELDS: Tuple[str, ...] = (
+    "state",
+    "next_transition",
+    "source",
+)
+
+# Catalog key prefix under which lifecycle explanations live.
+LIFECYCLE_KEY_PREFIX = "market.lifecycle"
+=======
+
 
 @dataclass
 class Violation:
@@ -167,8 +195,49 @@ def validate(
         _check_plural_forms(locale, source_flat, flat, result)
         _check_placeholders(locale, source_flat, flat, result)
         _check_unlocalized_values(locale, source_flat, flat, result)
+        _check_lifecycle_explanations(locale, source_flat, flat, result)
 
     return result
+
+
+def _check_lifecycle_explanations(
+    locale: str,
+    source_flat: Mapping[str, Any],
+    flat: Mapping[str, Any],
+    result: ValidationResult,
+) -> None:
+    """Every known lifecycle state must carry a reviewed explanation.
+
+    The source catalog defines the reviewed copy. Each supported locale must
+    provide the same explanation keys so the copy stays in one shared
+    localization catalog.
+    """
+    for state in LIFECYCLE_STATES:
+        for field_name in LIFECYCLE_EXPLANATION_FIELDS:
+            key = f"{LIFECYCLE_KEY_PREFIX}.{state}.{field_name}"
+            if key not in source_flat:
+                result.violations.append(
+                    Violation(
+                        SOURCE_LOCALE,
+                        key,
+                        "missing lifecycle explanation in source catalog",
+                    )
+                )
+                continue
+            if key not in flat:
+                result.violations.append(
+                    Violation(locale, key, "missing lifecycle explanation")
+                )
+                continue
+            value = flat[key]
+            if not isinstance(value, str):
+                result.violations.append(
+                    Violation(locale, key, "lifecycle explanation must be a string")
+                )
+            elif not value.strip():
+                result.violations.append(
+                    Violation(locale, key, "lifecycle explanation must not be empty")
+                )
 
 
 def _check_missing_keys(

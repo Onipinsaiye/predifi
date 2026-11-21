@@ -15,6 +15,11 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
             "pool_resolved": false,
             "claim_expiring": false,
             "new_pool_match": false
+        },
+        "digest": {
+            "enabled": false,
+            "schedule": "weekly",
+            "timezone": "UTC"
         }
     }'::jsonb CHECK (jsonb_typeof(preferences) = 'object'),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -117,3 +122,34 @@ CREATE TABLE IF NOT EXISTS background_job_outbox (
 CREATE INDEX IF NOT EXISTS idx_background_job_outbox_due
     ON background_job_outbox (available_at, id)
     WHERE status = 'pending';
+
+-- Weekly market digest. Preferences live in notification_preferences.digest
+-- (opt-in, schedule, timezone); these tables support deduplication of digest
+-- events and expiring one-click unsubscribe links.
+CREATE TABLE IF NOT EXISTS digest_unsubscribe_tokens (
+    id           BIGSERIAL   PRIMARY KEY,
+    token_hash   TEXT        NOT NULL UNIQUE,
+    user_address TEXT        NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    used_at      TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_digest_unsubscribe_tokens_expires
+    ON digest_unsubscribe_tokens (expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_digest_unsubscribe_tokens_user
+    ON digest_unsubscribe_tokens (user_address);
+
+CREATE TABLE IF NOT EXISTS digest_deliveries (
+    id                  BIGSERIAL   PRIMARY KEY,
+    user_address        TEXT        NOT NULL,
+    market_id           BIGINT      NOT NULL,
+    status_version      BIGINT      NOT NULL,
+    digest_period_start TIMESTAMPTZ NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_address, market_id, status_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_digest_deliveries_user
+    ON digest_deliveries (user_address, digest_period_start DESC);
