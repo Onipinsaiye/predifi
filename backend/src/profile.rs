@@ -308,6 +308,208 @@ pub struct RetentionReport {
     pub redacted_audit: u64,
 }
 
+/// Inventory of user-linked off-chain (private) field groups that a
+/// user-controlled export or deletion is allowed to touch.
+///
+/// Every entry must be classified as a deletable private/export class in
+/// [`RETENTION_POLICY`]; chain-derived fields are deliberately excluded so
+/// they can never be exported as "private" or deleted.
+pub const USER_PRIVATE_FIELD_GROUPS: &[&str] = &[
+    "user_profiles.display_data",
+    "user_discussions.body",
+    "notification_targets.endpoint",
+    "user_exports.payload",
+];
+
+/// Return the retention class for `field`, if it is part of the policy.
+pub fn retention_class_for(field: &str) -> Option<RetentionClass> {
+    RETENTION_POLICY
+        .iter()
+        .find(|(name, _)| *name == field)
+        .map(|(_, class)| *class)
+}
+
+/// Whether `field` may be exported/deleted by the user-controlled flow.
+///
+/// Only private and export artifacts are eligible; chain-derived and audit
+/// records are excluded.
+pub fn is_user_eligible_field(field: &str) -> bool {
+    matches!(
+        retention_class_for(field),
+        Some(RetentionClass::Private { .. }) | Some(RetentionClass::Export { .. })
+    )
+}
+
+/// One off-chain record included in a user data export.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportedRecord {
+    /// Field group the record belongs to (a key of [`RETENTION_POLICY`]).
+    pub field: String,
+    /// Serialized record payload.
+    pub payload: serde_json::Value,
+}
+
+/// Result of a user-controlled account data export.
+///
+/// Chain-derived history is reported separately (as a pointer to the public
+/// profile endpoints) and is never copied into `private_records`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountDataExport {
+    /// Address the export was produced for.
+    pub address: String,
+    /// When the export was generated.
+    pub generated_at: DateTime<Utc>,
+    /// Off-chain private records owned by the user.
+    pub private_records: Vec<ExportedRecord>,
+    /// Field groups that were exported, for completeness auditing.
+    pub included_fields: Vec<String>,
+    /// Human-readable note explaining that on-chain history is immutable
+    /// and remains available via the public profile endpoints.
+    pub on_chain_notice: String,
+}
+
+/// Build a user-controlled export of eligible off-chain records for `address`.
+///
+/// Only field groups listed in [`USER_PRIVATE_FIELD_GROUPS`] are read; the
+/// caller must have authenticated as `address` before invoking this.
+pub async fn export_account_data(
+    pool: &PgPool,
+    address: &str,
+) -> Result<AccountDataExport, sqlx::Error> {
+    let mut private_records = Vec::new();
+    let mut included_fields = Vec::new();
+
+    if is_user_eligible_field("user_profiles.display_data") {
+        let rows = sqlx::query_as::<_, (serde_json::Value,)>(
+            r#"SELECT display_data FROM user_profiles WHERE address = $1"#,
+        )
+        .bind(address)
+        .fetch_all(pool)
+        .await?;
+        for (payload,) in rows {
+            private_records.push(ExportedRecord {
+                field: "user_profiles.display_data".to_string(),
+                payload,
+            });
+        }
+        included_fields.push("user_profiles.display_data".to_string());
+    }
+
+    if is_user_eligible_field("user_discussions.body") {
+        let rows = sqlx::query_as::<_, (serde_json::Value,)>(
+            r#"SELECT jsonb_build_object('body', body, 'created_at', created_at)
+               FROM user_discussions WHERE author_address = $1"#,
+        )
+        .bind(address)
+        .fetch_all(pool)
+        .await?;
+        for (payload,) in rows {
+            private_records.push(ExportedRecord {
+                field: "user_discussions.body".to_string(),
+                payload,
+            });
+        }
+        included_fields.push("user_discussions.body".to_string());
+    }
+
+    if is_user_eligible_field("notification_targets.endpoint") {
+        let rows = sqlx::query_as::<_, (serde_json::Value,)>(
+            r#"SELECT jsonb_build_object('endpoint', endpoint, 'created_at', created_at)
+               FROM notification_targets WHERE user_address = $1"#,
+        )
+        .bind(address)
+        .fetch_all(pool)
+        .await?;
+        for (payload,) in rows {
+            private_records.push(ExportedRecord {
+                field: "notification_targets.endpoint".to_string(),
+                payload,
+            });
+        }
+        included_fields.push("notification_targets.endpoint".to_string());
+    }
+
+    Ok(AccountDataExport {
+        address: address.to_string(),
+        generated_at: Utc::now(),
+        private_records,
+        included_fields,
+        on_chain_notice: "Prediction history, claim status, and earnings are \
+            derived from public on-chain events and are immutable. They are not \
+            deleted by account data deletion and remain available via the public \
+            profile endpoints."
+            .to_string(),
+    })
+}
+
+/// Summary of a user-controlled account data deletion.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct AccountDeletionReport {
+    /// Private profile display rows deleted.
+    pub deleted_profile_rows: u64,
+    /// Discussion bodies deleted.
+    pub deleted_discussions: u64,
+    /// Notification targets deleted.
+    pub deleted_notification_targets: u64,
+    /// Pending export artifacts deleted.
+    pub deleted_exports: u64,
+    /// Whether an audit evidence row was recorded.
+    pub audit_recorded: bool,
+}
+
+/// Delete eligible off-chain records for `address`, retaining minimal audit
+/// evidence (a redacted audit row) and never touching chain-derived data.
+///
+/// Idempotent: re-running for an already-purged address deletes nothing and
+/// still records audit evidence.
+pub async fn delete_account_data(
+    pool: &PgPool,
+    address: &str,
+) -> Result<AccountDeletionReport, sqlx::Error> {
+    let mut report = AccountDeletionReport::default();
+
+    let profile = sqlx::query(r#"DELETE FROM user_profiles WHERE address = $1"#)
+        .bind(address)
+        .execute(pool)
+        .await?;
+    report.deleted_profile_rows += profile.rows_affected();
+
+    let discussions =
+        sqlx::query(r#"DELETE FROM user_discussions WHERE author_address = $1"#)
+            .bind(address)
+            .execute(pool)
+            .await?;
+    report.deleted_discussions += discussions.rows_affected();
+
+    let notif = sqlx::query(r#"DELETE FROM notification_targets WHERE user_address = $1"#)
+        .bind(address)
+        .execute(pool)
+        .await?;
+    report.deleted_notification_targets += notif.rows_affected();
+
+    let exports = sqlx::query(r#"DELETE FROM user_exports WHERE user_address = $1"#)
+        .bind(address)
+        .execute(pool)
+        .await?;
+    report.deleted_exports += exports.rows_affected();
+
+    // Minimal audit evidence: record that a deletion occurred without
+    // retaining any personal data beyond the actor address, which is itself
+    // redacted by `purge_expired_private_records` after the audit window.
+    let audit = sqlx::query(
+        r#"
+        INSERT INTO audit_log (actor_address, action, created_at)
+        VALUES ($1, 'account_data_deleted', NOW())
+        "#,
+    )
+    .bind(address)
+    .execute(pool)
+    .await?;
+    report.audit_recorded = audit.rows_affected() > 0;
+
+    Ok(report)
+}
+
 /// Scheduled cleanup for eligible private records. Chain-derived rows are
 /// never touched; audit rows only have personal identifiers nulled out so
 /// the audit trail remains intact.
@@ -408,6 +610,32 @@ mod tests {
         assert_eq!(r.deleted_private, 0);
         assert_eq!(r.deleted_exports, 0);
         assert_eq!(r.redacted_audit, 0);
+    }
+
+    #[test]
+    fn private_field_groups_are_all_eligible() {
+        for field in USER_PRIVATE_FIELD_GROUPS {
+            assert!(is_user_eligible_field(field), "{field} must be eligible");
+        }
+    }
+
+    #[test]
+    fn chain_and_audit_fields_are_not_user_eligible() {
+        assert!(!is_user_eligible_field("predictions.user_address"));
+        assert!(!is_user_eligible_field("predictions.claimed_amount"));
+        assert!(!is_user_eligible_field("predictions.claimed_at"));
+        assert!(!is_user_eligible_field("audit_log.actor_address"));
+        assert!(!is_user_eligible_field("unknown.field"));
+    }
+
+    #[test]
+    fn account_deletion_report_defaults_to_zero() {
+        let r = AccountDeletionReport::default();
+        assert_eq!(r.deleted_profile_rows, 0);
+        assert_eq!(r.deleted_discussions, 0);
+        assert_eq!(r.deleted_notification_targets, 0);
+        assert_eq!(r.deleted_exports, 0);
+        assert!(!r.audit_recorded);
     }
 
     // ------------------------------------------------------------------

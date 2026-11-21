@@ -1,4 +1,9 @@
-use axum::{body::Body, http::{HeaderValue, Request}, routing::get, Router};
+use axum::{
+    body::Body,
+    http::{HeaderValue, Request},
+    routing::get,
+    Router,
+};
 use predifi_backend::{build_cors, config::Config};
 use tower::ServiceExt;
 
@@ -28,17 +33,17 @@ async fn build_cors_preserves_valid_origin_list() {
         .unwrap();
 
     assert_eq!(
-        response.headers().get("access-control-allow-origin").unwrap(),
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
         HeaderValue::from_static("https://app.example.com")
     );
 }
 
 #[tokio::test]
 async fn build_cors_drops_unparseable_origin_without_panicking() {
-    let cfg = config_with_origins(vec![
-        "https://good.example.com",
-        "bad origin with spaces",
-    ]);
+    let cfg = config_with_origins(vec!["https://good.example.com", "bad origin with spaces"]);
     let app = Router::new()
         .route("/", get(|| async { "ok" }))
         .layer(build_cors(&cfg));
@@ -56,7 +61,10 @@ async fn build_cors_drops_unparseable_origin_without_panicking() {
         .unwrap();
 
     assert_eq!(
-        response.headers().get("access-control-allow-origin").unwrap(),
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
         HeaderValue::from_static("https://good.example.com")
     );
 
@@ -71,5 +79,8 @@ async fn build_cors_drops_unparseable_origin_without_panicking() {
         .await
         .unwrap();
 
-    assert!(response.headers().get("access-control-allow-origin").is_none());
+    assert!(response
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
 }

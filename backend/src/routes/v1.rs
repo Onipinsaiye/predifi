@@ -19,6 +19,296 @@ use crate::redis_cache::RedisCache;
 use crate::response::{error_codes, ApiResponse};
 use crate::validated_types::{BoundedI64, NonEmptyString, PoolSortBy, PoolStatus, StellarAddress};
 
+/// Maximum age (in seconds) of a pool snapshot that a quote may be derived
+/// from. Older state is rejected as stale so clients never sign against a
+/// price that has drifted.
+pub const QUOTE_MAX_POOL_STATE_AGE_SECS: i64 = 300;
+
+/// Query parameters for `GET /api/v1/pools/:id/quote`.
+#[derive(Debug, Deserialize)]
+pub struct QuoteQuery {
+    /// Input amount in the pool's input units (must be positive).
+    pub amount: BoundedI64,
+    /// Optional outcome index the input is placed on (defaults to 0).
+    #[serde(default)]
+    pub outcome: Option<u32>,
+}
+
+/// Deterministic quote returned by `GET /api/v1/pools/:id/quote`.
+#[derive(Debug, Serialize)]
+pub struct QuoteResponse {
+    /// Pool the quote was computed for.
+    pub pool_id: i64,
+    /// Outcome index the input is placed on.
+    pub outcome: u32,
+    /// Input amount, in input units.
+    pub input_units: i64,
+    /// Estimated output shares for the input.
+    pub output_estimate: i64,
+    /// Price impact in basis points (0 = no impact).
+    pub price_impact_bps: u32,
+    /// Fee charged for the trade, in input units.
+    pub fee: i64,
+    /// Unix timestamp (seconds) at which the quote was produced.
+    pub quote_timestamp: i64,
+}
+
+/// Snapshot of the pool state a quote is derived from.
+#[derive(Debug, Clone)]
+pub struct QuotePoolState {
+    /// Pool identifier.
+    pub pool_id: i64,
+    /// Lifecycle status as reported by the authoritative source.
+    pub status: String,
+    /// Unix timestamp (seconds) of the last state update.
+    pub updated_at: i64,
+    /// Total liquidity currently in the pool, in input units.
+    pub total_liquidity: i64,
+    /// Shares already issued for the outcome being quoted.
+    pub outcome_shares: i64,
+}
+
+/// Errors produced while computing a quote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuoteError {
+    /// The pool does not exist.
+    NotFound,
+    /// The pool state is older than [`QUOTE_MAX_POOL_STATE_AGE_SECS`].
+    Stale { age_secs: i64 },
+    /// The pool lifecycle state cannot be quoted (e.g. settled/closed).
+    UnsupportedState(String),
+    /// The input amount is not positive.
+    InvalidAmount,
+    /// The pool has no liquidity to price against.
+    InsufficientLiquidity,
+}
+
+impl std::fmt::Display for QuoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuoteError::NotFound => write!(f, "pool not found"),
+            QuoteError::Stale { age_secs } => {
+                write!(f, "pool state is stale ({age_secs}s old)")
+            }
+            QuoteError::UnsupportedState(state) => {
+                write!(f, "pool state '{state}' does not support quoting")
+            }
+            QuoteError::InvalidAmount => write!(f, "amount must be positive"),
+            QuoteError::InsufficientLiquidity => write!(f, "pool has no liquidity"),
+        }
+    }
+}
+
+/// Deterministic pricing model shared by the quote endpoint and the contract
+/// reference implementation.
+///
+/// The output estimate is the constant-product share price applied to the
+/// input, net of the protocol fee. Price impact is the relative change in the
+/// marginal price caused by the trade, expressed in basis points.
+pub fn compute_quote(
+    state: &QuotePoolState,
+    amount: i64,
+    outcome: u32,
+    fee_bps: u32,
+    now: i64,
+) -> Result<QuoteResponse, QuoteError> {
+    if amount <= 0 {
+        return Err(QuoteError::InvalidAmount);
+    }
+    if state.status != "active" {
+        return Err(QuoteError::UnsupportedState(state.status.clone()));
+    }
+    let age_secs = now.saturating_sub(state.updated_at);
+    if age_secs > QUOTE_MAX_POOL_STATE_AGE_SECS {
+        return Err(QuoteError::Stale { age_secs });
+    }
+    if state.total_liquidity <= 0 {
+        return Err(QuoteError::InsufficientLiquidity);
+    }
+
+    // Fee is charged on the input, rounded down, in input units.
+    let fee = (amount as i128 * fee_bps as i128 / 10_000) as i64;
+    let net_input = amount.saturating_sub(fee);
+
+    // Constant-product marginal price: shares per input unit scale with the
+    // existing shares over the pool liquidity.
+    let liquidity = state.total_liquidity as i128;
+    let shares = state.outcome_shares.max(0) as i128;
+    let output = (net_input as i128 * liquidity / (liquidity + shares)) as i64;
+
+    // Price impact: fraction of the pool consumed by the trade, in bps.
+    let price_impact_bps = ((net_input as i128 * 10_000) / (liquidity + net_input as i128))
+        .clamp(0, 10_000) as u32;
+
+    Ok(QuoteResponse {
+        pool_id: state.pool_id,
+        outcome,
+        input_units: amount,
+        output_estimate: output.max(0),
+        price_impact_bps,
+        fee,
+        quote_timestamp: now,
+    })
+}
+
+/// `GET /api/v1/pools/:id/quote` — deterministic, read-only trade quote.
+///
+/// Validates the pool id and input amount, loads the current pool state
+/// (pool cache first, then the indexer DB), rejects stale or unsupported
+/// state, and applies the shared pricing model.
+async fn get_pool_quote_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Query(query): Query<QuoteQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let amount = query.amount.get();
+    if pool_id <= 0 || amount <= 0 {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "pool id and amount must be positive",
+        )
+        .into_response();
+    }
+    let outcome = query.outcome.unwrap_or(0);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let pool_state = match load_quote_pool_state(&state, pool_id).await {
+        Ok(Some(pool_state)) => pool_state,
+        Ok(None) => {
+            return ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOT_FOUND,
+                "pool not found",
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, pool_id, "failed to load pool state for quote");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load pool state",
+            )
+            .into_response();
+        }
+    };
+
+    match compute_quote(
+        &pool_state,
+        amount,
+        outcome,
+        state.config.treasury_fee_bps,
+        now,
+    ) {
+        Ok(quote) => ApiResponse::success(quote).into_response(),
+        Err(QuoteError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "pool not found",
+        )
+        .into_response(),
+        Err(QuoteError::Stale { age_secs }) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("pool state is stale ({age_secs}s old)"),
+        )
+        .into_response(),
+        Err(QuoteError::UnsupportedState(status)) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("pool state '{status}' does not support quoting"),
+        )
+        .into_response(),
+        Err(QuoteError::InvalidAmount) => ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "amount must be positive",
+        )
+        .into_response(),
+        Err(QuoteError::InsufficientLiquidity) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            "pool has no liquidity",
+        )
+        .into_response(),
+    }
+}
+
+/// Load the pool state used for quoting: the pool cache is consulted first,
+/// then the indexer DB. Returns `Ok(None)` when the pool does not exist.
+async fn load_quote_pool_state(
+    state: &AppState,
+    pool_id: i64,
+) -> Result<Option<QuotePoolState>, sqlx::Error> {
+    if let crate::pool_cache::CacheLookup::Found(value) = state.pool_cache.get(pool_id) {
+        if let Some(pool_state) = quote_state_from_json(pool_id, &value) {
+            return Ok(Some(pool_state));
+        }
+    }
+
+    let Some(db) = &state.db else {
+        return Ok(None);
+    };
+
+    let row: Option<(i64, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, status, EXTRACT(EPOCH FROM updated_at)::BIGINT, \
+         COALESCE(total_liquidity, 0), COALESCE(outcome_shares, 0) \
+         FROM pools WHERE id = $1",
+    )
+    .bind(pool_id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(
+        |(pool_id, status, updated_at, total_liquidity, outcome_shares)| QuotePoolState {
+            pool_id,
+            status,
+            updated_at,
+            total_liquidity,
+            outcome_shares,
+        },
+    ))
+}
+
+/// Extract a [`QuotePoolState`] from a cached pool-detail JSON document.
+fn quote_state_from_json(pool_id: i64, value: &serde_json::Value) -> Option<QuotePoolState> {
+    let status = value.get("status")?.as_str()?.to_string();
+    let updated_at = value
+        .get("updated_at")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            value
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_market_timestamp(s).ok())
+                .map(|dt| dt.timestamp())
+        })?;
+    let total_liquidity = value
+        .get("total_liquidity")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let outcome_shares = value
+        .get("outcome_shares")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Some(QuotePoolState {
+        pool_id,
+        status,
+        updated_at,
+        total_liquidity,
+        outcome_shares,
+    })
+}
+
 /// Struct representing fee information, matching the contract structure.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FeeInfo {
@@ -574,6 +864,7 @@ pub struct PoolsResponse {
     pub offset: i64,
     pub status: String,
     pub category: Option<String>,
+    pub category_id: Option<String>,
     pub sort_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creator: Option<String>,
@@ -702,7 +993,29 @@ pub async fn get_stats(
         .into_response();
     };
 
-    let category = params.category.as_ref().map(|s| s.as_str());
+    let category = match params.category.as_ref().map(|s| s.as_str()) {
+        Some(input) => match crate::categories::resolve_category(db, input).await {
+            Ok(category) => Some(category.category_id),
+            Err(crate::categories::CategoryError::UnknownCategory) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unknown market category",
+                )
+                .into_response();
+            }
+            Err(crate::categories::CategoryError::Database) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "category registry unavailable",
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let category = category.as_deref();
     let status = params.status.map(|s| s.as_str());
 
     let cache_key = crate::redis_cache::stats_cache_key(category, status);
@@ -892,9 +1205,34 @@ pub async fn get_pools(
         .into_response();
     };
 
+    let resolved_category = match category {
+        Some(input) => match crate::categories::resolve_category(db, input).await {
+            Ok(category) => Some(category),
+            Err(crate::categories::CategoryError::UnknownCategory) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unknown market category",
+                )
+                .into_response();
+            }
+            Err(crate::categories::CategoryError::Database) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "category registry unavailable",
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let category_id = resolved_category.as_ref().map(|c| c.category_id.as_str());
+    let category_label = resolved_category.as_ref().map(|c| c.display_label.as_str());
+
     // Cache-aside pattern: Step 1 — Check cache
     let mut cache_key =
-        crate::redis_cache::pools_cache_key(sort_by, category, effective_status, limit, offset);
+        crate::redis_cache::pools_cache_key(sort_by, category_id, effective_status, limit, offset);
     if let Some(c) = creator_str {
         cache_key = format!("{cache_key}:creator:{c}");
     }
@@ -929,7 +1267,7 @@ pub async fn get_pools(
     // Cache miss — Step 2: Fetch from database with explicit filters
     let filter_criteria = crate::tags::MarketFilters {
         sort_by,
-        category,
+        category: category_id,
         tags: tags.as_deref(),
         status: effective_status,
         creator: creator_str,
@@ -940,7 +1278,7 @@ pub async fn get_pools(
         offset,
     };
     let count_criteria = crate::tags::MarketCountFilters {
-        category,
+        category: category_id,
         tags: tags.as_deref(),
         status: effective_status,
         creator: creator_str,
@@ -964,7 +1302,8 @@ pub async fn get_pools(
                 limit,
                 offset,
                 status: effective_status.to_string(),
-                category: category.map(|s| s.to_string()),
+                category: category_label.map(|s| s.to_string()),
+                category_id: category_id.map(|s| s.to_string()),
                 sort_by: sort_by.to_string(),
                 creator: creator_str.map(|s| s.to_string()),
                 tags,
@@ -1545,12 +1884,33 @@ pub async fn ingest_pool_created(
         .into_response();
     };
 
+    let category = match crate::categories::resolve_category(db, payload.category.as_str()).await {
+        Ok(category) => category,
+        Err(crate::categories::CategoryError::UnknownCategory) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "unknown market category",
+            )
+            .into_response();
+        }
+        Err(crate::categories::CategoryError::Database) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "category registry unavailable",
+            )
+            .into_response();
+        }
+    };
+
     let event = PoolCreatedEvent {
         pool_id: payload.pool_id,
         creator: payload.creator.into(),
         end_time: payload.end_time,
         token: payload.token.into(),
-        category: payload.category.into(),
+        category: category.display_label,
+        category_id: category.category_id,
         description: payload.description.into(),
     };
 
@@ -1784,7 +2144,7 @@ mod abuse_quota_tests {
     use crate::abuse::AbuseAction;
 
     fn test_state() -> AppState {
-        let config = Arc::new(Config::default());
+        let config = Arc::new(Config::default_for_test());
         let redis = RedisCache::disabled();
         AppState {
             abuse: Arc::new(AbuseController::from_config(&config)),
@@ -1794,7 +2154,7 @@ mod abuse_quota_tests {
             market_reads: market_reads_cache(&redis),
             redis,
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
         }
     }
@@ -1829,7 +2189,9 @@ mod abuse_quota_tests {
         }
         let response = response.expect("expected a rejection");
         assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
-        assert!(response.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert!(response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER));
     }
 }
 
@@ -1930,9 +2292,7 @@ pub async fn pay_creator_incentive_handler(
                 .await;
             Json(json!({ "status": "paid", "pool_id": pool_id, "amount": amount })).into_response()
         }
-        Ok(None) => {
-            Json(json!({ "status": "not_eligible", "pool_id": pool_id })).into_response()
-        }
+        Ok(None) => Json(json!({ "status": "not_eligible", "pool_id": pool_id })).into_response(),
         Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
     }
 }
@@ -2088,6 +2448,32 @@ pub async fn get_user_profile_handler(
 
 // ── Pool tags ────────────────────────────────────────────────────────────────
 
+/// `GET /api/v1/categories` — governed category registry, including aliases
+/// and deprecated categories retained for historic discovery.
+pub async fn list_categories_handler(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::categories::list_categories(db).await {
+        Ok(categories) => ApiResponse::success(categories).into_response(),
+        Err(error) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            error.to_string(),
+        )
+        .into_response(),
+    }
+}
+
 /// `GET /api/v1/tags` — distinct tags currently in use, for filter-UI dropdowns.
 pub async fn list_tags_handler(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;
@@ -2189,6 +2575,22 @@ pub struct ClaimPayload {
     pub user_address: StellarAddress,
     /// Amount paid out by `claim_winnings` / `claim_refund` (0 for losers).
     pub amount_paid: i64,
+    /// Optional canonical on-chain coordinates for this claim event (#309).
+    /// When every one of these is present, the claim is also recorded in
+    /// the wallet activity ledger with its canonical transaction reference.
+    /// Omitted (or only partially supplied) fields keep today's behavior:
+    /// `predictions.claimed_amount` is updated either way, since that
+    /// remains the payout ground truth independent of the activity ledger.
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub contract_id: Option<String>,
+    #[serde(default)]
+    pub ledger: Option<u64>,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    #[serde(default)]
+    pub event_index: Option<u32>,
 }
 
 /// `POST /api/v1/indexer/claim` — ingest a decoded `WinningsClaimed` /
@@ -2226,6 +2628,48 @@ pub async fn ingest_claim_handler(
     .await
     {
         Ok(rows) => {
+            // Best-effort: record the claim in the wallet activity ledger
+            // (#309) when the payload carries full chain coordinates. This
+            // is not inside the same transaction as the claim update above
+            // (claims are not threaded through `project_event_tx`'s
+            // transactional dedupe today), so it is idempotent via
+            // `ON CONFLICT DO NOTHING` rather than atomic with it.
+            if let (Some(network), Some(contract_id), Some(ledger), Some(tx_hash), Some(event_index)) = (
+                &payload.network,
+                &payload.contract_id,
+                payload.ledger,
+                &payload.tx_hash,
+                payload.event_index,
+            ) {
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO portfolio_activity_ledger
+                        (network, contract_id, ledger, tx_hash, event_index, event_type,
+                         user_address, pool_id, amount)
+                    VALUES ($1, $2, $3, $4, $5, 'claim', $6, $7, $8)
+                    ON CONFLICT (network, contract_id, ledger, tx_hash, event_index, user_address)
+                    DO NOTHING
+                    "#,
+                )
+                .bind(network)
+                .bind(contract_id)
+                .bind(ledger as i64)
+                .bind(tx_hash)
+                .bind(event_index as i32)
+                .bind(payload.user_address.as_str())
+                .bind(payload.pool_id as i64)
+                .bind(payload.amount_paid)
+                .execute(db)
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        pool_id = payload.pool_id,
+                        "failed to record claim in wallet activity ledger (claim itself still succeeded)"
+                    );
+                }
+            }
+
             ApiResponse::success(json!({ "status": "ok", "rows_updated": rows })).into_response()
         }
         Err(e) => ApiResponse::<()>::error(
@@ -2536,6 +2980,109 @@ pub async fn reset_notification_preferences_handler(
     }
 }
 
+/// Query parameters for `GET /api/v1/notifications/digest/unsubscribe`.
+#[derive(Debug, Deserialize)]
+pub struct DigestUnsubscribeQuery {
+    /// Signed, single-use unsubscribe token from the digest email footer.
+    pub token: String,
+}
+
+/// `GET /api/v1/notifications/digest/unsubscribe?token=...` — one-click
+/// opt-out from the weekly market digest.
+///
+/// The token is signed with the server secret and bound to the wallet, so it
+/// can be redeemed without a bearer token (mail clients cannot send one).
+/// Redemption is single-use: once consumed the token is rejected, and expired
+/// tokens are rejected before any state is touched. On success the wallet's
+/// digest preference is disabled and a confirmation is returned.
+pub async fn digest_unsubscribe_handler(
+    State(state): State<AppState>,
+    Query(params): Query<DigestUnsubscribeQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let claims = match crate::notifications::verify_digest_unsubscribe_token(
+        &params.token,
+        &state.config.secret_key,
+        now,
+    ) {
+        Ok(claims) => claims,
+        Err(crate::notifications::DigestTokenError::Expired) => {
+            return ApiResponse::<()>::error(
+                StatusCode::GONE,
+                error_codes::INVALID_INPUT,
+                "unsubscribe link has expired",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::DigestTokenError::Invalid) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "invalid unsubscribe token",
+            )
+            .into_response()
+        }
+    };
+
+    // Single-use enforcement: the token id is recorded in the revocation
+    // store, so a replayed link fails closed even across replicas.
+    let store = crate::token_revocation::RevocationStore::new(state.db.clone(), state.redis.clone());
+    match store.consume_digest_unsubscribe_token(&claims.jti, claims.exp, now).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return ApiResponse::<()>::error(
+                StatusCode::GONE,
+                error_codes::INVALID_INPUT,
+                "unsubscribe link has already been used",
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "digest unsubscribe token check failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to redeem unsubscribe token",
+            )
+            .into_response();
+        }
+    }
+
+    match crate::notifications::disable_digest_for_wallet(db, &claims.sub).await {
+        Ok(preferences) => ApiResponse::success(json!({
+            "status": "unsubscribed",
+            "address": claims.sub,
+            "digest": preferences.digest,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "digest unsubscribe failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to update digest preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
 /// `PUT /api/v1/notifications/:address/push-subscription` — create or rotate
 /// a browser push subscription after proving ownership of the wallet.
 pub async fn put_push_subscription_handler(
@@ -2657,6 +3204,261 @@ pub async fn delete_push_subscription_handler(
             .into_response()
         }
     }
+}
+
+// ── Portfolio JSON export (#265) ─────────────────────────────────────────────
+
+/// Schema identifier emitted by the portfolio JSON export. Bump the suffix
+/// whenever the payload shape changes incompatibly.
+pub const PORTFOLIO_EXPORT_SCHEMA: &str = "portfolio.export.v1";
+
+/// Default number of positions/ledger entries returned by the export.
+pub const PORTFOLIO_EXPORT_DEFAULT_LIMIT: i64 = 100;
+/// Hard upper bound on the number of positions/ledger entries per export.
+pub const PORTFOLIO_EXPORT_MAX_LIMIT: i64 = 500;
+
+/// Query parameters for `GET /api/v1/users/:address/portfolio/export`.
+#[derive(Debug, Default, Deserialize)]
+pub struct PortfolioExportQuery {
+    /// Maximum number of positions (and ledger entries) to include.
+    pub limit: Option<i64>,
+    /// Opaque continuation cursor returned by a previous truncated export.
+    pub cursor: Option<String>,
+}
+
+/// A single open/closed position in the exported portfolio.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportPosition {
+    pub pool_id: i64,
+    pub outcome: i16,
+    pub amount: i64,
+    pub claimed: bool,
+    /// Provenance of the position record.
+    pub source: PortfolioExportSource,
+}
+
+/// A single ledger entry (stake, payout or refund) in the exported portfolio.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportLedgerEntry {
+    pub pool_id: i64,
+    pub kind: String,
+    pub amount: i64,
+    pub occurred_at: Option<String>,
+    pub source: PortfolioExportSource,
+}
+
+/// Reference to the authoritative source a record was derived from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportSource {
+    /// Logical source, e.g. `indexer_db` or `chain_event`.
+    pub kind: String,
+    /// Table or event name the record came from.
+    pub reference: String,
+}
+
+/// Metadata describing how the export was calculated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportCalculation {
+    /// Identifier of the calculation/assembly routine.
+    pub method: String,
+    /// Version of the calculation routine.
+    pub version: u32,
+    /// Whether the export was bounded (i.e. a limit was applied).
+    pub bounded: bool,
+    /// Limit that was applied to positions and ledger entries.
+    pub limit: i64,
+    /// Number of positions included in this page.
+    pub position_count: usize,
+    /// Number of ledger entries included in this page.
+    pub ledger_entry_count: usize,
+}
+
+/// Versioned, self-describing portfolio export document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExport {
+    /// Schema identifier — always [`PORTFOLIO_EXPORT_SCHEMA`].
+    pub schema: String,
+    /// Wallet the export belongs to.
+    pub address: String,
+    /// Positions included in this page.
+    pub positions: Vec<PortfolioExportPosition>,
+    /// Ledger entries included in this page.
+    pub ledger_entries: Vec<PortfolioExportLedgerEntry>,
+    /// Calculation metadata.
+    pub calculation: PortfolioExportCalculation,
+    /// True when more records exist beyond this page.
+    pub truncated: bool,
+    /// Cursor to pass as `cursor` to fetch the next page, if truncated.
+    #[serde(rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+    /// Total number of positions for the wallet (before truncation).
+    #[serde(rename = "totalCount")]
+    pub total_count: i64,
+}
+
+/// Resolve the effective export limit, clamping into bounds.
+fn resolve_portfolio_export_limit(limit: Option<i64>) -> i64 {
+    match limit {
+        Some(value) if value > 0 => value.min(PORTFOLIO_EXPORT_MAX_LIMIT),
+        _ => PORTFOLIO_EXPORT_DEFAULT_LIMIT,
+    }
+}
+
+/// Encode a continuation cursor as the id of the last exported position.
+fn encode_portfolio_cursor(last_pool_id: i64) -> String {
+    format!("v1:{last_pool_id}")
+}
+
+/// Decode a continuation cursor, returning `None` when it is malformed.
+fn decode_portfolio_cursor(cursor: &str) -> Option<i64> {
+    cursor.strip_prefix("v1:")?.parse::<i64>().ok()
+}
+
+/// Assemble a [`PortfolioExport`] from raw position rows.
+///
+/// Positions are ordered by `pool_id`; the cursor is the last exported
+/// `pool_id`, so a truncated export can be continued deterministically.
+fn build_portfolio_export(
+    address: &str,
+    mut positions: Vec<PortfolioExportPosition>,
+    limit: i64,
+    total_count: i64,
+) -> PortfolioExport {
+    positions.sort_by_key(|position| position.pool_id);
+    let truncated = positions.len() as i64 > limit;
+    positions.truncate(limit as usize);
+
+    let ledger_entries: Vec<PortfolioExportLedgerEntry> = positions
+        .iter()
+        .map(|position| PortfolioExportLedgerEntry {
+            pool_id: position.pool_id,
+            kind: if position.claimed {
+                "claim".to_string()
+            } else {
+                "stake".to_string()
+            },
+            amount: position.amount,
+            occurred_at: None,
+            source: position.source.clone(),
+        })
+        .collect();
+
+    let next_cursor = if truncated {
+        positions
+            .last()
+            .map(|position| encode_portfolio_cursor(position.pool_id))
+    } else {
+        None
+    };
+
+    PortfolioExport {
+        schema: PORTFOLIO_EXPORT_SCHEMA.to_string(),
+        address: address.to_string(),
+        calculation: PortfolioExportCalculation {
+            method: "portfolio_export".to_string(),
+            version: 1,
+            bounded: true,
+            limit,
+            position_count: positions.len(),
+            ledger_entry_count: ledger_entries.len(),
+        },
+        positions,
+        ledger_entries,
+        truncated,
+        next_cursor,
+        total_count,
+    }
+}
+
+/// `GET /api/v1/users/:address/portfolio/export` — versioned JSON export of a
+/// wallet's complete portfolio (positions, ledger entries, provenance and
+/// calculation metadata) with explicit truncation/continuation fields.
+pub async fn export_portfolio_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Query(params): Query<PortfolioExportQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let limit = resolve_portfolio_export_limit(params.limit);
+    let after_pool_id = match params.cursor.as_deref() {
+        Some(cursor) => match decode_portfolio_cursor(cursor) {
+            Some(value) => Some(value),
+            None => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "invalid portfolio export cursor",
+                )
+                .into_response()
+            }
+        },
+        None => None,
+    };
+
+    // Fetch one extra row so truncation can be detected without a second query.
+    let fetch_limit = limit.saturating_add(1);
+    let rows = match crate::db::predictions::list_portfolio_positions(
+        db,
+        address.as_str(),
+        after_pool_id,
+        fetch_limit,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(error = %error, "portfolio export query failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load portfolio export",
+            )
+            .into_response();
+        }
+    };
+
+    let total_count = match crate::db::predictions::count_portfolio_positions(db, address.as_str())
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(error = %error, "portfolio export count failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load portfolio export",
+            )
+            .into_response();
+        }
+    };
+
+    let positions: Vec<PortfolioExportPosition> = rows
+        .into_iter()
+        .map(|row| PortfolioExportPosition {
+            pool_id: row.pool_id,
+            outcome: row.outcome,
+            amount: row.amount,
+            claimed: row.claimed,
+            source: PortfolioExportSource {
+                kind: "indexer_db".to_string(),
+                reference: "predictions".to_string(),
+            },
+        })
+        .collect();
+
+    let export = build_portfolio_export(address.as_str(), positions, limit, total_count);
+    ApiResponse::success(export).into_response()
 }
 
 /// `GET /api/v1/users/:address/interests` — categories/tags a user follows
@@ -2831,9 +3633,11 @@ pub fn router(
         Router::new()
             .route("/pools", get(get_pools))
             .route("/pools/:id", get(get_pool_by_id_handler))
+            .route("/pools/:id/quote", get(get_pool_quote_handler))
             .route("/pools/:id/leaderboard", get(get_pool_leaderboard))
             .route("/stats", get(get_stats))
             .route("/leaderboard", get(get_leaderboard))
+            .route("/categories", get(list_categories_handler))
             .route("/tags", get(list_tags_handler))
             .route("/referrals/:address", get(referrals_handler))
             .route(
@@ -2841,6 +3645,18 @@ pub fn router(
                 get(referral_estimate_handler),
             )
             .route("/markets/:id/predictions", get(get_market_predictions))
+            .route(
+                "/wallets/:address/activity",
+                get(crate::routes::portfolio::get_wallet_activity_handler),
+            )
+            .route(
+                "/wallets/:address/pnl",
+                get(crate::routes::portfolio::get_wallet_pnl_handler),
+            )
+            .route(
+                "/wallets/:address/snapshot",
+                get(crate::routes::portfolio::get_wallet_snapshot_handler),
+            )
             .with_state(state.clone()),
         RateLimitTier::Read,
         state.redis.clone(),
@@ -2852,6 +3668,10 @@ pub fn router(
             .route("/users/:address/history", get(get_user_history))
             .route("/users/:address/predictions", get(get_user_predictions))
             .route("/users/:address/profile", get(get_user_profile_handler))
+            .route(
+                "/users/:address/portfolio/export",
+                get(export_portfolio_handler),
+            )
             .route(
                 "/users/:address/referrals",
                 get(user_referral_earnings_handler),
@@ -2873,6 +3693,10 @@ pub fn router(
             )
             .route("/notifications/:address", get(list_notifications_handler))
             .route(
+                "/notifications/digest/unsubscribe",
+                get(digest_unsubscribe_handler),
+            )
+            .route(
                 "/notifications/:address/push-subscription",
                 put(put_push_subscription_handler)
                     .delete(delete_push_subscription_handler)
@@ -2885,6 +3709,23 @@ pub fn router(
                 post(mark_notifications_read_handler).layer(DefaultBodyLimit::max(
                     crate::notifications::MAX_NOTIFICATION_PREFERENCES_BODY_BYTES,
                 )),
+            )
+            .route(
+                "/wallets/:address/exports",
+                post(crate::routes::portfolio::create_export_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_PORTFOLIO_EXPORT)),
+            )
+            .route(
+                "/portfolio/exports/:id",
+                get(crate::routes::portfolio::get_export_status_handler),
+            )
+            .route(
+                "/portfolio/exports/:id/download",
+                get(crate::routes::portfolio::download_export_handler),
+            )
+            .route(
+                "/portfolio/exports/:id/cancel",
+                post(crate::routes::portfolio::cancel_export_handler),
             )
             .with_state(state.clone()),
         RateLimitTier::User,
@@ -3467,6 +4308,127 @@ mod pools_pagination_tests {
     }
 }
 
+/// Tests for the deterministic market quote simulation (#269).
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    fn active_state(updated_at: i64) -> QuotePoolState {
+        QuotePoolState {
+            pool_id: 1,
+            status: "active".to_string(),
+            updated_at,
+            total_liquidity: 10_000,
+            outcome_shares: 2_500,
+        }
+    }
+
+    #[test]
+    fn quote_is_deterministic_for_same_inputs() {
+        let state = active_state(1_000);
+        let a = compute_quote(&state, 500, 0, 100, 1_010).unwrap();
+        let b = compute_quote(&state, 500, 0, 100, 1_010).unwrap();
+        assert_eq!(a.output_estimate, b.output_estimate);
+        assert_eq!(a.price_impact_bps, b.price_impact_bps);
+        assert_eq!(a.fee, b.fee);
+        assert_eq!(a.quote_timestamp, b.quote_timestamp);
+    }
+
+    #[test]
+    fn quote_returns_input_output_impact_fee_and_timestamp() {
+        let state = active_state(1_000);
+        let quote = compute_quote(&state, 1_000, 0, 100, 1_010).unwrap();
+        assert_eq!(quote.input_units, 1_000);
+        assert_eq!(quote.fee, 10);
+        assert!(quote.output_estimate > 0);
+        assert!(quote.price_impact_bps > 0);
+        assert_eq!(quote.quote_timestamp, 1_010);
+    }
+
+    #[test]
+    fn quote_rejects_stale_pool_state() {
+        let state = active_state(1_000);
+        let err = compute_quote(
+            &state,
+            100,
+            0,
+            100,
+            1_000 + QUOTE_MAX_POOL_STATE_AGE_SECS + 1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuoteError::Stale { .. }));
+    }
+
+    #[test]
+    fn quote_rejects_unsupported_pool_state() {
+        let mut state = active_state(1_000);
+        state.status = "settled".to_string();
+        let err = compute_quote(&state, 100, 0, 100, 1_010).unwrap_err();
+        assert!(matches!(err, QuoteError::UnsupportedState(_)));
+    }
+
+    #[test]
+    fn quote_rejects_non_positive_amount() {
+        let state = active_state(1_000);
+        assert_eq!(
+            compute_quote(&state, 0, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InvalidAmount
+        );
+        assert_eq!(
+            compute_quote(&state, -1, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InvalidAmount
+        );
+    }
+
+    #[test]
+    fn quote_rejects_empty_liquidity() {
+        let mut state = active_state(1_000);
+        state.total_liquidity = 0;
+        assert_eq!(
+            compute_quote(&state, 100, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InsufficientLiquidity
+        );
+    }
+
+    #[test]
+    fn quote_matches_reference_constant_product_model() {
+        // Reference: output = net_input * L / (L + shares), impact = net * 1e4 / (L + net).
+        let state = active_state(1_000);
+        let amount = 2_000i64;
+        let fee_bps = 50u32;
+        let quote = compute_quote(&state, amount, 0, fee_bps, 1_010).unwrap();
+        let fee = (amount as i128 * fee_bps as i128 / 10_000) as i64;
+        let net = amount - fee;
+        let expected_output = (net as i128 * 10_000 / (10_000 + 2_500)) as i64;
+        let expected_impact = ((net as i128 * 10_000) / (10_000 + net as i128)) as u32;
+        assert_eq!(quote.fee, fee);
+        assert_eq!(quote.output_estimate, expected_output);
+        assert_eq!(quote.price_impact_bps, expected_impact);
+    }
+
+    #[test]
+    fn quote_state_from_json_parses_cached_pool() {
+        let value = serde_json::json!({
+            "status": "active",
+            "updated_at": 1_000,
+            "total_liquidity": 5_000,
+            "outcome_shares": 500,
+        });
+        let state = quote_state_from_json(7, &value).expect("valid cached pool");
+        assert_eq!(state.pool_id, 7);
+        assert_eq!(state.status, "active");
+        assert_eq!(state.updated_at, 1_000);
+        assert_eq!(state.total_liquidity, 5_000);
+        assert_eq!(state.outcome_shares, 500);
+    }
+
+    #[test]
+    fn quote_state_from_json_rejects_missing_status() {
+        let value = serde_json::json!({ "updated_at": 1_000 });
+        assert!(quote_state_from_json(7, &value).is_none());
+    }
+}
+
 #[cfg(test)]
 mod market_filters_tests {
     use super::*;
@@ -3578,18 +4540,24 @@ mod data_ownership_contract_tests {
         assert!(cache.get::<serde_json::Value>(&key).await.is_none());
 
         let state = AppState {
-            config: Arc::new(Config::default()),
+            config: Arc::new(Config::default_for_test()),
             cache: PriceCache::new(),
             pool_cache: PoolCache::default(),
             market_reads: market_reads_cache(&cache),
             redis: cache.clone(),
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
-            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
         };
-        let response = get_stats(State(state), Query(StatsQuery { category: None, status: None }))
-            .await;
+        let response = get_stats(
+            State(state),
+            Query(StatsQuery {
+                category: None,
+                status: None,
+            }),
+        )
+        .await;
         assert_eq!(
             response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -3613,7 +4581,10 @@ mod data_ownership_contract_tests {
     fn analytics_pool_cache_keys_do_not_collide_across_filters() {
         let base = pools_cache_key("new", None, "active", 20, 0);
         assert_ne!(base, pools_cache_key("popular", None, "active", 20, 0));
-        assert_ne!(base, pools_cache_key("new", Some("sports"), "active", 20, 0));
+        assert_ne!(
+            base,
+            pools_cache_key("new", Some("sports"), "active", 20, 0)
+        );
         assert_ne!(base, pools_cache_key("new", None, "settled", 20, 0));
         assert_ne!(base, pools_cache_key("new", None, "active", 20, 20));
     }
@@ -3630,15 +4601,15 @@ mod data_ownership_contract_tests {
         );
 
         let state = AppState {
-            config: Arc::new(Config::default()),
+            config: Arc::new(Config::default_for_test()),
             cache,
             pool_cache: PoolCache::default(),
             market_reads: market_reads_cache(&RedisCache::disabled()),
             redis: RedisCache::disabled(),
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
-            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
         };
         let response = health(State(state)).await;
         assert_eq!(
@@ -3692,21 +4663,20 @@ mod data_ownership_contract_tests {
     #[tokio::test]
     async fn profiles_require_indexer_db() {
         let state = AppState {
-            config: Arc::new(Config::default()),
+            config: Arc::new(Config::default_for_test()),
             cache: PriceCache::new(),
             pool_cache: PoolCache::default(),
             market_reads: market_reads_cache(&RedisCache::disabled()),
             redis: RedisCache::disabled(),
             db: None,
-            metrics: SharedMetrics::default(),
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
             event_bus: crate::ws::EventBus::new(),
-            abuse: Arc::new(AbuseController::from_config(&Config::default())),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
         };
-        let address: StellarAddress =
-            serde_json::from_value(serde_json::json!(
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
-            ))
-            .expect("valid address");
+        let address: StellarAddress = serde_json::from_value(serde_json::json!(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+        ))
+        .expect("valid address");
         let response = get_user_profile_handler(State(state), Path(address)).await;
         assert_eq!(
             response.status(),
@@ -3729,7 +4699,11 @@ mod data_ownership_contract_tests {
             .set(&pool_key, &serde_json::json!({"total": 1}), POOLS_CACHE_TTL)
             .await;
         cache
-            .set(&stats_key, &serde_json::json!({"total_pools": 1}), STATS_CACHE_TTL)
+            .set(
+                &stats_key,
+                &serde_json::json!({"total_pools": 1}),
+                STATS_CACHE_TTL,
+            )
             .await;
 
         // A chain event arrives that disagrees with the cached view; the
@@ -3742,6 +4716,88 @@ mod data_ownership_contract_tests {
         assert!(cache.get::<serde_json::Value>(&stats_key).await.is_none());
     }
 
+    /// Portfolio export (#265): the versioned document round-trips through
+    /// JSON for a large wallet fixture and carries explicit truncation and
+    /// continuation information.
+    #[test]
+    fn portfolio_export_round_trips_for_large_wallet_fixture() {
+        let limit = 100;
+        let fixture: Vec<PortfolioExportPosition> = (0..250)
+            .map(|index| PortfolioExportPosition {
+                pool_id: index,
+                outcome: (index % 2) as i16,
+                amount: 10 * (index + 1),
+                claimed: index % 3 == 0,
+                source: PortfolioExportSource {
+                    kind: "indexer_db".to_string(),
+                    reference: "predictions".to_string(),
+                },
+            })
+            .collect();
+
+        let export = build_portfolio_export(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            fixture,
+            limit,
+            250,
+        );
+
+        assert_eq!(export.schema, PORTFOLIO_EXPORT_SCHEMA);
+        assert!(export.truncated, "a 250-position wallet must truncate");
+        assert_eq!(export.total_count, 250);
+        assert_eq!(export.positions.len() as i64, limit);
+        assert_eq!(export.ledger_entries.len(), export.positions.len());
+        assert_eq!(export.calculation.position_count, export.positions.len());
+        assert_eq!(export.next_cursor, Some(encode_portfolio_cursor(limit - 1)));
+
+        // Round-trip: serialise, parse back, and compare the whole document.
+        let encoded = serde_json::to_string(&export).expect("export serialises");
+        let decoded: PortfolioExport = serde_json::from_str(&encoded).expect("export parses");
+        assert_eq!(decoded, export);
+
+        // The continuation cursor decodes back to the last exported pool id.
+        let cursor = decoded.next_cursor.expect("truncated export has a cursor");
+        assert_eq!(decode_portfolio_cursor(&cursor), Some(limit - 1));
+        assert_eq!(decode_portfolio_cursor("not-a-cursor"), None);
+    }
+
+    /// Portfolio export (#265): a wallet smaller than the limit is not
+    /// truncated and reports no continuation cursor.
+    #[test]
+    fn portfolio_export_is_not_truncated_when_it_fits() {
+        let fixture = vec![PortfolioExportPosition {
+            pool_id: 7,
+            outcome: 1,
+            amount: 42,
+            claimed: false,
+            source: PortfolioExportSource {
+                kind: "indexer_db".to_string(),
+                reference: "predictions".to_string(),
+            },
+        }];
+        let export = build_portfolio_export("GADDRESS", fixture, 100, 1);
+        assert!(!export.truncated);
+        assert_eq!(export.next_cursor, None);
+        assert_eq!(export.total_count, 1);
+        assert_eq!(export.positions.len(), 1);
+    }
+
+    /// Portfolio export (#265): limits are clamped into documented bounds.
+    #[test]
+    fn portfolio_export_limit_is_bounded() {
+        assert_eq!(
+            resolve_portfolio_export_limit(None),
+            PORTFOLIO_EXPORT_DEFAULT_LIMIT
+        );
+        assert_eq!(resolve_portfolio_export_limit(Some(0)), PORTFOLIO_EXPORT_DEFAULT_LIMIT);
+        assert_eq!(resolve_portfolio_export_limit(Some(-1)), PORTFOLIO_EXPORT_DEFAULT_LIMIT);
+        assert_eq!(resolve_portfolio_export_limit(Some(10)), 10);
+        assert_eq!(
+            resolve_portfolio_export_limit(Some(1_000_000)),
+            PORTFOLIO_EXPORT_MAX_LIMIT
+        );
+    }
+
     /// Conflict behaviour: a stale pool-detail cache entry must be dropped
     /// when the chain reports a lifecycle change, so readers never see the
     /// pre-change status.
@@ -3751,7 +4807,19 @@ mod data_ownership_contract_tests {
         let pool_id = 42;
         pool_cache.set(
             pool_id,
-            serde_json::json!({"id": pool_id, "status": "active"}),
+            crate::db::PoolWithOdds {
+                pool_id,
+                name: "test pool".to_string(),
+                category: "test".to_string(),
+                total_stake: 0,
+                end_time: chrono::Utc::now(),
+                created_at: chrono::Utc::now(),
+                state: "active".to_string(),
+                creator: "GCREATOR".to_string(),
+                token: "CTOKEN".to_string(),
+                result: None,
+                odds: Vec::new(),
+            },
         );
         assert!(matches!(
             pool_cache.get(pool_id),

@@ -114,7 +114,11 @@ async fn competing_workers_complete_each_job_once() {
     let executions = executions.lock().unwrap().clone();
     assert_eq!(executions.len(), ids.len());
     for id in &ids {
-        assert_eq!(executions.get(id), Some(&1), "job {id} executed more than once");
+        assert_eq!(
+            executions.get(id),
+            Some(&1),
+            "job {id} executed more than once"
+        );
         let (status, attempts, token, _) = job_row(&pool, *id).await;
         assert_eq!((status.as_str(), attempts, token), ("succeeded", 1, 1));
     }
@@ -165,15 +169,24 @@ async fn killed_lease_holder_is_fenced_and_job_redelivered() {
     assert_eq!((fresh.id, fresh.fencing_token, fresh.attempt), (id, 2, 2));
 
     // A comes back from the dead: every write it attempts is rejected.
-    assert!(matches!(store.complete(&stale).await, Err(LeaseError::Lost)));
+    assert!(matches!(
+        store.complete(&stale).await,
+        Err(LeaseError::Lost)
+    ));
     assert!(matches!(store.extend(&stale).await, Err(LeaseError::Lost)));
     assert!(matches!(
         store.fail(&stale, &JobError::Terminal("late".into())).await,
         Err(LeaseError::Lost)
     ));
 
-    store.complete(&fresh).await.expect("current holder completes");
-    assert!(matches!(store.complete(&fresh).await, Err(LeaseError::Lost)));
+    store
+        .complete(&fresh)
+        .await
+        .expect("current holder completes");
+    assert!(matches!(
+        store.complete(&fresh).await,
+        Err(LeaseError::Lost)
+    ));
     let (status, attempts, token, _) = job_row(&pool, id).await;
     assert_eq!((status.as_str(), attempts, token), ("succeeded", 2, 2));
 }
@@ -235,7 +248,10 @@ async fn redelivery_is_bounded_by_max_attempts() {
     assert!(store.claim(&queue, "crashy").await.unwrap().is_none());
     let (status, attempts, _, last_error) = job_row(&pool, id).await;
     assert_eq!((status.as_str(), attempts), ("failed", 2));
-    assert_eq!(last_error.as_deref(), Some("lease expired on final attempt"));
+    assert_eq!(
+        last_error.as_deref(),
+        Some("lease expired on final attempt")
+    );
 }
 
 /// Retryable errors go back to pending; terminal errors fail immediately.
@@ -251,7 +267,9 @@ async fn retryable_and_terminal_errors() {
         .unwrap();
 
     let report = store
-        .run_one(&queue, "w", |_| async { Err(JobError::Retryable("upstream down".into())) })
+        .run_one(&queue, "w", |_| async {
+            Err(JobError::Retryable("upstream down".into()))
+        })
         .await
         .unwrap()
         .unwrap();
@@ -260,7 +278,9 @@ async fn retryable_and_terminal_errors() {
 
     // Second (final) attempt: retryable errors no longer retry.
     let report = store
-        .run_one(&queue, "w", |_| async { Err(JobError::Retryable("still down".into())) })
+        .run_one(&queue, "w", |_| async {
+            Err(JobError::Retryable("still down".into()))
+        })
         .await
         .unwrap()
         .unwrap();
@@ -273,7 +293,9 @@ async fn retryable_and_terminal_errors() {
         .unwrap()
         .unwrap();
     let report = store
-        .run_one(&queue, "w", |_| async { Err(JobError::Terminal("bad payload".into())) })
+        .run_one(&queue, "w", |_| async {
+            Err(JobError::Terminal("bad payload".into()))
+        })
         .await
         .unwrap()
         .unwrap();

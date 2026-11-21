@@ -107,6 +107,7 @@ For full deployment guidelines, rollback SQL scripts, and interrupted migration 
 | `011_align_market_filter_indexes.sql` | Composite and partial indexes on `pools` for predictable status, time, creator, and outcome query plans. | `Share` | `IndexBuild` | **Yes** |
 | `011_create_listener_checkpoints.sql` | Dedicated listener checkpoints table and app_state compatibility table for atomic cursor persistence. | `AccessExclusive` | `MetadataOnly` | **Yes** |
 | `019_notification_inbox_preferences_push.sql` | Versioned wallet preferences, encrypted browser push subscriptions, cursor inbox index, and separated transactional outboxes. | `Share` | `DataBackfill` | **Yes** |
+| `020_governed_category_taxonomy.sql` | Stable category/alias registry and additive `pools.category_id` backfill for historic category labels. | `Share` | `MetadataOnly` / `DataBackfill` | **Yes** |
 | `021_market_proposals.sql` | Stores market proposal draft metadata used for bounded duplicate detection and distinction notes. | `Share` | `MetadataOnly` | **Yes** |
 
 The entries above document the migrations applicable to these schema areas.

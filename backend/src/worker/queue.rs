@@ -775,6 +775,9 @@ mod tests {
         };
         q.record_failure(job.clone(), "boom");
         assert_eq!(q.dead_letters().len(), 0); // first failure → retry
+        // The retry carries a (short) backoff delay before it becomes ready;
+        // wait it out rather than racing `dequeue_ready` against it.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let mut retried = q.dequeue_ready().expect("pending retry");
         retried.attempts = 1;
         q.record_failure(retried, "boom again");
@@ -897,6 +900,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: Some(42),
+            trace_context: None,
         };
         let result = q
             .process_with_retry(job, |_j| {
@@ -930,6 +934,7 @@ mod tests {
             payload: "{}".into(),
             attempts: 0,
             ledger: None,
+            trace_context: None,
         };
         assert!(q.enqueue(job.clone()));
         q.record_success(&job);

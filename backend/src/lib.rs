@@ -8,17 +8,20 @@
 pub mod api_versioning;
 pub mod abuse;
 pub mod cache_coalesce;
+pub mod categories;
 pub mod config;
 pub mod constants;
 pub mod cors;
 pub mod duplicate_markets;
 pub mod db;
 pub mod errors;
+pub mod health;
 pub mod idempotency;
 pub mod jwt;
 pub mod jwt_security;
 pub mod metrics;
 pub mod migration_checks;
+pub mod moderation_audit;
 pub mod notifications;
 // pub mod outbox;
 pub mod openapi;
@@ -32,6 +35,7 @@ pub mod referrals;
 pub mod request_logger;
 pub mod response;
 pub mod routes;
+pub mod rpc_quota;
 pub mod rpc_resilience;
 pub mod seed;
 pub mod server;
@@ -62,13 +66,13 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use tracing_subscriber::prelude::*;
 
-pub use cors:{
+pub use cors::{
     build_cors, build_credentialed_cors, build_public_cors, is_public_read_route,
     DynamicCorsLayer,
 };
 
 /// Check database health with a simple query.
-async fn check_db_health(db: &option<sqlx.PgPool>) -> (String, String) {
+async fn check_db_health(db: &Option<sqlx::PgPool>) -> (String, String) {
     if let Some(pool) = db {
         match sqlx::query("SELECT 1").execute(pool).await {
             Ok(_) => ("ok".to_string(), String::new()),
@@ -206,6 +210,7 @@ pub fn build_router(
         db: None,
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
+        abuse: Arc::new(crate::abuse::AbuseController::from_config(&config)),
     };
 
     let router = Router::new()
@@ -254,6 +259,7 @@ pub fn build_router_with_db(
         db: Some(pool.clone()),
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
+        abuse: Arc::new(crate::abuse::AbuseController::from_config(&config)),
     };
 
     let router = Router::new()

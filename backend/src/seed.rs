@@ -363,11 +363,12 @@ pub async fn insert_seed_pools(pool: &PgPool, pools: &[SeedPool]) -> Result<u64,
         let result_str = p.result.map(|r| r.to_string());
         sqlx::query(
             r#"
-            INSERT INTO pools (pool_id, name, category, total_stake, end_time, state, creator, token, result, created_at)
-            VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, NOW())
+            INSERT INTO pools (pool_id, name, category, category_id, total_stake, end_time, state, creator, token, result, created_at)
+            VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9, NOW())
             ON CONFLICT (pool_id) DO UPDATE SET
                 name        = EXCLUDED.name,
                 category    = EXCLUDED.category,
+                category_id = EXCLUDED.category_id,
                 end_time    = EXCLUDED.end_time,
                 state       = EXCLUDED.state,
                 creator     = EXCLUDED.creator,
@@ -378,6 +379,7 @@ pub async fn insert_seed_pools(pool: &PgPool, pools: &[SeedPool]) -> Result<u64,
         .bind(p.pool_id as i64)
         .bind(&p.description)
         .bind(&p.category)
+        .bind(crate::categories::category_id_for_label(&p.category))
         .bind(p.end_time)
         .bind(&p.state)
         .bind(&p.creator)
@@ -461,6 +463,7 @@ pub fn seed_pool_to_event(p: &SeedPool) -> PoolCreatedEvent {
         end_time: p.end_time.timestamp() as u64,
         token: p.token.clone(),
         category: p.category.clone(),
+        category_id: crate::categories::category_id_for_label(&p.category),
         description: p.description.clone(),
     }
 }

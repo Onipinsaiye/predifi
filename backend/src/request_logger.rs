@@ -76,21 +76,18 @@ use std::{
 };
 
 use axum::http::{HeaderMap, Request, Response};
+use opentelemetry::trace::TraceContextExt;
 use tower::{Layer, Service};
 use tracing::{error, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::metrics::SharedMetrics;
-use crate::trace_propagation::{self, TRACEPARENT_HEADER};
+use crate::trace_propagation::{self, TRACEPARENT_HEADER, TRACESTATE_HEADER};
 
 /// Requests that take longer than this threshold are logged at `WARN` level
 /// even when the status code indicates success.
 const SLOW_REQUEST_THRESHOLD_MS: u128 = 1_000;
-
-/// Standard W3C Trace Context headers.
-pub const TRACEPARENT_HEADER: &str = "traceparent";
-pub const TRACESTATE_HEADER: &str = "tracestate";
 
 /// Maximum length of an inbound `traceparent` / `tracestate` value we accept.
 /// Longer values are treated as unbounded identifiers and dropped.

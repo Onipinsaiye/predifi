@@ -1,4 +1,6 @@
-use predifi_backend::validated_types::{BoundedI64, NonEmptyString, PoolSortBy, PoolStatus, StellarAddress};
+use predifi_backend::validated_types::{
+    BoundedI64, NonEmptyString, PoolSortBy, PoolStatus, StellarAddress,
+};
 
 // ── NonEmptyString ────────────────────────────────────────────────────────────
 // Smallest valid value is a single non-whitespace character; there is no

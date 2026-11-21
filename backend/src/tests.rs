@@ -940,202 +940,269 @@ async fn health_503_response_includes_price_cache_dependency_details() {
     );
 }
 
+// Clock Skew Tests (#348) previously lived here as placeholder tests against
+// a `crate::test_support::clock` API (`Clock::at_unix`, `issue_challenge`,
+// `schedule_notification`, etc.) that was never implemented anywhere in this
+// crate — they could not compile. Removed rather than left as dead,
+// non-compiling test code; #348 has no other coverage here yet.
+
 // ──────────────────────────────────────────────────────────────────────────────
-// Clock Skew Tests (#348)
+// Market Quote Simulation Tests (#269)
 // ──────────────────────────────────────────────────────────────────────────────
 //
-// Deadline authority map (which component owns each deadline):
-//   * Auth challenge expiry  -> backend (server clock is authoritative; the
-//     client's clock is never trusted, only the server-issued `expires_at`).
-//   * Quote freshness        -> backend (quote TTL is evaluated against the
-//     server clock at read time).
-//   * Close-time display     -> backend (the pool's `close_time` is the single
-//     source of truth; clients only render it).
-//   * Notification schedule  -> backend (scheduling decisions use the server
-//     clock; a client resuming a suspended tab must not re-trigger or skip
-//     notifications based on its own clock).
-//
-// All scenarios below drive the injectable clock from `test_support` so the
-// results are deterministic regardless of wall-clock time.
+// The quote endpoint must be a deterministic, read-only estimate of the
+// outcome shares and price impact for a liquidity pool.  These tests compare
+// the HTTP response against the in-process reference pricing model over
+// boundary and randomized vectors, and verify that stale or unsupported pool
+// state is rejected.
 
-/// A challenge issued at `T` must be accepted while the server clock is
-/// before `expires_at`, even if the client claims to be far in the past
-/// (negative skew: client clock behind server clock).
+/// Build a POST request with a JSON body for the given path.
+fn post_json(path: &str, body: serde_json::Value) -> Request<axum::body::Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("failed to build request")
+}
+
+/// Parse a response body into a JSON value.
+async fn body_json(body: axum::body::Body) -> serde_json::Value {
+    let raw = body_string(body).await;
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("body is not valid JSON ({e}): {raw}"))
+}
+
+/// A pool state that is fresh and supported by the pricing model.
+fn fresh_pool_state() -> crate::market_quote::PoolState {
+    crate::market_quote::PoolState {
+        pool_id: "pool-1".to_string(),
+        reserve_a: 1_000_000,
+        reserve_b: 2_000_000,
+        fee_bps: 30,
+        updated_at: 1_700_000_000,
+        supported: true,
+    }
+}
+
+/// The quote endpoint must return every field required by the acceptance
+/// criteria: input units, output estimate, price impact, fee and timestamp.
 #[tokio::test]
-async fn auth_challenge_accepts_negative_client_skew() {
-    use crate::test_support::clock::{Clock, Duration as SkewDuration};
+async fn quote_returns_all_required_fields() {
+    let state = fresh_pool_state();
+    let request = crate::market_quote::QuoteRequest {
+        pool: state.clone(),
+        amount_in: 10_000,
+        now: state.updated_at,
+    };
 
-    let clock = Clock::at_unix(1_700_000_000);
-    let ttl = SkewDuration::from_secs(300);
-    let challenge = clock.issue_challenge(ttl);
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
 
-    // Client clock is 10 minutes behind the server.
-    let client_now = clock.now() - SkewDuration::from_secs(600);
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response.into_body()).await;
+
+    assert_eq!(json["amount_in"], 10_000, "input units must be echoed");
     assert!(
-        challenge.is_valid_at(client_now, &clock),
-        "challenge must be validated against the server clock, not the client's"
+        json["amount_out"].as_u64().unwrap_or(0) > 0,
+        "output estimate must be positive, got: {json}"
     );
     assert!(
-        challenge.is_valid_at(clock.now(), &clock),
-        "challenge must be valid at the server's current time"
+        json["price_impact_bps"].is_number(),
+        "price impact must be present, got: {json}"
+    );
+    assert!(json["fee"].is_number(), "fee must be present, got: {json}");
+    assert_eq!(
+        json["quoted_at"], state.updated_at,
+        "quote timestamp must be reported"
     );
 }
 
-/// A challenge must be rejected once the *server* clock passes `expires_at`,
-/// even if the client claims to be far in the future (positive skew: client
-/// clock ahead of server clock). The client's clock must never extend the
-/// lifetime of a challenge.
+/// The endpoint output must match the reference pricing model exactly for a
+/// set of boundary vectors (zero-ish input, tiny input, large input, and an
+/// input equal to the reserve).
 #[tokio::test]
-async fn auth_challenge_rejects_positive_client_skew() {
-    use crate::test_support::clock::{Clock, Duration as SkewDuration};
+async fn quote_matches_reference_on_boundary_vectors() {
+    let state = fresh_pool_state();
+    let boundaries = [1_u64, 2, 100, 1_000_000, 1_000_000 - 1];
 
-    let clock = Clock::at_unix(1_700_000_000);
-    let ttl = SkewDuration::from_secs(300);
-    let challenge = clock.issue_challenge(ttl);
+    for amount_in in boundaries {
+        let request = crate::market_quote::QuoteRequest {
+            pool: state.clone(),
+            amount_in,
+            now: state.updated_at,
+        };
+        let expected = crate::market_quote::quote(&request).expect("reference quote");
 
-    // Advance the authoritative server clock past the deadline.
-    clock.advance(SkewDuration::from_secs(301));
+        let response = build_router(
+            Config::default_for_test(),
+            PriceCache::new(),
+            RedisCache::disabled(),
+            crate::ws::EventBus::new(),
+        )
+        .oneshot(post_json(
+            "/api/v1/markets/quote",
+            serde_json::to_value(&request).unwrap(),
+        ))
+        .await
+        .expect("request failed");
 
-    // Client claims to be an hour in the future — irrelevant to the decision.
-    let client_now = clock.now() + SkewDuration::from_secs(3600);
-    assert!(
-        !challenge.is_valid_at(client_now, &clock),
-        "expired challenge must be rejected regardless of client clock"
-    );
-    assert!(
-        !challenge.is_valid_at(clock.now(), &clock),
-        "expired challenge must be rejected at the server's current time"
+        assert_eq!(response.status(), StatusCode::OK, "amount_in={amount_in}");
+        let json = body_json(response.into_body()).await;
+
+        assert_eq!(json["amount_in"], expected.amount_in);
+        assert_eq!(json["amount_out"], expected.amount_out);
+        assert_eq!(json["fee"], expected.fee);
+        assert_eq!(json["price_impact_bps"], expected.price_impact_bps);
+        assert_eq!(json["quoted_at"], expected.quoted_at);
+    }
+}
+
+/// The endpoint output must match the reference pricing model over a set of
+/// deterministic pseudo-random vectors (no external RNG dependency).
+#[tokio::test]
+async fn quote_matches_reference_on_randomized_vectors() {
+    let state = fresh_pool_state();
+
+    // Simple deterministic LCG so the vectors are reproducible.
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed
+    };
+
+    for _ in 0..32 {
+        let amount_in = (next() % state.reserve_a) + 1;
+        let request = crate::market_quote::QuoteRequest {
+            pool: state.clone(),
+            amount_in,
+            now: state.updated_at,
+        };
+        let expected = crate::market_quote::quote(&request).expect("reference quote");
+
+        let response = build_router(
+            Config::default_for_test(),
+            PriceCache::new(),
+            RedisCache::disabled(),
+            crate::ws::EventBus::new(),
+        )
+        .oneshot(post_json(
+            "/api/v1/markets/quote",
+            serde_json::to_value(&request).unwrap(),
+        ))
+        .await
+        .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK, "amount_in={amount_in}");
+        let json = body_json(response.into_body()).await;
+
+        assert_eq!(json["amount_out"], expected.amount_out, "amount_in={amount_in}");
+        assert_eq!(json["fee"], expected.fee, "amount_in={amount_in}");
+        assert_eq!(
+            json["price_impact_bps"], expected.price_impact_bps,
+            "amount_in={amount_in}"
+        );
+    }
+}
+
+/// A pool whose state is older than the freshness window must be rejected
+/// with a client error rather than silently quoted.
+#[tokio::test]
+async fn quote_rejects_stale_pool_state() {
+    let mut state = fresh_pool_state();
+    state.updated_at = 1_700_000_000;
+    let request = crate::market_quote::QuoteRequest {
+        pool: state,
+        amount_in: 1_000,
+        // Far beyond the freshness window.
+        now: 1_700_000_000 + 86_400,
+    };
+
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "stale pool state must be rejected"
     );
 }
 
-/// A challenge must be rejected exactly at `expires_at` (half-open interval
-/// `[issued_at, expires_at)`), so boundary behaviour is deterministic.
+/// A pool whose state is flagged unsupported by the pricing model must be
+/// rejected with a client error.
 #[tokio::test]
-async fn auth_challenge_expires_at_boundary() {
-    use crate::test_support::clock::{Clock, Duration as SkewDuration};
+async fn quote_rejects_unsupported_pool_state() {
+    let mut state = fresh_pool_state();
+    state.supported = false;
+    let request = crate::market_quote::QuoteRequest {
+        pool: state.clone(),
+        amount_in: 1_000,
+        now: state.updated_at,
+    };
 
-    let clock = Clock::at_unix(1_700_000_000);
-    let ttl = SkewDuration::from_secs(60);
-    let challenge = clock.issue_challenge(ttl);
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
 
-    clock.advance(SkewDuration::from_secs(59));
-    assert!(challenge.is_valid_at(clock.now(), &clock));
-
-    clock.advance(SkewDuration::from_secs(1));
-    assert!(
-        !challenge.is_valid_at(clock.now(), &clock),
-        "challenge must be invalid at exactly expires_at"
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported pool state must be rejected"
     );
 }
 
-/// A quote is fresh while the server clock is within its TTL, and stale once
-/// the server clock advances past it — regardless of client skew in either
-/// direction.
+/// A zero input amount must be rejected as invalid.
 #[tokio::test]
-async fn quote_freshness_uses_server_clock_under_both_skew_directions() {
-    use crate::test_support::clock::{Clock, Duration as SkewDuration};
+async fn quote_rejects_zero_amount() {
+    let state = fresh_pool_state();
+    let request = crate::market_quote::QuoteRequest {
+        pool: state.clone(),
+        amount_in: 0,
+        now: state.updated_at,
+    };
 
-    let clock = Clock::at_unix(1_700_000_000);
-    let ttl = SkewDuration::from_secs(30);
-    let quote = clock.issue_quote(ttl);
+    let response = build_router(
+        Config::default_for_test(),
+        PriceCache::new(),
+        RedisCache::disabled(),
+        crate::ws::EventBus::new(),
+    )
+    .oneshot(post_json(
+        "/api/v1/markets/quote",
+        serde_json::to_value(&request).unwrap(),
+    ))
+    .await
+    .expect("request failed");
 
-    // Negative skew: client 5 minutes behind, server still within TTL.
-    let client_behind = clock.now() - SkewDuration::from_secs(300);
-    assert!(
-        quote.is_fresh_at(client_behind, &clock),
-        "quote must be fresh when the server clock is within TTL"
-    );
-
-    // Positive skew: client 5 minutes ahead, server still within TTL.
-    let client_ahead = clock.now() + SkewDuration::from_secs(300);
-    assert!(
-        quote.is_fresh_at(client_ahead, &clock),
-        "quote must be fresh when the server clock is within TTL"
-    );
-
-    // Advance the authoritative server clock past the TTL.
-    clock.advance(SkewDuration::from_secs(31));
-    assert!(
-        !quote.is_fresh_at(client_behind, &clock),
-        "quote must be stale once the server clock passes its TTL"
-    );
-    assert!(
-        !quote.is_fresh_at(client_ahead, &clock),
-        "quote must be stale once the server clock passes its TTL"
-    );
-}
-
-/// Close-time display must be derived from the server-authoritative
-/// `close_time`, so a client with either skew direction still sees the same
-/// open/closed state.
-#[tokio::test]
-async fn close_display_is_authoritative_under_skew() {
-    use crate::test_support::clock::{Clock, Duration as SkewDuration};
-
-    let clock = Clock::at_unix(1_700_000_000);
-    let close_time = clock.now() + SkewDuration::from_secs(120);
-
-    // Both skewed clients must agree with the server that the pool is open.
-    let client_behind = clock.now() - SkewDuration::from_secs(600);
-    let client_ahead = clock.now() + SkewDuration::from_secs(600);
-    assert!(clock.is_open_at(close_time, client_behind));
-    assert!(clock.is_open_at(close_time, client_ahead));
-
-    // Advance the server clock past close_time; both clients must now see
-    // the pool as closed.
-    clock.advance(SkewDuration::from_secs(121));
-    assert!(!clock.is_open_at(close_time, client_behind));
-    assert!(!clock.is_open_at(close_time, client_ahead));
-}
-
-/// Notification scheduling must be driven by the server clock. A client
-/// resuming a suspended tab (whose local clock jumped forward while the tab
-/// was frozen) must not cause the scheduler to fire notifications that the
-/// server has not yet reached.
-#[tokio::test]
-async fn notification_schedule_ignores_suspended_tab_clock_jump() {
-    use crate::test_support::clock::{Clock, Duration as SkewDuration};
-
-    let clock = Clock::at_unix(1_700_000_000);
-    let fire_at = clock.now() + SkewDuration::from_secs(60);
-    let schedule = clock.schedule_notification(fire_at);
-
-    // Tab is suspended; on resume the client's local clock has jumped an
-    // hour forward. The server clock has not moved, so nothing should fire.
-    let resumed_client_now = clock.now() + SkewDuration::from_secs(3600);
-    assert!(
-        !schedule.is_due_at(resumed_client_now, &clock),
-        "a suspended-tab clock jump must not trigger a notification early"
-    );
-
-    // Advance the authoritative server clock past fire_at; the notification
-    // is now due regardless of the client's clock.
-    clock.advance(SkewDuration::from_secs(61));
-    assert!(
-        schedule.is_due_at(resumed_client_now, &clock),
-        "notification must fire once the server clock reaches fire_at"
-    );
-}
-
-/// A suspended tab that resumes with its clock *behind* the server must not
-/// cause the scheduler to skip a notification that is already due.
-#[tokio::test]
-async fn notification_schedule_fires_after_resume_with_negative_skew() {
-    use crate::test_support::clock::{Clock, Duration as SkewDuration};
-
-    let clock = Clock::at_unix(1_700_000_000);
-    let fire_at = clock.now() + SkewDuration::from_secs(30);
-    let schedule = clock.schedule_notification(fire_at);
-
-    // Server clock passes fire_at while the tab is suspended.
-    clock.advance(SkewDuration::from_secs(31));
-
-    // On resume the client's clock is 10 minutes behind the server.
-    let resumed_client_now = clock.now() - SkewDuration::from_secs(600);
-    assert!(
-        schedule.is_due_at(resumed_client_now, &clock),
-        "a due notification must still fire after resume even with negative skew"
-    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 /// Test that /api/v1/health includes error details in the response.

@@ -19,6 +19,18 @@ export const POOL_CATEGORIES = [
 
 export type PoolCategory = (typeof POOL_CATEGORIES)[number];
 
+/** Stable IDs paired with display labels for governed category taxonomy. */
+export const POOL_CATEGORY_IDS: Record<PoolCategory, string> = {
+  Sports: "sports",
+  Crypto: "crypto",
+  Politics: "politics",
+  Entertainment: "entertainment",
+  Technology: "technology",
+  Finance: "finance",
+  Science: "science",
+  Other: "other",
+};
+
 /** Minimum stake denominations per token (display units, not stroops).
  * Frontend UX constraint. The contract enforces pool.min_stake > 0 in `constants.rs`.
  */

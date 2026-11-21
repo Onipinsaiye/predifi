@@ -41,6 +41,20 @@ use tokio::task::JoinHandle as TaskJoinHandle;
 use tracing::{field, info_span, Instrument, Span};
 use uuid::Uuid;
 
+// ── W3C trace context extraction ─────────────────────────────────────────────
+
+/// Parse the inbound `traceparent`/`tracestate` headers (if present) into a
+/// [`crate::trace_propagation::TraceContext`], so an HTTP request's span can
+/// join the caller's trace instead of always starting a new one.
+///
+/// Delegates to [`crate::trace_propagation::TraceContext::extract`], which
+/// does the actual W3C Trace Context parsing and validation.
+pub fn extract_trace_context(
+    headers: &http::HeaderMap,
+) -> Option<crate::trace_propagation::TraceContext> {
+    crate::trace_propagation::TraceContext::extract(headers)
+}
+
 // ── Correlation ID ────────────────────────────────────────────────────────────
 
 /// Generate a new correlation ID (UUID v4).
