@@ -403,6 +403,129 @@ pub async fn get_pool_with_odds(
     }))
 }
 
+// ── Portfolio export queries (#265) ──────────────────────────────────────────
+//
+// These back the versioned JSON portfolio export. They are additive: the CSV
+// export paths are untouched. Both queries are bounded and cursor-paginated so
+// the caller can emit explicit truncation / continuation metadata.
+
+/// A single position row for the portfolio JSON export, including the source
+/// references (pool, originating event, transaction) and the calculation
+/// metadata (stake, payout, fee, rounding) needed to reproduce the numbers.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct PortfolioPositionExportRow {
+    pub position_id: i64,
+    pub pool_id: i64,
+    pub outcome: i32,
+    pub stake: i64,
+    pub payout: i64,
+    pub fee: i64,
+    pub rounding: i64,
+    pub source_event_id: Option<i64>,
+    pub tx_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A single ledger entry row for the portfolio JSON export.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct PortfolioLedgerExportRow {
+    pub entry_id: i64,
+    pub pool_id: Option<i64>,
+    pub entry_type: String,
+    pub amount: i64,
+    pub fee: i64,
+    pub rounding: i64,
+    pub source_event_id: Option<i64>,
+    pub tx_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Fetch one bounded page of a wallet's positions for the JSON export.
+///
+/// Cursor pagination is by ascending `position_id`: pass `after_id = None` for
+/// the first page, then the last returned `position_id` for subsequent pages.
+/// At most `limit` rows are returned; callers detect truncation by comparing
+/// the returned length against `limit` (or by fetching `limit + 1`).
+#[instrument(skip(pool), name = "db.get_portfolio_positions_for_export",
+    fields(wallet = %wallet, limit = limit, after_id = ?after_id))]
+pub async fn get_portfolio_positions_for_export(
+    pool: &PgPool,
+    wallet: &str,
+    limit: i64,
+    after_id: Option<i64>,
+) -> Result<Vec<PortfolioPositionExportRow>, sqlx::Error> {
+    sqlx::query_as::<_, PortfolioPositionExportRow>(
+        r#"
+        SELECT position_id, pool_id, outcome, stake, payout, fee, rounding,
+               source_event_id, tx_hash, created_at
+        FROM positions
+        WHERE wallet = $1
+          AND ($2::bigint IS NULL OR position_id > $2)
+        ORDER BY position_id ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(wallet)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Fetch one bounded page of a wallet's ledger entries for the JSON export.
+///
+/// Cursor pagination is by ascending `entry_id`, mirroring
+/// [`get_portfolio_positions_for_export`].
+#[instrument(skip(pool), name = "db.get_portfolio_ledger_for_export",
+    fields(wallet = %wallet, limit = limit, after_id = ?after_id))]
+pub async fn get_portfolio_ledger_for_export(
+    pool: &PgPool,
+    wallet: &str,
+    limit: i64,
+    after_id: Option<i64>,
+) -> Result<Vec<PortfolioLedgerExportRow>, sqlx::Error> {
+    sqlx::query_as::<_, PortfolioLedgerExportRow>(
+        r#"
+        SELECT entry_id, pool_id, entry_type, amount, fee, rounding,
+               source_event_id, tx_hash, created_at
+        FROM ledger_entries
+        WHERE wallet = $1
+          AND ($2::bigint IS NULL OR entry_id > $2)
+        ORDER BY entry_id ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(wallet)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Total number of positions and ledger entries for a wallet.
+///
+/// Returned as `(positions, ledger_entries)` so the export can state whether a
+/// bounded page was truncated and how much remains.
+#[instrument(skip(pool), name = "db.count_portfolio_export_rows", fields(wallet = %wallet))]
+pub async fn count_portfolio_export_rows(
+    pool: &PgPool,
+    wallet: &str,
+) -> Result<(i64, i64), sqlx::Error> {
+    let positions: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM positions WHERE wallet = $1")
+            .bind(wallet)
+            .fetch_one(pool)
+            .await?;
+
+    let ledger: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM ledger_entries WHERE wallet = $1")
+            .bind(wallet)
+            .fetch_one(pool)
+            .await?;
+
+    Ok((positions.0, ledger.0))
+}
+
 // ── Write queries ─────────────────────────────────────────────────────────────
 
 /// Insert a pool record decoded from a `pool_created` contract event.
@@ -933,4 +1056,126 @@ mod tests {
 
     #[test]
     fn total_stake_prefers_derived_sum_when_indexer_is_ahead() {
-        // Indexer has ingested predictions
+        // Indexer has ingested predictions the cache has not caught up with.
+        let details = details_with_cached_total(100);
+        let stakes = vec![(0i32, 400i64), (1, 300)];
+        assert_eq!(
+            resolve_total_stake(details.total_stake, &stakes),
+            700,
+            "derived sum must win when the indexer is ahead of the cache"
+        );
+    }
+
+    #[test]
+    fn total_stake_falls_back_to_cache_when_indexer_is_stale() {
+        // Indexer lagging: predictions table has fewer rows than the cache.
+        let details = details_with_cached_total(1_000);
+        let stakes = vec![(0i32, 100i64)];
+        assert_eq!(
+            resolve_total_stake(details.total_stake, &stakes),
+            1_000,
+            "cached total must be used when the indexer is stale"
+        );
+    }
+
+    #[test]
+    fn total_stake_uses_cache_when_no_predictions_indexed() {
+        let details = details_with_cached_total(250);
+        assert_eq!(resolve_total_stake(details.total_stake, &[]), 250);
+    }
+
+    #[test]
+    fn odds_are_derived_from_the_authoritative_total_stake() {
+        // Odds must be computed against the resolved (authoritative) total,
+        // not the stale cached column, so payouts and UI agree.
+        let details = details_with_cached_total(100);
+        let stakes = vec![(0i32, 500i64), (1, 500)];
+        let total = resolve_total_stake(details.total_stake, &stakes);
+        let odds = calculate_odds(&stakes, total);
+        for o in &odds {
+            assert!(
+                (o.odds - 2.0).abs() < 1e-9,
+                "odds must use the derived total (1000), not the cache (100)"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_state_is_passed_through_unchanged() {
+        // The API must surface the indexer's lifecycle value verbatim.
+        let details = details_with_cached_total(0);
+        let with_odds = PoolWithOdds {
+            pool_id: details.pool_id,
+            name: details.name,
+            category: details.category,
+            total_stake: details.total_stake,
+            end_time: details.end_time,
+            created_at: details.created_at,
+            state: details.state.clone(),
+            creator: details.creator,
+            token: details.token,
+            result: details.result,
+            odds: vec![],
+        };
+        assert_eq!(with_odds.state, "active");
+        assert!(with_odds.result.is_none());
+    }
+
+    #[test]
+    fn lifecycle_result_is_authoritative_from_chain_event() {
+        // `result` is only ever set by `resolve_pool_in_db`, which mirrors the
+        // on-chain `pool_resolved` event. The API must not synthesise it.
+        let mut details = details_with_cached_total(0);
+        details.state = "settled".to_string();
+        details.result = Some("1".to_string());
+        assert_eq!(details.state, "settled");
+        assert_eq!(details.result.as_deref(), Some("1"));
+    }
+
+    // ── Portfolio JSON export rows (#265) ─────────────────────────────────────
+
+    #[test]
+    fn portfolio_position_export_row_serializes_source_and_calculation_metadata() {
+        let row = PortfolioPositionExportRow {
+            position_id: 7,
+            pool_id: 42,
+            outcome: 1,
+            stake: 1_000,
+            payout: 2_000,
+            fee: 20,
+            rounding: -1,
+            source_event_id: Some(99),
+            tx_hash: Some("abc123".to_string()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&row).expect("row must serialize");
+        assert_eq!(json["pool_id"], 42);
+        assert_eq!(json["source_event_id"], 99);
+        assert_eq!(json["tx_hash"], "abc123");
+        assert_eq!(json["stake"], 1_000);
+        assert_eq!(json["payout"], 2_000);
+        assert_eq!(json["fee"], 20);
+        assert_eq!(json["rounding"], -1);
+    }
+
+    #[test]
+    fn portfolio_ledger_export_row_serializes_source_and_calculation_metadata() {
+        let row = PortfolioLedgerExportRow {
+            entry_id: 3,
+            pool_id: None,
+            entry_type: "deposit".to_string(),
+            amount: 500,
+            fee: 0,
+            rounding: 0,
+            source_event_id: None,
+            tx_hash: Some("def456".to_string()),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&row).expect("row must serialize");
+        assert_eq!(json["entry_type"], "deposit");
+        assert!(json["pool_id"].is_null());
+        assert!(json["source_event_id"].is_null());
+        assert_eq!(json["tx_hash"], "def456");
+        assert_eq!(json["amount"], 500);
+    }
+}

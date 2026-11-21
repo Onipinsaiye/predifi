@@ -134,6 +134,237 @@ export function profileUrl(address: string): string {
   return `${API_BASE_URL}/api/v1/users/${encodeURIComponent(address)}/profile`;
 }
 
+/**
+ * Versioned JSON export of a complete portfolio record.
+ *
+ * Unlike CSV, this format preserves nested market and event provenance as
+ * well as the calculation metadata used to derive the exported figures.
+ * The payload is versioned via `schema_version` so consumers can branch on
+ * the shape they receive.
+ */
+export const PORTFOLIO_EXPORT_SCHEMA_VERSION = "portfolio.export.v1" as const;
+
+export interface PortfolioExportSourceRef {
+  /** Logical source of the datum, e.g. "indexer", "chain", "pool_contract". */
+  source: string;
+  /** Identifier of the record within that source (tx hash, pool id, ...). */
+  reference: string;
+  /** Optional URL to the canonical record. */
+  url?: string | null;
+}
+
+export interface PortfolioExportCalculation {
+  /** Name of the derived field, e.g. "total_earnings". */
+  field: string;
+  /** Formula or method used to derive the value. */
+  method: string;
+  /** Inputs the calculation consumed. */
+  inputs?: Record<string, unknown>;
+}
+
+export interface PortfolioExportPosition {
+  prediction_id: number;
+  pool_id: number;
+  pool_name: string;
+  outcome: number;
+  amount: number;
+  pool_state: string;
+  pool_result: string | null;
+  is_winner: boolean | null;
+  claimed: boolean;
+  claimed_amount: number;
+  sources: PortfolioExportSourceRef[];
+}
+
+export interface PortfolioExportLedgerEntry {
+  id: string;
+  prediction_id: number;
+  pool_id: number;
+  kind: string;
+  amount: number;
+  timestamp: string;
+  sources: PortfolioExportSourceRef[];
+}
+
+export interface PortfolioExportTruncation {
+  /** True when the export was bounded and some records were omitted. */
+  truncated: boolean;
+  /** Opaque cursor to request the next page, or null when complete. */
+  continuation: string | null;
+  /** Number of records included in this export. */
+  returned: number;
+  /** Total number of records available, when known. */
+  total: number | null;
+}
+
+export interface PortfolioExport {
+  schema_version: typeof PORTFOLIO_EXPORT_SCHEMA_VERSION;
+  address: string;
+  generated_at: string;
+  positions: PortfolioExportPosition[];
+  ledger: PortfolioExportLedgerEntry[];
+  calculations: PortfolioExportCalculation[];
+  truncation: PortfolioExportTruncation;
+}
+
+function isSourceRef(obj: unknown): obj is PortfolioExportSourceRef {
+  if (!obj || typeof obj !== "object") return false;
+  const ref = obj as Record<string, unknown>;
+  return (
+    typeof ref.source === "string" &&
+    typeof ref.reference === "string" &&
+    (ref.url === undefined || ref.url === null || typeof ref.url === "string")
+  );
+}
+
+function isCalculation(obj: unknown): obj is PortfolioExportCalculation {
+  if (!obj || typeof obj !== "object") return false;
+  const calc = obj as Record<string, unknown>;
+  return (
+    typeof calc.field === "string" &&
+    typeof calc.method === "string" &&
+    (calc.inputs === undefined ||
+      calc.inputs === null ||
+      (typeof calc.inputs === "object" && !Array.isArray(calc.inputs)))
+  );
+}
+
+function isExportPosition(obj: unknown): obj is PortfolioExportPosition {
+  if (!obj || typeof obj !== "object") return false;
+  const pos = obj as Record<string, unknown>;
+  return (
+    typeof pos.prediction_id === "number" &&
+    typeof pos.pool_id === "number" &&
+    typeof pos.pool_name === "string" &&
+    typeof pos.outcome === "number" &&
+    typeof pos.amount === "number" &&
+    typeof pos.pool_state === "string" &&
+    (pos.pool_result === null || typeof pos.pool_result === "string") &&
+    (pos.is_winner === null || typeof pos.is_winner === "boolean") &&
+    typeof pos.claimed === "boolean" &&
+    typeof pos.claimed_amount === "number" &&
+    Array.isArray(pos.sources) &&
+    pos.sources.every(isSourceRef)
+  );
+}
+
+function isExportLedgerEntry(obj: unknown): obj is PortfolioExportLedgerEntry {
+  if (!obj || typeof obj !== "object") return false;
+  const entry = obj as Record<string, unknown>;
+  return (
+    typeof entry.id === "string" &&
+    typeof entry.prediction_id === "number" &&
+    typeof entry.pool_id === "number" &&
+    typeof entry.kind === "string" &&
+    typeof entry.amount === "number" &&
+    typeof entry.timestamp === "string" &&
+    Array.isArray(entry.sources) &&
+    entry.sources.every(isSourceRef)
+  );
+}
+
+function isTruncation(obj: unknown): obj is PortfolioExportTruncation {
+  if (!obj || typeof obj !== "object") return false;
+  const trunc = obj as Record<string, unknown>;
+  return (
+    typeof trunc.truncated === "boolean" &&
+    (trunc.continuation === null || typeof trunc.continuation === "string") &&
+    typeof trunc.returned === "number" &&
+    (trunc.total === null || typeof trunc.total === "number")
+  );
+}
+
+/** Type guard validating the `portfolio.export.v1` schema. */
+export function isPortfolioExport(obj: unknown): obj is PortfolioExport {
+  if (!obj || typeof obj !== "object") return false;
+  const exp = obj as Record<string, unknown>;
+  return (
+    exp.schema_version === PORTFOLIO_EXPORT_SCHEMA_VERSION &&
+    typeof exp.address === "string" &&
+    typeof exp.generated_at === "string" &&
+    Array.isArray(exp.positions) &&
+    exp.positions.every(isExportPosition) &&
+    Array.isArray(exp.ledger) &&
+    exp.ledger.every(isExportLedgerEntry) &&
+    Array.isArray(exp.calculations) &&
+    exp.calculations.every(isCalculation) &&
+    isTruncation(exp.truncation)
+  );
+}
+
+export interface FetchPortfolioExportOptions {
+  /** Opaque continuation cursor from a previous truncated export. */
+  cursor?: string | null;
+  /** Maximum number of records to request; the server may bound this. */
+  limit?: number;
+}
+
+export function portfolioExportUrl(address: string, options: FetchPortfolioExportOptions = {}): string {
+  const params = new URLSearchParams();
+  if (options.cursor) params.set("cursor", options.cursor);
+  if (typeof options.limit === "number") params.set("limit", String(options.limit));
+  const query = params.toString();
+  return `${API_BASE_URL}/api/v1/users/${encodeURIComponent(address)}/portfolio/export${query ? `?${query}` : ""}`;
+}
+
+/**
+ * Fetch the versioned JSON portfolio export.
+ *
+ * The returned payload always carries `truncation` metadata so callers can
+ * surface "showing N of M" messaging and follow `continuation` for the next
+ * page. Malformed payloads are rejected at the boundary.
+ */
+export async function fetchPortfolioExport(
+  address: string,
+  options: FetchPortfolioExportOptions = {},
+): Promise<PortfolioExport> {
+  const res = await fetch(portfolioExportUrl(address, options), {
+    headers: { Accept: "application/json" },
+  });
+
+  if (!res.ok) {
+    throw new ApiError(`Failed to export portfolio (HTTP ${res.status})`, res.status);
+  }
+
+  const body = await res.json();
+  const payload =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  if (!isPortfolioExport(payload)) {
+    throw new ApiError("Invalid portfolio export response shape", 500);
+  }
+
+  return payload;
+}
+
+/**
+ * Trigger a browser download of the JSON portfolio export.
+ *
+ * Returns the parsed export so callers can also surface truncation metadata
+ * in the UI after the download starts.
+ */
+export async function downloadPortfolioExport(
+  address: string,
+  options: FetchPortfolioExportOptions = {},
+): Promise<PortfolioExport> {
+  const payload = await fetchPortfolioExport(address, options);
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `portfolio-${address}-${payload.generated_at}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return payload;
+}
+
 export async function fetchProfile(url: string): Promise<UserProfile> {
   const res = await fetch(url, { headers: { Accept: "application/json" } });
 

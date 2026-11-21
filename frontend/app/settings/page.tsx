@@ -35,16 +35,28 @@ const NotificationPreferences = dynamic(
   },
 );
 
+// AccountDataSettings — below-the-fold, lazily loaded
+const AccountDataSettings = dynamic(
+  () => import("@/components/settings/AccountDataSettings").then((mod) => mod.AccountDataSettings),
+  {
+    loading: () => (
+      <div className="h-[300px] w-full animate-pulse bg-zinc-800/50 rounded-xl" aria-hidden="true" />
+    ),
+  },
+);
+
 const PANEL_MAP: Record<SettingsTab, React.ReactNode> = {
   profile: <ProfileForm />,
   security: <SecuritySettings />,
   notifications: <NotificationPreferences />,
+  "account-data": <AccountDataSettings />,
 };
 
 const TAB_LABELS: Record<SettingsTab, string> = {
   profile: "Profile",
   security: "Security",
   notifications: "Notifications",
+  "account-data": "Account data",
 };
 
 export default function SettingsPage() {
@@ -90,7 +102,7 @@ export default function SettingsPage() {
           <div className="space-y-1">
             <h1 className="text-3xl font-bold">Settings</h1>
             <p className="text-sm text-foreground/70">
-              Manage your profile, security, and notification preferences.
+              Manage your profile, security, notification preferences, and account data.
             </p>
           </div>
           <button

@@ -27,6 +27,8 @@ INSERT INTO retention_policy (record_type, classification, retention_days, delet
     ('notification_outbox',      'private',      7,    'ttl_purge',   'Purged after delivery or expiry window'),
     ('notification_deliveries',  'private',      30,   'ttl_purge',   'Delivery status retained for bounded retry window'),
     ('exports',                  'private',      2,    'ttl_purge',   'Export artifacts expire after download window'),
+    ('export_requests',          'private',      2,    'ttl_purge',   'Export request metadata purged after download window'),
+    ('deletion_requests',        'private',      NULL, 'tombstone',   'Deletion request state tombstoned; no personal data retained'),
     ('idempotency_keys',         'operational',  1,    'ttl_purge',   'Request-scoped TTL'),
     ('background_jobs',          'operational',  14,   'ttl_purge',   'Completed job payloads purged after short retention'),
     ('token_revocation',         'operational',  NULL, 'ttl_purge',   'Retained until token would have expired'),
@@ -44,3 +46,33 @@ CREATE TABLE IF NOT EXISTS retention_audit (
 );
 
 CREATE INDEX IF NOT EXISTS idx_retention_audit_executed_at ON retention_audit (executed_at);
+
+-- Account data export / deletion audit evidence.
+--
+-- Policy requires that we can prove an export or deletion was performed for a
+-- subject without retaining the deleted personal data. We therefore store only:
+--   * an opaque, salted subject reference (never the raw user id),
+--   * the action performed and its outcome,
+--   * aggregate counts of affected records per record type,
+--   * timestamps.
+-- No field values, payloads or export contents are stored here.
+CREATE TABLE IF NOT EXISTS account_data_audit (
+    id            BIGSERIAL PRIMARY KEY,
+    subject_ref   TEXT NOT NULL,        -- salted hash of the user id, not the raw id
+    action        TEXT NOT NULL CHECK (action IN ('export', 'delete')),
+    outcome       TEXT NOT NULL CHECK (outcome IN ('completed', 'partial', 'failed')),
+    record_counts JSONB NOT NULL DEFAULT '{}'::jsonb,  -- {record_type: affected_rows}
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at  TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_data_audit_subject_ref ON account_data_audit (subject_ref);
+CREATE INDEX IF NOT EXISTS idx_account_data_audit_requested_at ON account_data_audit (requested_at);
+
+-- Idempotent deletion support: track that a subject's private data has already
+-- been deleted so repeated requests are no-ops. Stores only the opaque subject
+-- reference and a timestamp; no personal data.
+CREATE TABLE IF NOT EXISTS account_deletion_ledger (
+    subject_ref   TEXT PRIMARY KEY,     -- salted hash of the user id, not the raw id
+    deleted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

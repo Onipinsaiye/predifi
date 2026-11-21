@@ -61,3 +61,39 @@ export async function getPoolById(id: string): Promise<Pool | null> {
 export function getPoolImageSeed(id: string): string {
   return createHash("sha256").update(id).toString("hex").slice(0, 12);
 }
+
+/**
+ * Market lifecycle states. Explanations for each state live in the shared
+ * localization catalog; this list is the authoritative set of known states.
+ */
+export const POOL_LIFECYCLE_STATES = [
+  "draft",
+  "scheduled",
+  "open",
+  "paused",
+  "closed",
+  "resolved",
+  "cancelled",
+] as const;
+
+export type PoolLifecycleState = (typeof POOL_LIFECYCLE_STATES)[number];
+
+export const UNKNOWN_LIFECYCLE_STATE = "unknown" as const;
+
+export type ResolvedLifecycleState =
+  | PoolLifecycleState
+  | typeof UNKNOWN_LIFECYCLE_STATE;
+
+/**
+ * Maps a raw lifecycle state string to a known state, or "unknown" for
+ * unrecognized or future states so callers can render a safe fallback.
+ */
+export function resolveLifecycleState(
+  raw: unknown,
+): ResolvedLifecycleState {
+  if (typeof raw !== "string") return UNKNOWN_LIFECYCLE_STATE;
+  const normalized = raw.trim().toLowerCase();
+  return (POOL_LIFECYCLE_STATES as readonly string[]).includes(normalized)
+    ? (normalized as PoolLifecycleState)
+    : UNKNOWN_LIFECYCLE_STATE;
+}

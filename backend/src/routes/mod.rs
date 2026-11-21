@@ -408,6 +408,46 @@ mod tests {
         );
     }
 
+    // ── Portfolio JSON export (#265) ─────────────────────────────────────────
+
+    /// Without a DB the portfolio JSON export endpoint must return a structured
+    /// DATABASE_UNAVAILABLE error rather than panicking.
+    #[tokio::test]
+    async fn portfolio_export_json_without_db_returns_database_unavailable() {
+        let response = build_router_without_db()
+            .oneshot(get("/v1/portfolio/export.json"))
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = body_string(response.into_body()).await;
+        assert!(
+            body.contains("database not available") || body.contains("DATABASE_UNAVAILABLE"),
+            "should surface DATABASE_UNAVAILABLE, got: {body}"
+        );
+    }
+
+    /// With a lazy (unreachable) DB the export handler must attempt a query and
+    /// return a DB error envelope, proving the pool was wired through.
+    #[tokio::test]
+    async fn portfolio_export_json_with_lazy_db_attempts_query() {
+        let response = build_router_with_lazy_db()
+            .oneshot(get("/v1/portfolio/export.json"))
+            .await
+            .expect("request failed");
+
+        let body = body_string(response.into_body()).await;
+        assert!(
+            !body.contains("database not available"),
+            "router_with_db should wire the pool; got: {body}"
+        );
+        assert!(
+            body.contains("\"error\""),
+            "should return an error envelope; got: {body}"
+        );
+    }
+
     // ── Request body and query limits (#54) ────────────────────────────
 
     fn post_json(path: &str, body: String) -> Request<axum::body::Body> {
