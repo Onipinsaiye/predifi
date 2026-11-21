@@ -66,6 +66,7 @@ fn fixture_pool(pool_id: u64) -> PoolCreatedEvent {
         end_time: 2_000_000_000,
         token: "XLM".to_string(),
         category: "stress-fixture".to_string(),
+        category_id: "other".to_string(),
         description: format!("Fixture pool {pool_id}"),
     }
 }
@@ -106,7 +107,10 @@ async fn rpc_throttling_produces_bounded_retries_without_duplicate_submission() 
         .await
         .expect("router must eventually succeed via fallback");
 
-    assert_eq!(outcome.provider, "fallback", "fallback ordering must be honored");
+    assert_eq!(
+        outcome.provider, "fallback",
+        "fallback ordering must be honored"
+    );
     assert!(
         outcome.attempts <= RPC_MAX_ATTEMPTS,
         "retries must be bounded: {} > {RPC_MAX_ATTEMPTS}",
@@ -167,10 +171,7 @@ async fn rpc_provider_outage_transitions_health_and_fails_over() {
         ProviderHealth::Unhealthy,
         "primary must be marked unhealthy after repeated failures"
     );
-    assert_eq!(
-        router.provider_health("secondary"),
-        ProviderHealth::Healthy
-    );
+    assert_eq!(router.provider_health("secondary"), ProviderHealth::Healthy);
 
     // While the primary is cooling down, subsequent requests must skip it.
     let second = router
@@ -191,7 +192,10 @@ async fn rpc_provider_outage_transitions_health_and_fails_over() {
         .execute(sample_request("tx-outage-3", RpcPriority::Indexer))
         .await
         .expect("router must recover the primary provider");
-    assert_eq!(third.provider, "primary", "recovered provider must be preferred");
+    assert_eq!(
+        third.provider, "primary",
+        "recovered provider must be preferred"
+    );
     assert_eq!(
         router.provider_health("primary"),
         ProviderHealth::Healthy,
@@ -228,10 +232,9 @@ async fn rpc_budget_exhaustion_returns_bounded_error() {
 #[tokio::test]
 #[ignore = "Scheduled fault-injection test; run with --ignored"]
 async fn rpc_provider_disagreement_is_detected_and_not_resubmitted() {
-    let primary = MockRpcProvider::new("primary")
-        .with_response(RpcResponse::ledger(100, "hash-a"));
-    let secondary = MockRpcProvider::new("secondary")
-        .with_response(RpcResponse::ledger(100, "hash-b"));
+    let primary = MockRpcProvider::new("primary").with_response(RpcResponse::ledger(100, "hash-a"));
+    let secondary =
+        MockRpcProvider::new("secondary").with_response(RpcResponse::ledger(100, "hash-b"));
     let router = fault_injection_router(vec![primary.clone(), secondary.clone()]);
 
     let request = sample_request("tx-disagree-1", RpcPriority::UserTransaction);

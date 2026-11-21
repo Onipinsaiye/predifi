@@ -864,6 +864,7 @@ pub struct PoolsResponse {
     pub offset: i64,
     pub status: String,
     pub category: Option<String>,
+    pub category_id: Option<String>,
     pub sort_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creator: Option<String>,
@@ -992,7 +993,29 @@ pub async fn get_stats(
         .into_response();
     };
 
-    let category = params.category.as_ref().map(|s| s.as_str());
+    let category = match params.category.as_ref().map(|s| s.as_str()) {
+        Some(input) => match crate::categories::resolve_category(db, input).await {
+            Ok(category) => Some(category.category_id),
+            Err(crate::categories::CategoryError::UnknownCategory) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unknown market category",
+                )
+                .into_response();
+            }
+            Err(crate::categories::CategoryError::Database) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "category registry unavailable",
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let category = category.as_deref();
     let status = params.status.map(|s| s.as_str());
 
     let cache_key = crate::redis_cache::stats_cache_key(category, status);
@@ -1182,9 +1205,34 @@ pub async fn get_pools(
         .into_response();
     };
 
+    let resolved_category = match category {
+        Some(input) => match crate::categories::resolve_category(db, input).await {
+            Ok(category) => Some(category),
+            Err(crate::categories::CategoryError::UnknownCategory) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unknown market category",
+                )
+                .into_response();
+            }
+            Err(crate::categories::CategoryError::Database) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "category registry unavailable",
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let category_id = resolved_category.as_ref().map(|c| c.category_id.as_str());
+    let category_label = resolved_category.as_ref().map(|c| c.display_label.as_str());
+
     // Cache-aside pattern: Step 1 — Check cache
     let mut cache_key =
-        crate::redis_cache::pools_cache_key(sort_by, category, effective_status, limit, offset);
+        crate::redis_cache::pools_cache_key(sort_by, category_id, effective_status, limit, offset);
     if let Some(c) = creator_str {
         cache_key = format!("{cache_key}:creator:{c}");
     }
@@ -1219,7 +1267,7 @@ pub async fn get_pools(
     // Cache miss — Step 2: Fetch from database with explicit filters
     let filter_criteria = crate::tags::MarketFilters {
         sort_by,
-        category,
+        category: category_id,
         tags: tags.as_deref(),
         status: effective_status,
         creator: creator_str,
@@ -1230,7 +1278,7 @@ pub async fn get_pools(
         offset,
     };
     let count_criteria = crate::tags::MarketCountFilters {
-        category,
+        category: category_id,
         tags: tags.as_deref(),
         status: effective_status,
         creator: creator_str,
@@ -1254,7 +1302,8 @@ pub async fn get_pools(
                 limit,
                 offset,
                 status: effective_status.to_string(),
-                category: category.map(|s| s.to_string()),
+                category: category_label.map(|s| s.to_string()),
+                category_id: category_id.map(|s| s.to_string()),
                 sort_by: sort_by.to_string(),
                 creator: creator_str.map(|s| s.to_string()),
                 tags,
@@ -1610,12 +1659,33 @@ pub async fn ingest_pool_created(
         .into_response();
     };
 
+    let category = match crate::categories::resolve_category(db, payload.category.as_str()).await {
+        Ok(category) => category,
+        Err(crate::categories::CategoryError::UnknownCategory) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "unknown market category",
+            )
+            .into_response();
+        }
+        Err(crate::categories::CategoryError::Database) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "category registry unavailable",
+            )
+            .into_response();
+        }
+    };
+
     let event = PoolCreatedEvent {
         pool_id: payload.pool_id,
         creator: payload.creator.into(),
         end_time: payload.end_time,
         token: payload.token.into(),
-        category: payload.category.into(),
+        category: category.display_label,
+        category_id: category.category_id,
         description: payload.description.into(),
     };
 
@@ -1894,7 +1964,9 @@ mod abuse_quota_tests {
         }
         let response = response.expect("expected a rejection");
         assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
-        assert!(response.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert!(response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER));
     }
 }
 
@@ -1995,9 +2067,7 @@ pub async fn pay_creator_incentive_handler(
                 .await;
             Json(json!({ "status": "paid", "pool_id": pool_id, "amount": amount })).into_response()
         }
-        Ok(None) => {
-            Json(json!({ "status": "not_eligible", "pool_id": pool_id })).into_response()
-        }
+        Ok(None) => Json(json!({ "status": "not_eligible", "pool_id": pool_id })).into_response(),
         Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
     }
 }
@@ -2152,6 +2222,32 @@ pub async fn get_user_profile_handler(
 }
 
 // ── Pool tags ────────────────────────────────────────────────────────────────
+
+/// `GET /api/v1/categories` — governed category registry, including aliases
+/// and deprecated categories retained for historic discovery.
+pub async fn list_categories_handler(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::categories::list_categories(db).await {
+        Ok(categories) => ApiResponse::success(categories).into_response(),
+        Err(error) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            error.to_string(),
+        )
+        .into_response(),
+    }
+}
 
 /// `GET /api/v1/tags` — distinct tags currently in use, for filter-UI dropdowns.
 pub async fn list_tags_handler(State(state): State<AppState>) -> axum::response::Response {
@@ -3258,6 +3354,7 @@ pub fn router(
             .route("/pools/:id/leaderboard", get(get_pool_leaderboard))
             .route("/stats", get(get_stats))
             .route("/leaderboard", get(get_leaderboard))
+            .route("/categories", get(list_categories_handler))
             .route("/tags", get(list_tags_handler))
             .route("/referrals/:address", get(referrals_handler))
             .route(
@@ -4136,8 +4233,14 @@ mod data_ownership_contract_tests {
             event_bus: crate::ws::EventBus::new(),
             abuse: Arc::new(AbuseController::from_config(&Config::default())),
         };
-        let response = get_stats(State(state), Query(StatsQuery { category: None, status: None }))
-            .await;
+        let response = get_stats(
+            State(state),
+            Query(StatsQuery {
+                category: None,
+                status: None,
+            }),
+        )
+        .await;
         assert_eq!(
             response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -4161,7 +4264,10 @@ mod data_ownership_contract_tests {
     fn analytics_pool_cache_keys_do_not_collide_across_filters() {
         let base = pools_cache_key("new", None, "active", 20, 0);
         assert_ne!(base, pools_cache_key("popular", None, "active", 20, 0));
-        assert_ne!(base, pools_cache_key("new", Some("sports"), "active", 20, 0));
+        assert_ne!(
+            base,
+            pools_cache_key("new", Some("sports"), "active", 20, 0)
+        );
         assert_ne!(base, pools_cache_key("new", None, "settled", 20, 0));
         assert_ne!(base, pools_cache_key("new", None, "active", 20, 20));
     }
@@ -4250,11 +4356,10 @@ mod data_ownership_contract_tests {
             event_bus: crate::ws::EventBus::new(),
             abuse: Arc::new(AbuseController::from_config(&Config::default())),
         };
-        let address: StellarAddress =
-            serde_json::from_value(serde_json::json!(
-                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
-            ))
-            .expect("valid address");
+        let address: StellarAddress = serde_json::from_value(serde_json::json!(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+        ))
+        .expect("valid address");
         let response = get_user_profile_handler(State(state), Path(address)).await;
         assert_eq!(
             response.status(),
@@ -4277,7 +4382,11 @@ mod data_ownership_contract_tests {
             .set(&pool_key, &serde_json::json!({"total": 1}), POOLS_CACHE_TTL)
             .await;
         cache
-            .set(&stats_key, &serde_json::json!({"total_pools": 1}), STATS_CACHE_TTL)
+            .set(
+                &stats_key,
+                &serde_json::json!({"total_pools": 1}),
+                STATS_CACHE_TTL,
+            )
             .await;
 
         // A chain event arrives that disagrees with the cached view; the

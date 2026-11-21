@@ -85,6 +85,8 @@ enum CacheEntry {
         /// quote handler to price against the same state the pool detail
         /// response reflects.
         snapshot: PoolSnapshot,
+
+        cached_at: Instant,
         cached_at: Instant,
     },
     /// A confirmed "no such pool" result, valid for the cache's configured
@@ -198,7 +200,9 @@ impl PoolCache {
             }) if cached_at.elapsed() < POOL_CACHE_TTL => {
                 CacheLookup::Found(value.clone(), snapshot.clone())
             }
-            Some(CacheEntry::NotFound { cached_at }) if cached_at.elapsed() < self.0.negative_ttl => {
+            Some(CacheEntry::NotFound { cached_at })
+                if cached_at.elapsed() < self.0.negative_ttl =>
+            {
                 CacheLookup::NotFound
             }
             _ => CacheLookup::Miss,
@@ -270,6 +274,7 @@ mod tests {
             pool_id,
             name: name.to_string(),
             category: "Sports".to_string(),
+            category_id: Some("sports".to_string()),
             total_stake: 1000,
             end_time: Utc::now(),
             created_at: Utc::now(),
