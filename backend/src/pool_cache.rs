@@ -79,7 +79,10 @@ const DEFAULT_POOL_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 enum CacheEntry {
     /// A successfully fetched pool, valid for [`POOL_CACHE_TTL`].
-    Found { value: PoolWithOdds, cached_at: Instant },
+    Found {
+        value: PoolWithOdds,
+        cached_at: Instant,
+    },
     /// A confirmed "no such pool" result, valid for the cache's configured
     /// negative TTL (see [`PoolCache::negative_ttl`]).
     NotFound { cached_at: Instant },
@@ -147,10 +150,14 @@ impl PoolCache {
             return CacheLookup::Miss;
         };
         match guard.get(&pool_id) {
-            Some(CacheEntry::Found { value, cached_at }) if cached_at.elapsed() < POOL_CACHE_TTL => {
+            Some(CacheEntry::Found { value, cached_at })
+                if cached_at.elapsed() < POOL_CACHE_TTL =>
+            {
                 CacheLookup::Found(value.clone())
             }
-            Some(CacheEntry::NotFound { cached_at }) if cached_at.elapsed() < self.0.negative_ttl => {
+            Some(CacheEntry::NotFound { cached_at })
+                if cached_at.elapsed() < self.0.negative_ttl =>
+            {
                 CacheLookup::NotFound
             }
             _ => CacheLookup::Miss,
@@ -204,6 +211,7 @@ mod tests {
             pool_id,
             name: name.to_string(),
             category: "Sports".to_string(),
+            category_id: Some("sports".to_string()),
             total_stake: 1000,
             end_time: Utc::now(),
             created_at: Utc::now(),

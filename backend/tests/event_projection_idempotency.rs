@@ -184,6 +184,7 @@ fn ledger_range() -> Vec<ContractEvent> {
         end_time: 4_102_444_800,
         token: "CTOKEN".into(),
         category: "sports".into(),
+        category_id: "sports".into(),
         description: "Idempotency test pool".into(),
     });
     vec![
@@ -354,6 +355,7 @@ async fn duplicate_events_within_one_batch_are_projected_once() {
             end_time: 4_102_444_800,
             token: "CTOKEN".into(),
             category: "sports".into(),
+            category_id: "sports".into(),
             description: "Batch duplicate pool".into(),
         }),
     };
