@@ -28,8 +28,8 @@ When adding a new migration, use the **next unused integer**, run
 `sqlx migrate add <description>` (or create the file by hand) inside this
 directory, and never reuse or renumber a prefix that already exists — see
 [Duplicate prefixes](#duplicate-004-and-009-prefixes-do-not-rename) below.
-The next available prefix after `020_governed_category_taxonomy.sql`
-is **`021_`**.
+The next available prefix after `021_market_proposals.sql`
+is **`022_`**.
 
 ## Rollback-safe sequencing (required for new migrations)
 
@@ -108,6 +108,7 @@ For full deployment guidelines, rollback SQL scripts, and interrupted migration 
 | `011_create_listener_checkpoints.sql` | Dedicated listener checkpoints table and app_state compatibility table for atomic cursor persistence. | `AccessExclusive` | `MetadataOnly` | **Yes** |
 | `019_notification_inbox_preferences_push.sql` | Versioned wallet preferences, encrypted browser push subscriptions, cursor inbox index, and separated transactional outboxes. | `Share` | `DataBackfill` | **Yes** |
 | `020_governed_category_taxonomy.sql` | Stable category/alias registry and additive `pools.category_id` backfill for historic category labels. | `Share` | `MetadataOnly` / `DataBackfill` | **Yes** |
+| `021_market_proposals.sql` | Stores market proposal draft metadata used for bounded duplicate detection and distinction notes. | `Share` | `MetadataOnly` | **Yes** |
 
 The entries above document the migrations applicable to these schema areas.
 
