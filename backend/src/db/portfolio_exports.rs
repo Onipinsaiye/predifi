@@ -403,6 +403,45 @@ pub async fn run_next_export(pool: &PgPool) -> Result<Option<i64>, sqlx::Error> 
     Ok(Some(export_id))
 }
 
+/// The per-batch streaming query, shared between [`export_rows_bounded`]
+/// (which runs it) and [`explain_export_rows_plan`] (which asks Postgres to
+/// `EXPLAIN` it) — see `crate::db::predictions::leaderboard_sql` for the
+/// same pattern — so the plan a test inspects can never drift from the
+/// query actually served (#316). Placeholders: `$1` = wallet address,
+/// `$2` = checkpoint ledger, `$3` = `after_id`, `$4` = batch size.
+fn export_batch_sql() -> &'static str {
+    r#"
+            SELECT id, ledger, tx_hash, event_index, event_type, pool_id, outcome, amount, created_at
+            FROM portfolio_activity_ledger
+            WHERE user_address = $1 AND ledger <= $2 AND id > $3
+            ORDER BY id
+            LIMIT $4
+            "#
+}
+
+/// Run `EXPLAIN` on the bounded per-batch export query used by
+/// [`export_rows_bounded`] and return the plan as a single string (#316),
+/// so a test can assert the planner uses
+/// `idx_portfolio_activity_ledger_wallet_ledger` rather than a sequential
+/// scan as a wallet's ledger grows.
+pub async fn explain_export_rows_plan(
+    pool: &PgPool,
+    wallet_address: &str,
+    checkpoint_ledger: i64,
+    after_id: i64,
+    batch_size: i64,
+) -> Result<String, sqlx::Error> {
+    let sql = format!("EXPLAIN {}", export_batch_sql());
+    let lines: Vec<String> = sqlx::query_scalar(&sql)
+        .bind(wallet_address)
+        .bind(checkpoint_ledger)
+        .bind(after_id)
+        .bind(batch_size)
+        .fetch_all(pool)
+        .await?;
+    Ok(lines.join("\n"))
+}
+
 /// Stream `wallet_address`'s activity into a bounded CSV artifact.
 ///
 /// Reads are checkpoint-gated (`ledger <= committed_checkpoint_ledger`)
@@ -451,15 +490,7 @@ async fn export_rows_bounded(
             Option<i32>,
             Option<i64>,
             DateTime<Utc>,
-        )> = sqlx::query_as(
-            r#"
-            SELECT id, ledger, tx_hash, event_index, event_type, pool_id, outcome, amount, created_at
-            FROM portfolio_activity_ledger
-            WHERE user_address = $1 AND ledger <= $2 AND id > $3
-            ORDER BY id
-            LIMIT $4
-            "#,
-        )
+        )> = sqlx::query_as(export_batch_sql())
         .bind(wallet_address)
         .bind(checkpoint_ledger)
         .bind(after_id)

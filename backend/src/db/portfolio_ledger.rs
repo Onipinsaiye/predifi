@@ -240,6 +240,29 @@ struct ActivityRow {
     created_at: DateTime<Utc>,
 }
 
+/// The wallet-activity cursor query, shared between [`get_wallet_activity`]
+/// (which runs it) and [`explain_wallet_activity_plan`] (which asks
+/// Postgres to `EXPLAIN` it) — see the same rationale as
+/// `crate::db::predictions::leaderboard_sql` — so the plan a test inspects
+/// can never drift from the query actually served.
+///
+/// Placeholders: `$1` = wallet address, `$2`/`$3`/`$4` = optional cursor
+/// `(ledger, event_index, id)`, `$5` = limit + 1.
+fn wallet_activity_sql() -> &'static str {
+    r#"
+        SELECT id, network, contract_id, ledger, tx_hash, event_index, event_type,
+               pool_id, counterparty, outcome, amount, created_at
+        FROM portfolio_activity_ledger
+        WHERE user_address = $1
+          AND (
+            $2::bigint IS NULL
+            OR (ledger, event_index, id) > ($2, $3, $4)
+          )
+        ORDER BY ledger ASC, event_index ASC, id ASC
+        LIMIT $5
+        "#
+}
+
 /// Fetch one page of `wallet_address`'s normalized activity, newest-first
 /// by `(ledger, event_index, id)`... actually oldest-first ascending, so
 /// `next_cursor` always advances forward through chain history.
@@ -251,27 +274,14 @@ pub async fn get_wallet_activity(
 ) -> Result<WalletActivityPage, sqlx::Error> {
     let limit = limit.clamp(1, MAX_ACTIVITY_PAGE_SIZE);
 
-    let rows = sqlx::query_as::<_, ActivityRow>(
-        r#"
-        SELECT id, network, contract_id, ledger, tx_hash, event_index, event_type,
-               pool_id, counterparty, outcome, amount, created_at
-        FROM portfolio_activity_ledger
-        WHERE user_address = $1
-          AND (
-            $2::bigint IS NULL
-            OR (ledger, event_index, id) > ($2, $3, $4)
-          )
-        ORDER BY ledger ASC, event_index ASC, id ASC
-        LIMIT $5
-        "#,
-    )
-    .bind(wallet_address)
-    .bind(after.map(|c| c.ledger))
-    .bind(after.map(|c| c.event_index))
-    .bind(after.map(|c| c.id))
-    .bind(limit + 1)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query_as::<_, ActivityRow>(wallet_activity_sql())
+        .bind(wallet_address)
+        .bind(after.map(|c| c.ledger))
+        .bind(after.map(|c| c.event_index))
+        .bind(after.map(|c| c.id))
+        .bind(limit + 1)
+        .fetch_all(pool)
+        .await?;
 
     let has_more = rows.len() as i64 > limit;
     let rows = if has_more {
@@ -334,6 +344,36 @@ pub async fn get_wallet_activity(
         next_cursor,
         indexing_status,
     })
+}
+
+/// Run `EXPLAIN` on the wallet-activity cursor query used by
+/// [`get_wallet_activity`] and return the plan as a single string (one line
+/// per row Postgres returns) — see `crate::db::predictions::explain_leaderboard_plan`
+/// for the same pattern applied to the leaderboard query (#316).
+///
+/// Exists so a test can assert the plan uses
+/// `idx_portfolio_activity_ledger_wallet_cursor` rather than a sequential
+/// scan as a wallet's history grows, without duplicating (and risking
+/// drift from) the real query text.
+pub async fn explain_wallet_activity_plan(
+    pool: &PgPool,
+    wallet_address: &str,
+    after: Option<ActivityCursor>,
+    limit: i64,
+) -> Result<String, sqlx::Error> {
+    let limit = limit.clamp(1, MAX_ACTIVITY_PAGE_SIZE);
+    let sql = format!("EXPLAIN {}", wallet_activity_sql());
+
+    let lines: Vec<String> = sqlx::query_scalar(&sql)
+        .bind(wallet_address)
+        .bind(after.map(|c| c.ledger))
+        .bind(after.map(|c| c.event_index))
+        .bind(after.map(|c| c.id))
+        .bind(limit + 1)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]

@@ -113,13 +113,15 @@ pub async fn generate_portfolio_snapshot(
 /// separately from [`generate_portfolio_snapshot`] so tests can exercise
 /// checkpoint-advancement and crash-recovery scenarios deterministically
 /// without racing the live listener.
-pub async fn generate_portfolio_snapshot_at(
-    pool: &PgPool,
-    wallet_address: &str,
-    checkpoint_ledger: i64,
-) -> Result<PortfolioSnapshot, SnapshotError> {
-    let row = sqlx::query_as::<_, (i64, i64, i64)>(
-        r#"
+/// The checkpoint-gated aggregation query, shared between
+/// [`generate_portfolio_snapshot_at`] (which runs it) and
+/// [`explain_portfolio_snapshot_plan`] (which asks Postgres to `EXPLAIN`
+/// it) — see `crate::db::predictions::leaderboard_sql` for the same pattern
+/// — so the plan a test inspects can never drift from the query actually
+/// served (#316). Placeholders: `$1` = wallet address, `$2` = checkpoint
+/// ledger.
+fn snapshot_aggregation_sql() -> &'static str {
+    r#"
         SELECT
             COALESCE(SUM(amount) FILTER (WHERE event_type = 'prediction_placed'), 0)::BIGINT
                 AS total_staked,
@@ -134,12 +136,19 @@ pub async fn generate_portfolio_snapshot_at(
             )::BIGINT AS open_positions
         FROM portfolio_activity_ledger
         WHERE user_address = $1 AND ledger <= $2
-        "#,
-    )
-    .bind(wallet_address)
-    .bind(checkpoint_ledger)
-    .fetch_one(pool)
-    .await?;
+        "#
+}
+
+pub async fn generate_portfolio_snapshot_at(
+    pool: &PgPool,
+    wallet_address: &str,
+    checkpoint_ledger: i64,
+) -> Result<PortfolioSnapshot, SnapshotError> {
+    let row = sqlx::query_as::<_, (i64, i64, i64)>(snapshot_aggregation_sql())
+        .bind(wallet_address)
+        .bind(checkpoint_ledger)
+        .fetch_one(pool)
+        .await?;
 
     let (total_staked, total_realized_return, open_positions) = row;
     let net_realized_pnl = total_realized_return - total_staked;
@@ -172,6 +181,25 @@ pub async fn generate_portfolio_snapshot_at(
     .await?;
 
     Ok(snapshot)
+}
+
+/// Run `EXPLAIN` on the checkpoint-gated aggregation query used by
+/// [`generate_portfolio_snapshot_at`] and return the plan as a single
+/// string (#316), so a test can assert the planner uses
+/// `idx_portfolio_activity_ledger_wallet_ledger` rather than a sequential
+/// scan as a wallet's ledger grows.
+pub async fn explain_portfolio_snapshot_plan(
+    pool: &PgPool,
+    wallet_address: &str,
+    checkpoint_ledger: i64,
+) -> Result<String, sqlx::Error> {
+    let sql = format!("EXPLAIN {}", snapshot_aggregation_sql());
+    let lines: Vec<String> = sqlx::query_scalar(&sql)
+        .bind(wallet_address)
+        .bind(checkpoint_ledger)
+        .fetch_all(pool)
+        .await?;
+    Ok(lines.join("\n"))
 }
 
 #[cfg(all(test, feature = "integration-tests"))]
