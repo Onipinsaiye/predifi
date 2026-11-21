@@ -1,6 +1,129 @@
 {
   "components": {
     "schemas": {
+      "ActivityEventDoc": {
+        "description": "OpenAPI schema for one typed wallet-activity event. Forward-compatible:\nan `event_type` this build doesn't recognize decodes as `unknown` rather\nthan being dropped or erroring.",
+        "oneOf": [
+          {
+            "properties": {
+              "creator": {
+                "type": "string"
+              },
+              "pool_id": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "pool_created"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "pool_id",
+              "creator",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "amount": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "outcome": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "pool_id": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "prediction_placed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "pool_id",
+              "outcome",
+              "amount",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "pool_id": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "pool_resolved"
+                ],
+                "type": "string"
+              },
+              "winning_outcome": {
+                "format": "int32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "pool_id",
+              "winning_outcome",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "amount_paid": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "pool_id": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "claim"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "pool_id",
+              "amount_paid",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "raw_type": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "unknown"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "raw_type",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ApiIndexDoc": {
         "description": "OpenAPI schema for the v1 API index document.",
         "properties": {
@@ -120,6 +243,95 @@
           "user_address",
           "amount_paid"
         ],
+        "type": "object"
+      },
+      "ClaimStatusDoc": {
+        "description": "OpenAPI schema for one prediction's claim status on a user's profile.",
+        "properties": {
+          "amount": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "claim_expired": {
+            "type": "boolean"
+          },
+          "claim_window_expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "claimed": {
+            "type": "boolean"
+          },
+          "claimed_amount": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "is_winner": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "outcome": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "pool_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pool_name": {
+            "type": "string"
+          },
+          "pool_result": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pool_state": {
+            "type": "string"
+          },
+          "prediction_id": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "prediction_id",
+          "pool_id",
+          "pool_name",
+          "outcome",
+          "amount",
+          "pool_state",
+          "claimed",
+          "claimed_amount",
+          "claim_expired"
+        ],
+        "type": "object"
+      },
+      "CreateExportRequestDoc": {
+        "description": "OpenAPI schema for `POST /api/v1/wallets/{address}/exports`.",
+        "properties": {
+          "row_limit": {
+            "description": "Max rows to export (default 10000, max 50000).",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "time_limit_secs": {
+            "description": "Max wall-clock seconds the export worker may spend (default 60, max 300).",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "DataEnvelope": {
@@ -262,6 +474,95 @@
         ],
         "type": "object"
       },
+      "ExportStatusEnvelope": {
+        "description": "Success envelope for the portfolio export endpoints.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ExportStatusViewDoc"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "ExportStatusKindDoc": {
+        "description": "Lifecycle status of a portfolio export.",
+        "enum": [
+          "pending",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "expired"
+        ],
+        "type": "string"
+      },
+      "ExportStatusViewDoc": {
+        "description": "OpenAPI schema for an export's status/progress.",
+        "properties": {
+          "checkpoint_ledger": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "download_available": {
+            "description": "`true` only when the artifact exists and has not expired.",
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "row_limit": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "rows_written": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ExportStatusKindDoc"
+          },
+          "time_limit_secs": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "rows_written",
+          "row_limit",
+          "time_limit_secs",
+          "created_at",
+          "download_available"
+        ],
+        "type": "object"
+      },
       "FeeInfoDoc": {
         "description": "OpenAPI schema for the fee configuration response.",
         "properties": {
@@ -392,6 +693,32 @@
         "required": [
           "status",
           "pool_id"
+        ],
+        "type": "object"
+      },
+      "IndexingStatusDoc": {
+        "description": "OpenAPI schema for the wallet-activity page's indexing-status block.",
+        "properties": {
+          "checkpoint_ledger": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "complete": {
+            "description": "`true` only when the listener checkpoint is a valid, known ledger.",
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "complete"
         ],
         "type": "object"
       },
@@ -536,6 +863,48 @@
         },
         "type": "object"
       },
+      "MarketHistoryEnvelope": {
+        "description": "Success envelope for `GET /api/v1/markets/{pool_id}/history`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/MarketHistoryPageDoc"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "MarketHistoryPageDoc": {
+        "description": "OpenAPI schema for `GET /api/v1/markets/{pool_id}/history`.",
+        "properties": {
+          "bucket_width": {
+            "description": "`1m` | `5m` | `1h` | `1d`.",
+            "type": "string"
+          },
+          "pool_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "samples": {
+            "items": {
+              "$ref": "#/components/schemas/MarketValueSampleDoc"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pool_id",
+          "bucket_width",
+          "samples"
+        ],
+        "type": "object"
+      },
       "MarketPredictionDoc": {
         "description": "OpenAPI schema for a single prediction in the market predictions list.",
         "properties": {
@@ -622,6 +991,40 @@
         ],
         "type": "object"
       },
+      "MarketValueSampleDoc": {
+        "description": "OpenAPI schema for one bucketed historical market-value sample.",
+        "properties": {
+          "bucket_start": {
+            "description": "Start of this bucket's interval, UTC, RFC 3339.",
+            "type": "string"
+          },
+          "checkpoint_ledger": {
+            "description": "Committed listener checkpoint this sample was derived from.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "value": {
+            "description": "Cumulative value as of the end of this interval, as an exact decimal\nstring (never a float).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket_start",
+          "value",
+          "checkpoint_ledger"
+        ],
+        "type": "object"
+      },
+      "MissingInputReasonDoc": {
+        "description": "OpenAPI schema for why a position's P&L could not be computed.",
+        "enum": [
+          "pool_unresolved",
+          "zero_winning_stake",
+          "amount_overflow",
+          "negative_input"
+        ],
+        "type": "string"
+      },
       "OutcomeOddsDoc": {
         "description": "OpenAPI schema for outcome odds within a pool.",
         "properties": {
@@ -642,6 +1045,34 @@
           "outcome",
           "stake",
           "odds"
+        ],
+        "type": "object"
+      },
+      "PerformancePointDoc": {
+        "description": "OpenAPI schema for one day of staking/earnings activity.",
+        "properties": {
+          "day": {
+            "description": "Start of the UTC day this point represents.",
+            "type": "string"
+          },
+          "earnings": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "predictions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "staked": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "day",
+          "staked",
+          "earnings",
+          "predictions"
         ],
         "type": "object"
       },
@@ -818,6 +1249,184 @@
         ],
         "type": "object"
       },
+      "PortfolioPnlDoc": {
+        "description": "OpenAPI schema for the aggregate P&L across a wallet's whole portfolio.",
+        "properties": {
+          "missing_reasons": {
+            "items": {
+              "$ref": "#/components/schemas/MissingInputReasonDoc"
+            },
+            "type": "array"
+          },
+          "pnl_model_version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "positions_computed": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "positions_missing": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_net_pnl": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_net_return": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_stake": {
+            "description": "Exact integer, serialized as a number (sums of `i64` stakes fit\ncomfortably in this range in practice).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pnl_model_version",
+          "total_stake",
+          "total_net_return",
+          "total_net_pnl",
+          "positions_computed",
+          "positions_missing",
+          "missing_reasons"
+        ],
+        "type": "object"
+      },
+      "PortfolioSnapshotDoc": {
+        "description": "OpenAPI schema for a checkpoint-gated portfolio snapshot.",
+        "properties": {
+          "checkpoint_ledger": {
+            "description": "Ledger the snapshot was computed against — its source cursor.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "computed_at": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "net_realized_pnl": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "open_positions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pnl_model_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "total_realized_return": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_staked": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "user_address": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_address",
+          "checkpoint_ledger",
+          "pnl_model_version",
+          "total_staked",
+          "total_realized_return",
+          "net_realized_pnl",
+          "open_positions",
+          "computed_at"
+        ],
+        "type": "object"
+      },
+      "PortfolioSnapshotEnvelope": {
+        "description": "Success envelope for `GET /api/v1/wallets/{address}/snapshot`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PortfolioSnapshotDoc"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "PositionPnlDoc": {
+        "description": "OpenAPI schema for one position's computed (or not-yet-computable) P&L.",
+        "properties": {
+          "fees": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "gross_payout_before_fee": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "missing_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MissingInputReasonDoc"
+              }
+            ]
+          },
+          "net_pnl": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "net_return": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pnl_model_version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "realized": {
+            "description": "`true` when `net_return` is a realized on-chain claim rather than an\nestimate derived from current pool state.",
+            "type": "boolean"
+          },
+          "stake": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pnl_model_version",
+          "stake",
+          "realized"
+        ],
+        "type": "object"
+      },
       "PredictionDoc": {
         "description": "OpenAPI schema for a single prediction record.",
         "properties": {
@@ -946,6 +1555,54 @@
         "required": [
           "status",
           "data"
+        ],
+        "type": "object"
+      },
+      "ProfileStatsDoc": {
+        "description": "OpenAPI schema for aggregate prediction statistics on a user's profile.",
+        "properties": {
+          "active_positions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "losses": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pending": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_earnings": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_predictions": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total_staked": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "win_rate": {
+            "format": "double",
+            "type": "number"
+          },
+          "wins": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_predictions",
+          "wins",
+          "losses",
+          "pending",
+          "win_rate",
+          "total_staked",
+          "total_earnings",
+          "active_positions"
         ],
         "type": "object"
       },
@@ -1223,6 +1880,195 @@
           "total_predictions"
         ],
         "type": "object"
+      },
+      "UserProfileDoc": {
+        "description": "OpenAPI schema for the full user profile payload.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "claims": {
+            "items": {
+              "$ref": "#/components/schemas/ClaimStatusDoc"
+            },
+            "type": "array"
+          },
+          "performance": {
+            "items": {
+              "$ref": "#/components/schemas/PerformancePointDoc"
+            },
+            "type": "array"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/ProfileStatsDoc"
+          }
+        },
+        "required": [
+          "address",
+          "stats",
+          "claims",
+          "performance"
+        ],
+        "type": "object"
+      },
+      "UserProfileEnvelope": {
+        "description": "Success envelope for `GET /api/v1/users/{address}/profile`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/UserProfileDoc"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "WalletActivityEnvelope": {
+        "description": "Success envelope for `GET /api/v1/wallets/{address}/activity`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/WalletActivityPageDoc"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "WalletActivityItemDoc": {
+        "description": "OpenAPI schema for one wallet-activity item.",
+        "properties": {
+          "contract_id": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "cursor": {
+            "description": "Opaque cursor for this item; pass as `?after=` to fetch the next page.",
+            "type": "string"
+          },
+          "event": {
+            "$ref": "#/components/schemas/ActivityEventDoc"
+          },
+          "event_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "ledger": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "network": {
+            "type": "string"
+          },
+          "tx_hash": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "network",
+          "contract_id",
+          "ledger",
+          "tx_hash",
+          "event_index",
+          "created_at",
+          "event",
+          "cursor"
+        ],
+        "type": "object"
+      },
+      "WalletActivityPageDoc": {
+        "description": "OpenAPI schema for a cursor-paginated page of wallet activity.",
+        "properties": {
+          "indexing_status": {
+            "$ref": "#/components/schemas/IndexingStatusDoc"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WalletActivityItemDoc"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "indexing_status"
+        ],
+        "type": "object"
+      },
+      "WalletPnlDoc": {
+        "description": "OpenAPI schema for `GET /api/v1/wallets/{address}/pnl`.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "portfolio": {
+            "$ref": "#/components/schemas/PortfolioPnlDoc"
+          },
+          "positions": {
+            "items": {
+              "$ref": "#/components/schemas/WalletPositionDoc"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "address",
+          "positions",
+          "portfolio"
+        ],
+        "type": "object"
+      },
+      "WalletPnlEnvelope": {
+        "description": "Success envelope for `GET /api/v1/wallets/{address}/pnl`.",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/WalletPnlDoc"
+          },
+          "status": {
+            "description": "Always `\"success\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "data"
+        ],
+        "type": "object"
+      },
+      "WalletPositionDoc": {
+        "description": "OpenAPI schema for one `(pool_id, pnl)` entry in a wallet's P&L response.",
+        "properties": {
+          "pnl": {
+            "$ref": "#/components/schemas/PositionPnlDoc"
+          },
+          "pool_id": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pool_id",
+          "pnl"
+        ],
+        "type": "object"
       }
     }
   },
@@ -1294,6 +2140,16 @@
             },
             "description": "Session (or all sessions) revoked"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Malformed JSON body"
+          },
           "401": {
             "content": {
               "application/json": {
@@ -1323,6 +2179,26 @@
               }
             },
             "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Body present with a non-JSON content type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Body does not match the schema"
           },
           "429": {
             "content": {
@@ -2185,6 +3061,105 @@
         ]
       }
     },
+    "/api/v1/markets/{pool_id}/history": {
+      "get": {
+        "operationId": "api_get_market_history",
+        "parameters": [
+          {
+            "description": "On-chain pool (market) identifier",
+            "in": "path",
+            "name": "pool_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Bucket width: 1m | 5m | 1h | 1d",
+            "in": "query",
+            "name": "bucket",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive start of the range, RFC3339 UTC",
+            "in": "query",
+            "name": "from",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exclusive end of the range, RFC3339 UTC",
+            "in": "query",
+            "name": "to",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarketHistoryEnvelope"
+                }
+              }
+            },
+            "description": "Ordered, bucketed historical market-value samples"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid pool id, bucket width, timestamp, range order, or a range exceeding the maximum bucket count"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Indexer checkpoint not ready, or database not available"
+          }
+        },
+        "tags": [
+          "markets"
+        ]
+      }
+    },
     "/api/v1/notifications/{address}": {
       "get": {
         "operationId": "api_list_notifications",
@@ -2862,6 +3837,332 @@
         },
         "tags": [
           "pools"
+        ]
+      }
+    },
+    "/api/v1/portfolio/exports/{id}": {
+      "get": {
+        "operationId": "api_get_export_status",
+        "parameters": [
+          {
+            "description": "Export job identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportStatusEnvelope"
+                }
+              }
+            },
+            "description": "Export status and progress"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Malformed export id"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer access token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Token does not authorize the export's owning wallet"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Export not found"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "portfolio"
+        ]
+      }
+    },
+    "/api/v1/portfolio/exports/{id}/cancel": {
+      "post": {
+        "operationId": "api_cancel_export",
+        "parameters": [
+          {
+            "description": "Export job identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataEnvelope"
+                }
+              }
+            },
+            "description": "Export cancelled"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Malformed export id"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer access token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Token does not authorize the export's owning wallet"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Export not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Export already reached a terminal state"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "portfolio"
+        ]
+      }
+    },
+    "/api/v1/portfolio/exports/{id}/download": {
+      "get": {
+        "operationId": "api_download_export",
+        "parameters": [
+          {
+            "description": "Export job identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Finished CSV artifact"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Malformed export id"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer access token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Token does not authorize the export's owning wallet"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Export not found, or not ready yet"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Export artifact has expired"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "portfolio"
         ]
       }
     },
@@ -3558,7 +4859,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataEnvelope"
+                  "$ref": "#/components/schemas/UserProfileEnvelope"
                 }
               }
             },
@@ -3681,6 +4982,369 @@
         ]
       }
     },
+    "/api/v1/wallets/{address}/activity": {
+      "get": {
+        "operationId": "api_get_wallet_activity",
+        "parameters": [
+          {
+            "description": "Stellar wallet address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque cursor from previous page's `next_cursor` field",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (1-100, default 20)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletActivityEnvelope"
+                }
+              }
+            },
+            "description": "Cursor-paginated, typed wallet activity feed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid address or cursor"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "portfolio"
+        ]
+      }
+    },
+    "/api/v1/wallets/{address}/exports": {
+      "post": {
+        "operationId": "api_create_wallet_export",
+        "parameters": [
+          {
+            "description": "Stellar wallet address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateExportRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExportStatusEnvelope"
+                }
+              }
+            },
+            "description": "Export job accepted; poll its status endpoint for progress"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid address or malformed body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Missing or invalid bearer access token"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Token does not authorize this wallet"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Missing JSON content type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Body does not match the schema"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "portfolio"
+        ]
+      }
+    },
+    "/api/v1/wallets/{address}/pnl": {
+      "get": {
+        "operationId": "api_get_wallet_pnl",
+        "parameters": [
+          {
+            "description": "Stellar wallet address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletPnlEnvelope"
+                }
+              }
+            },
+            "description": "Centralized, typed portfolio P&L across every position"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Database not available"
+          }
+        },
+        "tags": [
+          "portfolio"
+        ]
+      }
+    },
+    "/api/v1/wallets/{address}/snapshot": {
+      "get": {
+        "operationId": "api_get_wallet_snapshot",
+        "parameters": [
+          {
+            "description": "Stellar wallet address (G...)",
+            "in": "path",
+            "name": "address",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortfolioSnapshotEnvelope"
+                }
+              }
+            },
+            "description": "Portfolio snapshot generated against the latest committed checkpoint"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid address"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableResponse"
+                }
+              }
+            },
+            "description": "Indexer checkpoint not ready, or database not available"
+          }
+        },
+        "tags": [
+          "portfolio"
+        ]
+      }
+    },
     "/health": {
       "get": {
         "operationId": "api_health",
@@ -3722,6 +5386,10 @@
       "name": "pools"
     },
     {
+      "description": "Historical market-value time series",
+      "name": "markets"
+    },
+    {
       "description": "Protocol-wide statistics",
       "name": "stats"
     },
@@ -3736,6 +5404,10 @@
     {
       "description": "User profiles, interests and notifications",
       "name": "users"
+    },
+    {
+      "description": "Wallet activity ledger, P&L, snapshots and exports",
+      "name": "portfolio"
     },
     {
       "description": "Referral earnings",

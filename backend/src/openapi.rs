@@ -220,6 +220,257 @@ pub struct HealthResponse {
     pub errors: HealthErrors,
 }
 
+// ── Profile (src/profile.rs) ───────────────────────────────────────────────────
+
+/// OpenAPI schema for aggregate prediction statistics on a user's profile.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct ProfileStatsDoc {
+    pub total_predictions: i64,
+    pub wins: i64,
+    pub losses: i64,
+    pub pending: i64,
+    pub win_rate: f64,
+    pub total_staked: i64,
+    pub total_earnings: i64,
+    pub active_positions: i64,
+}
+
+/// OpenAPI schema for one prediction's claim status on a user's profile.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct ClaimStatusDoc {
+    pub prediction_id: i64,
+    pub pool_id: i64,
+    pub pool_name: String,
+    pub outcome: i32,
+    pub amount: i64,
+    pub pool_state: String,
+    pub pool_result: Option<String>,
+    pub is_winner: Option<bool>,
+    pub claimed: bool,
+    pub claimed_amount: i64,
+    pub claim_window_expires_at: Option<String>,
+    pub claim_expired: bool,
+}
+
+/// OpenAPI schema for one day of staking/earnings activity.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PerformancePointDoc {
+    /// Start of the UTC day this point represents.
+    pub day: String,
+    pub staked: i64,
+    pub earnings: i64,
+    pub predictions: i64,
+}
+
+/// OpenAPI schema for the full user profile payload.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct UserProfileDoc {
+    pub address: String,
+    pub stats: ProfileStatsDoc,
+    pub claims: Vec<ClaimStatusDoc>,
+    pub performance: Vec<PerformancePointDoc>,
+}
+
+// ── Portfolio: wallet activity ledger (#309) ────────────────────────────────────
+
+/// OpenAPI schema for one typed wallet-activity event. Forward-compatible:
+/// an `event_type` this build doesn't recognize decodes as `unknown` rather
+/// than being dropped or erroring.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActivityEventDoc {
+    PoolCreated {
+        pool_id: i64,
+        creator: String,
+    },
+    PredictionPlaced {
+        pool_id: i64,
+        outcome: i32,
+        amount: i64,
+    },
+    PoolResolved {
+        pool_id: i64,
+        winning_outcome: i32,
+    },
+    Claim {
+        pool_id: i64,
+        amount_paid: i64,
+    },
+    Unknown {
+        raw_type: String,
+    },
+}
+
+/// OpenAPI schema for one wallet-activity item.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct WalletActivityItemDoc {
+    pub network: String,
+    pub contract_id: String,
+    pub ledger: i64,
+    pub tx_hash: String,
+    pub event_index: i32,
+    pub created_at: String,
+    pub event: ActivityEventDoc,
+    /// Opaque cursor for this item; pass as `?after=` to fetch the next page.
+    pub cursor: String,
+}
+
+/// OpenAPI schema for the wallet-activity page's indexing-status block.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct IndexingStatusDoc {
+    /// `true` only when the listener checkpoint is a valid, known ledger.
+    pub complete: bool,
+    pub checkpoint_ledger: Option<i64>,
+    pub reason: Option<String>,
+}
+
+/// OpenAPI schema for a cursor-paginated page of wallet activity.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct WalletActivityPageDoc {
+    pub items: Vec<WalletActivityItemDoc>,
+    pub next_cursor: Option<String>,
+    pub indexing_status: IndexingStatusDoc,
+}
+
+// ── Portfolio: P&L (#310) ───────────────────────────────────────────────────────
+
+/// OpenAPI schema for why a position's P&L could not be computed.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingInputReasonDoc {
+    PoolUnresolved,
+    ZeroWinningStake,
+    AmountOverflow,
+    NegativeInput,
+}
+
+/// OpenAPI schema for one position's computed (or not-yet-computable) P&L.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PositionPnlDoc {
+    pub pnl_model_version: u32,
+    pub stake: i64,
+    /// `true` when `net_return` is a realized on-chain claim rather than an
+    /// estimate derived from current pool state.
+    pub realized: bool,
+    pub gross_payout_before_fee: Option<i64>,
+    pub fees: Option<i64>,
+    pub net_return: Option<i64>,
+    pub net_pnl: Option<i64>,
+    pub missing_reason: Option<MissingInputReasonDoc>,
+}
+
+/// OpenAPI schema for one `(pool_id, pnl)` entry in a wallet's P&L response.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct WalletPositionDoc {
+    pub pool_id: i64,
+    pub pnl: PositionPnlDoc,
+}
+
+/// OpenAPI schema for the aggregate P&L across a wallet's whole portfolio.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioPnlDoc {
+    pub pnl_model_version: u32,
+    /// Exact integer, serialized as a number (sums of `i64` stakes fit
+    /// comfortably in this range in practice).
+    #[schema(value_type = i64)]
+    pub total_stake: i128,
+    #[schema(value_type = i64)]
+    pub total_net_return: i128,
+    #[schema(value_type = i64)]
+    pub total_net_pnl: i128,
+    pub positions_computed: i64,
+    pub positions_missing: i64,
+    pub missing_reasons: Vec<MissingInputReasonDoc>,
+}
+
+/// OpenAPI schema for `GET /api/v1/wallets/{address}/pnl`.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct WalletPnlDoc {
+    pub address: String,
+    pub positions: Vec<WalletPositionDoc>,
+    pub portfolio: PortfolioPnlDoc,
+}
+
+// ── Portfolio: snapshots (#311) ─────────────────────────────────────────────────
+
+/// OpenAPI schema for a checkpoint-gated portfolio snapshot.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct PortfolioSnapshotDoc {
+    pub id: i64,
+    pub user_address: String,
+    /// Ledger the snapshot was computed against — its source cursor.
+    pub checkpoint_ledger: i64,
+    pub pnl_model_version: i32,
+    pub total_staked: i64,
+    pub total_realized_return: i64,
+    pub net_realized_pnl: i64,
+    pub open_positions: i64,
+    pub computed_at: String,
+}
+
+// ── Portfolio: exports (#312) ───────────────────────────────────────────────────
+
+/// OpenAPI schema for `POST /api/v1/wallets/{address}/exports`.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct CreateExportRequestDoc {
+    /// Max rows to export (default 10000, max 50000).
+    pub row_limit: Option<i64>,
+    /// Max wall-clock seconds the export worker may spend (default 60, max 300).
+    pub time_limit_secs: Option<i64>,
+}
+
+/// Lifecycle status of a portfolio export.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportStatusKindDoc {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// Derived, not stored: `succeeded` plus `expires_at` in the past.
+    Expired,
+}
+
+/// OpenAPI schema for an export's status/progress.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct ExportStatusViewDoc {
+    pub id: i64,
+    pub status: ExportStatusKindDoc,
+    pub rows_written: i64,
+    pub row_limit: i64,
+    pub time_limit_secs: i64,
+    pub checkpoint_ledger: Option<i64>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    /// `true` only when the artifact exists and has not expired.
+    pub download_available: bool,
+}
+
+// ── Market history (#313, #314) ─────────────────────────────────────────────────
+
+/// OpenAPI schema for one bucketed historical market-value sample.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct MarketValueSampleDoc {
+    /// Start of this bucket's interval, UTC, RFC 3339.
+    pub bucket_start: String,
+    /// Cumulative value as of the end of this interval, as an exact decimal
+    /// string (never a float).
+    pub value: String,
+    /// Committed listener checkpoint this sample was derived from.
+    pub checkpoint_ledger: i64,
+}
+
+/// OpenAPI schema for `GET /api/v1/markets/{pool_id}/history`.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct MarketHistoryPageDoc {
+    pub pool_id: i64,
+    /// `1m` | `5m` | `1h` | `1d`.
+    pub bucket_width: String,
+    pub samples: Vec<MarketValueSampleDoc>,
+}
+
 // ── Envelopes ─────────────────────────────────────────────────────────────────
 
 /// One rejected field inside a validation error.
@@ -336,6 +587,36 @@ success_envelope!(
     /// Success envelope for `GET /api/v1/prices`.
     PricesEnvelope,
     Vec<AssetPriceDoc>
+);
+success_envelope!(
+    /// Success envelope for `GET /api/v1/users/{address}/profile`.
+    UserProfileEnvelope,
+    UserProfileDoc
+);
+success_envelope!(
+    /// Success envelope for `GET /api/v1/wallets/{address}/activity`.
+    WalletActivityEnvelope,
+    WalletActivityPageDoc
+);
+success_envelope!(
+    /// Success envelope for `GET /api/v1/wallets/{address}/pnl`.
+    WalletPnlEnvelope,
+    WalletPnlDoc
+);
+success_envelope!(
+    /// Success envelope for `GET /api/v1/wallets/{address}/snapshot`.
+    PortfolioSnapshotEnvelope,
+    PortfolioSnapshotDoc
+);
+success_envelope!(
+    /// Success envelope for the portfolio export endpoints.
+    ExportStatusEnvelope,
+    ExportStatusViewDoc
+);
+success_envelope!(
+    /// Success envelope for `GET /api/v1/markets/{pool_id}/history`.
+    MarketHistoryEnvelope,
+    MarketHistoryPageDoc
 );
 
 // ── Request / response bodies ─────────────────────────────────────────────────
@@ -504,6 +785,14 @@ pub struct SetInterestsRequestDoc {
         api_ingest_pool_created,
         api_ingest_prediction_placed,
         api_ingest_claim,
+        api_get_wallet_activity,
+        api_get_wallet_pnl,
+        api_get_wallet_snapshot,
+        api_create_wallet_export,
+        api_get_export_status,
+        api_download_export,
+        api_cancel_export,
+        api_get_market_history,
     ),
     components(schemas(
         PoolDoc,
@@ -553,14 +842,41 @@ pub struct SetInterestsRequestDoc {
         UpdatePoolTagsRequestDoc,
         MarkNotificationsReadRequestDoc,
         SetInterestsRequestDoc,
+        UserProfileDoc,
+        ProfileStatsDoc,
+        ClaimStatusDoc,
+        PerformancePointDoc,
+        UserProfileEnvelope,
+        ActivityEventDoc,
+        WalletActivityItemDoc,
+        IndexingStatusDoc,
+        WalletActivityPageDoc,
+        WalletActivityEnvelope,
+        MissingInputReasonDoc,
+        PositionPnlDoc,
+        WalletPositionDoc,
+        PortfolioPnlDoc,
+        WalletPnlDoc,
+        WalletPnlEnvelope,
+        PortfolioSnapshotDoc,
+        PortfolioSnapshotEnvelope,
+        CreateExportRequestDoc,
+        ExportStatusKindDoc,
+        ExportStatusViewDoc,
+        ExportStatusEnvelope,
+        MarketValueSampleDoc,
+        MarketHistoryPageDoc,
+        MarketHistoryEnvelope,
     )),
     tags(
         (name = "health", description = "Service liveness and dependency checks"),
         (name = "pools", description = "Prediction market pools"),
+        (name = "markets", description = "Historical market-value time series"),
         (name = "stats", description = "Protocol-wide statistics"),
         (name = "leaderboard", description = "User rankings"),
         (name = "predictions", description = "User prediction history"),
         (name = "users", description = "User profiles, interests and notifications"),
+        (name = "portfolio", description = "Wallet activity ledger, P&L, snapshots and exports"),
         (name = "referrals", description = "Referral earnings"),
         (name = "auth", description = "Token rotation"),
         (name = "indexer", description = "Internal event ingestion endpoints"),
@@ -822,7 +1138,7 @@ async fn api_get_user_predictions() {}
 #[utoipa::path(get, path = "/api/v1/users/{address}/profile", tag = "users",
     params(("address" = String, Path, description = "Stellar account address (G...)")),
     responses(
-        (status = 200, description = "User profile and statistics", body = DataEnvelope),
+        (status = 200, description = "User profile and statistics", body = UserProfileEnvelope),
         (status = 400, description = "Invalid address", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 500, description = "Database error", body = ErrorResponse),
@@ -987,9 +1303,12 @@ async fn api_refresh_tokens() {}
     request_body = LogoutRequestDoc,
     responses(
         (status = 200, description = "Session (or all sessions) revoked", body = DataEnvelope),
+        (status = 400, description = "Malformed JSON body", body = ErrorResponse),
         (status = 401, description = "Missing, invalid, expired or revoked access token", body = ErrorResponse),
         (status = 403, description = "Refresh token belongs to a different user", body = ErrorResponse),
         (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Body present with a non-JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
         (status = 503, description = "Revocation store or rate limiter unavailable (fails closed)", body = ServiceUnavailableResponse),
     )
@@ -1058,6 +1377,138 @@ async fn api_ingest_prediction_placed() {}
     )
 )]
 async fn api_ingest_claim() {}
+
+// ── Portfolio & market history (#309-#314) ──────────────────────────────────────
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/wallets/{address}/activity", tag = "portfolio",
+    params(
+        ("address" = String, Path, description = "Stellar wallet address (G...)"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from previous page's `next_cursor` field"),
+        ("limit" = Option<i64>, Query, description = "Page size (1-100, default 20)"),
+    ),
+    responses(
+        (status = 200, description = "Cursor-paginated, typed wallet activity feed", body = WalletActivityEnvelope),
+        (status = 400, description = "Invalid address or cursor", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_get_wallet_activity() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/wallets/{address}/pnl", tag = "portfolio",
+    params(("address" = String, Path, description = "Stellar wallet address (G...)")),
+    responses(
+        (status = 200, description = "Centralized, typed portfolio P&L across every position", body = WalletPnlEnvelope),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_get_wallet_pnl() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/wallets/{address}/snapshot", tag = "portfolio",
+    params(("address" = String, Path, description = "Stellar wallet address (G...)")),
+    responses(
+        (status = 200, description = "Portfolio snapshot generated against the latest committed checkpoint", body = PortfolioSnapshotEnvelope),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Indexer checkpoint not ready, or database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_get_wallet_snapshot() {}
+
+#[allow(dead_code)]
+#[utoipa::path(post, path = "/api/v1/wallets/{address}/exports", tag = "portfolio",
+    params(("address" = String, Path, description = "Stellar wallet address (G...)")),
+    request_body = CreateExportRequestDoc,
+    responses(
+        (status = 202, description = "Export job accepted; poll its status endpoint for progress", body = ExportStatusEnvelope),
+        (status = 400, description = "Invalid address or malformed body", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer access token", body = ErrorResponse),
+        (status = 403, description = "Token does not authorize this wallet", body = ErrorResponse),
+        (status = 413, description = "Request body too large", body = ErrorResponse),
+        (status = 415, description = "Missing JSON content type", body = ErrorResponse),
+        (status = 422, description = "Body does not match the schema", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_create_wallet_export() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/portfolio/exports/{id}", tag = "portfolio",
+    params(("id" = i64, Path, description = "Export job identifier")),
+    responses(
+        (status = 200, description = "Export status and progress", body = ExportStatusEnvelope),
+        (status = 400, description = "Malformed export id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer access token", body = ErrorResponse),
+        (status = 403, description = "Token does not authorize the export's owning wallet", body = ErrorResponse),
+        (status = 404, description = "Export not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_get_export_status() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/portfolio/exports/{id}/download", tag = "portfolio",
+    params(("id" = i64, Path, description = "Export job identifier")),
+    responses(
+        (status = 200, description = "Finished CSV artifact", body = String, content_type = "text/csv"),
+        (status = 400, description = "Malformed export id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer access token", body = ErrorResponse),
+        (status = 403, description = "Token does not authorize the export's owning wallet", body = ErrorResponse),
+        (status = 404, description = "Export not found, or not ready yet", body = ErrorResponse),
+        (status = 410, description = "Export artifact has expired", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_download_export() {}
+
+#[allow(dead_code)]
+#[utoipa::path(post, path = "/api/v1/portfolio/exports/{id}/cancel", tag = "portfolio",
+    params(("id" = i64, Path, description = "Export job identifier")),
+    responses(
+        (status = 200, description = "Export cancelled", body = DataEnvelope),
+        (status = 400, description = "Malformed export id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer access token", body = ErrorResponse),
+        (status = 403, description = "Token does not authorize the export's owning wallet", body = ErrorResponse),
+        (status = 404, description = "Export not found", body = ErrorResponse),
+        (status = 409, description = "Export already reached a terminal state", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_cancel_export() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/markets/{pool_id}/history", tag = "markets",
+    params(
+        ("pool_id" = i64, Path, description = "On-chain pool (market) identifier"),
+        ("bucket" = String, Query, description = "Bucket width: 1m | 5m | 1h | 1d"),
+        ("from" = String, Query, description = "Inclusive start of the range, RFC3339 UTC"),
+        ("to" = String, Query, description = "Exclusive end of the range, RFC3339 UTC"),
+    ),
+    responses(
+        (status = 200, description = "Ordered, bucketed historical market-value samples", body = MarketHistoryEnvelope),
+        (status = 400, description = "Invalid pool id, bucket width, timestamp, range order, or a range exceeding the maximum bucket count", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Indexer checkpoint not ready, or database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_get_market_history() {}
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
