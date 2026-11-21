@@ -10,18 +10,18 @@ use crate::gas_opt;
 // NB: a merge conflict once duplicated this whole `use` block (upstream #167/#163)
 // which made `cargo test` fail with E0252 name-collision errors; keep it merged.
 use crate::{
-    Config, DataKey, FeeSchedule, FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent,
-    LiquidityAccounting, LiquidityDepositedEvent, LiquidityWithdrawnEvent,
-    LpFeesAccruedEvent, LpLedger, LpLossAllocatedEvent, LpFeeAttributedEvent,
-    MarketOracleConfig, MarketOracleConfiguredEvent, MarketState, MaxTotalStakeIncreasedEvent,
-    Pool, PoolCanceledEvent, PoolConfig, PoolCreatedEvent, PoolDescriptionUpdatedEvent,
-    PoolDisputedEvent, PoolReadyForResolutionEvent, PoolResolvedDiagEvent, PoolResolvedEvent,
-    PoolStats, PredifiContract, PredifiContractArgs, PredifiContractClient, PredifiError,
-    ProviderFeeRecord, ResolutionConflictEvent, ResolutionVoteCastEvent, StakeLimitsUpdatedEvent,
-    StakingClosedEvent, CANCELATION_DELAY, DEFAULT_MIN_POOL_DURATION,
-    EMERGENCY_CANCEL_MULTISIG_THRESHOLD, INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS,
-    MAX_AGGREGATE_STAKE_PER_POOL, MAX_INITIAL_LIQUIDITY, MAX_OPTIONS_COUNT, MAX_OUTCOMES_PER_POOL,
-    MAX_POOL_BOOTSTRAP_DEPTH, MAX_POOL_DURATION, MIN_POOL_BOOTSTRAP_DEPTH, UNRESOLVED_OUTCOME,
+    validate_bootstrap_depth, BootstrapError, Config, DataKey, FeeSchedule,
+    FeeScheduleSnapshotEvent, InitialLiquidityProvidedEvent, LiquidityAccounting,
+    LiquidityDepositedEvent, LiquidityWithdrawnEvent, LpFeeAttributedEvent, LpFeesAccruedEvent,
+    LpLedger, LpLossAllocatedEvent, MarketOracleConfig, MarketOracleConfiguredEvent, MarketState,
+    MaxTotalStakeIncreasedEvent, Pool, PoolCanceledEvent, PoolConfig, PoolCreatedEvent,
+    PoolDescriptionUpdatedEvent, PoolDisputedEvent, PoolReadyForResolutionEvent,
+    PoolResolvedDiagEvent, PoolResolvedEvent, PoolStats, PredifiContract, PredifiContractArgs,
+    PredifiContractClient, PredifiError, ProviderFeeRecord, ResolutionConflictEvent,
+    ResolutionVoteCastEvent, StakeLimitsUpdatedEvent, StakingClosedEvent, CANCELATION_DELAY,
+    DEFAULT_MIN_POOL_DURATION, EMERGENCY_CANCEL_MULTISIG_THRESHOLD,
+    INITIAL_LIQUIDITY_SAFETY_MARGIN_BPS, MAX_AGGREGATE_STAKE_PER_POOL, MAX_OPTIONS_COUNT,
+    MAX_OUTCOMES_PER_POOL, MAX_POOL_DURATION, UNRESOLVED_OUTCOME,
 };
 
 #[contractimpl]
@@ -451,38 +451,29 @@ impl PredifiContract {
             return Err(PredifiError::MaxOutcomesExceeded);
         }
 
-        // Validate: initial_liquidity must be non-negative if provided
-        assert!(
-            config.initial_liquidity >= 0,
-            "initial_liquidity must be non-negative"
-        );
-
-        // Validate: initial_liquidity must not exceed maximum limit
-        assert!(
-            config.initial_liquidity <= MAX_INITIAL_LIQUIDITY,
-            "initial_liquidity exceeds maximum allowed value"
-        );
-
-        // Validate: initial liquidity must fit under the contract-level
-        // aggregate stake ceiling so the pool cannot start over-cap.
-        if config.initial_liquidity > MAX_AGGREGATE_STAKE_PER_POOL {
-            soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
-        }
-
         // Issue #275 — bootstrap depth limits.
         //
-        // A pool created with non-zero initial_liquidity must seed at least
-        // MIN_POOL_BOOTSTRAP_DEPTH so that the share model can initialise
-        // without producing zero-share mints (BootstrapDepthTooLow).
-        //
-        // The upper bound is MAX_POOL_BOOTSTRAP_DEPTH (== MAX_INITIAL_LIQUIDITY),
-        // which is already enforced by the assert above; the named error
-        // BootstrapDepthTooHigh is emitted here for a stable, typed signal.
-        if config.initial_liquidity > 0 && config.initial_liquidity < MIN_POOL_BOOTSTRAP_DEPTH {
-            soroban_sdk::panic_with_error!(&env, PredifiError::BootstrapDepthTooLow);
+        // A single pure validation rule (shared with the native and optimised
+        // WASM builds) keeps the accepted range identical across every pool
+        // creation entry point and emits a stable, typed error on rejection:
+        // negative / sub-minimum depth -> BootstrapDepthTooLow,
+        // over-maximum depth          -> BootstrapDepthTooHigh.
+        match validate_bootstrap_depth(config.initial_liquidity) {
+            Ok(()) => {}
+            Err(BootstrapError::DepthTooLow) => {
+                return Err(PredifiError::BootstrapDepthTooLow);
+            }
+            Err(BootstrapError::DepthTooHigh) => {
+                return Err(PredifiError::BootstrapDepthTooHigh);
+            }
         }
-        if config.initial_liquidity > MAX_POOL_BOOTSTRAP_DEPTH {
-            soroban_sdk::panic_with_error!(&env, PredifiError::BootstrapDepthTooHigh);
+
+        // Defensive aggregate-stake guard. MAX_POOL_BOOTSTRAP_DEPTH is already
+        // below this ceiling, but keeping the check makes a cap breach
+        // distinguishable from a bootstrap-limit breach if either constant is
+        // retuned in a future release.
+        if config.initial_liquidity > MAX_AGGREGATE_STAKE_PER_POOL {
+            soroban_sdk::panic_with_error!(&env, PredifiError::MaxAggregateStakeExceeded);
         }
 
         // Issue #1131 — initial-liquidity safety margin. When the creator

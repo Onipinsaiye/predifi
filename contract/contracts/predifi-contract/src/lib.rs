@@ -14,6 +14,7 @@ mod admin;
 mod upgrade_migration_tests;
 #[cfg(test)]
 mod boundary_edge_case_tests;
+pub mod bootstrap;
 mod constants;
 mod gas_opt;
 mod oracle;
@@ -84,6 +85,7 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
+pub use bootstrap::{validate_bootstrap_depth, BootstrapError};
 pub use constants::*;
 pub use payouts::{
     calculate_claim_payout, calculate_odds_bps, calculate_protocol_fee, calculate_referral_amount,
