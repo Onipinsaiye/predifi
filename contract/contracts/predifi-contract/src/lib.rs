@@ -35,6 +35,7 @@ mod pool;
 mod prediction;
 mod price_feed;
 mod price_feed_simple;
+mod quote;
 mod referral;
 mod safe_math;
 mod schema;
@@ -90,6 +91,9 @@ pub use payouts::{
     calculate_winnings, PayoutBreakdown, PayoutInput,
 };
 pub use price_feed_simple::PriceFeedAdapter;
+pub use quote::{
+    compute_quote, LiquidityQuote, QuoteError, QuotePoolState, MAX_QUOTE_STALENESS_SECONDS,
+};
 pub use safe_math::{RoundingMode, SafeMath};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1494,6 +1498,80 @@ pub struct InitialLiquidityProvidedEvent {
     pub pool_id: u64,
     pub creator: Address,
     pub amount: i128,
+}
+
+/// Emitted when a liquidity provider deposits assets into a pool and receives
+/// liquidity shares in return.
+///
+/// `event_version` is bumped whenever the payload layout changes so that
+/// off-chain indexers can decode historical events unambiguously.
+#[contractevent(topics = ["liquidity_deposited"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityDepositedEvent {
+    /// Schema version of this event payload.
+    pub event_version: u32,
+    /// The pool that received liquidity.
+    pub pool_id: u64,
+    /// The liquidity provider.
+    pub provider: Address,
+    /// Asset amount transferred into the pool escrow.
+    pub amount: i128,
+    /// Shares minted to the provider.
+    pub shares_minted: i128,
+    /// Provider's total share balance after the deposit.
+    pub total_shares: i128,
+    /// Pool reserve after the deposit.
+    pub reserve_after: i128,
+    /// Total shares outstanding after the deposit.
+    pub total_shares_after: i128,
+    /// Ledger timestamp of the deposit.
+    pub timestamp: u64,
+}
+
+/// Emitted when a liquidity provider burns shares and withdraws assets.
+#[contractevent(topics = ["liquidity_withdrawn"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityWithdrawnEvent {
+    /// Schema version of this event payload.
+    pub event_version: u32,
+    /// The pool that released liquidity.
+    pub pool_id: u64,
+    /// The liquidity provider.
+    pub provider: Address,
+    /// Shares burned.
+    pub shares_burned: i128,
+    /// Asset amount transferred out of the pool escrow.
+    pub amount: i128,
+    /// Provider's remaining share balance.
+    pub remaining_shares: i128,
+    /// Pool reserve after the withdrawal.
+    pub reserve_after: i128,
+    /// Total shares outstanding after the withdrawal.
+    pub total_shares_after: i128,
+    /// Ledger timestamp of the withdrawal.
+    pub timestamp: u64,
+}
+
+/// Emitted when a quote is served for a pool, so that clients can reconcile
+/// their pre-signing estimate with the executed trade.
+#[contractevent(topics = ["quote_served"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuoteServedEvent {
+    /// The pool the quote was computed for.
+    pub pool_id: u64,
+    /// Input amount in base token units.
+    pub amount_in: i128,
+    /// Estimated output in base token units.
+    pub amount_out: i128,
+    /// Price impact in basis points.
+    pub price_impact_bps: u32,
+    /// Fee charged, in base token units.
+    pub fee: i128,
+    /// Ledger timestamp at which the quote was produced.
+    pub timestamp: u64,
 }
 
 #[contractevent(topics = ["pool_resolved"])]
@@ -2990,6 +3068,112 @@ impl PredifiContract {
         applied_fee
     }
 
+    /// Read-only deterministic quote for a liquidity pool.
+    ///
+    /// Uses the same pricing math as the reference model in [`quote`] so that
+    /// off-chain clients can reproduce the estimate exactly before asking a
+    /// wallet to sign. Rejects pools whose state is stale or unsupported.
+    ///
+    /// # Arguments
+    /// * `pool_id` — pool to quote against.
+    /// * `amount_in` — input amount in base token units (must be > 0).
+    ///
+    /// # Returns
+    /// A [`LiquidityQuote`] carrying input units, output estimate, price
+    /// impact, fee and the quote timestamp.
+    ///
+    /// # Errors
+    /// * [`PredifiError::PoolNotFound`] — no such pool.
+    /// * [`PredifiError::InvalidPoolState`] — pool is not quotable (closed,
+    ///   resolved, canceled, or has no liquidity).
+    /// * [`PredifiError::InvalidAmount`] — `amount_in <= 0`.
+    /// * [`PredifiError::PriceStale`] — pool state is older than
+    ///   [`MAX_QUOTE_STALENESS_SECONDS`].
+    pub fn quote_liquidity(
+        env: Env,
+        pool_id: u64,
+        amount_in: i128,
+    ) -> Result<LiquidityQuote, PredifiError> {
+        if amount_in <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(pool_id))
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &DataKey::Pool(pool_id));
+
+        // Only active pools with an open staking window are quotable.
+        if Self::is_pool_resolved(&pool) || pool.canceled {
+            return Err(PredifiError::InvalidPoolState);
+        }
+        let now = env.ledger().timestamp();
+        if now >= pool.end_time {
+            return Err(PredifiError::InvalidPoolState);
+        }
+
+        let state = Self::load_quote_pool_state(&env, pool_id, &pool)?;
+        if now.saturating_sub(state.updated_at) > MAX_QUOTE_STALENESS_SECONDS {
+            return Err(PredifiError::PriceStale);
+        }
+
+        let quote = compute_quote(&state, amount_in).map_err(|e| match e {
+            QuoteError::InvalidAmount => PredifiError::InvalidAmount,
+            QuoteError::UnsupportedState => PredifiError::InvalidPoolState,
+            QuoteError::StaleState => PredifiError::PriceStale,
+            QuoteError::Overflow => PredifiError::InvalidData,
+        })?;
+
+        QuoteServedEvent {
+            pool_id,
+            amount_in: quote.amount_in,
+            amount_out: quote.amount_out,
+            price_impact_bps: quote.price_impact_bps,
+            fee: quote.fee,
+            timestamp: quote.timestamp,
+        }
+        .publish(&env);
+
+        Ok(quote)
+    }
+
+    /// Load the pricing-relevant pool state used by [`Self::quote_liquidity`].
+    ///
+    /// Kept separate so the quote path never mutates reserves and so the
+    /// reference model can be exercised against identical inputs.
+    fn load_quote_pool_state(
+        env: &Env,
+        pool_id: u64,
+        pool: &Pool,
+    ) -> Result<QuotePoolState, PredifiError> {
+        let reserve: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolReserve(pool_id))
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolTotalShares(pool_id))
+            .unwrap_or(0);
+        let updated_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolStateUpdatedAt(pool_id))
+            .unwrap_or_else(|| env.ledger().timestamp());
+
+        let fee_bps = Self::calculate_dynamic_fee(env, pool_id, pool);
+        Ok(QuotePoolState {
+            reserve,
+            total_shares,
+            total_stake: pool.total_stake,
+            fee_bps,
+            updated_at,
+        })
+    }
+
     /// Current protocol fee schedule version (1 until the first change).
     fn current_fee_schedule_version(env: &Env) -> u32 {
         env.storage()
@@ -3019,6 +3203,8 @@ impl PredifiContract {
 mod issues_1446_1447_1448_1449_boundary_tests;
 #[cfg(test)]
 mod lifecycle_invariants_tests;
+#[cfg(test)]
+mod liquidity_quote_tests;
 #[cfg(test)]
 mod referral_integration_tests;
 #[cfg(test)]

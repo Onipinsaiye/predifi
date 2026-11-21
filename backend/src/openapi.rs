@@ -47,6 +47,37 @@ pub struct PoolWithOddsDoc {
     pub odds: Vec<OutcomeOddsDoc>,
 }
 
+/// OpenAPI schema for a single outcome's simulated share of a quote.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct QuoteOutcomeDoc {
+    /// Outcome index the estimate applies to.
+    pub outcome: i32,
+    /// Estimated shares received for this outcome (stroops).
+    pub shares: i64,
+    /// Implied odds for this outcome after the trade.
+    pub odds: f64,
+}
+
+/// OpenAPI schema for a deterministic market quote.
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct QuoteResponseDoc {
+    pub pool_id: i64,
+    /// Outcome the quote was requested for.
+    pub outcome: i32,
+    /// Input amount in stroops, echoed from the request.
+    pub input_amount: i64,
+    /// Estimated output (shares) in stroops.
+    pub output_estimate: i64,
+    /// Price impact of the trade in basis points.
+    pub price_impact_bps: u32,
+    /// Fee charged for the trade in stroops.
+    pub fee: i64,
+    /// RFC 3339 timestamp at which the quote was computed.
+    pub quote_timestamp: String,
+    /// Per-outcome share estimates after applying the trade.
+    pub outcomes: Vec<QuoteOutcomeDoc>,
+}
+
 /// OpenAPI schema for the paginated pool list response.
 #[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct PoolListResponse {
@@ -301,6 +332,11 @@ success_envelope!(
     /// Success envelope for `GET /api/v1/pools/{pool_id}`.
     PoolWithOddsEnvelope,
     PoolWithOddsDoc
+);
+success_envelope!(
+    /// Success envelope for `GET /api/v1/pools/{pool_id}/quote`.
+    QuoteEnvelope,
+    QuoteResponseDoc
 );
 success_envelope!(
     /// Success envelope for `GET /api/v1/stats`.
@@ -654,6 +690,7 @@ pub struct AccountDeletionAuditDoc {
         api_v1_health,
         api_get_pools,
         api_get_pool_by_id,
+        api_get_pool_quote,
         api_get_pool_leaderboard,
         api_update_pool_tags,
         api_get_stats,
@@ -691,6 +728,9 @@ pub struct AccountDeletionAuditDoc {
         PoolDoc,
         OutcomeOddsDoc,
         PoolWithOddsDoc,
+        QuoteOutcomeDoc,
+        QuoteResponseDoc,
+        QuoteEnvelope,
         PoolListResponse,
         MarketPredictionDoc,
         MarketPredictionsResponse,
@@ -880,6 +920,25 @@ async fn api_get_pools() {}
     )
 )]
 async fn api_get_pool_by_id() {}
+
+#[allow(dead_code)]
+#[utoipa::path(get, path = "/api/v1/pools/{pool_id}/quote", tag = "pools",
+    params(
+        ("pool_id" = i64, Path, description = "On-chain pool identifier"),
+        ("outcome" = i32, Query, description = "Outcome index to quote (0 or 1)"),
+        ("amount" = i64, Query, description = "Input amount in stroops (must be positive)"),
+    ),
+    responses(
+        (status = 200, description = "Deterministic quote: input units, output estimate, price impact, fee and quote timestamp", body = QuoteEnvelope),
+        (status = 400, description = "Malformed pool id, outcome or amount", body = ErrorResponse),
+        (status = 404, description = "Pool not found", body = ErrorResponse),
+        (status = 409, description = "Pool state is stale or unsupported for quoting (e.g. closed, settled or missing odds)", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = RateLimitErrorResponse),
+        (status = 500, description = "Database error", body = ErrorResponse),
+        (status = 503, description = "Database not available", body = ServiceUnavailableResponse),
+    )
+)]
+async fn api_get_pool_quote() {}
 
 #[allow(dead_code)]
 #[utoipa::path(get, path = "/api/v1/pools/{pool_id}/leaderboard", tag = "leaderboard",

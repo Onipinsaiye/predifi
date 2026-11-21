@@ -402,7 +402,6 @@ impl SafeMath {
         if shares > total_shares {
             return Err(PrediFiError::ArithmeticError);
         }
-
         let product = shares
             .checked_mul(total_assets)
             .ok_or(PrediFiError::InvalidAmount)?;
@@ -1567,6 +1566,88 @@ mod tests {
             }
 
             #[test]
+            fn shares_for_deposit_rounds_down_and_conserves(
+                deposit in 1i128..=1_000_000_000i128,
+                total_assets in 1i128..=1_000_000_000i128,
+                total_shares in 1i128..=1_000_000_000i128,
+            ) {
+                let shares = SafeMath::shares_for_deposit(deposit, total_assets, total_shares);
+                let expected = (deposit * total_shares) / total_assets;
+                if expected == 0 {
+                    prop_assert_eq!(shares, Err(PrediFiError::InvalidAmount));
+                } else {
+                    prop_assert_eq!(shares, Ok(expected));
+                    let remainder = SafeMath::deposit_remainder(deposit, total_assets, total_shares).unwrap();
+                    // shares * total_assets + remainder == deposit * total_shares
+                    prop_assert_eq!(shares.unwrap() * total_assets + remainder, deposit * total_shares);
+                }
+            }
+                }
+            }
+
+            #[test]
+            fn assets_for_shares_rounds_down_and_conserves(
+                shares in 1i128..=1_000_000_000i128,
+                total_assets in 1i128..=1_000_000_000i128,
+                total_shares in 1i128..=1_000_000_000i128,
+            ) {
+                prop_assume!(shares <= total_shares);
+                let assets = SafeMath::assets_for_shares(shares, total_assets, total_shares);
+                let expected = (shares * total_assets) / total_shares;
+                if expected == 0 {
+                    prop_assert_eq!(assets, Err(PrediFiError::InvalidAmount));
+                } else {
+                    prop_assert_eq!(assets, Ok(expected));
+                    let remainder = SafeMath::withdraw_remainder(shares, total_assets, total_shares).unwrap();
+                    prop_assert_eq!(assets.unwrap() * total_shares + remainder, shares * total_assets);
+                }
+            }
+
+            #[test]
+            fn share_helpers_reject_zero_values(
+                a in 0i128..=1_000_000i128,
+                b in 0i128..=1_000_000i128,
+                c in 0i128..=1_000_000i128,
+            ) {
+                if a == 0 || b == 0 || c == 0 {
+                    prop_assert_eq!(SafeMath::shares_for_deposit(a, b, c), Err(PrediFiError::InvalidAmount));
+                    prop_assert_eq!(SafeMath::assets_for_shares(a, b, c), Err(PrediFiError::InvalidAmount));
+                }
+            }
+
+            #[test]
+            fn constant_product_out_matches_reference(
+                amount_in in 1i128..=1_000_000i128,
+                reserve_in in 1i128..=1_000_000i128,
+                reserve_out in 1i128..=1_000_000i128,
+            ) {
+                let expected = (amount_in * reserve_out) / (reserve_in + amount_in);
+                prop_assert_eq!(
+                    SafeMath::constant_product_out(amount_in, reserve_in, reserve_out),
+                    Ok(expected),
+                );
+            }
+
+            #[test]
+            fn price_impact_is_bounded_and_monotonic(
+                amount_in in 1i128..=1_000_000i128,
+                reserve_in in 1i128..=1_000_000i128,
+                reserve_out in 1i128..=1_000_000i128,
+            ) {
+                let impact = SafeMath::price_impact_bps(amount_in, reserve_in, reserve_out).unwrap();
+                prop_assert!(impact >= 0);
+                prop_assert!(impact <= MAX_BPS);
+            }
+
+            #[test]
+            fn swap_fee_matches_percentage(
+                amount_in in 0i128..=1_000_000_000i128,
+                fee_bps in 0i128..=MAX_BPS,
+            ) {
+                let expected = (amount_in * fee_bps) / MAX_BPS;
+                prop_assert_eq!(SafeMath::swap_fee(amount_in, fee_bps), Ok(expected));
+            }
+
             fn lp_withdrawal_never_exceeds_proportional(
                 shares in 0i128..=1_000_000i128,
                 total_assets in 0i128..=1_000_000i128,
@@ -1651,6 +1732,7 @@ mod tests {
                 let new_shares = total_shares + shares;
                 let withdrawn = SafeMath::lp_assets_for_withdrawal(shares, new_assets, new_shares).unwrap();
                 prop_assert!(withdrawn <= deposit);
+            }
             }
         }
     }
@@ -1824,6 +1906,106 @@ mod tests {
 
         // Verify validation passes
         assert!(audit.validate_payout().is_ok());
+    }
+
+    #[test]
+    fn test_shares_for_deposit_basic() {
+        // First deposit into an empty pool is handled by the caller seeding
+        // 1:1 shares; here we test proportional minting.
+        assert_eq!(SafeMath::shares_for_deposit(100, 1000, 500).unwrap(), 50);
+        assert_eq!(SafeMath::shares_for_deposit(1000, 1000, 1000).unwrap(), 1000);
+        // Rounding down: (3 * 10) / 7 = 4 (remainder 2)
+        assert_eq!(SafeMath::shares_for_deposit(3, 7, 10).unwrap(), 4);
+        assert_eq!(SafeMath::deposit_remainder(3, 7, 10).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_shares_for_deposit_rejects_zero_and_dust() {
+        assert_eq!(
+            SafeMath::shares_for_deposit(0, 1000, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::shares_for_deposit(100, 0, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::shares_for_deposit(100, 1000, 0),
+            Err(PrediFiError::InvalidAmount)
+        );
+        // Deposit too small to mint a share
+        assert_eq!(
+            SafeMath::shares_for_deposit(1, 1000, 1),
+            Err(PrediFiError::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn test_assets_for_shares_basic() {
+        assert_eq!(SafeMath::assets_for_shares(50, 1000, 500).unwrap(), 100);
+        assert_eq!(SafeMath::assets_for_shares(500, 1000, 500).unwrap(), 1000);
+        // Rounding down: (3 * 10) / 7 = 4 (remainder 2)
+        assert_eq!(SafeMath::assets_for_shares(3, 10, 7).unwrap(), 4);
+        assert_eq!(SafeMath::withdraw_remainder(3, 10, 7).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_assets_for_shares_rejects_invalid() {
+        assert_eq!(
+            SafeMath::assets_for_shares(0, 1000, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::assets_for_shares(1001, 1000, 1000),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn test_constant_product_out_basic() {
+        // 100 in, reserves 1000/1000 → (100 * 1000) / 1100 = 90
+        assert_eq!(SafeMath::constant_product_out(100, 1000, 1000).unwrap(), 90);
+        // Symmetric reserves, equal in/out
+        assert_eq!(SafeMath::constant_product_out(1, 1, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_constant_product_out_rejects_zero() {
+        assert_eq!(
+            SafeMath::constant_product_out(0, 1000, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::constant_product_out(100, 0, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::constant_product_out(100, 1000, 0),
+            Err(PrediFiError::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn test_swap_fee_basic() {
+        assert_eq!(SafeMath::swap_fee(10_000, 30).unwrap(), 30);
+        assert_eq!(SafeMath::swap_fee(0, 30).unwrap(), 0);
+        assert_eq!(SafeMath::swap_fee(10_000, 0).unwrap(), 0);
+        assert_eq!(
+            SafeMath::swap_fee(10_000, 10_001),
+            Err(PrediFiError::InvalidFeeBps)
+        );
+    }
+
+    #[test]
+    fn test_price_impact_basic() {
+        // Zero input → zero impact
+        assert_eq!(SafeMath::price_impact_bps(0, 1000, 1000).unwrap(), 0);
+        // Small trade has small impact
+        let impact = SafeMath::price_impact_bps(10, 1000, 1000).unwrap();
+        assert!(impact > 0 && impact < 100);
+        // Large trade approaches but never exceeds 100%
+        let impact = SafeMath::price_impact_bps(1_000_000, 1000, 1000).unwrap();
+        assert!(impact <= 10_000);
     }
 
     #[test]

@@ -97,6 +97,33 @@ pub struct PoolWithOdds {
     pub odds: Vec<OutcomeOdds>,
 }
 
+/// Reserve / share state required to produce a deterministic market quote.
+///
+/// This is the raw snapshot the quote handler needs: the per-outcome reserves
+/// (stakes), the total shares outstanding, the pool lifecycle status, and the
+/// timestamp the snapshot was last updated. The handler is responsible for
+/// rejecting stale (`last_updated` too old) or unsupported (`status` not
+/// `"active"`) snapshots before computing a quote.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolQuoteState {
+    pub pool_id: i64,
+    /// Per-outcome reserves, ordered by `outcome`.
+    pub reserves: Vec<OutcomeReserve>,
+    /// Total shares outstanding across all outcomes.
+    pub total_shares: i64,
+    /// Pool lifecycle status (`"active"`, `"closed"`, `"settled"`).
+    pub status: String,
+    /// When the reserve/share snapshot was last updated.
+    pub last_updated: DateTime<Utc>,
+}
+
+/// A single outcome's reserve within a [`PoolQuoteState`] snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutcomeReserve {
+    pub outcome: i32,
+    pub reserve: i64,
+}
+
 /// Aggregate creator reputation / reward-eligibility metrics.
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
 pub struct CreatorStats {
@@ -138,6 +165,14 @@ pub struct PoolCreatedEvent {
 struct OutcomeStakeRow {
     outcome: i32,
     total_stake: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct PoolQuoteStateRow {
+    pool_id: i64,
+    state: String,
+    total_stake: i64,
+    updated_at: DateTime<Utc>,
 }
 
 // ── Column list shared by template queries ────────────────────────────────────
@@ -280,6 +315,58 @@ pub async fn get_pool_outcome_stakes(
     .await?;
 
     Ok(rows.into_iter().map(|r| (r.outcome, r.total_stake)).collect())
+}
+
+/// Fetch the reserve / share snapshot needed to produce a deterministic quote.
+///
+/// Returns `None` when the pool does not exist. The returned snapshot carries
+/// the per-outcome reserves, the total shares outstanding, the pool lifecycle
+/// status, and the timestamp the snapshot was last updated. Callers (the quote
+/// handler) must reject snapshots whose `status` is not `"active"` or whose
+/// `last_updated` is older than the configured staleness window.
+///
+/// The total shares are resolved the same way as [`get_pool_with_odds`]: the
+/// derived sum from `predictions` wins when it exceeds the denormalised
+/// `pools.total_stake` cache, so quotes agree with displayed odds.
+pub async fn get_pool_quote_state(
+    pool: &PgPool,
+    pool_id: i64,
+) -> Result<Option<PoolQuoteState>, sqlx::Error> {
+    let started = Instant::now();
+
+    let row = sqlx::query_as::<_, PoolQuoteStateRow>(
+        r#"
+        SELECT pool_id, state, total_stake, updated_at
+        FROM pools
+        WHERE pool_id = $1
+        "#,
+    )
+    .bind(pool_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let outcome_stakes = get_pool_outcome_stakes(pool, pool_id).await?;
+    let calculated_total: i64 = outcome_stakes.iter().map(|(_, s)| s).sum();
+    let total_shares = std::cmp::max(row.total_stake, calculated_total);
+
+    let reserves = outcome_stakes
+        .into_iter()
+        .map(|(outcome, reserve)| OutcomeReserve { outcome, reserve })
+        .collect();
+
+    observe_read_budget("pools.quote", 2, started.elapsed().as_millis() as u64);
+
+    Ok(Some(PoolQuoteState {
+        pool_id: row.pool_id,
+        reserves,
+        total_shares,
+        status: row.state,
+        last_updated: row.updated_at,
+    }))
 }
 
 /// Fetch a pool's full detail joined with real-time odds for each outcome.
