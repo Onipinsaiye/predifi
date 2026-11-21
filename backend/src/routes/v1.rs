@@ -19,6 +19,296 @@ use crate::redis_cache::RedisCache;
 use crate::response::{error_codes, ApiResponse};
 use crate::validated_types::{BoundedI64, NonEmptyString, PoolSortBy, PoolStatus, StellarAddress};
 
+/// Maximum age (in seconds) of a pool snapshot that a quote may be derived
+/// from. Older state is rejected as stale so clients never sign against a
+/// price that has drifted.
+pub const QUOTE_MAX_POOL_STATE_AGE_SECS: i64 = 300;
+
+/// Query parameters for `GET /api/v1/pools/:id/quote`.
+#[derive(Debug, Deserialize)]
+pub struct QuoteQuery {
+    /// Input amount in the pool's input units (must be positive).
+    pub amount: BoundedI64,
+    /// Optional outcome index the input is placed on (defaults to 0).
+    #[serde(default)]
+    pub outcome: Option<u32>,
+}
+
+/// Deterministic quote returned by `GET /api/v1/pools/:id/quote`.
+#[derive(Debug, Serialize)]
+pub struct QuoteResponse {
+    /// Pool the quote was computed for.
+    pub pool_id: i64,
+    /// Outcome index the input is placed on.
+    pub outcome: u32,
+    /// Input amount, in input units.
+    pub input_units: i64,
+    /// Estimated output shares for the input.
+    pub output_estimate: i64,
+    /// Price impact in basis points (0 = no impact).
+    pub price_impact_bps: u32,
+    /// Fee charged for the trade, in input units.
+    pub fee: i64,
+    /// Unix timestamp (seconds) at which the quote was produced.
+    pub quote_timestamp: i64,
+}
+
+/// Snapshot of the pool state a quote is derived from.
+#[derive(Debug, Clone)]
+pub struct QuotePoolState {
+    /// Pool identifier.
+    pub pool_id: i64,
+    /// Lifecycle status as reported by the authoritative source.
+    pub status: String,
+    /// Unix timestamp (seconds) of the last state update.
+    pub updated_at: i64,
+    /// Total liquidity currently in the pool, in input units.
+    pub total_liquidity: i64,
+    /// Shares already issued for the outcome being quoted.
+    pub outcome_shares: i64,
+}
+
+/// Errors produced while computing a quote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuoteError {
+    /// The pool does not exist.
+    NotFound,
+    /// The pool state is older than [`QUOTE_MAX_POOL_STATE_AGE_SECS`].
+    Stale { age_secs: i64 },
+    /// The pool lifecycle state cannot be quoted (e.g. settled/closed).
+    UnsupportedState(String),
+    /// The input amount is not positive.
+    InvalidAmount,
+    /// The pool has no liquidity to price against.
+    InsufficientLiquidity,
+}
+
+impl std::fmt::Display for QuoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuoteError::NotFound => write!(f, "pool not found"),
+            QuoteError::Stale { age_secs } => {
+                write!(f, "pool state is stale ({age_secs}s old)")
+            }
+            QuoteError::UnsupportedState(state) => {
+                write!(f, "pool state '{state}' does not support quoting")
+            }
+            QuoteError::InvalidAmount => write!(f, "amount must be positive"),
+            QuoteError::InsufficientLiquidity => write!(f, "pool has no liquidity"),
+        }
+    }
+}
+
+/// Deterministic pricing model shared by the quote endpoint and the contract
+/// reference implementation.
+///
+/// The output estimate is the constant-product share price applied to the
+/// input, net of the protocol fee. Price impact is the relative change in the
+/// marginal price caused by the trade, expressed in basis points.
+pub fn compute_quote(
+    state: &QuotePoolState,
+    amount: i64,
+    outcome: u32,
+    fee_bps: u32,
+    now: i64,
+) -> Result<QuoteResponse, QuoteError> {
+    if amount <= 0 {
+        return Err(QuoteError::InvalidAmount);
+    }
+    if state.status != "active" {
+        return Err(QuoteError::UnsupportedState(state.status.clone()));
+    }
+    let age_secs = now.saturating_sub(state.updated_at);
+    if age_secs > QUOTE_MAX_POOL_STATE_AGE_SECS {
+        return Err(QuoteError::Stale { age_secs });
+    }
+    if state.total_liquidity <= 0 {
+        return Err(QuoteError::InsufficientLiquidity);
+    }
+
+    // Fee is charged on the input, rounded down, in input units.
+    let fee = (amount as i128 * fee_bps as i128 / 10_000) as i64;
+    let net_input = amount.saturating_sub(fee);
+
+    // Constant-product marginal price: shares per input unit scale with the
+    // existing shares over the pool liquidity.
+    let liquidity = state.total_liquidity as i128;
+    let shares = state.outcome_shares.max(0) as i128;
+    let output = (net_input as i128 * liquidity / (liquidity + shares)) as i64;
+
+    // Price impact: fraction of the pool consumed by the trade, in bps.
+    let price_impact_bps = ((net_input as i128 * 10_000) / (liquidity + net_input as i128))
+        .clamp(0, 10_000) as u32;
+
+    Ok(QuoteResponse {
+        pool_id: state.pool_id,
+        outcome,
+        input_units: amount,
+        output_estimate: output.max(0),
+        price_impact_bps,
+        fee,
+        quote_timestamp: now,
+    })
+}
+
+/// `GET /api/v1/pools/:id/quote` — deterministic, read-only trade quote.
+///
+/// Validates the pool id and input amount, loads the current pool state
+/// (pool cache first, then the indexer DB), rejects stale or unsupported
+/// state, and applies the shared pricing model.
+async fn get_pool_quote_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Query(query): Query<QuoteQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let amount = query.amount.get();
+    if pool_id <= 0 || amount <= 0 {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "pool id and amount must be positive",
+        )
+        .into_response();
+    }
+    let outcome = query.outcome.unwrap_or(0);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let pool_state = match load_quote_pool_state(&state, pool_id).await {
+        Ok(Some(pool_state)) => pool_state,
+        Ok(None) => {
+            return ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOT_FOUND,
+                "pool not found",
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, pool_id, "failed to load pool state for quote");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load pool state",
+            )
+            .into_response();
+        }
+    };
+
+    match compute_quote(
+        &pool_state,
+        amount,
+        outcome,
+        state.config.treasury_fee_bps,
+        now,
+    ) {
+        Ok(quote) => ApiResponse::success(quote).into_response(),
+        Err(QuoteError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "pool not found",
+        )
+        .into_response(),
+        Err(QuoteError::Stale { age_secs }) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("pool state is stale ({age_secs}s old)"),
+        )
+        .into_response(),
+        Err(QuoteError::UnsupportedState(status)) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("pool state '{status}' does not support quoting"),
+        )
+        .into_response(),
+        Err(QuoteError::InvalidAmount) => ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "amount must be positive",
+        )
+        .into_response(),
+        Err(QuoteError::InsufficientLiquidity) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            "pool has no liquidity",
+        )
+        .into_response(),
+    }
+}
+
+/// Load the pool state used for quoting: the pool cache is consulted first,
+/// then the indexer DB. Returns `Ok(None)` when the pool does not exist.
+async fn load_quote_pool_state(
+    state: &AppState,
+    pool_id: i64,
+) -> Result<Option<QuotePoolState>, sqlx::Error> {
+    if let crate::pool_cache::CacheLookup::Found(value) = state.pool_cache.get(pool_id) {
+        if let Some(pool_state) = quote_state_from_json(pool_id, &value) {
+            return Ok(Some(pool_state));
+        }
+    }
+
+    let Some(db) = &state.db else {
+        return Ok(None);
+    };
+
+    let row: Option<(i64, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, status, EXTRACT(EPOCH FROM updated_at)::BIGINT, \
+         COALESCE(total_liquidity, 0), COALESCE(outcome_shares, 0) \
+         FROM pools WHERE id = $1",
+    )
+    .bind(pool_id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(
+        |(pool_id, status, updated_at, total_liquidity, outcome_shares)| QuotePoolState {
+            pool_id,
+            status,
+            updated_at,
+            total_liquidity,
+            outcome_shares,
+        },
+    ))
+}
+
+/// Extract a [`QuotePoolState`] from a cached pool-detail JSON document.
+fn quote_state_from_json(pool_id: i64, value: &serde_json::Value) -> Option<QuotePoolState> {
+    let status = value.get("status")?.as_str()?.to_string();
+    let updated_at = value
+        .get("updated_at")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            value
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_market_timestamp(s).ok())
+                .map(|dt| dt.timestamp())
+        })?;
+    let total_liquidity = value
+        .get("total_liquidity")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let outcome_shares = value
+        .get("outcome_shares")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Some(QuotePoolState {
+        pool_id,
+        status,
+        updated_at,
+        total_liquidity,
+        outcome_shares,
+    })
+}
+
 /// Struct representing fee information, matching the contract structure.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FeeInfo {
@@ -2606,6 +2896,7 @@ pub fn router(
         Router::new()
             .route("/pools", get(get_pools))
             .route("/pools/:id", get(get_pool_by_id_handler))
+            .route("/pools/:id/quote", get(get_pool_quote_handler))
             .route("/pools/:id/leaderboard", get(get_pool_leaderboard))
             .route("/stats", get(get_stats))
             .route("/leaderboard", get(get_leaderboard))
@@ -3234,6 +3525,127 @@ mod pools_pagination_tests {
     fn non_positive_limit_is_clamped_up_to_one() {
         assert_eq!(resolve_pools_page_size(Some(0)), 1);
         assert_eq!(resolve_pools_page_size(Some(-5)), 1);
+    }
+}
+
+/// Tests for the deterministic market quote simulation (#269).
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    fn active_state(updated_at: i64) -> QuotePoolState {
+        QuotePoolState {
+            pool_id: 1,
+            status: "active".to_string(),
+            updated_at,
+            total_liquidity: 10_000,
+            outcome_shares: 2_500,
+        }
+    }
+
+    #[test]
+    fn quote_is_deterministic_for_same_inputs() {
+        let state = active_state(1_000);
+        let a = compute_quote(&state, 500, 0, 100, 1_010).unwrap();
+        let b = compute_quote(&state, 500, 0, 100, 1_010).unwrap();
+        assert_eq!(a.output_estimate, b.output_estimate);
+        assert_eq!(a.price_impact_bps, b.price_impact_bps);
+        assert_eq!(a.fee, b.fee);
+        assert_eq!(a.quote_timestamp, b.quote_timestamp);
+    }
+
+    #[test]
+    fn quote_returns_input_output_impact_fee_and_timestamp() {
+        let state = active_state(1_000);
+        let quote = compute_quote(&state, 1_000, 0, 100, 1_010).unwrap();
+        assert_eq!(quote.input_units, 1_000);
+        assert_eq!(quote.fee, 10);
+        assert!(quote.output_estimate > 0);
+        assert!(quote.price_impact_bps > 0);
+        assert_eq!(quote.quote_timestamp, 1_010);
+    }
+
+    #[test]
+    fn quote_rejects_stale_pool_state() {
+        let state = active_state(1_000);
+        let err = compute_quote(
+            &state,
+            100,
+            0,
+            100,
+            1_000 + QUOTE_MAX_POOL_STATE_AGE_SECS + 1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuoteError::Stale { .. }));
+    }
+
+    #[test]
+    fn quote_rejects_unsupported_pool_state() {
+        let mut state = active_state(1_000);
+        state.status = "settled".to_string();
+        let err = compute_quote(&state, 100, 0, 100, 1_010).unwrap_err();
+        assert!(matches!(err, QuoteError::UnsupportedState(_)));
+    }
+
+    #[test]
+    fn quote_rejects_non_positive_amount() {
+        let state = active_state(1_000);
+        assert_eq!(
+            compute_quote(&state, 0, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InvalidAmount
+        );
+        assert_eq!(
+            compute_quote(&state, -1, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InvalidAmount
+        );
+    }
+
+    #[test]
+    fn quote_rejects_empty_liquidity() {
+        let mut state = active_state(1_000);
+        state.total_liquidity = 0;
+        assert_eq!(
+            compute_quote(&state, 100, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InsufficientLiquidity
+        );
+    }
+
+    #[test]
+    fn quote_matches_reference_constant_product_model() {
+        // Reference: output = net_input * L / (L + shares), impact = net * 1e4 / (L + net).
+        let state = active_state(1_000);
+        let amount = 2_000i64;
+        let fee_bps = 50u32;
+        let quote = compute_quote(&state, amount, 0, fee_bps, 1_010).unwrap();
+        let fee = (amount as i128 * fee_bps as i128 / 10_000) as i64;
+        let net = amount - fee;
+        let expected_output = (net as i128 * 10_000 / (10_000 + 2_500)) as i64;
+        let expected_impact = ((net as i128 * 10_000) / (10_000 + net as i128)) as u32;
+        assert_eq!(quote.fee, fee);
+        assert_eq!(quote.output_estimate, expected_output);
+        assert_eq!(quote.price_impact_bps, expected_impact);
+    }
+
+    #[test]
+    fn quote_state_from_json_parses_cached_pool() {
+        let value = serde_json::json!({
+            "status": "active",
+            "updated_at": 1_000,
+            "total_liquidity": 5_000,
+            "outcome_shares": 500,
+        });
+        let state = quote_state_from_json(7, &value).expect("valid cached pool");
+        assert_eq!(state.pool_id, 7);
+        assert_eq!(state.status, "active");
+        assert_eq!(state.updated_at, 1_000);
+        assert_eq!(state.total_liquidity, 5_000);
+        assert_eq!(state.outcome_shares, 500);
+    }
+
+    #[test]
+    fn quote_state_from_json_rejects_missing_status() {
+        let value = serde_json::json!({ "updated_at": 1_000 });
+        assert!(quote_state_from_json(7, &value).is_none());
     }
 }
 

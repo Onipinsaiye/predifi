@@ -91,6 +91,22 @@ pub struct RefPool {
     pub participants_count: u32,
     /// Timestamp set when the pool transitions to `Resolved`.
     pub resolution_timestamp: Option<u64>,
+
+    // --- liquidity accounting ---
+    /// Total liquidity-provider shares outstanding.
+    pub total_shares: i128,
+    /// Escrowed liquidity reserves backing outstanding shares.
+    pub liquidity_reserve: i128,
+    /// Accepted asset identifier for liquidity deposits (0 = any).
+    pub accepted_asset: u32,
+    /// Minimum single deposit amount (0 = no minimum).
+    pub min_deposit: i128,
+    /// Maximum single deposit amount (0 = no maximum).
+    pub max_deposit: i128,
+    /// Maximum shares a single withdrawal call may burn (0 = no cap).
+    pub max_withdraw_shares: i128,
+    /// Timestamp after which withdrawals are locked (0 = no lock).
+    pub withdraw_lock_time: u64,
 }
 
 impl RefPool {
@@ -146,6 +162,26 @@ impl RefPool {
                 self.options_count,
             );
         }
+
+        // INV-L1: shares and reserves are non-negative
+        assert!(
+            self.total_shares >= 0,
+            "INV-L1: total_shares ({}) < 0",
+            self.total_shares
+        );
+        assert!(
+            self.liquidity_reserve >= 0,
+            "INV-L1: liquidity_reserve ({}) < 0",
+            self.liquidity_reserve
+        );
+
+        // INV-L2: zero shares iff zero reserve (no orphaned liabilities)
+        assert!(
+            (self.total_shares == 0) == (self.liquidity_reserve == 0),
+            "INV-L2: total_shares ({}) and liquidity_reserve ({}) must be jointly zero or non-zero",
+            self.total_shares,
+            self.liquidity_reserve,
+        );
     }
 }
 
@@ -189,6 +225,24 @@ pub enum ModelError {
     CannotChangeOutcome,
     /// Pool is in Disputed state; no operations allowed.
     PoolDisputed,
+    /// Liquidity deposit/withdraw attempted with a zero or negative amount.
+    InvalidLiquidityAmount,
+    /// Deposit is below the pool's configured minimum.
+    DepositBelowMinimum,
+    /// Deposit exceeds the pool's configured maximum.
+    DepositAboveMaximum,
+    /// Asset is not the pool's accepted liquidity asset.
+    UnsupportedAsset,
+    /// Caller is not authorized to provide liquidity.
+    Unauthorized,
+    /// Withdrawals are locked for this pool (lifecycle window closed).
+    WithdrawalsLocked,
+    /// Withdrawal exceeds the caller's share balance.
+    InsufficientShares,
+    /// Withdrawal exceeds the per-call share cap.
+    WithdrawCapExceeded,
+    /// Pool state is stale or unsupported for quoting.
+    StalePoolState,
 }
 
 impl From<MathError> for ModelError {
@@ -242,6 +296,10 @@ pub struct RefModel {
     claimed: HashMap<(String, u64), bool>,
     /// Tracks cumulative claimed winnings per pool for INV-5.
     claimed_total: HashMap<u64, i128>,
+    /// `lp_shares[(provider.to_string(), pool_id)]` → shares held.
+    lp_shares: HashMap<(String, u64), i128>,
+    /// Providers authorized to supply liquidity (empty = open to all).
+    liquidity_providers: HashMap<String, bool>,
 }
 
 impl RefModel {
@@ -297,11 +355,328 @@ impl RefModel {
             fee_bps: 0, // set at resolution
             participants_count: 0,
             resolution_timestamp: None,
+            total_shares: 0,
+            liquidity_reserve: 0,
+            accepted_asset: 0,
+            min_deposit: 0,
+            max_deposit: 0,
+            max_withdraw_shares: 0,
+            withdraw_lock_time: 0,
         };
 
         pool.check_invariants();
         self.pools.insert(pool_id, pool);
         Ok(pool_id)
+    }
+
+    /// Configure liquidity parameters for an existing pool.
+    ///
+    /// Must be called before any liquidity is provided. `accepted_asset` of 0
+    /// means any asset is accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure_liquidity(
+        &mut self,
+        pool_id: u64,
+        accepted_asset: u32,
+        min_deposit: i128,
+        max_deposit: i128,
+        max_withdraw_shares: i128,
+        withdraw_lock_time: u64,
+    ) -> Result<(), ModelError> {
+        let pool = self.pools.get_mut(&pool_id).ok_or(ModelError::PoolNotFound)?;
+        if pool.total_shares != 0 {
+            return Err(ModelError::InvalidPoolState);
+        }
+        if min_deposit < 0 || max_deposit < 0 || max_withdraw_shares < 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+        if max_deposit > 0 && min_deposit > max_deposit {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+        pool.accepted_asset = accepted_asset;
+        pool.min_deposit = min_deposit;
+        pool.max_deposit = max_deposit;
+        pool.max_withdraw_shares = max_withdraw_shares;
+        pool.withdraw_lock_time = withdraw_lock_time;
+        pool.check_invariants();
+        Ok(())
+    }
+
+    /// Authorize (or de-authorize) a liquidity provider.
+    pub fn set_liquidity_provider(
+        &mut self,
+        provider: impl Into<String>,
+        authorized: bool,
+    ) -> Result<(), ModelError> {
+        let provider = provider.into();
+        if authorized {
+            self.liquidity_providers.insert(provider, true);
+        } else {
+            self.liquidity_providers.remove(&provider);
+        }
+        Ok(())
+    }
+
+    // ── Liquidity: deposits ───────────────────────────────────────────────
+
+    /// Guarded liquidity deposit.
+    ///
+    /// Validates market status, accepted asset, deposit bounds and caller
+    /// authorization, then mints shares and updates reserves atomically.
+    /// Returns the number of shares minted.
+    pub fn deposit_liquidity(
+        &mut self,
+        provider: impl Into<String>,
+        pool_id: u64,
+        amount: i128,
+        asset: u32,
+        timestamp: u64,
+    ) -> Result<i128, ModelError> {
+        let provider = provider.into();
+
+        if amount <= 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+
+        // Authorization: if any providers are registered, caller must be one.
+        if !self.liquidity_providers.is_empty()
+            && !self.liquidity_providers.contains_key(&provider)
+        {
+            return Err(ModelError::Unauthorized);
+        }
+
+        let pool = self.pools.get(&pool_id).ok_or(ModelError::PoolNotFound)?;
+
+        // Lifecycle guard: only Active pools accept liquidity.
+        match pool.state {
+            MarketState::Active => {}
+            MarketState::Disputed => return Err(ModelError::PoolDisputed),
+            _ => return Err(ModelError::InvalidPoolState),
+        }
+
+        // Deposit window must still be open.
+        if timestamp >= pool.end_time {
+            return Err(ModelError::InvalidPoolState);
+        }
+
+        // Asset guard.
+        if pool.accepted_asset != 0 && asset != pool.accepted_asset {
+            return Err(ModelError::UnsupportedAsset);
+        }
+
+        // Bounds.
+        if amount < pool.min_deposit {
+            return Err(ModelError::DepositBelowMinimum);
+        }
+        if pool.max_deposit > 0 && amount > pool.max_deposit {
+            return Err(ModelError::DepositAboveMaximum);
+        }
+
+        // Compute shares before mutation.
+        let shares = if pool.total_shares == 0 {
+            amount
+        } else {
+            // shares = amount * total_shares / liquidity_reserve (floor)
+            let num = amount
+                .checked_mul(pool.total_shares)
+                .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+            let s = num / pool.liquidity_reserve;
+            if s <= 0 {
+                return Err(ModelError::InvalidLiquidityAmount);
+            }
+            s
+        };
+
+        let pool = self.pools.get_mut(&pool_id).unwrap();
+
+        // Atomic reserve + share update.
+        pool.liquidity_reserve = pool
+            .liquidity_reserve
+            .checked_add(amount)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        pool.total_shares = pool
+            .total_shares
+            .checked_add(shares)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+
+        let key = (provider, pool_id);
+        let entry = self.lp_shares.entry(key).or_insert(0);
+        *entry = entry
+            .checked_add(shares)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+
+        pool.check_invariants();
+        Ok(shares)
+    }
+
+    // ── Liquidity: withdrawals ────────────────────────────────────────────
+
+    /// Bounded liquidity withdrawal.
+    ///
+    /// Only permitted while the pool is `Active` and before `withdraw_lock_time`
+    /// (if set). The payout amount is computed exactly before any state mutation
+    /// and the per-call share cap is enforced. Returns the asset amount paid out.
+    pub fn withdraw_liquidity(
+        &mut self,
+        provider: impl Into<String>,
+        pool_id: u64,
+        shares: i128,
+        timestamp: u64,
+    ) -> Result<i128, ModelError> {
+        let provider = provider.into();
+
+        if shares <= 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+
+        let pool = self.pools.get(&pool_id).ok_or(ModelError::PoolNotFound)?;
+
+        // Lifecycle guard: withdrawals only from Active pools.
+        match pool.state {
+            MarketState::Active => {}
+            MarketState::Disputed => return Err(ModelError::PoolDisputed),
+            _ => return Err(ModelError::InvalidPoolState),
+        }
+
+        // Lock window.
+        if pool.withdraw_lock_time != 0 && timestamp >= pool.withdraw_lock_time {
+            return Err(ModelError::WithdrawalsLocked);
+        }
+
+        // Per-call cap.
+        if pool.max_withdraw_shares > 0 && shares > pool.max_withdraw_shares {
+            return Err(ModelError::WithdrawCapExceeded);
+        }
+
+        // Provider balance.
+        let key = (provider, pool_id);
+        let held = *self.lp_shares.get(&key).unwrap_or(&0);
+        if shares > held {
+            return Err(ModelError::InsufficientShares);
+        }
+
+        // Exact amount before mutation: amount = shares * reserve / total_shares (floor)
+        let num = shares
+            .checked_mul(pool.liquidity_reserve)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+        let amount = num / pool.total_shares;
+        if amount <= 0 {
+            return Err(ModelError::InvalidLiquidityAmount);
+        }
+        if amount > pool.liquidity_reserve {
+            return Err(ModelError::InsufficientBalance);
+        }
+
+        let pool = self.pools.get_mut(&pool_id).unwrap();
+
+        // Atomic update.
+        pool.liquidity_reserve -= amount;
+        pool.total_shares -= shares;
+
+        let entry = self.lp_shares.get_mut(&key).unwrap();
+        *entry -= shares;
+        if *entry == 0 {
+            self.lp_shares.remove(&key);
+        }
+
+        pool.check_invariants();
+        Ok(amount)
+    }
+
+    /// Shares held by a provider for a pool.
+    pub fn shares_of(&self, provider: &str, pool_id: u64) -> i128 {
+        *self
+            .lp_shares
+            .get(&(provider.to_string(), pool_id))
+            .unwrap_or(&0)
+    }
+
+    // ── Quoting ───────────────────────────────────────────────────────────
+
+    /// Deterministic read-only quote for a prospective stake.
+    ///
+    /// Returns `(input_units, output_estimate, price_impact_bps, fee, timestamp)`.
+    /// Rejects stale or unsupported pool state (non-Active, closed window,
+    /// invalid outcome, non-positive amount).
+    pub fn quote(
+        &self,
+        pool_id: u64,
+        outcome: u32,
+        amount: i128,
+        timestamp: u64,
+    ) -> Result<Quote, ModelError> {
+        if amount <= 0 {
+            return Err(ModelError::InvalidAmount);
+        }
+
+        let pool = self.pools.get(&pool_id).ok_or(ModelError::PoolNotFound)?;
+
+        // Stale / unsupported state rejection.
+        match pool.state {
+            MarketState::Active => {}
+            MarketState::Disputed => return Err(ModelError::StalePoolState),
+            _ => return Err(ModelError::StalePoolState),
+        }
+        if timestamp >= pool.end_time {
+            return Err(ModelError::StalePoolState);
+        }
+        if outcome >= pool.options_count {
+            return Err(ModelError::InvalidOutcome);
+        }
+
+        // Fee for this quote (flat base fee; dynamic tiers depend on final total).
+        let fee_bps = pool.fee_schedule.base_fee_bps as i128;
+        let fee = amount
+            .checked_mul(fee_bps)
+            .ok_or(ModelError::ArithmeticError(MathError::Overflow))?
+            / MAX_BPS as i128;
+
+        // Output estimate: net stake against the outcome's current share of the
+        // pool. Uses the same proportional model as claim payouts.
+        let net = amount - fee;
+        let outcome_stake = pool.outcome_stakes[outcome as usize];
+        let total = pool.total_stake;
+        let output_estimate = if total <= 0 {
+            net
+        } else {
+            // Estimated payout if this outcome wins: net * total / (outcome_stake + amount)
+            let num = net
+                .checked_mul(total)
+                .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+            let denom = outcome_stake
+                .checked_add(amount)
+                .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+            if denom <= 0 {
+                net
+            } else {
+                num / denom
+            }
+        };
+
+        // Price impact: fraction of the outcome pool this stake represents.
+        let price_impact_bps = if total <= 0 {
+            0
+        } else {
+            let num = amount
+                .checked_mul(MAX_BPS as i128)
+                .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+            let denom = total
+                .checked_add(amount)
+                .ok_or(ModelError::ArithmeticError(MathError::Overflow))?;
+            if denom <= 0 {
+                0
+            } else {
+                (num / denom) as u32
+            }
+        };
+
+        Ok(Quote {
+            input_units: amount,
+            output_estimate,
+            price_impact_bps,
+            fee,
+            timestamp,
+        })
     }
 
     // ── Staking ───────────────────────────────────────────────────────────
@@ -650,6 +1025,21 @@ impl RefModel {
     }
 }
 
+/// A deterministic, read-only market quote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quote {
+    /// Input units the caller would stake.
+    pub input_units: i128,
+    /// Estimated output (payout) units.
+    pub output_estimate: i128,
+    /// Price impact in basis points.
+    pub price_impact_bps: u32,
+    /// Fee charged on the input, in input units.
+    pub fee: i128,
+    /// Ledger timestamp the quote was produced at.
+    pub timestamp: u64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests for the model state machine
 // ─────────────────────────────────────────────────────────────────────────────
@@ -964,5 +1354,212 @@ mod tests {
         // "dave" never staked
         let payout = m.claim("dave", pid, 600).unwrap();
         assert_eq!(payout, 0);
+    }
+
+    // ── Liquidity: deposits ───────────────────────────────────────────────
+
+    #[test]
+    fn deposit_mints_shares_and_updates_reserve() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        let shares = m.deposit_liquidity("lp", pid, 1000, 0, 10).unwrap();
+        assert_eq!(shares, 1000);
+        let pool = m.pool(pid).unwrap();
+        assert_eq!(pool.total_shares, 1000);
+        assert_eq!(pool.liquidity_reserve, 1000);
+        assert_eq!(m.shares_of("lp", pid), 1000);
+    }
+
+    #[test]
+    fn deposit_rejects_zero_and_negative() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        assert_eq!(
+            m.deposit_liquidity("lp", pid, 0, 0, 10),
+            Err(ModelError::InvalidLiquidityAmount)
+        );
+        assert_eq!(
+            m.deposit_liquidity("lp", pid, -5, 0, 10),
+            Err(ModelError::InvalidLiquidityAmount)
+        );
+    }
+
+    #[test]
+    fn deposit_rejects_unsupported_asset() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.configure_liquidity(pid, 7, 0, 0, 0, 0).unwrap();
+        assert_eq!(
+            m.deposit_liquidity("lp", pid, 100, 8, 10),
+            Err(ModelError::UnsupportedAsset)
+        );
+        assert!(m.deposit_liquidity("lp", pid, 100, 7, 10).is_ok());
+    }
+
+    #[test]
+    fn deposit_rejects_unauthorized_provider() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.set_liquidity_provider("lp", true).unwrap();
+        assert_eq!(
+            m.deposit_liquidity("stranger", pid, 100, 0, 10),
+            Err(ModelError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn deposit_rejects_closed_and_paused_pools() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.dispute(pid).unwrap();
+        assert_eq!(
+            m.deposit_liquidity("lp", pid, 100, 0, 10),
+            Err(ModelError::PoolDisputed)
+        );
+
+        let mut m2 = RefModel::new();
+        let pid2 = simple_pool(&mut m2);
+        m2.cancel(pid2).unwrap();
+        assert_eq!(
+            m2.deposit_liquidity("lp", pid2, 100, 0, 10),
+            Err(ModelError::InvalidPoolState)
+        );
+    }
+
+    #[test]
+    fn deposit_bounds_enforced() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.configure_liquidity(pid, 0, 100, 500, 0, 0).unwrap();
+        assert_eq!(
+            m.deposit_liquidity("lp", pid, 99, 0, 10),
+            Err(ModelError::DepositBelowMinimum)
+        );
+        assert_eq!(
+            m.deposit_liquidity("lp", pid, 501, 0, 10),
+            Err(ModelError::DepositAboveMaximum)
+        );
+        assert!(m.deposit_liquidity("lp", pid, 100, 0, 10).is_ok());
+        assert!(m.deposit_liquidity("lp", pid, 500, 0, 10).is_ok());
+    }
+
+    // ── Liquidity: withdrawals ────────────────────────────────────────────
+
+    #[test]
+    fn withdraw_returns_proportional_amount() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp", pid, 1000, 0, 10).unwrap();
+        let amount = m.withdraw_liquidity("lp", pid, 400, 20).unwrap();
+        assert_eq!(amount, 400);
+        let pool = m.pool(pid).unwrap();
+        assert_eq!(pool.total_shares, 600);
+        assert_eq!(pool.liquidity_reserve, 600);
+        assert_eq!(m.shares_of("lp", pid), 600);
+    }
+
+    #[test]
+    fn withdraw_rejects_insufficient_shares() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp", pid, 1000, 0, 10).unwrap();
+        assert_eq!(
+            m.withdraw_liquidity("lp", pid, 1001, 20),
+            Err(ModelError::InsufficientShares)
+        );
+    }
+
+    #[test]
+    fn withdraw_respects_lock_time() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.configure_liquidity(pid, 0, 0, 0, 0, 500).unwrap();
+        m.deposit_liquidity("lp", pid, 1000, 0, 10).unwrap();
+        assert_eq!(
+            m.withdraw_liquidity("lp", pid, 100, 500),
+            Err(ModelError::WithdrawalsLocked)
+        );
+        assert!(m.withdraw_liquidity("lp", pid, 100, 499).is_ok());
+    }
+
+    #[test]
+    fn withdraw_respects_per_call_cap() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.configure_liquidity(pid, 0, 0, 0, 100, 0).unwrap();
+        m.deposit_liquidity("lp", pid, 1000, 0, 10).unwrap();
+        assert_eq!(
+            m.withdraw_liquidity("lp", pid, 101, 20),
+            Err(ModelError::WithdrawCapExceeded)
+        );
+        assert!(m.withdraw_liquidity("lp", pid, 100, 20).is_ok());
+    }
+
+    #[test]
+    fn withdraw_rejects_after_close() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        m.deposit_liquidity("lp", pid, 1000, 0, 10).unwrap();
+        m.resolve(pid, 0, 500).unwrap();
+        assert_eq!(
+            m.withdraw_liquidity("lp", pid, 100, 600),
+            Err(ModelError::InvalidPoolState)
+        );
+    }
+
+    #[test]
+    fn repeated_deposit_withdraw_preserves_solvency() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        for i in 0..10 {
+            m.deposit_liquidity("lp", pid, 100 + i, 0, 10).unwrap();
+            let shares = m.shares_of("lp", pid);
+            let half = shares / 2;
+            if half > 0 {
+                m.withdraw_liquidity("lp", pid, half, 20).unwrap();
+            }
+            let pool = m.pool(pid).unwrap();
+            assert!(pool.liquidity_reserve >= 0);
+            assert_eq!(pool.total_shares, m.shares_of("lp", pid));
+        }
+    }
+
+    // ── Quoting ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn quote_returns_expected_fields() {
+        let mut m = RefModel::new();
+        let pid = m.create_pool(0, 1000, 1, 0, 0, 0, 0, 2, FeeSchedule::flat(200)).unwrap();
+        m.stake("alice", pid, 1000, 0).unwrap();
+        let q = m.quote(pid, 1, 500, 10).unwrap();
+        assert_eq!(q.input_units, 500);
+        assert_eq!(q.fee, 10); // 500 * 200 / 10_000
+        assert_eq!(q.timestamp, 10);
+        assert!(q.output_estimate > 0);
+    }
+
+    #[test]
+    fn quote_rejects_stale_state() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        // Closed window
+        assert_eq!(
+            m.quote(pid, 0, 100, 1000),
+            Err(ModelError::StalePoolState)
+        );
+        // Resolved pool
+        m.stake("alice", pid, 100, 0).unwrap();
+        m.resolve(pid, 0, 500).unwrap();
+        assert_eq!(
+            m.quote(pid, 0, 100, 600),
+            Err(ModelError::StalePoolState)
+        );
+    }
+
+    #[test]
+    fn quote_rejects_invalid_outcome() {
+        let mut m = RefModel::new();
+        let pid = simple_pool(&mut m);
+        assert_eq!(m.quote(pid, 5, 100, 10), Err(ModelError::InvalidOutcome));
     }
 }

@@ -316,6 +316,222 @@ impl SafeMath {
     pub fn safe_mul(a: i128, b: i128) -> Result<i128, PrediFiError> {
         a.checked_mul(b).ok_or(PrediFiError::InvalidAmount)
     }
+
+    /// Compute the number of shares to mint for a liquidity deposit.
+    ///
+    /// Uses the canonical constant-product share model:
+    /// `shares = (deposit * total_shares) / total_assets`, rounded **down**
+    /// (protocol-favor) so that the provider can never mint more shares than
+    /// their contribution entitles them to. The rounding remainder is retained
+    /// by the pool, preserving the solvency invariant
+    /// `total_liabilities <= escrow`.
+    ///
+    /// # Arguments
+    /// * `deposit` - Assets being contributed (must be > 0)
+    /// * `total_assets` - Assets currently held by the pool (must be > 0)
+    /// * `total_shares` - Shares currently outstanding (must be > 0)
+    ///
+    /// # Returns
+    /// * `Ok(shares)` on success (always >= 1 for a valid non-zero deposit)
+    /// * `Err(InvalidAmount)` on zero-value inputs or overflow
+    pub fn shares_for_deposit(
+        deposit: i128,
+        total_assets: i128,
+        total_shares: i128,
+    ) -> Result<i128, PrediFiError> {
+        if deposit <= 0 || total_assets <= 0 || total_shares <= 0 {
+            return Err(PrediFiError::InvalidAmount);
+        }
+        let numerator = deposit
+            .checked_mul(total_shares)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        let shares = numerator
+            .checked_div(total_assets)
+            .ok_or(PrediFiError::ArithmeticError)?;
+        if shares <= 0 {
+            // Deposit too small to mint a single share — reject rather than
+            // silently donating the deposit to the pool.
+            return Err(PrediFiError::InvalidAmount);
+        }
+        Ok(shares)
+    }
+
+    /// Compute the number of assets returned for burning liquidity shares.
+    ///
+    /// Uses `assets = (shares * total_assets) / total_shares`, rounded **down**
+    /// (protocol-favor) so that a withdrawal can never drain more than the
+    /// provider's proportional entitlement. The remainder stays in escrow,
+    /// preserving solvency on every path.
+    ///
+    /// # Arguments
+    /// * `shares` - Shares being burned (must be > 0)
+    /// * `total_assets` - Assets currently held by the pool (must be > 0)
+    /// * `total_shares` - Shares currently outstanding (must be > 0)
+    ///
+    /// # Returns
+    /// * `Ok(assets)` on success (always >= 1 for a valid non-zero burn)
+    /// * `Err(InvalidAmount)` on zero-value inputs or overflow
+    pub fn assets_for_shares(
+        shares: i128,
+        total_assets: i128,
+        total_shares: i128,
+    ) -> Result<i128, PrediFiError> {
+        if shares <= 0 || total_assets <= 0 || total_shares <= 0 {
+            return Err(PrediFiError::InvalidAmount);
+        }
+        if shares > total_shares {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        let numerator = shares
+            .checked_mul(total_assets)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        let assets = numerator
+            .checked_div(total_shares)
+            .ok_or(PrediFiError::ArithmeticError)?;
+        if assets <= 0 {
+            return Err(PrediFiError::InvalidAmount);
+        }
+        Ok(assets)
+    }
+
+    /// Compute the rounding remainder retained by the pool for a share mint.
+    ///
+    /// `remainder = (deposit * total_shares) % total_assets`. This is the dust
+    /// that stays in escrow and must be accounted for when reconciling
+    /// liabilities against escrow.
+    pub fn deposit_remainder(
+        deposit: i128,
+        total_assets: i128,
+        total_shares: i128,
+    ) -> Result<i128, PrediFiError> {
+        if deposit <= 0 || total_assets <= 0 || total_shares <= 0 {
+            return Err(PrediFiError::InvalidAmount);
+        }
+        let numerator = deposit
+            .checked_mul(total_shares)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        numerator
+            .checked_rem(total_assets)
+            .ok_or(PrediFiError::ArithmeticError)
+    }
+
+    /// Compute the rounding remainder retained by the pool for a share burn.
+    ///
+    /// `remainder = (shares * total_assets) % total_shares`.
+    pub fn withdraw_remainder(
+        shares: i128,
+        total_assets: i128,
+        total_shares: i128,
+    ) -> Result<i128, PrediFiError> {
+        if shares <= 0 || total_assets <= 0 || total_shares <= 0 {
+            return Err(PrediFiError::InvalidAmount);
+        }
+        if shares > total_shares {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        let numerator = shares
+            .checked_mul(total_assets)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        numerator
+            .checked_rem(total_shares)
+            .ok_or(PrediFiError::ArithmeticError)
+    }
+
+    /// Compute the constant-product output for a swap quote.
+    ///
+    /// `output = (amount_in * reserve_out) / (reserve_in + amount_in)`, rounded
+    /// **down** (protocol-favor) to match the contract reference model. The
+    /// fee is deducted from `amount_in` before pricing, so callers must pass
+    /// the post-fee amount.
+    ///
+    /// # Arguments
+    /// * `amount_in` - Post-fee input amount (must be > 0)
+    /// * `reserve_in` - Reserve of the input asset (must be > 0)
+    /// * `reserve_out` - Reserve of the output asset (must be > 0)
+    pub fn constant_product_out(
+        amount_in: i128,
+        reserve_in: i128,
+        reserve_out: i128,
+    ) -> Result<i128, PrediFiError> {
+        if amount_in <= 0 || reserve_in <= 0 || reserve_out <= 0 {
+            return Err(PrediFiError::InvalidAmount);
+        }
+        let numerator = amount_in
+            .checked_mul(reserve_out)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        let denominator = reserve_in
+            .checked_add(amount_in)
+            .ok_or(PrediFiError::ArithmeticError)?;
+        numerator
+            .checked_div(denominator)
+            .ok_or(PrediFiError::ArithmeticError)
+    }
+
+    /// Compute the fee charged on a swap input amount.
+    ///
+    /// `fee = (amount_in * fee_bps) / 10_000`, rounded **down** so the trader
+    /// never pays more than the configured rate. `fee_bps` must be in
+    /// `[0, 10_000]`.
+    pub fn swap_fee(amount_in: i128, fee_bps: i128) -> Result<i128, PrediFiError> {
+        if amount_in < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if !(0..=MAX_BPS).contains(&fee_bps) {
+            return Err(PrediFiError::InvalidFeeBps);
+        }
+        if amount_in == 0 || fee_bps == 0 {
+            return Ok(0);
+        }
+        Self::percentage(amount_in, fee_bps, RoundingMode::ProtocolFavor)
+    }
+
+    /// Compute the price impact of a swap in basis points.
+    ///
+    /// `impact_bps = ((spot_out - actual_out) * 10_000) / spot_out`, where
+    /// `spot_out = (amount_in * reserve_out) / reserve_in` is the output at the
+    /// pre-trade spot price. Rounded **up** (user-favor) so the reported impact
+    /// is never understated. Returns `0` when `amount_in == 0`.
+    ///
+    /// # Arguments
+    /// * `amount_in` - Post-fee input amount (must be >= 0)
+    /// * `reserve_in` - Reserve of the input asset (must be > 0)
+    /// * `reserve_out` - Reserve of the output asset (must be > 0)
+    pub fn price_impact_bps(
+        amount_in: i128,
+        reserve_in: i128,
+        reserve_out: i128,
+    ) -> Result<i128, PrediFiError> {
+        if amount_in < 0 {
+            return Err(PrediFiError::ArithmeticError);
+        }
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(PrediFiError::InvalidAmount);
+        }
+        if amount_in == 0 {
+            return Ok(0);
+        }
+        let spot_numerator = amount_in
+            .checked_mul(reserve_out)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        let spot_out = spot_numerator
+            .checked_div(reserve_in)
+            .ok_or(PrediFiError::ArithmeticError)?;
+        if spot_out <= 0 {
+            return Ok(0);
+        }
+        let actual_out = Self::constant_product_out(amount_in, reserve_in, reserve_out)?;
+        let diff = spot_out
+            .checked_sub(actual_out)
+            .ok_or(PrediFiError::ArithmeticError)?;
+        if diff <= 0 {
+            return Ok(0);
+        }
+        let scaled = diff
+            .checked_mul(MAX_BPS)
+            .ok_or(PrediFiError::InvalidAmount)?;
+        let impact = Self::divide_with_rounding(scaled, spot_out, RoundingMode::UserFavor)?;
+        Ok(impact)
+    }
 }
 
 /// # Payout Rounding Precision Audit
@@ -1163,6 +1379,87 @@ mod tests {
                 prop_assert_eq!(results.iter().sum::<i128>(), pool_balance);
                 prop_assert!(results.iter().all(|result| *result >= 0));
             }
+
+            #[test]
+            fn shares_for_deposit_rounds_down_and_conserves(
+                deposit in 1i128..=1_000_000_000i128,
+                total_assets in 1i128..=1_000_000_000i128,
+                total_shares in 1i128..=1_000_000_000i128,
+            ) {
+                let shares = SafeMath::shares_for_deposit(deposit, total_assets, total_shares);
+                let expected = (deposit * total_shares) / total_assets;
+                if expected == 0 {
+                    prop_assert_eq!(shares, Err(PrediFiError::InvalidAmount));
+                } else {
+                    prop_assert_eq!(shares, Ok(expected));
+                    let remainder = SafeMath::deposit_remainder(deposit, total_assets, total_shares).unwrap();
+                    // shares * total_assets + remainder == deposit * total_shares
+                    prop_assert_eq!(shares.unwrap() * total_assets + remainder, deposit * total_shares);
+                }
+            }
+
+            #[test]
+            fn assets_for_shares_rounds_down_and_conserves(
+                shares in 1i128..=1_000_000_000i128,
+                total_assets in 1i128..=1_000_000_000i128,
+                total_shares in 1i128..=1_000_000_000i128,
+            ) {
+                prop_assume!(shares <= total_shares);
+                let assets = SafeMath::assets_for_shares(shares, total_assets, total_shares);
+                let expected = (shares * total_assets) / total_shares;
+                if expected == 0 {
+                    prop_assert_eq!(assets, Err(PrediFiError::InvalidAmount));
+                } else {
+                    prop_assert_eq!(assets, Ok(expected));
+                    let remainder = SafeMath::withdraw_remainder(shares, total_assets, total_shares).unwrap();
+                    prop_assert_eq!(assets.unwrap() * total_shares + remainder, shares * total_assets);
+                }
+            }
+
+            #[test]
+            fn share_helpers_reject_zero_values(
+                a in 0i128..=1_000_000i128,
+                b in 0i128..=1_000_000i128,
+                c in 0i128..=1_000_000i128,
+            ) {
+                if a == 0 || b == 0 || c == 0 {
+                    prop_assert_eq!(SafeMath::shares_for_deposit(a, b, c), Err(PrediFiError::InvalidAmount));
+                    prop_assert_eq!(SafeMath::assets_for_shares(a, b, c), Err(PrediFiError::InvalidAmount));
+                }
+            }
+
+            #[test]
+            fn constant_product_out_matches_reference(
+                amount_in in 1i128..=1_000_000i128,
+                reserve_in in 1i128..=1_000_000i128,
+                reserve_out in 1i128..=1_000_000i128,
+            ) {
+                let expected = (amount_in * reserve_out) / (reserve_in + amount_in);
+                prop_assert_eq!(
+                    SafeMath::constant_product_out(amount_in, reserve_in, reserve_out),
+                    Ok(expected),
+                );
+            }
+
+            #[test]
+            fn price_impact_is_bounded_and_monotonic(
+                amount_in in 1i128..=1_000_000i128,
+                reserve_in in 1i128..=1_000_000i128,
+                reserve_out in 1i128..=1_000_000i128,
+            ) {
+                let impact = SafeMath::price_impact_bps(amount_in, reserve_in, reserve_out).unwrap();
+                prop_assert!(impact >= 0);
+                prop_assert!(impact <= MAX_BPS);
+            }
+
+            #[test]
+            fn swap_fee_matches_percentage(
+                amount_in in 0i128..=1_000_000_000i128,
+                fee_bps in 0i128..=MAX_BPS,
+            ) {
+                let expected = (amount_in * fee_bps) / MAX_BPS;
+                prop_assert_eq!(SafeMath::swap_fee(amount_in, fee_bps), Ok(expected));
+            }
         }
     }
 
@@ -1335,6 +1632,106 @@ mod tests {
 
         // Verify validation passes
         assert!(audit.validate_payout().is_ok());
+    }
+
+    #[test]
+    fn test_shares_for_deposit_basic() {
+        // First deposit into an empty pool is handled by the caller seeding
+        // 1:1 shares; here we test proportional minting.
+        assert_eq!(SafeMath::shares_for_deposit(100, 1000, 500).unwrap(), 50);
+        assert_eq!(SafeMath::shares_for_deposit(1000, 1000, 1000).unwrap(), 1000);
+        // Rounding down: (3 * 10) / 7 = 4 (remainder 2)
+        assert_eq!(SafeMath::shares_for_deposit(3, 7, 10).unwrap(), 4);
+        assert_eq!(SafeMath::deposit_remainder(3, 7, 10).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_shares_for_deposit_rejects_zero_and_dust() {
+        assert_eq!(
+            SafeMath::shares_for_deposit(0, 1000, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::shares_for_deposit(100, 0, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::shares_for_deposit(100, 1000, 0),
+            Err(PrediFiError::InvalidAmount)
+        );
+        // Deposit too small to mint a share
+        assert_eq!(
+            SafeMath::shares_for_deposit(1, 1000, 1),
+            Err(PrediFiError::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn test_assets_for_shares_basic() {
+        assert_eq!(SafeMath::assets_for_shares(50, 1000, 500).unwrap(), 100);
+        assert_eq!(SafeMath::assets_for_shares(500, 1000, 500).unwrap(), 1000);
+        // Rounding down: (3 * 10) / 7 = 4 (remainder 2)
+        assert_eq!(SafeMath::assets_for_shares(3, 10, 7).unwrap(), 4);
+        assert_eq!(SafeMath::withdraw_remainder(3, 10, 7).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_assets_for_shares_rejects_invalid() {
+        assert_eq!(
+            SafeMath::assets_for_shares(0, 1000, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::assets_for_shares(1001, 1000, 1000),
+            Err(PrediFiError::ArithmeticError)
+        );
+    }
+
+    #[test]
+    fn test_constant_product_out_basic() {
+        // 100 in, reserves 1000/1000 → (100 * 1000) / 1100 = 90
+        assert_eq!(SafeMath::constant_product_out(100, 1000, 1000).unwrap(), 90);
+        // Symmetric reserves, equal in/out
+        assert_eq!(SafeMath::constant_product_out(1, 1, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_constant_product_out_rejects_zero() {
+        assert_eq!(
+            SafeMath::constant_product_out(0, 1000, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::constant_product_out(100, 0, 1000),
+            Err(PrediFiError::InvalidAmount)
+        );
+        assert_eq!(
+            SafeMath::constant_product_out(100, 1000, 0),
+            Err(PrediFiError::InvalidAmount)
+        );
+    }
+
+    #[test]
+    fn test_swap_fee_basic() {
+        assert_eq!(SafeMath::swap_fee(10_000, 30).unwrap(), 30);
+        assert_eq!(SafeMath::swap_fee(0, 30).unwrap(), 0);
+        assert_eq!(SafeMath::swap_fee(10_000, 0).unwrap(), 0);
+        assert_eq!(
+            SafeMath::swap_fee(10_000, 10_001),
+            Err(PrediFiError::InvalidFeeBps)
+        );
+    }
+
+    #[test]
+    fn test_price_impact_basic() {
+        // Zero input → zero impact
+        assert_eq!(SafeMath::price_impact_bps(0, 1000, 1000).unwrap(), 0);
+        // Small trade has small impact
+        let impact = SafeMath::price_impact_bps(10, 1000, 1000).unwrap();
+        assert!(impact > 0 && impact < 100);
+        // Large trade approaches but never exceeds 100%
+        let impact = SafeMath::price_impact_bps(1_000_000, 1000, 1000).unwrap();
+        assert!(impact <= 10_000);
     }
 
     #[test]

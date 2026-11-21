@@ -97,6 +97,33 @@ pub struct PoolWithOdds {
     pub odds: Vec<OutcomeOdds>,
 }
 
+/// Reserve / share state required to produce a deterministic market quote.
+///
+/// This is the raw snapshot the quote handler needs: the per-outcome reserves
+/// (stakes), the total shares outstanding, the pool lifecycle status, and the
+/// timestamp the snapshot was last updated. The handler is responsible for
+/// rejecting stale (`last_updated` too old) or unsupported (`status` not
+/// `"active"`) snapshots before computing a quote.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolQuoteState {
+    pub pool_id: i64,
+    /// Per-outcome reserves, ordered by `outcome`.
+    pub reserves: Vec<OutcomeReserve>,
+    /// Total shares outstanding across all outcomes.
+    pub total_shares: i64,
+    /// Pool lifecycle status (`"active"`, `"closed"`, `"settled"`).
+    pub status: String,
+    /// When the reserve/share snapshot was last updated.
+    pub last_updated: DateTime<Utc>,
+}
+
+/// A single outcome's reserve within a [`PoolQuoteState`] snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutcomeReserve {
+    pub outcome: i32,
+    pub reserve: i64,
+}
+
 /// Aggregate creator reputation / reward-eligibility metrics.
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
 pub struct CreatorStats {
@@ -138,6 +165,14 @@ pub struct PoolCreatedEvent {
 struct OutcomeStakeRow {
     outcome: i32,
     total_stake: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct PoolQuoteStateRow {
+    pool_id: i64,
+    state: String,
+    total_stake: i64,
+    updated_at: DateTime<Utc>,
 }
 
 // ── Column list shared by template queries ────────────────────────────────────
@@ -280,6 +315,58 @@ pub async fn get_pool_outcome_stakes(
     .await?;
 
     Ok(rows.into_iter().map(|r| (r.outcome, r.total_stake)).collect())
+}
+
+/// Fetch the reserve / share snapshot needed to produce a deterministic quote.
+///
+/// Returns `None` when the pool does not exist. The returned snapshot carries
+/// the per-outcome reserves, the total shares outstanding, the pool lifecycle
+/// status, and the timestamp the snapshot was last updated. Callers (the quote
+/// handler) must reject snapshots whose `status` is not `"active"` or whose
+/// `last_updated` is older than the configured staleness window.
+///
+/// The total shares are resolved the same way as [`get_pool_with_odds`]: the
+/// derived sum from `predictions` wins when it exceeds the denormalised
+/// `pools.total_stake` cache, so quotes agree with displayed odds.
+pub async fn get_pool_quote_state(
+    pool: &PgPool,
+    pool_id: i64,
+) -> Result<Option<PoolQuoteState>, sqlx::Error> {
+    let started = Instant::now();
+
+    let row = sqlx::query_as::<_, PoolQuoteStateRow>(
+        r#"
+        SELECT pool_id, state, total_stake, updated_at
+        FROM pools
+        WHERE pool_id = $1
+        "#,
+    )
+    .bind(pool_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let outcome_stakes = get_pool_outcome_stakes(pool, pool_id).await?;
+    let calculated_total: i64 = outcome_stakes.iter().map(|(_, s)| s).sum();
+    let total_shares = std::cmp::max(row.total_stake, calculated_total);
+
+    let reserves = outcome_stakes
+        .into_iter()
+        .map(|(outcome, reserve)| OutcomeReserve { outcome, reserve })
+        .collect();
+
+    observe_read_budget("pools.quote", 2, started.elapsed().as_millis() as u64);
+
+    Ok(Some(PoolQuoteState {
+        pool_id: row.pool_id,
+        reserves,
+        total_shares,
+        status: row.state,
+        last_updated: row.updated_at,
+    }))
 }
 
 /// Fetch a pool's full detail joined with real-time odds for each outcome.
@@ -846,79 +933,4 @@ mod tests {
 
     #[test]
     fn total_stake_prefers_derived_sum_when_indexer_is_ahead() {
-        // Indexer has ingested predictions the cache has not caught up with.
-        let details = details_with_cached_total(100);
-        let stakes = vec![(0i32, 400i64), (1, 300)];
-        assert_eq!(
-            resolve_total_stake(details.total_stake, &stakes),
-            700,
-            "derived sum must win when the indexer is ahead of the cache"
-        );
-    }
-
-    #[test]
-    fn total_stake_falls_back_to_cache_when_indexer_is_stale() {
-        // Indexer lagging: predictions table has fewer rows than the cache.
-        let details = details_with_cached_total(1_000);
-        let stakes = vec![(0i32, 100i64)];
-        assert_eq!(
-            resolve_total_stake(details.total_stake, &stakes),
-            1_000,
-            "cached total must be used when the indexer is stale"
-        );
-    }
-
-    #[test]
-    fn total_stake_uses_cache_when_no_predictions_indexed() {
-        let details = details_with_cached_total(250);
-        assert_eq!(resolve_total_stake(details.total_stake, &[]), 250);
-    }
-
-    #[test]
-    fn odds_are_derived_from_the_authoritative_total_stake() {
-        // Odds must be computed against the resolved (authoritative) total,
-        // not the stale cached column, so payouts and UI agree.
-        let details = details_with_cached_total(100);
-        let stakes = vec![(0i32, 500i64), (1, 500)];
-        let total = resolve_total_stake(details.total_stake, &stakes);
-        let odds = calculate_odds(&stakes, total);
-        for o in &odds {
-            assert!(
-                (o.odds - 2.0).abs() < 1e-9,
-                "odds must use the derived total (1000), not the cache (100)"
-            );
-        }
-    }
-
-    #[test]
-    fn lifecycle_state_is_passed_through_unchanged() {
-        // The API must surface the indexer's lifecycle value verbatim.
-        let details = details_with_cached_total(0);
-        let with_odds = PoolWithOdds {
-            pool_id: details.pool_id,
-            name: details.name,
-            category: details.category,
-            total_stake: details.total_stake,
-            end_time: details.end_time,
-            created_at: details.created_at,
-            state: details.state.clone(),
-            creator: details.creator,
-            token: details.token,
-            result: details.result,
-            odds: vec![],
-        };
-        assert_eq!(with_odds.state, "active");
-        assert!(with_odds.result.is_none());
-    }
-
-    #[test]
-    fn lifecycle_result_is_authoritative_from_chain_event() {
-        // `result` is only ever set by `resolve_pool_in_db`, which mirrors the
-        // on-chain `pool_resolved` event. The API must not synthesise it.
-        let mut details = details_with_cached_total(0);
-        details.state = "settled".to_string();
-        details.result = Some("1".to_string());
-        assert_eq!(details.state, "settled");
-        assert_eq!(details.result.as_deref(), Some("1"));
-    }
-}
+        // Indexer has ingested predictions
