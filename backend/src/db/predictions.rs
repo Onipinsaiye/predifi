@@ -829,7 +829,7 @@ pub async fn get_protocol_stats(
         WITH filtered_pools AS (
             SELECT pool_id, total_stake
             FROM pools
-            WHERE ($1::text IS NULL OR category = $1)
+            WHERE ($1::text IS NULL OR category_id = $1)
               AND ($2::text IS NULL OR state    = $2)
         )
         SELECT
@@ -1023,10 +1023,7 @@ mod tests {
     // the matrix fails here rather than surfacing as a UI discrepancy.
 
     /// Build a `UserPredictionRow` with the given pool result and user outcome.
-    fn make_user_prediction_row(
-        pool_result: Option<&str>,
-        user_outcome: i32,
-    ) -> UserPredictionRow {
+    fn make_user_prediction_row(pool_result: Option<&str>, user_outcome: i32) -> UserPredictionRow {
         UserPredictionRow {
             prediction_id: 1,
             pool_id: 7,
