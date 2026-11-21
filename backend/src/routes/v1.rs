@@ -2446,7 +2446,180 @@ pub async fn get_user_profile_handler(
     }
 }
 
-// ── Pool tags ────────────────────────────────────────────────────────────────
+// ── Creator profiles (Issue #278) ─────────────────────────────────────────────
+
+/// `GET /api/v1/users/:address/creator-profile`
+///
+/// Returns the creator profile for `address`.
+///
+/// - If the caller is authenticated as `address` (bearer token), the full
+///   profile is returned whether public or private.
+/// - Unauthenticated requests and requests authenticated as a different wallet
+///   only receive the profile when `public = TRUE`.
+/// - Returns 404 when the creator has not opted in or the profile is not
+///   publicly visible.
+pub async fn get_creator_profile_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    // Determine whether the requester is the profile owner.
+    let is_owner = if let Some(bearer) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+    {
+        matches!(
+            crate::jwt::verify_jwt_token_strict(
+                bearer,
+                &state.config.secret_key,
+                "access",
+                state.config.jwt_key_version,
+            ),
+            Ok(claims) if claims.sub == address.as_str()
+        )
+    } else {
+        false
+    };
+
+    // Public requests see only public profiles; owners see their own regardless.
+    let require_public = !is_owner;
+
+    match crate::creator_profile::get_creator_profile(db, address.as_str(), require_public).await {
+        Ok(Some(profile)) => ApiResponse::success(profile).into_response(),
+        Ok(None) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "creator profile not found",
+        )
+        .into_response(),
+        Err(crate::creator_profile::CreatorProfileError::Db(e)) => {
+            tracing::error!(error = %e, address = %address, "failed to fetch creator profile");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to fetch creator profile",
+            )
+            .into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// `PUT /api/v1/users/:address/creator-profile`
+///
+/// Create or update the creator profile for `address`. The caller must
+/// present a valid bearer token for `address`; other wallets are forbidden.
+///
+/// Every call resets `verified = false` on all provenance links; the
+/// background verification job is responsible for confirming them.
+pub async fn put_creator_profile_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<crate::creator_profile::UpsertCreatorProfile>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Authenticate: bearer token must belong to this wallet.
+    let token = match headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+    {
+        Some(t) => t,
+        None => {
+            return ApiResponse::<()>::error(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "missing bearer token",
+            )
+            .into_response()
+        }
+    };
+
+    let claims = match crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            return ApiResponse::<()>::error(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "invalid bearer token",
+            )
+            .into_response()
+        }
+    };
+
+    if claims.sub != address.as_str() {
+        return ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "access token belongs to a different wallet",
+        )
+        .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::creator_profile::upsert_creator_profile(db, address.as_str(), &body).await {
+        Ok(profile) => ApiResponse::success(profile).into_response(),
+        Err(crate::creator_profile::CreatorProfileError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(crate::creator_profile::CreatorProfileError::Db(e)) => {
+            tracing::error!(error = %e, address = %address, "failed to upsert creator profile");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to save creator profile",
+            )
+            .into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Pool tags ─────────────────────────────────────────────────────────────────
 
 /// `GET /api/v1/categories` — governed category registry, including aliases
 /// and deprecated categories retained for historic discovery.
@@ -3668,6 +3841,12 @@ pub fn router(
             .route("/users/:address/history", get(get_user_history))
             .route("/users/:address/predictions", get(get_user_predictions))
             .route("/users/:address/profile", get(get_user_profile_handler))
+            .route(
+                "/users/:address/creator-profile",
+                get(get_creator_profile_handler)
+                    .put(put_creator_profile_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
             .route(
                 "/users/:address/portfolio/export",
                 get(export_portfolio_handler),

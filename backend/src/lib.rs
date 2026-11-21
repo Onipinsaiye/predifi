@@ -28,6 +28,7 @@ pub mod openapi;
 pub mod openapi_drift;
 pub mod pool_cache;
 pub mod price_cache;
+pub mod creator_profile;
 pub mod profile;
 pub mod rate_limit;
 pub mod redis_cache;
