@@ -30,12 +30,24 @@ import {
   setPersistedStellarTransaction,
 } from "@/lib/stellarTransactionStorage";
 import { useNetworkGuard } from "@/lib/hooks/useNetworkGuard";
+import {
+  buildTradePreview,
+  type TradePreview,
+  type TradePreviewInputs,
+} from "@/lib/tradePreview";
 
 export type StellarTxStatus = "idle" | "running" | "confirmed" | "ambiguous" | "failed";
 
 export interface UseStellarTransactionOptions<TParams> {
   /** Connected source account, or null when disconnected. */
   address: string | null;
+  /**
+   * The wallet that is currently authorized to sign. In a multi-wallet
+   * portfolio view, read-only addresses may be aggregated, but every
+   * mutation must originate from this active signing account. Defaults to
+   * `address` when omitted.
+   */
+  activeSigningAddress?: string | null;
   /** Network the wallet is connected to; scopes persisted state. */
   network?: string;
   /** Build, sign and broadcast the intent. Throw `TransactionSubmitError`. */
@@ -75,6 +87,17 @@ export interface UseStellarTransactionResult<TParams> {
   /** Retry an ambiguous outcome after explicit user confirmation. */
   confirmRetry: () => Promise<TransactionRunResult<TParams> | null>;
   reset: () => void;
+  /**
+   * Pre-trade balance and position impact preview. `null` until the caller
+   * supplies preview inputs via `setPreviewInputs`. Estimates are marked
+   * non-final until simulation succeeds, and a stale preview (inputs changed
+   * since it was built) is rejected by `run`.
+   */
+  preview: TradePreview | null;
+  /** True when the current preview is stale and must not be submitted. */
+  previewStale: boolean;
+  /** Update the inputs the preview is derived from. */
+  setPreviewInputs: (inputs: TradePreviewInputs | null) => void;
 }
 
 let intentCounter = 0;
@@ -101,6 +124,45 @@ export function useStellarTransaction<TParams>(
   } = options;
   const refreshAccountState = options.refreshAccountState ?? refreshAccountSequence;
 
+  // The active signing wallet. When not explicitly provided, the connected
+  // `address` is the only signer.
+  const activeSigningAddress =
+    options.activeSigningAddress !== undefined
+      ? options.activeSigningAddress
+      : address;
+  const activeSigningAddressRef = useRef(activeSigningAddress);
+  activeSigningAddressRef.current = activeSigningAddress;
+
+  /**
+   * Refuse to sign from any account other than the active signing wallet.
+   * Returns a `WalletError` describing the refusal, or `null` when the
+   * requested source is authorized to sign.
+   */
+  const checkSigningAuthorization = useCallback(
+    (requestedAddress: string | null | undefined): WalletError | null => {
+      const active = activeSigningAddressRef.current;
+      if (!active) {
+        return {
+          code: "WALLET_NOT_CONNECTED",
+          title: "No active signing wallet",
+          message: "Connect the wallet you want to sign with before submitting.",
+          recoveryAction: "Connect the active signing wallet and try again.",
+        };
+      }
+      if (!requestedAddress || requestedAddress !== active) {
+        return {
+          code: "SIGNING_WALLET_MISMATCH",
+          title: "Wrong signing wallet",
+          message:
+            "This transaction must be signed by the active wallet. Switch to the active signing wallet to continue.",
+          recoveryAction: "Switch to the active signing wallet and retry.",
+        };
+      }
+      return null;
+    },
+    [],
+  );
+
   // Contract identity guard: a mismatch (or unavailable/stale manifest)
   // disables mutations and surfaces a diagnostic through `error`.
   const guard = useNetworkGuard();
@@ -117,6 +179,18 @@ export function useStellarTransaction<TParams>(
   const [intent, setIntent] = useState<TransactionIntent<TParams> | null>(null);
   const [requiresUserConfirmation, setRequiresUserConfirmation] = useState(false);
   const [accountState, setAccountState] = useState<AccountState | null>(null);
+  const [previewInputs, setPreviewInputsState] = useState<TradePreviewInputs | null>(
+    null,
+  );
+  const [preview, setPreview] = useState<TradePreview | null>(null);
+  const [previewStale, setPreviewStale] = useState(false);
+  const previewRef = useRef<TradePreview | null>(null);
+  previewRef.current = preview;
+  const previewInputsRef = useRef<TradePreviewInputs | null>(null);
+  previewInputsRef.current = previewInputs;
+  const previewStaleRef = useRef(false);
+  previewStaleRef.current = previewStale;
+  const previewSimulationRef = useRef(0);
 
   const intentRef = useRef<TransactionIntent<TParams> | null>(null);
   const activeRunRef = useRef<Promise<TransactionRunResult<TParams>> | null>(null);
@@ -148,6 +222,10 @@ export function useStellarTransaction<TParams>(
     setIntent(null);
     setRequiresUserConfirmation(false);
     setAccountState(null);
+    setPreviewInputsState(null);
+    setPreview(null);
+    setPreviewStale(false);
+    previewSimulationRef.current += 1;
 
     if (!persistTransaction || !address) return;
 
@@ -203,6 +281,24 @@ export function useStellarTransaction<TParams>(
       txIntent: TransactionIntent<TParams>,
       userConfirmedRetry: boolean,
     ): Promise<TransactionRunResult<TParams>> => {
+      // Refuse to sign from any account other than the active signing wallet.
+      const authorizationError = checkSigningAuthorization(address);
+      if (authorizationError) {
+        const refused: TransactionRunResult<TParams> = {
+          status: "failed",
+          intent: txIntent,
+          error: authorizationError,
+          requiresUserConfirmation: false,
+          accountState: null,
+        };
+        if (mountedRef.current) {
+          setStatus("failed");
+          setError(authorizationError);
+          setRequiresUserConfirmation(false);
+        }
+        return refused;
+      }
+
       // Refuse to submit while the contract identity is unverified.
       if (mutationsDisabledRef.current) {
         const diagnostic = identityDiagnosticRef.current;
@@ -276,7 +372,15 @@ export function useStellarTransaction<TParams>(
 
       return result;
     },
-    [address, identityKey, submit, refreshAccountState, maxAutoRetries, persistResult],
+    [
+      address,
+      identityKey,
+      submit,
+      refreshAccountState,
+      maxAutoRetries,
+      persistResult,
+      checkSigningAuthorization,
+    ],
   );
 
   const startExecution = useCallback(
@@ -321,6 +425,17 @@ export function useStellarTransaction<TParams>(
         return Promise.reject(new Error("Connect your wallet before submitting."));
       }
 
+      // Block mutations that would be signed by a non-active account.
+      const authorizationError = checkSigningAuthorization(address);
+      if (authorizationError) {
+        setError(authorizationError);
+        return Promise.reject(
+          Object.assign(new Error(authorizationError.message), {
+            walletError: authorizationError,
+          }),
+        );
+      }
+
       // Block new mutations when the contract identity is unverified.
       if (mutationsDisabled) {
         const diagnostic = identityDiagnostic;
@@ -336,10 +451,28 @@ export function useStellarTransaction<TParams>(
         );
       }
 
+      // Refuse to submit a stale preview: the inputs changed after the
+      // preview was built, so the user has not confirmed these values.
+      if (previewInputsRef.current && previewStaleRef.current) {
+        return Promise.reject(
+          new Error(
+            "The trade preview is out of date. Review the updated estimate before submitting.",
+          ),
+        );
+      }
+
       const txIntent = (createIntent ?? defaultIntent)(params);
       return startExecution(txIntent, false);
     },
-    [address, status, createIntent, startExecution, mutationsDisabled, identityDiagnostic],
+    [
+      address,
+      status,
+      createIntent,
+      startExecution,
+      mutationsDisabled,
+      identityDiagnostic,
+      checkSigningAuthorization,
+    ],
   );
 
   const confirmRetry = useCallback(() => {
@@ -353,6 +486,14 @@ export function useStellarTransaction<TParams>(
       return Promise.resolve(null);
     }
 
+    // A confirmed retry is still a mutation; it must be signed by the
+    // active wallet.
+    const authorizationError = checkSigningAuthorization(address);
+    if (authorizationError) {
+      setError(authorizationError);
+      return Promise.resolve(null);
+    }
+
     // A confirmed retry is still a mutation; block it on identity mismatch.
     if (mutationsDisabled) {
       const diagnostic = identityDiagnostic;
@@ -363,7 +504,14 @@ export function useStellarTransaction<TParams>(
     }
 
     return startExecution(txIntent, true);
-  }, [intent, startExecution, mutationsDisabled, identityDiagnostic]);
+  }, [
+    intent,
+    address,
+    startExecution,
+    mutationsDisabled,
+    identityDiagnostic,
+    checkSigningAuthorization,
+  ]);
 
   const reset = useCallback(() => {
     if (persistTransaction && address) {
@@ -377,7 +525,72 @@ export function useStellarTransaction<TParams>(
     setIntent(null);
     setRequiresUserConfirmation(false);
     setAccountState(null);
+    setPreviewInputsState(null);
+    setPreview(null);
+    setPreviewStale(false);
+    previewSimulationRef.current += 1;
   }, [address, network, persistTransaction]);
+
+  const setPreviewInputs = useCallback(
+    (inputs: TradePreviewInputs | null) => {
+      // Any input change invalidates the previously built preview so a stale
+      // estimate can never be submitted.
+      previewSimulationRef.current += 1;
+      setPreviewInputsState(inputs);
+      setPreviewStale(false);
+      if (!inputs) {
+        setPreview(null);
+        return;
+      }
+      setPreview(buildTradePreview(inputs));
+    },
+    [],
+  );
+
+  // Re-run the simulation whenever the inputs change, marking the preview as
+  // an estimate until the simulation resolves.
+  useEffect(() => {
+    if (!previewInputs) {
+      setPreview(null);
+      setPreviewStale(false);
+      return;
+    }
+
+    const simulationId = ++previewSimulationRef.current;
+    setPreview(buildTradePreview(previewInputs));
+    setPreviewStale(false);
+
+    const simulate = previewInputs.simulate;
+    if (!simulate) {
+      return;
+    }
+
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => simulate(previewInputs))
+      .then((result) => {
+        if (cancelled || previewSimulationRef.current !== simulationId) return;
+        setPreview(
+          buildTradePreview(previewInputs, {
+            simulationStatus: "succeeded",
+            estimatedPosition: result.estimatedPosition,
+            balanceAfterFees: result.balanceAfterFees,
+          }),
+        );
+        setPreviewStale(false);
+      })
+      .catch(() => {
+        if (cancelled || previewSimulationRef.current !== simulationId) return;
+        setPreview(
+          buildTradePreview(previewInputs, { simulationStatus: "failed" }),
+        );
+        setPreviewStale(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [previewInputs]);
 
   // Surface the identity diagnostic through the existing error banner while
   // idle, without clobbering a real transaction error.
@@ -399,6 +612,9 @@ export function useStellarTransaction<TParams>(
       run,
       confirmRetry,
       reset,
+      preview,
+      previewStale,
+      setPreviewInputs,
     }),
     [
       status,
@@ -411,6 +627,9 @@ export function useStellarTransaction<TParams>(
       run,
       confirmRetry,
       reset,
+      preview,
+      previewStale,
+      setPreviewInputs,
     ],
   );
 }

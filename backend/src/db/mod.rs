@@ -12,14 +12,18 @@
 
 pub mod checkpoints;
 pub mod event_projection;
-pub mod health;
 
 mod pools;
 mod predictions;
 mod referrals;
+pub mod market_history;
+pub mod market_history_archive;
 pub mod outbox;
 pub mod metrics;
-pub mod outbox;
+pub mod portfolio_exports;
+pub mod portfolio_ledger;
+pub mod portfolio_pnl;
+pub mod portfolio_snapshots;
 
 // ── Re-export every public item from each repository module ──────────────────
 // This keeps the `crate::db::*` call surface identical to the original
@@ -110,6 +114,39 @@ pub use event_projection::{
 
 pub use outbox::{ClaimedNotification, NotificationIntent};
 
+pub use portfolio_ledger::{
+    explain_wallet_activity_plan, get_wallet_activity, ActivityCursor, ActivityEvent,
+    IndexingStatus, WalletActivityItem, WalletActivityPage, DEFAULT_ACTIVITY_PAGE_SIZE,
+    MAX_ACTIVITY_PAGE_SIZE,
+};
+
+pub use portfolio_pnl::{
+    calculate_portfolio_pnl, calculate_position_pnl, MissingInputReason, PoolLifecycle,
+    PortfolioPnl, PositionInputs, PositionPnl, PNL_MODEL_VERSION,
+};
+
+pub use portfolio_snapshots::{
+    explain_portfolio_snapshot_plan, generate_portfolio_snapshot, generate_portfolio_snapshot_at,
+    PortfolioSnapshot, SnapshotError,
+};
+
+pub use portfolio_exports::{
+    cancel_export, create_export, explain_export_rows_plan, get_export_artifact,
+    get_export_status, run_next_export, ArtifactResult, CancelOutcome, ExportStatus,
+    ExportStatusView, DEFAULT_ROW_LIMIT, DEFAULT_TIME_LIMIT_SECS, EXPORT_KIND, MAX_ROW_LIMIT,
+    MAX_TIME_LIMIT_SECS,
+};
+
+pub use market_history::{
+    bucket_cumulative_stake, bucket_count, floor_to_bucket, get_market_history, BucketWidth,
+    MarketHistoryError, MarketHistoryPage, MarketValueSample, RawStakeEvent,
+    MAX_BUCKETS_PER_QUERY,
+};
+
+pub use market_history_archive::{
+    archive_market_history, restore_market_history_archive, ArchiveError,
+};
+
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
@@ -118,8 +155,6 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-
-pub use health::{DependencyHealth, DependencyStatus, ReadinessReport};
 
 // ── Connection budget ─────────────────────────────────────────────────────────
 

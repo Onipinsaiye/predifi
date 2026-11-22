@@ -47,10 +47,41 @@ fn openapi_document_has_required_shape() {
         "OpenAPI components.schemas must be non-empty, got: {spec:?}"
     );
 
+    // The quote endpoint must be published so clients can request a
+    // deterministic estimate before signing.
+    let paths = spec["paths"].as_object().expect("paths must be an object");
+    let quote_path = paths
+        .keys()
+        .find(|path| path.contains("quote"))
+        .unwrap_or_else(|| panic!("OpenAPI paths must include a quote endpoint, got: {spec:?}"));
+    let quote_item = paths[quote_path]
+        .as_object()
+        .unwrap_or_else(|| panic!("quote path {quote_path} must be an object"));
+    let quote_op = quote_item
+        .get("get")
+        .unwrap_or_else(|| panic!("quote path {quote_path} must declare a GET operation"));
+    assert!(
+        quote_op["responses"]
+            .as_object()
+            .is_some_and(|responses| !responses.is_empty()),
+        "quote operation must declare responses, got: {quote_op:?}"
+    );
+
+    // The quote request/response models must be published as components so
+    // generated clients can derive typed models for them.
+    let schemas = spec["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas must be an object");
+    for required in ["QuoteRequest", "QuoteResponse"] {
+        assert!(
+            schemas.contains_key(required),
+            "OpenAPI components.schemas must include {required}, got: {spec:?}"
+        );
+    }
+
     // Every path must declare at least one operation and each operation
     // must declare responses so runtime responses can be validated against
     // the published schema.
-    let paths = spec["paths"].as_object().expect("paths must be an object");
     for (path, item) in paths {
         let item_obj = item
             .as_object()
@@ -69,15 +100,13 @@ fn openapi_document_has_required_shape() {
             "path {path} must declare at least one HTTP operation, got: {item:?}"
         );
         for (method, op) in operations {
-            let responses = op["responses"]
-                .as_object()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "operation {} {} must declare responses, got: {op:?}",
-                        method.to_uppercase(),
-                        path
-                    )
-                });
+            let responses = op["responses"].as_object().unwrap_or_else(|| {
+                panic!(
+                    "operation {} {} must declare responses, got: {op:?}",
+                    method.to_uppercase(),
+                    path
+                )
+            });
             assert!(
                 !responses.is_empty(),
                 "operation {} {} must declare at least one response, got: {op:?}",

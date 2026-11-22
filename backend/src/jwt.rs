@@ -12,7 +12,7 @@ use crate::constants::{
     JWT_ACCESS_TOKEN_EXPIRY_SECS, JWT_MIN_LENGTH, JWT_PARTS_COUNT, JWT_REFRESH_TOKEN_EXPIRY_SECS,
     JWT_SECRET_MIN_LENGTH,
 };
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 /// Clock-skew leeway applied to `exp` (seconds).
@@ -245,6 +245,12 @@ pub fn has_fresh_step_up(claims: &PredifiClaims, action: &str, now: u64) -> bool
 fn hs256_validation() -> Validation {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
+    // `iss`/`aud`/`chain`/`network` are checked explicitly against our own
+    // expected values just below in `verify_jwt_token`. jsonwebtoken's
+    // built-in `aud` check is disabled here because, with no expected `aud`
+    // configured, it rejects *any* token that carries an `aud` claim at
+    // all (`InvalidAudience`) rather than leaving it unchecked.
+    validation.validate_aud = false;
     validation.leeway = JWT_EXP_LEEWAY_SECS;
     validation.required_spec_claims.insert("exp".to_string());
     validation
@@ -340,6 +346,91 @@ pub fn verify_jwt_token_strict(
     }
 
     Ok(claims)
+}
+
+/// Extract the bearer token from an `Authorization` header value.
+///
+/// Accepts the standard `Bearer <token>` form (case-insensitive scheme),
+/// trims surrounding whitespace, and returns `None` for anything else
+/// (missing scheme, empty token, wrong scheme).
+pub fn extract_bearer_token(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let rest = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .or_else(|| value.strip_prefix("BEARER "))?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+/// Sign a new PrediFi JWT carrying an explicit per-user token version (`tv`).
+///
+/// `token_type` is either `"access"` or `"refresh"`, which selects the
+/// expiry window ([`JWT_ACCESS_TOKEN_EXPIRY_SECS`] /
+/// [`JWT_REFRESH_TOKEN_EXPIRY_SECS`]). Always signs with HS256.
+pub fn sign_jwt_with_token_version(
+    sub: &str,
+    secret: &str,
+    now_unix: u64,
+    token_type: &str,
+    key_version: u64,
+    token_version: u64,
+) -> Result<String, String> {
+    verify_jwt_secret(secret).map_err(|e| e.to_string())?;
+
+    let expiry_secs = if token_type == "refresh" {
+        JWT_REFRESH_TOKEN_EXPIRY_SECS
+    } else {
+        JWT_ACCESS_TOKEN_EXPIRY_SECS
+    };
+
+    let claims = PredifiClaims {
+        iss: JWT_ISSUER.to_string(),
+        aud: JWT_AUDIENCE.to_string(),
+        chain: "stellar".to_string(),
+        network: configured_stellar_network(),
+        sub: sub.to_string(),
+        exp: now_unix.saturating_add(expiry_secs),
+        iat: now_unix,
+        jti: uuid::Uuid::new_v4().to_string(),
+        token_type: token_type.to_string(),
+        key_version,
+        tv: token_version,
+        step_up_at: 0,
+        step_up_action: String::new(),
+    };
+
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Sign a token for `sub` with an explicit type but no per-user token
+/// version (`tv` defaults to `0`). Thin convenience wrapper over
+/// [`sign_jwt_with_token_version`] used by other modules' tests.
+pub fn sign_jwt_with_type(
+    sub: &str,
+    secret: &str,
+    now_unix: u64,
+    token_type: &str,
+    key_version: u64,
+) -> Result<String, String> {
+    sign_jwt_with_token_version(sub, secret, now_unix, token_type, key_version, 0)
+}
+
+/// Test-only convenience: sign an access token for `wallet` with sensible
+/// defaults (key version 0, a fixed far-future-relative timestamp so tokens
+/// are valid for the lifetime of a test run).
+pub fn sign_jwt_for_test(wallet: &str, secret: &str) -> String {
+    sign_jwt_with_type(wallet, secret, 1_800_000_000, "access", 0)
+        .expect("sign_jwt_for_test: signing must not fail for a valid test secret")
 }
 
 fn map_decode_error(error: jsonwebtoken::errors::Error) -> JwtVerifyError {

@@ -108,6 +108,8 @@ export interface PoolsQuery {
   status?: "active" | "closed" | "settled";
   limit?: number;
   offset?: number;
+  /** Filter by pool creator (Stellar address). */
+  creator?: string;
 }
 
 /**
@@ -124,6 +126,7 @@ export function poolsUrl(query: PoolsQuery = {}): string {
   if (query.status) params.set("status", query.status);
   if (query.limit != null) params.set("limit", String(query.limit));
   if (query.offset != null) params.set("offset", String(query.offset));
+  if (query.creator) params.set("creator", query.creator);
 
   const qs = params.toString();
   return `${API_BASE_URL}/api/v1/pools${qs ? `?${qs}` : ""}`;
@@ -352,4 +355,227 @@ export interface PoolLiveEvent {
   user_address?: string;
   outcome?: number;
   amount?: number;
+}
+
+/**
+ * Kinds of market activity surfaced in the timeline.
+ *
+ * These are *indexed* events: they describe what the indexer observed on
+ * chain, not authoritative contract state. The UI must present them as a
+ * chronological activity log and never treat them as a substitute for a
+ * fresh chain read (see `docs/data-ownership.md`).
+ */
+export type MarketEventType = "creation" | "trade" | "close" | "resolution" | "claim";
+
+/** Event types the timeline knows how to render. */
+export const MARKET_EVENT_TYPES: readonly MarketEventType[] = [
+  "creation",
+  "trade",
+  "close",
+  "resolution",
+  "claim",
+];
+
+/**
+ * A single normalized market activity event.
+ *
+ * Optional fields are normalized to `null` (never `undefined`) so consumers
+ * can branch on presence without worrying about missing keys. `timestamp` is
+ * the *source* timestamp (when the chain event occurred), not when the
+ * indexer observed it.
+ */
+export interface MarketEvent {
+  /** Event kind, or `null` when the backend reports an unsupported type. */
+  type: MarketEventType | null;
+  /** Raw type string as reported by the backend (useful for debugging). */
+  raw_type: string;
+  pool_id: number;
+  /** Canonical chain identity: transaction hash + log/event index. */
+  tx_hash: string;
+  event_index: number;
+  /** Source timestamp as a Unix timestamp (seconds). */
+  timestamp: number;
+  /** Actor address, when the event has one. */
+  user_address: string | null;
+  /** Outcome index, when the event references one. */
+  outcome: number | null;
+  /** Amount in the token's base units, when the event carries one. */
+  amount: number | null;
+  /** Ledger/block number, when reported. */
+  block_number: number | null;
+}
+
+/** Response body of `GET /api/v1/pools/:id/events`. */
+export interface MarketEventsResponse {
+  events: MarketEvent[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** Query parameters accepted by `GET /api/v1/pools/:id/events`. */
+export interface MarketEventsQuery {
+  limit?: number;
+  offset?: number;
+}
+
+/** Cache key / URL for a pool's activity timeline. */
+export function marketEventsUrl(poolId: number | string, query: MarketEventsQuery = {}): string {
+  const params = new URLSearchParams();
+  if (query.limit != null) params.set("limit", String(query.limit));
+  if (query.offset != null) params.set("offset", String(query.offset));
+  const qs = params.toString();
+  return `${API_BASE_URL}/api/v1/pools/${poolId}/events${qs ? `?${qs}` : ""}`;
+}
+
+/** Canonical identity of an event on chain. */
+export function marketEventKey(event: Pick<MarketEvent, "tx_hash" | "event_index">): string {
+  return `${event.tx_hash}:${event.event_index}`;
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function asTimestamp(value: unknown): number {
+  const numeric = asFiniteNumber(value);
+  if (numeric != null) {
+    // Heuristic: values that look like milliseconds are normalized to seconds.
+    return numeric > 1e12 ? Math.floor(numeric / 1000) : Math.floor(numeric);
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+  }
+  return 0;
+}
+
+function normalizeEventType(value: unknown): MarketEventType | null {
+  if (typeof value !== "string") return null;
+  const lower = value.toLowerCase();
+  return (MARKET_EVENT_TYPES as readonly string[]).includes(lower)
+    ? (lower as MarketEventType)
+    : null;
+}
+
+/**
+ * Normalize a raw event payload from the backend.
+ *
+ * Returns `null` when the payload lacks the canonical chain identity
+ * (`tx_hash` + `event_index`) — such an event cannot be deduplicated or
+ * ordered reliably and is dropped rather than guessed at.
+ */
+export function normalizeMarketEvent(raw: unknown): MarketEvent | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+
+  const txHash =
+    typeof obj.tx_hash === "string"
+      ? obj.tx_hash
+      : typeof obj.transaction_hash === "string"
+        ? obj.transaction_hash
+        : null;
+  const eventIndex = asFiniteNumber(obj.event_index ?? obj.log_index ?? obj.index);
+  const poolId = asFiniteNumber(obj.pool_id);
+
+  if (!txHash || eventIndex == null || poolId == null) return null;
+
+  const rawType = typeof obj.type === "string" ? obj.type : "";
+
+  return {
+    type: normalizeEventType(rawType),
+    raw_type: rawType,
+    pool_id: poolId,
+    tx_hash: txHash,
+    event_index: eventIndex,
+    timestamp: asTimestamp(obj.timestamp ?? obj.block_time ?? obj.created_at),
+    user_address: typeof obj.user_address === "string" ? obj.user_address : null,
+    outcome: asFiniteNumber(obj.outcome),
+    amount: asFiniteNumber(obj.amount),
+    block_number: asFiniteNumber(obj.block_number),
+  };
+}
+
+/**
+ * Deduplicate and order events for the timeline.
+ *
+ * - Duplicates are collapsed by canonical chain identity
+ *   ({@link marketEventKey}); the first occurrence wins.
+ * - Events are sorted by source timestamp ascending, with `tx_hash` and
+ *   `event_index` as stable tie-breakers so the order is deterministic and
+ *   consistent across pagination boundaries.
+ */
+export function mergeMarketEvents(events: readonly MarketEvent[]): MarketEvent[] {
+  const seen = new Set<string>();
+  const unique: MarketEvent[] = [];
+  for (const event of events) {
+    const key = marketEventKey(event);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(event);
+  }
+
+  return unique.sort((a, b) => {
+    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+    if (a.tx_hash !== b.tx_hash) return a.tx_hash < b.tx_hash ? -1 : 1;
+    return a.event_index - b.event_index;
+  });
+}
+
+/** Type guard for a normalized event payload. */
+function isMarketEventsResponse(obj: unknown): obj is { events: unknown[] } {
+  if (!obj || typeof obj !== "object") return false;
+  const body = obj as Record<string, unknown>;
+  return Array.isArray(body.events);
+}
+
+/**
+ * Fetch a page of a pool's activity timeline.
+ *
+ * Raw events are normalized, deduplicated by canonical chain identity, and
+ * sorted by source timestamp. Callers paginating through results should merge
+ * pages with {@link mergeMarketEvents} to keep ordering stable across page
+ * boundaries.
+ *
+ * @param url - A URL produced by {@link marketEventsUrl}.
+ * @param timeout - Optional timeout in milliseconds. Defaults to DEFAULT_REQUEST_TIMEOUT.
+ * @throws {ApiError} When the response status is not 2xx or the shape is invalid.
+ * @throws {TimeoutError} When the request exceeds the timeout.
+ */
+export async function fetchMarketEvents(
+  url: string,
+  timeout?: number,
+): Promise<MarketEventsResponse> {
+  const res = await fetchWithTimeout(url, { headers: { Accept: "application/json" } }, timeout);
+
+  if (!res.ok) {
+    throw new ApiError(`Failed to load market events (HTTP ${res.status})`, res.status);
+  }
+
+  const body = await res.json();
+
+  if (!isMarketEventsResponse(body)) {
+    throw new ApiError("Invalid market events response shape", 500);
+  }
+
+  const normalized = body.events
+    .map(normalizeMarketEvent)
+    .filter((event): event is MarketEvent => event !== null);
+
+  const record = body as Record<string, unknown>;
+  const total = asFiniteNumber(record.total) ?? normalized.length;
+  const limit = asFiniteNumber(record.limit) ?? normalized.length;
+  const offset = asFiniteNumber(record.offset) ?? 0;
+
+  return {
+    events: mergeMarketEvents(normalized),
+    total,
+    limit,
+    offset,
+  };
 }

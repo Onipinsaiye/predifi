@@ -1,6 +1,8 @@
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use predifi_backend::{build_router, config::Config, price_cache::PriceCache, redis_cache::RedisCache, ws};
+use predifi_backend::{
+    build_router, config::Config, price_cache::PriceCache, redis_cache::RedisCache, ws,
+};
 use tower::ServiceExt;
 
 fn get(path: &str) -> Request<axum::body::Body> {

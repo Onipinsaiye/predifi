@@ -187,6 +187,27 @@ pub struct UserPrediction {
     pub is_winning_outcome: Option<bool>,
 }
 
+/// Ledger entry row for the portfolio JSON export.
+///
+/// Carries the on-chain provenance (`tx_hash`, `ledger_sequence`) and the
+/// calculation inputs (`amount`, `outcome`, `pool_result`) needed to reproduce
+/// the derived win/loss and payout metadata in the export.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct PortfolioLedgerEntryRow {
+    pub prediction_id: i64,
+    pub pool_id: i64,
+    pub pool_name: String,
+    pub pool_category: String,
+    pub pool_state: String,
+    pub pool_result: Option<String>,
+    pub user_outcome: i32,
+    pub user_amount: i64,
+    pub pool_total_stake: i64,
+    pub tx_hash: Option<String>,
+    pub ledger_sequence: Option<i64>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Cursor-paginated prediction row for the market predictions endpoint.
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
 pub struct MarketPredictionRow {
@@ -244,7 +265,7 @@ pub struct ProtocolStats {
 }
 
 /// Decoded data from a `prediction_placed` contract event.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PredictionPlacedEvent {
     pub pool_id: u64,
     pub user_address: String,
@@ -467,6 +488,98 @@ pub async fn get_user_predictions(
             }
         })
         .collect())
+}
+
+/// Bounded, cursor-paginated prediction history for the portfolio JSON export.
+///
+/// Returns at most `limit` rows ordered newest-first by `(created_at, id)`.
+/// `after` is the `(created_at, id)` position from the previous page; pass
+/// `None` to start at the most recent row. The caller pairs this with
+/// [`count_user_predictions`] to emit explicit truncation/continuation info.
+pub async fn get_portfolio_prediction_history(
+    pool: &PgPool,
+    address: &str,
+    after: Option<(DateTime<Utc>, i64)>,
+    limit: i64,
+) -> Result<Vec<PredictionHistoryRow>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::PredictionHistory);
+    sqlx::query_as::<_, PredictionHistoryRow>(
+        r#"
+        SELECT
+            p.pool_id,
+            pl.name   AS pool_name,
+            pl.result AS pool_result,
+            p.outcome,
+            p.amount,
+            p.created_at
+        FROM predictions p
+        JOIN pools pl ON pl.pool_id = p.pool_id
+        WHERE p.user_address = $1
+          AND ($2::timestamptz IS NULL OR (p.created_at, p.id) < ($2, $3))
+        ORDER BY p.created_at DESC, p.id DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(address)
+    .bind(after.as_ref().map(|cursor| cursor.0))
+    .bind(after.as_ref().map(|cursor| cursor.1))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Total prediction count for a user address (portfolio export truncation info).
+pub async fn count_user_predictions(pool: &PgPool, address: &str) -> Result<i64, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::PredictionHistory);
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM predictions WHERE user_address = $1")
+        .bind(address)
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+/// Bounded, cursor-paginated ledger entries for the portfolio JSON export.
+///
+/// Each row includes the source reference (`tx_hash`, `ledger_sequence`) and
+/// the calculation inputs (`user_amount`, `user_outcome`, `pool_result`,
+/// `pool_total_stake`) so the export can reproduce derived metadata. Ordered
+/// newest-first by `(created_at, id)`; `after` is the previous page position.
+pub async fn get_portfolio_ledger_entries(
+    pool: &PgPool,
+    address: &str,
+    after: Option<(DateTime<Utc>, i64)>,
+    limit: i64,
+) -> Result<Vec<PortfolioLedgerEntryRow>, sqlx::Error> {
+    let _timer = QueryTimer::start(QueryGroup::PredictionHistory);
+    sqlx::query_as::<_, PortfolioLedgerEntryRow>(
+        r#"
+        SELECT
+            p.id           AS prediction_id,
+            p.pool_id,
+            pl.name        AS pool_name,
+            pl.category    AS pool_category,
+            pl.state       AS pool_state,
+            pl.result      AS pool_result,
+            p.outcome      AS user_outcome,
+            p.amount       AS user_amount,
+            pl.total_stake AS pool_total_stake,
+            p.tx_hash,
+            p.ledger_sequence,
+            p.created_at
+        FROM predictions p
+        JOIN pools pl ON pl.pool_id = p.pool_id
+        WHERE p.user_address = $1
+          AND ($2::timestamptz IS NULL OR (p.created_at, p.id) < ($2, $3))
+        ORDER BY p.created_at DESC, p.id DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(address)
+    .bind(after.as_ref().map(|cursor| cursor.0))
+    .bind(after.as_ref().map(|cursor| cursor.1))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// Cursor-paginated market predictions for a pool (newest first by timestamp, then ID).
@@ -829,7 +942,7 @@ pub async fn get_protocol_stats(
         WITH filtered_pools AS (
             SELECT pool_id, total_stake
             FROM pools
-            WHERE ($1::text IS NULL OR category = $1)
+            WHERE ($1::text IS NULL OR category_id = $1)
               AND ($2::text IS NULL OR state    = $2)
         )
         SELECT
@@ -987,6 +1100,58 @@ mod tests {
         assert_eq!(50i64.clamp(1, 100), 50);
     }
 
+    // ── Portfolio export pagination ───────────────────────────────────────────
+
+    fn make_ledger_rows(ids: &[i64]) -> Vec<PortfolioLedgerEntryRow> {
+        ids.iter()
+            .map(|&id| PortfolioLedgerEntryRow {
+                prediction_id: id,
+                pool_id: 1,
+                pool_name: "Pool".to_string(),
+                pool_category: "sports".to_string(),
+                pool_state: "settled".to_string(),
+                pool_result: Some("0".to_string()),
+                user_outcome: 0,
+                user_amount: 100,
+                pool_total_stake: 1_000,
+                tx_hash: Some(format!("tx{id}")),
+                ledger_sequence: Some(id),
+                created_at: Utc::now(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn portfolio_export_reports_truncation_and_continuation() {
+        let limit = 2i64;
+        let total = 5i64;
+        let rows = make_ledger_rows(&[5, 4]);
+        let truncated = total > rows.len() as i64;
+        let next_cursor = if truncated {
+            rows.last().map(|r| (r.created_at, r.prediction_id))
+        } else {
+            None
+        };
+        assert!(truncated);
+        assert_eq!(next_cursor.map(|c| c.1), Some(4));
+    }
+
+    #[test]
+    fn portfolio_export_complete_when_rows_cover_total() {
+        let total = 2i64;
+        let rows = make_ledger_rows(&[2, 1]);
+        let truncated = total > rows.len() as i64;
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn portfolio_ledger_entry_keeps_source_references() {
+        let rows = make_ledger_rows(&[7]);
+        assert_eq!(rows[0].tx_hash.as_deref(), Some("tx7"));
+        assert_eq!(rows[0].ledger_sequence, Some(7));
+        assert_eq!(rows[0].pool_total_stake, 1_000);
+    }
+
     // ── Read budgets ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1023,10 +1188,7 @@ mod tests {
     // the matrix fails here rather than surfacing as a UI discrepancy.
 
     /// Build a `UserPredictionRow` with the given pool result and user outcome.
-    fn make_user_prediction_row(
-        pool_result: Option<&str>,
-        user_outcome: i32,
-    ) -> UserPredictionRow {
+    fn make_user_prediction_row(pool_result: Option<&str>, user_outcome: i32) -> UserPredictionRow {
         UserPredictionRow {
             prediction_id: 1,
             pool_id: 7,
@@ -1088,6 +1250,7 @@ mod tests {
     #[test]
     fn balances_pool_total_stake_is_passed_through_verbatim() {
         let row = make_user_prediction_row(Some("0"), 0);
+        let is_winning_outcome = derive_is_winning_outcome(&row);
         let prediction = UserPrediction {
             prediction_id: row.prediction_id,
             pool_id: row.pool_id,
@@ -1100,7 +1263,7 @@ mod tests {
             user_outcome: row.user_outcome,
             user_amount: row.user_amount,
             prediction_created_at: row.prediction_created_at,
-            is_winning_outcome: derive_is_winning_outcome(&row),
+            is_winning_outcome,
         };
         assert_eq!(prediction.pool_total_stake, 1_000);
         assert_eq!(prediction.user_amount, 100);

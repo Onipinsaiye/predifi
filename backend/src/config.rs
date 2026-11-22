@@ -30,6 +30,36 @@ const DEFAULT_SECRET_KEY: &str = "predifi-dev-secret-do-not-use-in-production-32
 const DEFAULT_APP_ENV: &str = "development";
 const DEFAULT_INDEXER_MAX_BATCH_SIZE: usize = crate::constants::DEFAULT_INDEXER_MAX_BATCH_SIZE;
 
+// ── Weekly market digest (issue #289) ────────────────────────────────────────
+/// Environment variable enabling/disabling the weekly digest worker.
+const DIGEST_ENABLED_ENV: &str = "PREDIFI_DIGEST_ENABLED";
+/// Environment variable controlling how often the digest worker polls for due
+/// digests, in seconds.
+const DIGEST_POLL_INTERVAL_ENV: &str = "PREDIFI_DIGEST_POLL_INTERVAL_SECS";
+/// Environment variable controlling how long an unsubscribe token remains
+/// valid, in seconds.
+const DIGEST_UNSUBSCRIBE_TOKEN_TTL_ENV: &str = "PREDIFI_DIGEST_UNSUBSCRIBE_TOKEN_TTL_SECS";
+/// Environment variable holding the secret used to sign unsubscribe tokens.
+const DIGEST_SIGNING_SECRET_ENV: &str = "PREDIFI_DIGEST_SIGNING_SECRET";
+/// The digest worker is disabled unless explicitly opted in.
+const DEFAULT_DIGEST_ENABLED: bool = false;
+/// Default poll interval for the digest worker (5 minutes).
+const DEFAULT_DIGEST_POLL_INTERVAL_SECS: u64 = 300;
+/// Default unsubscribe token lifetime (30 days).
+const DEFAULT_DIGEST_UNSUBSCRIBE_TOKEN_TTL_SECS: u64 = 2_592_000;
+/// Minimum acceptable digest poll interval (10 seconds) — guards against
+/// operators accidentally hammering the database.
+const MIN_DIGEST_POLL_INTERVAL_SECS: u64 = 10;
+/// Maximum acceptable digest poll interval (24 hours).
+const MAX_DIGEST_POLL_INTERVAL_SECS: u64 = 86_400;
+/// Minimum acceptable unsubscribe token TTL (1 hour).
+const MIN_DIGEST_UNSUBSCRIBE_TOKEN_TTL_SECS: u64 = 3_600;
+/// Maximum acceptable unsubscribe token TTL (365 days).
+const MAX_DIGEST_UNSUBSCRIBE_TOKEN_TTL_SECS: u64 = 31_536_000;
+/// Minimum length of the digest signing secret. Unsubscribe tokens are
+/// HMAC-signed, so a short secret would be trivially forgeable.
+const MIN_DIGEST_SIGNING_SECRET_LEN: usize = 32;
+
 // ── Contract identity pinning (issue #347) ───────────────────────────────────
 /// Environment variable holding the path to the pinned deployment manifest.
 const MANIFEST_PATH_ENV: &str = "PREDIFI_CONTRACT_MANIFEST_PATH";
@@ -673,7 +703,7 @@ impl Config {
         Self::from_map(&vars)
     }
 
-    fn from_map(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
+    pub fn from_map(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let host = get_string(vars, "PREDIFI_APP_HOST", DEFAULT_HOST);
         let port = get_u16(vars, "PREDIFI_APP_PORT", DEFAULT_PORT)?;
         let database_url = get_string(vars, "PREDIFI_DATABASE_URL", DEFAULT_DATABASE_URL);
@@ -1466,9 +1496,6 @@ impl Config {
                 reason: format!(
                     "must be < PREDIFI_DB_SERVER_MAX_CONNECTIONS ({}), got {}",
                     self.db_server_max_connections, self.db_admin_headroom_connections
-                ),
-            });
-        }
                 ),
             });
         }
@@ -2519,6 +2546,10 @@ mod tests {
                 String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
                 String::from("https://app.predifi.com,https://predifi.com"),
             ),
+            (
+                String::from("PREDIFI_CONTRACT_ID"),
+                String::from("CTESTCONTRACTID00000000000000000000000000000000000000"),
+            ),
         ]);
         let config = Config::from_map(&vars).expect("valid production origins must be accepted");
         assert_eq!(
@@ -3237,6 +3268,9 @@ mod tests {
         let config = Config {
             app_env: String::from("production"),
             secret_key: String::from(DEFAULT_SECRET_KEY),
+            // Isolate the secret-key check: use a non-default CORS origin so
+            // the production CORS-default check doesn't fire first.
+            cors_allowed_origins: vec!["https://app.predifi.com".to_string()],
             ..Config::default_for_test()
         };
         assert!(matches!(
@@ -3267,6 +3301,8 @@ mod tests {
             app_env: String::from("production"),
             secret_key: String::from("a-very-strong-production-secret-key-at-least-32-bytes"),
             allowed_ws_origins: vec!["https://app.predifi.com".to_string()],
+            cors_allowed_origins: vec!["https://app.predifi.com".to_string()],
+            contract_id: String::from("CTESTCONTRACTID00000000000000000000000000000000000000"),
             ..Config::default_for_test()
         };
         config
@@ -3280,6 +3316,9 @@ mod tests {
             app_env: String::from("production"),
             secret_key: String::from("a-very-strong-production-secret-key-at-least-32-bytes"),
             allowed_ws_origins: Vec::new(),
+            // Isolate the WS-origins check: use a non-default CORS origin so
+            // the production CORS-default check doesn't fire first.
+            cors_allowed_origins: vec!["https://app.predifi.com".to_string()],
             ..Config::default_for_test()
         };
         assert!(matches!(
@@ -3296,6 +3335,12 @@ mod tests {
         let vars = HashMap::from([
             (String::from("PREDIFI_APP_ENV"), String::from("production")),
             // Default secret key is not set, so from_map uses DEFAULT_SECRET_KEY.
+            // Isolate that check: use a non-default CORS origin so the
+            // production CORS-default check doesn't fire first.
+            (
+                String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
         ]);
         assert!(matches!(
             Config::from_map(&vars),
@@ -3781,6 +3826,182 @@ mod tests {
         assert!(status.mutations_disabled());
     }
 
+    // ── Weekly market digest (issue #289) ────────────────────────────────────
+
+    #[test]
+    fn digest_settings_default_when_env_absent() {
+        let vars = HashMap::new();
+        let config = Config::from_map(&vars).unwrap();
+        assert_eq!(config.digest_enabled, DEFAULT_DIGEST_ENABLED);
+        assert_eq!(
+            config.digest_poll_interval_secs,
+            DEFAULT_DIGEST_POLL_INTERVAL_SECS
+        );
+        assert_eq!(
+            config.digest_unsubscribe_token_ttl_secs,
+            DEFAULT_DIGEST_UNSUBSCRIBE_TOKEN_TTL_SECS
+        );
+        assert!(config.digest_signing_secret.is_none());
+    }
+
+    #[test]
+    fn digest_settings_read_from_env() {
+        let vars = HashMap::from([
+            (String::from(DIGEST_ENABLED_ENV), String::from("true")),
+            (
+                String::from(DIGEST_POLL_INTERVAL_ENV),
+                String::from("600"),
+            ),
+            (
+                String::from(DIGEST_UNSUBSCRIBE_TOKEN_TTL_ENV),
+                String::from("86400"),
+            ),
+            (
+                String::from(DIGEST_SIGNING_SECRET_ENV),
+                String::from("a-very-strong-digest-signing-secret-value"),
+            ),
+        ]);
+        let config = Config::from_map(&vars).unwrap();
+        assert!(config.digest_enabled);
+        assert_eq!(config.digest_poll_interval_secs, 600);
+        assert_eq!(config.digest_unsubscribe_token_ttl_secs, 86_400);
+        assert_eq!(
+            config.digest_signing_secret.as_deref(),
+            Some("a-very-strong-digest-signing-secret-value")
+        );
+    }
+
+    #[test]
+    fn digest_settings_reject_invalid_enabled_flag() {
+        let vars = HashMap::from([(String::from(DIGEST_ENABLED_ENV), String::from("yes-please"))]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: DIGEST_ENABLED_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn digest_settings_reject_poll_interval_below_minimum() {
+        let vars = HashMap::from([(
+            String::from(DIGEST_POLL_INTERVAL_ENV),
+            String::from("1"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: DIGEST_POLL_INTERVAL_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn digest_settings_reject_poll_interval_above_maximum() {
+        let vars = HashMap::from([(
+            String::from(DIGEST_POLL_INTERVAL_ENV),
+            String::from("1000000"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: DIGEST_POLL_INTERVAL_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn digest_settings_reject_non_numeric_poll_interval() {
+        let vars = HashMap::from([(
+            String::from(DIGEST_POLL_INTERVAL_ENV),
+            String::from("often"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidNumber {
+                key: DIGEST_POLL_INTERVAL_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn digest_settings_reject_token_ttl_out_of_range() {
+        for bad in ["0", "10", "999999999"] {
+            let vars = HashMap::from([(
+                String::from(DIGEST_UNSUBSCRIBE_TOKEN_TTL_ENV),
+                String::from(bad),
+            )]);
+            assert!(
+                matches!(
+                    Config::from_map(&vars),
+                    Err(ConfigError::InvalidValue {
+                        key: DIGEST_UNSUBSCRIBE_TOKEN_TTL_ENV,
+                        ..
+                    })
+                ),
+                "ttl {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn digest_settings_reject_short_signing_secret() {
+        let vars = HashMap::from([(
+            String::from(DIGEST_SIGNING_SECRET_ENV),
+            String::from("too-short"),
+        )]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: DIGEST_SIGNING_SECRET_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn digest_settings_ignore_blank_signing_secret() {
+        let vars = HashMap::from([(String::from(DIGEST_SIGNING_SECRET_ENV), String::from("   "))]);
+        let config = Config::from_map(&vars).unwrap();
+        assert!(config.digest_signing_secret.is_none());
+    }
+
+    #[test]
+    fn digest_settings_require_signing_secret_when_enabled_in_production() {
+        let config = Config {
+            app_env: String::from("production"),
+            secret_key: String::from("a-very-strong-production-secret-key-at-least-32-bytes"),
+            allowed_ws_origins: vec!["https://app.predifi.com".to_string()],
+            cors_allowed_origins: vec!["https://app.predifi.com".to_string()],
+            digest_enabled: true,
+            digest_signing_secret: None,
+            ..Config::default_for_test()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue {
+                key: DIGEST_SIGNING_SECRET_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn digest_settings_allow_enabled_without_secret_outside_production() {
+        let config = Config {
+            digest_enabled: true,
+            digest_signing_secret: None,
+            ..Config::default_for_test()
+        };
+        config
+            .validate()
+            .expect("digest may be enabled without a secret outside production");
+    }
+
     #[test]
     fn config_reads_contract_identity_from_env() {
         let vars = HashMap::from([
@@ -3819,20 +4040,6 @@ mod tests {
             Config::from_map(&vars),
             Err(ConfigError::InvalidValue {
                 key: CONTRACT_INTERFACE_VERSION_ENV,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn config_rejects_empty_manifest_path() {
-        let vars = HashMap::from([(String::from(MANIFEST_PATH_ENV), String::new())]);
-        ass
-        )]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED",
                 ..
             })
         ));
@@ -3929,12 +4136,6 @@ mod tests {
     }
 
     #[test]
-                ..
-            })
-        ));
-    }
-
-    #[test]
     fn config_requires_contract_id_in_production() {
         let vars = HashMap::from([
             (String::from("PREDIFI_APP_ENV"), String::from("production")),
@@ -3979,44 +4180,4 @@ mod tests {
         let config = Config::from_map(&vars).expect("blank previous key should be ignored");
         assert_eq!(config.notification_provider_previous_key, None);
     }
-
-                ..
-            })
-        ));
-    }
-    #[test]
-    fn notification_provider_ignores_blank_previous_key() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("new-key"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY"),
-                String::from("   "),
-            ),
-        ]);
-        let config = Config::from_map(&vars).unwrap();
-        assert!(config.notification_provider_previous_key.is_none());
-    }
-
-    #[test]
-    fn db_budget_rejects_non_numeric_replicas() {
-        let vars = HashMap::from([(
-            String::from("PREDIFI_DB_MAX_REPLICAS"),
-            String::from("many"),
-        )]);
-        assert!(matches!(
-            Config::from_map(&vars),
-            Err(ConfigError::InvalidNumber {
-                key: "PREDIFI_DB_MAX_REPLICAS",
-                ..
-            })
-        ));
-    }
-
 }

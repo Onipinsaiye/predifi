@@ -105,7 +105,10 @@ async fn test_startup_behavior_missing_checkpoint() {
     assert_eq!(status, CheckpointStatus::Missing);
 
     let resolved = resolve_startup_checkpoint(&status, test_listener_id, 1);
-    assert_eq!(resolved, 1, "missing checkpoint must safely default to initial ledger");
+    assert_eq!(
+        resolved, 1,
+        "missing checkpoint must safely default to initial ledger"
+    );
 }
 
 #[tokio::test]
@@ -181,7 +184,10 @@ async fn test_failure_injection_before_commit_rolls_back_and_restart_prevents_lo
         &FailureInjector::fail_before_commit(),
     )
     .await;
-    assert!(res.is_err(), "injected failure before commit must return an error");
+    assert!(
+        res.is_err(),
+        "injected failure before commit must return an error"
+    );
 
     // 2. Verify neither the pool nor the checkpoint were committed
     let pool_row = sqlx::query("SELECT pool_id FROM pools WHERE pool_id = $1")
@@ -189,10 +195,17 @@ async fn test_failure_injection_before_commit_rolls_back_and_restart_prevents_lo
         .fetch_optional(&pool)
         .await
         .unwrap();
-    assert!(pool_row.is_none(), "rolled back event must not exist in pools table");
+    assert!(
+        pool_row.is_none(),
+        "rolled back event must not exist in pools table"
+    );
 
     let status = load_checkpoint(&pool, test_listener_id).await;
-    assert_eq!(status, CheckpointStatus::Valid(100), "checkpoint must remain at baseline ledger");
+    assert_eq!(
+        status,
+        CheckpointStatus::Valid(100),
+        "checkpoint must remain at baseline ledger"
+    );
 
     // 3. Simulate process restart and retry without injected failure
     let restart_cursor = resolve_startup_checkpoint(&status, test_listener_id, 1);
@@ -216,10 +229,17 @@ async fn test_failure_injection_before_commit_rolls_back_and_restart_prevents_lo
         .fetch_optional(&pool)
         .await
         .unwrap();
-    assert!(committed_pool.is_some(), "replayed event must be durably committed");
+    assert!(
+        committed_pool.is_some(),
+        "replayed event must be durably committed"
+    );
 
     let new_status = load_checkpoint(&pool, test_listener_id).await;
-    assert_eq!(new_status, CheckpointStatus::Valid(102), "checkpoint must advance to 102");
+    assert_eq!(
+        new_status,
+        CheckpointStatus::Valid(102),
+        "checkpoint must advance to 102"
+    );
 }
 
 #[tokio::test]
@@ -266,7 +286,10 @@ async fn test_failure_injection_after_commit_restart_prevents_duplicate_processi
         &FailureInjector::fail_after_commit(),
     )
     .await;
-    assert!(res.is_err(), "injected failure after commit must report error");
+    assert!(
+        res.is_err(),
+        "injected failure after commit must report error"
+    );
 
     // 2. Restart inspection: checkpoint was already committed along with the events
     let status = load_checkpoint(&pool, test_listener_id).await;
@@ -277,7 +300,10 @@ async fn test_failure_injection_after_commit_restart_prevents_duplicate_processi
     );
 
     let resume_cursor = resolve_startup_checkpoint(&status, test_listener_id, 1);
-    assert_eq!(resume_cursor, 202, "restart resumes past ledger 201, avoiding duplicate execution");
+    assert_eq!(
+        resume_cursor, 202,
+        "restart resumes past ledger 201, avoiding duplicate execution"
+    );
 
     // 3. Confirm exact single row in pools table (no duplicate)
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pools WHERE pool_id = $1")

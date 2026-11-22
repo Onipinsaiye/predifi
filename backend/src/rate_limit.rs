@@ -700,7 +700,9 @@ mod tests {
         let key = rate_limit_key(RateLimitTier::Read, " 203.0.113.9 ");
         assert_eq!(key, "rate_limit:read:203.0.113.9");
         let key = rate_limit_key(RateLimitTier::User, "GABC:DE*F?");
-        assert_eq!(key, "rate_limit:user:GABCDEF");
+        // Lowercased so a case-variant of the same wallet address shares the
+        // same rate-limit bucket instead of bypassing it.
+        assert_eq!(key, "rate_limit:user:gabcdef");
         assert_eq!(
             rate_limit_key(RateLimitTier::Token, "   "),
             "rate_limit:token:unknown"

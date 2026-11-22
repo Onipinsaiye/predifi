@@ -944,7 +944,7 @@ pub struct SetInterestsRequest {
 
 // ── Wallet-scoped notification preferences (#301) ────────────────────────────
 
-pub const NOTIFICATION_PREFERENCES_SCHEMA_VERSION: i16 = 1;
+pub const NOTIFICATION_PREFERENCES_SCHEMA_VERSION: i16 = 2;
 pub const MAX_NOTIFICATION_PREFERENCES_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_PUSH_SUBSCRIPTION_BODY_BYTES: usize = 16 * 1024;
 const PREFERENCE_CHANNELS: &[&str] = &["in_app", "push", "email"];
@@ -955,6 +955,45 @@ const PREFERENCE_EVENTS: &[&str] = &[
     "new_pool_match",
 ];
 
+/// Opt-in schedule for the weekly market digest (#289).
+///
+/// The digest is disabled by default. When enabled, `day_of_week` (0 = Monday,
+/// 6 = Sunday), `send_time_local` (`HH:MM`), and `timezone` (IANA name) define
+/// the local send window. The next send instant is computed DST-safely.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DigestPreferences {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 0 = Monday … 6 = Sunday.
+    #[serde(default)]
+    pub day_of_week: u8,
+    /// Local wall-clock send time, `HH:MM`.
+    #[serde(default = "default_digest_time")]
+    pub send_time_local: String,
+    /// IANA timezone name, e.g. `Europe/London`.
+    #[serde(default = "default_digest_timezone")]
+    pub timezone: String,
+}
+
+fn default_digest_time() -> String {
+    "09:00".to_string()
+}
+
+fn default_digest_timezone() -> String {
+    "UTC".to_string()
+}
+
+impl Default for DigestPreferences {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            day_of_week: 0,
+            send_time_local: default_digest_time(),
+            timezone: default_digest_timezone(),
+        }
+    }
+}
+
 /// Versioned, default-deny preferences for one wallet.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NotificationPreferences {
@@ -963,6 +1002,8 @@ pub struct NotificationPreferences {
     pub channels: BTreeMap<String, bool>,
     #[serde(default)]
     pub events: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub digest: DigestPreferences,
 }
 
 impl Default for NotificationPreferences {
@@ -971,6 +1012,7 @@ impl Default for NotificationPreferences {
             schema_version: NOTIFICATION_PREFERENCES_SCHEMA_VERSION,
             channels: default_disabled(PREFERENCE_CHANNELS),
             events: default_disabled(PREFERENCE_EVENTS),
+            digest: DigestPreferences::default(),
         }
     }
 }
@@ -1004,7 +1046,37 @@ fn normalize_preferences(mut preferences: NotificationPreferences) -> Notificati
     preferences.schema_version = NOTIFICATION_PREFERENCES_SCHEMA_VERSION;
     preferences.channels = channels;
     preferences.events = events;
+    preferences.digest = normalize_digest(preferences.digest);
     preferences
+}
+
+/// Clamp digest schedule fields into valid ranges so a malformed stored value
+/// can never produce an unschedulable digest.
+fn normalize_digest(mut digest: DigestPreferences) -> DigestPreferences {
+    if digest.day_of_week > 6 {
+        digest.day_of_week = 0;
+    }
+    if parse_local_time(&digest.send_time_local).is_none() {
+        digest.send_time_local = default_digest_time();
+    }
+    if digest.timezone.parse::<chrono_tz::Tz>().is_err() {
+        digest.timezone = default_digest_timezone();
+    }
+    digest
+}
+
+/// Parse an `HH:MM` local time into `(hour, minute)`.
+fn parse_local_time(value: &str) -> Option<(u32, u32)> {
+    let (hour, minute) = value.split_once(':')?;
+    if hour.len() != 2 || minute.len() != 2 {
+        return None;
+    }
+    let hour: u32 = hour.parse().ok()?;
+    let minute: u32 = minute.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some((hour, minute))
 }
 
 /// Migrate the original unversioned/flat preference object to schema v1.
@@ -1021,6 +1093,16 @@ fn migrate_preferences(
     if schema_version == NOTIFICATION_PREFERENCES_SCHEMA_VERSION {
         let preferences: NotificationPreferences =
             serde_json::from_value(value).map_err(|error| error.to_string())?;
+        return Ok(normalize_preferences(preferences));
+    }
+
+    // v1 → v2: the digest block did not exist, so it stays disabled. Preserve
+    // the v1 channels/events maps and let normalization fill in defaults.
+    if schema_version == 1 {
+        let mut preferences: NotificationPreferences =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        preferences.schema_version = NOTIFICATION_PREFERENCES_SCHEMA_VERSION;
+        preferences.digest = DigestPreferences::default();
         return Ok(normalize_preferences(preferences));
     }
 
@@ -1411,6 +1493,553 @@ pub async fn prune_expired_push_subscriptions(pool: &PgPool) -> Result<u64, sqlx
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+// ── Account data export and deletion (#267) ─────────────────────────────────
+//
+// Off-chain notification data linked to a wallet is exported and deleted here.
+// Only private, user-owned records are touched:
+//
+// * `notification_preferences` — private channel/event opt-ins.
+// * `notifications`            — delivered in-app inbox entries.
+// * `user_notification_outbox` — pending/terminal delivery intents.
+// * `user_interests`           — private interest tags used for matching.
+// * `browser_push_subscriptions` — encrypted push endpoints.
+//
+// Chain-derived history (pools, predictions, resolutions, claims) is public and
+// immutable; it is never read or written by these functions. Audit tables
+// (`credential_rotation_audit`) hold no personal data and are retained.
+
+/// One exported push subscription. The encrypted payload is decrypted so the
+/// user receives the endpoint and keys they registered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedPushSubscription {
+    pub id: i64,
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// One exported outbox intent (pending or terminal delivery record).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportedOutboxEntry {
+    pub id: i64,
+    pub event_key: String,
+    pub notif_type: String,
+    pub title: String,
+    pub message: String,
+    pub pool_id: i64,
+    pub status: String,
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Complete export of a wallet's off-chain notification data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationDataExport {
+    pub user_address: String,
+    pub exported_at: DateTime<Utc>,
+    pub preferences: NotificationPreferences,
+    pub notifications: Vec<NotificationRow>,
+    pub outbox: Vec<ExportedOutboxEntry>,
+    pub interests: Vec<String>,
+    pub push_subscriptions: Vec<ExportedPushSubscription>,
+    /// Human-readable explanation of what is (and is not) included, so the
+    /// user understands that on-chain history is immutable and public.
+    pub on_chain_data_note: String,
+}
+
+/// Explanation attached to every export describing immutable on-chain data.
+pub const ON_CHAIN_DATA_NOTE: &str = "Public on-chain history (pools, predictions, \
+resolutions and claims) is immutable and is not part of this export or of account \
+deletion. Only private off-chain profile and notification data is exported or removed.";
+
+/// Export every off-chain notification record linked to `address`.
+///
+/// The read runs in a single repeatable-read transaction so the export is a
+/// consistent snapshot. Push subscription payloads are decrypted with `secret`.
+pub async fn export_notification_data(
+    pool: &PgPool,
+    address: &str,
+    secret: &str,
+) -> Result<NotificationDataExport, PushSubscriptionError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+
+    let preferences = get_notification_preferences(pool, address)
+        .await
+        .map_err(PushSubscriptionError::Database)?;
+
+    let notifications: Vec<NotificationRow> = sqlx::query_as(
+        r#"
+        SELECT id, user_address, notif_type, title, message, pool_id, read, created_at
+        FROM notifications
+        WHERE user_address = $1
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let outbox: Vec<ExportedOutboxEntry> = sqlx::query_as(
+        r#"
+        SELECT id, event_key, notif_type, title, message, pool_id,
+               status, attempts, created_at, updated_at
+        FROM user_notification_outbox
+        WHERE user_address = $1
+        ORDER BY id ASC
+        "#,
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let interests: Vec<String> = sqlx::query_as(
+        "SELECT interest FROM user_interests WHERE user_address = $1 ORDER BY interest",
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|(interest,)| interest)
+    .collect();
+
+    let push_rows = sqlx::query(
+        "SELECT id, encrypted_payload, expires_at FROM browser_push_subscriptions WHERE user_address = $1 ORDER BY id",
+    )
+    .bind(address)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut push_subscriptions = Vec::with_capacity(push_rows.len());
+    for row in push_rows {
+        let payload = decrypt_push_payload(
+            secret,
+            &row.try_get::<Vec<u8>, _>("encrypted_payload")
+                .map_err(PushSubscriptionError::Database)?,
+        )?;
+        let payload: PushSubscriptionPayload =
+            serde_json::from_slice(&payload).map_err(|_| PushSubscriptionError::Encryption)?;
+        push_subscriptions.push(ExportedPushSubscription {
+            id: row.try_get("id").map_err(PushSubscriptionError::Database)?,
+            endpoint: payload.endpoint,
+            p256dh: payload.p256dh,
+            auth: payload.auth,
+            expires_at: row
+                .try_get("expires_at")
+                .map_err(PushSubscriptionError::Database)?,
+        });
+    }
+
+    tx.commit().await?;
+
+    Ok(NotificationDataExport {
+        user_address: address.to_string(),
+        exported_at: Utc::now(),
+        preferences,
+        notifications,
+        outbox,
+        interests,
+        push_subscriptions,
+        on_chain_data_note: ON_CHAIN_DATA_NOTE.to_string(),
+    })
+}
+
+/// Counts of private records removed by [`delete_notification_data`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct NotificationDeletionReport {
+    pub preferences_deleted: u64,
+    pub notifications_deleted: u64,
+    pub outbox_deleted: u64,
+    pub interests_deleted: u64,
+    pub push_subscriptions_deleted: u64,
+}
+
+impl NotificationDeletionReport {
+    /// Total number of private rows removed.
+    pub fn total(&self) -> u64 {
+        self.preferences_deleted
+            + self.notifications_deleted
+            + self.outbox_deleted
+            + self.interests_deleted
+            + self.push_subscriptions_deleted
+    }
+}
+
+/// Delete every off-chain notification record linked to `address`.
+///
+/// Deletion is idempotent: running it again removes nothing and returns a
+/// zeroed report. Chain-derived tables are never touched. The whole operation
+/// runs in one transaction so a partial failure leaves no half-deleted state.
+pub async fn delete_notification_data(
+    pool: &PgPool,
+    address: &str,
+) -> Result<NotificationDeletionReport, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let preferences_deleted =
+        sqlx::query("DELETE FROM notification_preferences WHERE user_address = $1")
+            .bind(address)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+    let notifications_deleted = sqlx::query("DELETE FROM notifications WHERE user_address = $1")
+        .bind(address)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    let outbox_deleted =
+        sqlx::query("DELETE FROM user_notification_outbox WHERE user_address = $1")
+            .bind(address)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+    let interests_deleted = sqlx::query("DELETE FROM user_interests WHERE user_address = $1")
+        .bind(address)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    let push_subscriptions_deleted =
+        sqlx::query("DELETE FROM browser_push_subscriptions WHERE user_address = $1")
+            .bind(address)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+    tx.commit().await?;
+
+    let report = NotificationDeletionReport {
+        preferences_deleted,
+        notifications_deleted,
+        outbox_deleted,
+        interests_deleted,
+        push_subscriptions_deleted,
+    };
+    info!(?report, "notification data deleted for account");
+    Ok(report)
+}
+
+// ── Weekly market digest (#289) ──────────────────────────────────────────────
+
+/// How long an unsubscribe token remains redeemable after issuance.
+const DIGEST_UNSUBSCRIBE_TOKEN_TTL_HOURS: i64 = 24 * 30;
+
+/// A single public market status change for a followed market.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestEvent {
+    pub market_id: i64,
+    pub market_name: String,
+    /// Public status, e.g. `active`, `settled`.
+    pub status: String,
+    /// Monotonic version of the status so repeated scans dedupe correctly.
+    pub status_version: i64,
+}
+
+impl DigestEvent {
+    /// Stable identity used for deduplication across digest runs.
+    fn event_key(&self) -> String {
+        format!("market:{}:{}", self.market_id, self.status_version)
+    }
+}
+
+/// A rendered digest ready to email.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedDigest {
+    pub subject: String,
+    pub body: String,
+    pub events: Vec<DigestEvent>,
+}
+
+/// Compute the next digest send instant for `prefs` strictly after `now`.
+///
+/// The computation is DST-safe: it walks forward day by day in the user's
+/// timezone and only accepts a candidate whose local wall-clock time matches
+/// the configured send time. On a spring-forward day the configured time may
+/// not exist; on a fall-back day it may occur twice. In both cases the first
+/// instant whose local time is at or after the configured time on the target
+/// weekday is chosen, so a digest is never skipped or duplicated.
+pub fn next_digest_send(
+    prefs: &DigestPreferences,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    use chrono::{Datelike, Duration, NaiveTime, TimeZone, Timelike, Weekday};
+
+    let tz: chrono_tz::Tz = prefs.timezone.parse().ok()?;
+    let (hour, minute) = parse_local_time(&prefs.send_time_local)?;
+    let target_weekday = match prefs.day_of_week {
+        0 => Weekday::Mon,
+        1 => Weekday::Tue,
+        2 => Weekday::Wed,
+        3 => Weekday::Thu,
+        4 => Weekday::Fri,
+        5 => Weekday::Sat,
+        _ => Weekday::Sun,
+    };
+    let target_time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+
+    let local_now = now.with_timezone(&tz);
+    // Walk up to 8 days forward to cover the current week plus one full cycle.
+    for offset in 0..=8i64 {
+        let day = local_now.date_naive() + Duration::days(offset);
+        if day.weekday() != target_weekday {
+            continue;
+        }
+        // Resolve the local wall-clock time to an instant. `from_local_datetime`
+        // returns `None` for a nonexistent (spring-forward) time and `Ambiguous`
+        // for a repeated (fall-back) time.
+        match tz.from_local_datetime(&day.and_time(target_time)) {
+            chrono::LocalResult::Single(dt) => {
+                let dt = dt.with_timezone(&Utc);
+                if dt > now {
+                    return Some(dt);
+                }
+            }
+            chrono::LocalResult::Ambiguous(earliest, _latest) => {
+                // Fall-back: the wall-clock time occurs twice. Pick the earliest
+                // occurrence that is still in the future.
+                let earliest = earliest.with_timezone(&Utc);
+                if earliest > now {
+                    return Some(earliest);
+                }
+            }
+            chrono::LocalResult::None => {
+                // Spring-forward: the configured time does not exist. Send at
+                // the first valid instant after the gap on that day.
+                let after_gap = tz
+                    .from_local_datetime(&day.and_time(target_time + Duration::hours(1)))
+                    .earliest()?
+                    .with_timezone(&Utc);
+                if after_gap > now {
+                    return Some(after_gap);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Deduplicate `events` by their stable event key, preserving first-seen order.
+pub fn dedupe_digest_events(events: Vec<DigestEvent>) -> Vec<DigestEvent> {
+    let mut seen = std::collections::BTreeSet::new();
+    events
+        .into_iter()
+        .filter(|event| seen.insert(event.event_key()))
+        .collect()
+}
+
+/// Render a digest email body. Returns `None` for an empty digest so callers
+/// can skip sending entirely.
+pub fn render_digest(events: &[DigestEvent], unsubscribe_url: &str) -> Option<RenderedDigest> {
+    let events = dedupe_digest_events(events.to_vec());
+    if events.is_empty() {
+        return None;
+    }
+    let mut body = String::from("Your weekly market digest\n\n");
+    for event in &events {
+        body.push_str(&format!(
+            "- {} is now {}.\n",
+            event.market_name, event.status
+        ));
+    }
+    body.push_str(&format!("\nUnsubscribe: {unsubscribe_url}\n"));
+    Some(RenderedDigest {
+        subject: "Your weekly market digest".to_string(),
+        body,
+        events,
+    })
+}
+
+/// Hash an unsubscribe token so only the digest is stored server-side.
+fn hash_unsubscribe_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    digest
+        .iter()
+        .flat_map(|byte| {
+            [
+                HEX[(byte >> 4) as usize] as char,
+                HEX[(byte & 0x0f) as usize] as char,
+            ]
+        })
+        .collect()
+}
+
+/// Issue a signed, expiring unsubscribe token for `address`.
+///
+/// The raw token is returned to the caller (embedded in the email link); only
+/// its hash is persisted, so a database leak cannot be used to unsubscribe
+/// other users.
+pub async fn issue_unsubscribe_token(
+    pool: &PgPool,
+    address: &str,
+    now: DateTime<Utc>,
+) -> Result<String, sqlx::Error> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let token_hash = hash_unsubscribe_token(&token);
+    let expires_at = now + chrono::Duration::hours(DIGEST_UNSUBSCRIBE_TOKEN_TTL_HOURS);
+    sqlx::query(
+        r#"
+        INSERT INTO digest_unsubscribe_tokens (token_hash, user_address, expires_at)
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(token_hash)
+    .bind(address)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(token)
+}
+
+/// Redeem an unsubscribe token. Returns the address whose digest was disabled,
+/// or `None` if the token is unknown, already used, or expired.
+pub async fn redeem_unsubscribe_token(
+    pool: &PgPool,
+    token: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, sqlx::Error> {
+    let token_hash = hash_unsubscribe_token(token);
+    let mut tx = pool.begin().await?;
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        UPDATE digest_unsubscribe_tokens
+        SET used_at = $2
+        WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2
+        RETURNING user_address
+        "#,
+    )
+    .bind(token_hash)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((address,)) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    sqlx::query(
+        r#"
+        UPDATE notification_preferences
+        SET preferences = jsonb_set(preferences, '{digest,enabled}', 'false'::jsonb),
+            updated_at = NOW()
+        WHERE user_address = $1
+        "#,
+    )
+    .bind(&address)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(address))
+}
+
+/// Record that `event` was included in a digest for `address`. Returns `true`
+/// when the row was newly inserted (i.e. the event had not been delivered).
+async fn record_digest_delivery(
+    tx: &mut Transaction<'_, Postgres>,
+    address: &str,
+    event: &DigestEvent,
+) -> Result<bool, sqlx::Error> {
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO digest_deliveries (user_address, market_id, status_version)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_address, market_id, status_version) DO NOTHING
+        "#,
+    )
+    .bind(address)
+    .bind(event.market_id)
+    .bind(event.status_version)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
+}
+
+/// Build the digest for `address` from followed-market public status changes,
+/// excluding events already delivered. Returns `None` when nothing is new.
+pub async fn build_digest(
+    pool: &PgPool,
+    address: &str,
+    unsubscribe_url: &str,
+) -> Result<Option<RenderedDigest>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT m.market_id, m.name, m.status, m.status_version
+        FROM followed_markets f
+        JOIN markets m ON m.market_id = f.market_id
+        WHERE f.user_address = $1
+          AND m.is_public = TRUE
+          AND NOT EXISTS (
+              SELECT 1 FROM digest_deliveries d
+              WHERE d.user_address = $1
+                AND d.market_id = m.market_id
+                AND d.status_version = m.status_version
+          )
+        ORDER BY m.market_id
+        "#,
+    )
+    .bind(address)
+    .fetch_all(pool)
+    .await?;
+
+    let events: Vec<DigestEvent> = rows
+        .into_iter()
+        .map(|row| {
+            Ok(DigestEvent {
+                market_id: row.try_get("market_id")?,
+                market_name: row.try_get("name")?,
+                status: row.try_get("status")?,
+                status_version: row.try_get("status_version")?,
+            })
+        })
+        .collect::<Result<_, sqlx::Error>>()?;
+
+    Ok(render_digest(&events, unsubscribe_url))
+}
+
+/// Send the weekly digest for `address` if one is due and non-empty.
+///
+/// Returns the number of events delivered (0 when the digest is disabled,
+/// not due, or empty). Each delivered event is recorded so a later run never
+/// repeats it.
+pub async fn send_digest_if_due(
+    pool: &PgPool,
+    address: &str,
+    now: DateTime<Utc>,
+    unsubscribe_url: &str,
+) -> Result<usize, sqlx::Error> {
+    let preferences = get_notification_preferences(pool, address).await?;
+    if !preferences.digest.enabled {
+        return Ok(0);
+    }
+    let Some(next) = next_digest_send(&preferences.digest, now) else {
+        return Ok(0);
+    };
+    // Only send within the hour window leading up to the scheduled instant.
+    if next - now > chrono::Duration::hours(1) {
+        return Ok(0);
+    }
+    let Some(rendered) = build_digest(pool, address, unsubscribe_url).await? else {
+        return Ok(0);
+    };
+
+    let mut tx = pool.begin().await?;
+    let mut delivered = 0usize;
+    for event in &rendered.events {
+        if record_digest_delivery(&mut tx, address, event).await? {
+            delivered += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(delivered)
+}
 }
 
 // ── Sweep: generates notifications from current pool/prediction state ────────
@@ -1818,7 +2447,25 @@ mod tests {
 
     #[test]
     fn future_preference_schema_is_rejected() {
-        assert!(migrate_preferences(2, serde_json::json!({})).is_err());
+        assert!(migrate_preferences(3, serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn v1_preferences_migrate_to_v2_with_digest_disabled() {
+        let migrated = migrate_preferences(
+            1,
+            serde_json::json!({
+                "schema_version": 1,
+                "channels": { "in_app": true },
+                "events": { "pool_resolved": true }
+            }),
+        )
+        .expect("v1 preferences should migrate");
+        assert_eq!(migrated.schema_version, NOTIFICATION_PREFERENCES_SCHEMA_VERSION);
+        assert!(migrated.channels["in_app"]);
+        assert!(migrated.events["pool_resolved"]);
+        assert!(!migrated.digest.enabled);
+        assert_eq!(migrated.digest.timezone, "UTC");
     }
 
     #[test]
@@ -1865,5 +2512,129 @@ mod tests {
         assert!(validate_push_endpoint("https://push.example.test/sub").is_ok());
         assert!(validate_push_endpoint("http://push.example.test/sub").is_err());
         assert!(validate_push_endpoint("https://user:pass@push.example.test/sub").is_err());
+    }
+
+    #[test]
+    fn deletion_report_total_sums_all_private_records() {
+        let report = NotificationDeletionReport {
+            preferences_deleted: 1,
+            notifications_deleted: 2,
+            outbox_deleted: 3,
+            interests_deleted: 4,
+            push_subscriptions_deleted: 5,
+        };
+        assert_eq!(report.total(), 15);
+        assert_eq!(NotificationDeletionReport::default().total(), 0);
+    }
+
+    #[test]
+    fn export_note_explains_immutable_on_chain_data() {
+        assert!(ON_CHAIN_DATA_NOTE.contains("immutable"));
+        assert!(ON_CHAIN_DATA_NOTE.contains("on-chain"));
+    }
+
+    // ── Weekly digest tests (#289) ──────────────────────────────────────────
+
+    fn digest_prefs(day: u8, time: &str, tz: &str) -> DigestPreferences {
+        DigestPreferences {
+            enabled: true,
+            day_of_week: day,
+            send_time_local: time.to_string(),
+            timezone: tz.to_string(),
+        }
+    }
+
+    #[test]
+    fn digest_next_send_respects_dst_spring_forward() {
+        // 2024-03-31 is the EU spring-forward day; 02:30 does not exist in
+        // Europe/London. The digest must still fire that day, after the gap.
+        let prefs = digest_prefs(6, "02:30", "Europe/London"); // Sunday
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 3, 30, 12, 0, 0)
+            .unwrap();
+        let next = next_digest_send(&prefs, now).expect("digest should schedule");
+        let local = next.with_timezone(&chrono_tz::Europe::London);
+        assert_eq!(local.date_naive(), chrono::NaiveDate::from_ymd_opt(2024, 3, 31).unwrap());
+        // 02:30 local does not exist; the send lands at/after 03:00 local.
+        assert!(local.time() >= chrono::NaiveTime::from_hms_opt(3, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn digest_next_send_respects_dst_fall_back() {
+        // 2024-10-27 is the EU fall-back day; 01:30 occurs twice. The digest
+        // must fire exactly once, at the earliest future occurrence.
+        let prefs = digest_prefs(6, "01:30", "Europe/London"); // Sunday
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 10, 26, 12, 0, 0)
+            .unwrap();
+        let next = next_digest_send(&prefs, now).expect("digest should schedule");
+        let local = next.with_timezone(&chrono_tz::Europe::London);
+        assert_eq!(local.date_naive(), chrono::NaiveDate::from_ymd_opt(2024, 10, 27).unwrap());
+        assert_eq!(local.time(), chrono::NaiveTime::from_hms_opt(1, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn digest_next_send_is_strictly_in_the_future() {
+        let prefs = digest_prefs(0, "09:00", "UTC"); // Monday
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 4, 1, 9, 0, 0).unwrap();
+        let next = next_digest_send(&prefs, now).expect("digest should schedule");
+        assert!(next > now);
+        assert_eq!(next, chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 4, 8, 9, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn empty_digest_renders_nothing() {
+        assert!(render_digest(&[], "https://example.test/unsub").is_none());
+    }
+
+    #[test]
+    fn digest_deduplicates_events_by_market_and_version() {
+        let events = vec![
+            DigestEvent {
+                market_id: 1,
+                market_name: "A".to_string(),
+                status: "active".to_string(),
+                status_version: 1,
+            },
+            DigestEvent {
+                market_id: 1,
+                market_name: "A".to_string(),
+                status: "active".to_string(),
+                status_version: 1,
+            },
+            DigestEvent {
+                market_id: 1,
+                market_name: "A".to_string(),
+                status: "settled".to_string(),
+                status_version: 2,
+            },
+        ];
+        let deduped = dedupe_digest_events(events);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].status_version, 1);
+        assert_eq!(deduped[1].status_version, 2);
+
+        let rendered = render_digest(&deduped, "https://example.test/unsub").unwrap();
+        assert_eq!(rendered.events.len(), 2);
+        assert!(rendered.body.contains("Unsubscribe: https://example.test/unsub"));
+    }
+
+    #[test]
+    fn unsubscribe_token_hash_is_stable_and_opaque() {
+        let hash = hash_unsubscribe_token("token-abc");
+        assert_eq!(hash, hash_unsubscribe_token("token-abc"));
+        assert_ne!(hash, "token-abc");
+        assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn digest_preferences_normalize_invalid_schedule() {
+        let normalized = normalize_digest(DigestPreferences {
+            enabled: true,
+            day_of_week: 9,
+            send_time_local: "25:99".to_string(),
+            timezone: "Not/AZone".to_string(),
+        });
+        assert_eq!(normalized.day_of_week, 0);
+        assert_eq!(normalized.send_time_local, "09:00");
+        assert_eq!(normalized.timezone, "UTC");
     }
 }

@@ -6,6 +6,7 @@ import { sanitizeRichText } from "../../../lib/security";
 
 type PageProps = {
   params: { [key: string]: string | string[] | undefined };
+  searchParams?: { [key: string]: string | string[] | undefined };
 };
 
 function resolveId({ params }: PageProps): string {
@@ -14,12 +15,18 @@ function resolveId({ params }: PageProps): string {
   return typeof id === "string" ? id : "";
 }
 
+function resolveOutcome({ searchParams }: PageProps): string | null {
+  const raw = searchParams?.outcome;
+  const outcome = Array.isArray(raw) ? raw[0] : raw;
+  return typeof outcome === "string" && outcome.length > 0 ? outcome : null;
+}
+
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
   const id = resolveId({ params });
   return generatePoolMetadata(id);
 }
 
-export default async function MarketPage({ params }: PageProps) {
+export default async function MarketPage({ params, searchParams }: PageProps) {
   const id = resolveId({ params });
   const pool = isValidPoolId(id) ? await getPoolById(id) : null;
 
@@ -34,9 +41,27 @@ export default async function MarketPage({ params }: PageProps) {
     );
   }
 
+  const requestedOutcome = resolveOutcome({ params, searchParams });
+  const outcomes = Array.isArray(pool.outcomes) ? pool.outcomes : [];
+  const selectedOutcome =
+    requestedOutcome !== null
+      ? outcomes.find((outcome) => outcome.id === requestedOutcome) ?? null
+      : null;
+  const outcomeFallback = requestedOutcome !== null && selectedOutcome === null;
+
   return (
     <main className="mx-auto max-w-2xl px-6 py-16">
       <h1 className="text-3xl font-semibold">{pool.name}</h1>
+      {outcomeFallback ? (
+        <p className="mt-4 text-sm text-amber-700" role="status">
+          The selected outcome is no longer available. Showing the market overview.
+        </p>
+      ) : null}
+      {selectedOutcome ? (
+        <p className="mt-4 text-gray-700">
+          Selected outcome: <span className="font-medium">{selectedOutcome.name}</span>
+        </p>
+      ) : null}
       {pool.description ? (
         <p className="mt-4 text-gray-600">{sanitizeRichText(pool.description)}</p>
       ) : null}

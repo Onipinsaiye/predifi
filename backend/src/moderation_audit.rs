@@ -344,8 +344,13 @@ impl ModerationAuditLog {
             prev_hash,
             record_hash: String::new(),
         };
-        record.record_hash =
-            compute_record_hash(&record).map_err(ModerationAuditError::VerificationFailed)?;
+        record.record_hash = compute_record_hash(&record).map_err(|kind| {
+            ModerationAuditError::VerificationFailed(VerificationError {
+                index: self.records.len(),
+                sequence: record.sequence,
+                kind,
+            })
+        })?;
         append_record_to_disk(&self.path, &record)?;
         self.records.push(record.clone());
         Ok(record)

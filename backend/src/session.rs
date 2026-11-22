@@ -521,6 +521,7 @@ mod tests {
                     key_version: 0,
                     created_at: Instant::now(),
                     last_activity: Instant::now(),
+                    last_step_up_unix_ms: None,
                 },
             );
         }

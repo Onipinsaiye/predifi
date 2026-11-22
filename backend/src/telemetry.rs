@@ -286,8 +286,11 @@ pub fn init_telemetry(service_name: &'static str, otlp_endpoint: &'static str) -
         .expect("failed to create OTLP span exporter");
 
     let provider = trace::TracerProvider::builder()
-        .with_config(trace::Config::default().with_resource(resource))
-        .with_sampler(build_sampler())
+        .with_config(
+            trace::Config::default()
+                .with_resource(resource)
+                .with_sampler(build_sampler()),
+        )
         .with_batch_exporter(otlp_exporter, opentelemetry_sdk::runtime::Tokio)
         .build();
 

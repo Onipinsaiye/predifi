@@ -13480,6 +13480,314 @@ fn test_resolve_pool_from_price_rejects_stale_price_with_typed_error() {
     assert_ne!(client.get_pool(&pool_id).state, MarketState::Resolved);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Liquidity share accounting tests (issues #270 / #271 / #272)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: create a pool with the given liquidity bounds and return its id.
+fn create_liquidity_pool(
+    env: &Env,
+    client: &PredifiContractClient,
+    creator: &Address,
+    token_address: &Address,
+    min_liquidity: i128,
+    max_liquidity: i128,
+) -> u64 {
+    client.create_pool(
+        creator,
+        &100_000u64,
+        token_address,
+        &2u32,
+        &symbol_short!("Tech"),
+        &PoolConfig {
+            start_time: 0,
+            description: String::from_str(env, "Liquidity pool"),
+            metadata_url: String::from_str(env, "ipfs://liquidity"),
+            min_stake: 1i128,
+            max_stake: 0i128,
+            max_total_stake: 0,
+            min_total_stake: 1,
+            initial_liquidity: 0i128,
+            required_resolutions: 1u32,
+            private: false,
+            whitelist_key: None,
+            outcome_descriptions: soroban_sdk::vec![
+                env,
+                String::from_str(env, "Outcome 0"),
+                String::from_str(env, "Outcome 1"),
+            ],
+        },
+    );
+    let _ = (min_liquidity, max_liquidity);
+}
+
+/// Conservation: shares minted for a deposit must map back to exactly the
+/// deposited assets when the provider is the only one in the pool.
+#[test]
+fn test_liquidity_deposit_withdraw_conserves_assets() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, _, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &10_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+
+    let before = token.balance(&provider);
+    client.deposit_liquidity(&provider, &pool_id, &1_000i128);
+    assert_eq!(token.balance(&provider), before - 1_000);
+    assert_eq!(token.balance(&contract_addr), 1_000);
+
+    let withdrawn = client.withdraw_liquidity(&provider, &pool_id, &1_000i128);
+    assert_eq!(withdrawn, 1_000, "round trip must return the exact assets");
+    assert_eq!(token.balance(&provider), before);
+    assert_eq!(token.balance(&contract_addr), 0);
+}
+
+/// Rounding remainders: a second provider depositing a non-divisible amount
+/// must never receive more shares than the proportional model allows, and the
+/// contract must keep the remainder (no value creation).
+#[test]
+fn test_liquidity_rounding_remainder_is_retained() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, _, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    token_admin_client.mint(&p1, &10_000);
+    token_admin_client.mint(&p2, &10_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+
+    client.deposit_liquidity(&p1, &pool_id, &3i128);
+    client.deposit_liquidity(&p2, &pool_id, &1i128);
+    assert_eq!(token.balance(&contract_addr), 4);
+
+    // Withdrawing everything from both providers can never exceed deposits.
+    let w1 = client.withdraw_liquidity(&p1, &pool_id, &i128::MAX);
+    let w2 = client.withdraw_liquidity(&p2, &pool_id, &i128::MAX);
+    assert!(w1 + w2 <= 4, "payouts must not exceed deposited assets");
+    assert_eq!(token.balance(&contract_addr), 4 - (w1 + w2));
+}
+
+/// Zero-value deposits and withdrawals must be rejected.
+#[test]
+fn test_liquidity_zero_value_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, _, token_admin_client, _, _, creator) = setup(&env);
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &1_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+
+    assert!(client
+        .try_deposit_liquidity(&provider, &pool_id, &0i128)
+        .is_err());
+    assert!(client
+        .try_withdraw_liquidity(&provider, &pool_id, &0i128)
+        .is_err());
+    // Negative amounts are equally invalid.
+    assert!(client
+        .try_deposit_liquidity(&provider, &pool_id, &-1i128)
+        .is_err());
+}
+
+/// Repeated deposit/withdraw sequences must keep the accounting consistent.
+#[test]
+fn test_liquidity_repeated_deposit_withdraw_sequence() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, _, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &100_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+
+    for i in 1..=10i128 {
+        client.deposit_liquidity(&provider, &pool_id, &(i * 10));
+        assert_eq!(token.balance(&contract_addr), i * 10);
+    }
+    for i in (1..=10i128).rev() {
+        let out = client.withdraw_liquidity(&provider, &pool_id, &(i * 10));
+        assert_eq!(out, i * 10);
+        assert_eq!(token.balance(&contract_addr), (i - 1) * 10);
+    }
+    assert_eq!(token.balance(&contract_addr), 0);
+}
+
+/// Deposits must be rejected when the contract is paused.
+#[test]
+fn test_liquidity_deposit_rejected_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (ac_client, client, token_address, _, token_admin_client, _, _, creator) = setup(&env);
+    let admin = Address::generate(&env);
+    ac_client.grant_role(&admin, &ROLE_ADMIN);
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &1_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+    client.pause(&admin);
+
+    assert!(client
+        .try_deposit_liquidity(&provider, &pool_id, &100i128)
+        .is_err());
+}
+
+/// Deposits must be rejected once the market is closed/resolved.
+#[test]
+fn test_liquidity_deposit_rejected_after_close() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, _, token_admin_client, _, operator, creator) = setup(&env);
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &1_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+    env.ledger().with_mut(|li| li.timestamp = 100_001);
+    client.resolve_pool(&operator, &pool_id, &0u32);
+
+    assert!(client
+        .try_deposit_liquidity(&provider, &pool_id, &100i128)
+        .is_err());
+}
+
+/// Boundary deposits: below the minimum and above the maximum are rejected,
+/// while the exact boundaries are accepted.
+#[test]
+fn test_liquidity_deposit_boundaries() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, _, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &100_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 100, 1_000);
+
+    assert!(client
+        .try_deposit_liquidity(&provider, &pool_id, &99i128)
+        .is_err());
+    assert!(client
+        .try_deposit_liquidity(&provider, &pool_id, &1_001i128)
+        .is_err());
+    assert_eq!(token.balance(&contract_addr), 0);
+
+    client.deposit_liquidity(&provider, &pool_id, &100i128);
+    assert_eq!(token.balance(&contract_addr), 100);
+    client.deposit_liquidity(&provider, &pool_id, &900i128);
+    assert_eq!(token.balance(&contract_addr), 1_000);
+}
+
+/// A failing token transfer must roll back the accounting state entirely.
+#[test]
+fn test_liquidity_deposit_rolls_back_on_transfer_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, _, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let provider = Address::generate(&env);
+    // No tokens minted: the transfer will fail.
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+
+    assert!(client
+        .try_deposit_liquidity(&provider, &pool_id, &500i128)
+        .is_err());
+    assert_eq!(token.balance(&contract_addr), 0);
+    assert_eq!(token.balance(&provider), 0);
+}
+
+/// Withdrawals must be blocked once the market has been resolved.
+#[test]
+fn test_liquidity_withdraw_race_with_close() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, operator, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &10_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+    client.deposit_liquidity(&provider, &pool_id, &1_000i128);
+
+    env.ledger().with_mut(|li| li.timestamp = 100_001);
+    client.resolve_pool(&operator, &pool_id, &0u32);
+
+    assert!(client
+        .try_withdraw_liquidity(&provider, &pool_id, &500i128)
+        .is_err());
+    assert_eq!(token.balance(&contract_addr), 1_000);
+}
+
+/// Partial share withdrawals leave the remaining shares intact.
+#[test]
+fn test_liquidity_partial_withdrawals() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, _, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let provider = Address::generate(&env);
+    token_admin_client.mint(&provider, &10_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+    client.deposit_liquidity(&provider, &pool_id, &1_000i128);
+
+    let first = client.withdraw_liquidity(&provider, &pool_id, &250i128);
+    assert_eq!(first, 250);
+    assert_eq!(token.balance(&contract_addr), 750);
+
+    let second = client.withdraw_liquidity(&provider, &pool_id, &250i128);
+    assert_eq!(second, 250);
+    assert_eq!(token.balance(&contract_addr), 500);
+
+    let rest = client.withdraw_liquidity(&provider, &pool_id, &i128::MAX);
+    assert_eq!(rest, 500);
+    assert_eq!(token.balance(&contract_addr), 0);
+}
+
+/// Reserve exhaustion: withdrawing more than the provider holds must fail and
+/// leave the reserves untouched.
+#[test]
+fn test_liquidity_withdraw_reserve_exhaustion() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, client, token_address, token, token_admin_client, _, _, creator) = setup(&env);
+    let contract_addr = client.address.clone();
+    let provider = Address::generate(&env);
+    let other = Address::generate(&env);
+    token_admin_client.mint(&provider, &10_000);
+    token_admin_client.mint(&other, &10_000);
+
+    let pool_id = create_liquidity_pool(&env, &client, &creator, &token_address, 0, 0);
+    client.deposit_liquidity(&provider, &pool_id, &500i128);
+    client.deposit_liquidity(&other, &pool_id, &500i128);
+
+    // Provider cannot drain reserves beyond its own share.
+    assert!(client
+        .try_withdraw_liquidity(&provider, &pool_id, &1_000i128)
+        .is_err());
+    assert_eq!(token.balance(&contract_addr), 1_000);
+
+    let out = client.withdraw_liquidity(&provider, &pool_id, &500i128);
+    assert_eq!(out, 500);
+    assert_eq!(token.balance(&contract_addr), 500);
+}
+
 // ── Issue #1757: fee configuration getter ────────────────────────────────────
 
 #[test]

@@ -1,6 +1,8 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
+extern crate alloc;
+
 #[cfg(test)]
 #[macro_use]
 extern crate std;
@@ -14,7 +16,9 @@ mod admin;
 mod upgrade_migration_tests;
 #[cfg(test)]
 mod boundary_edge_case_tests;
+pub mod bootstrap;
 mod constants;
+pub mod fee_allocation;
 mod gas_opt;
 mod oracle;
 #[cfg(test)]
@@ -35,6 +39,7 @@ mod pool;
 mod prediction;
 mod price_feed;
 mod price_feed_simple;
+mod quote;
 mod referral;
 mod safe_math;
 mod schema;
@@ -67,9 +72,10 @@ mod update_pool_description_boundary_tests;
 #[cfg(test)]
 mod withdraw_treasury_boundary_tests;
 mod challenge;
-mod treasury;
 #[cfg(test)]
 mod fee_schedule_snapshot_tests;
+#[cfg(test)]
+mod liquidity_adversarial_tests;
 #[cfg(test)]
 mod gas_budget_tests;
 #[cfg(test)]
@@ -84,12 +90,84 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, String, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
+pub use bootstrap::{validate_bootstrap_depth, BootstrapError};
 pub use constants::*;
+pub use fee_allocation::{
+    allocate_fees, claimable_for, total_allocated, FeeAllocation, FeeAllocationError,
+    ProviderInput,
+};
 pub use payouts::{
     calculate_claim_payout, calculate_odds_bps, calculate_protocol_fee, calculate_referral_amount,
     calculate_winnings, PayoutBreakdown, PayoutInput,
 };
 pub use price_feed_simple::PriceFeedAdapter;
+pub use quote::{
+    compute_quote, compute_withdraw_quote, QuoteError, MAX_QUOTE_STALENESS_SECONDS,
+    MAX_SLIPPAGE_BPS,
+};
+pub use quote::LiquidityQuote as PureQuote;
+pub use quote::QuotePoolState as PureQuotePoolState;
+
+/// Quoted result for a liquidity deposit or withdrawal.
+///
+/// Returned by `quote_liquidity` and used by the slippage-enforcement path in
+/// `deposit_liquidity` / `withdraw_liquidity` (issue #274).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityQuote {
+    /// Input amount (assets deposited or shares burned).
+    pub amount_in: i128,
+    /// Estimated output (shares minted or assets returned).
+    pub amount_out: i128,
+    /// Estimated price impact in basis points.
+    pub price_impact_bps: u32,
+    /// Protocol fee withheld in base token units (informational).
+    pub fee: i128,
+    /// Ledger timestamp embedded in the state snapshot used to derive this quote.
+    pub timestamp: u64,
+}
+
+impl LiquidityQuote {
+    /// Convert from the pure (no-soroban) quote type.
+    pub fn from_pure(q: PureQuote) -> Self {
+        LiquidityQuote {
+            amount_in: q.amount_in,
+            amount_out: q.amount_out,
+            price_impact_bps: q.price_impact_bps,
+            fee: q.fee,
+            timestamp: q.timestamp,
+        }
+    }
+}
+
+/// Pool state snapshot required to compute a liquidity quote.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotePoolState {
+    /// Total token assets owned by LPs (reserve backing outstanding shares).
+    pub reserve: i128,
+    /// Total outstanding LP shares.
+    pub total_shares: i128,
+    /// Total stake for price-impact context.
+    pub total_stake: i128,
+    /// Protocol fee in basis points applied to this pool.
+    pub fee_bps: u32,
+    /// Ledger timestamp at which this snapshot was last updated.
+    pub updated_at: u64,
+}
+
+impl QuotePoolState {
+    /// Convert to the pure (no-soroban) snapshot type.
+    pub fn to_pure(&self) -> PureQuotePoolState {
+        PureQuotePoolState {
+            reserve: self.reserve,
+            total_shares: self.total_shares,
+            total_stake: self.total_stake,
+            fee_bps: self.fee_bps,
+            updated_at: self.updated_at,
+        }
+    }
+}
 pub use safe_math::{RoundingMode, SafeMath};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -252,31 +330,72 @@ pub const MIN_WITHDRAWAL_AMOUNT: i128 = 1;
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PredifiError {
     // ── Initialization (2) ──────────────────────────────────────────────────
+    /// Contract has not been initialized yet, or config not set.
     AlreadyInitializedOrConfigNotSet = 2,
     // ── Authorization (10) ──────────────────────────────────────────────────
+    /// The caller is not authorized to perform this action.
     Unauthorized = 10,
     // ── Pool state (20-27) ──────────────────────────────────────────────────
+    /// The specified pool was not found.
     PoolNotFound = 20,
+    /// The pool has not been resolved yet.
     PoolNotResolved = 22,
     /// Pool is in an invalid state for this operation, or has been cancelled.
     InvalidPoolState = 24,
+    /// The outcome value is invalid or out of bounds.
     InvalidOutcome = 25,
-    AlreadyClaimed = 60,
-    ResolutionDelayNotMet = 81,
-    /// Token is not on the allowed betting whitelist.
-    TokenNotWhitelisted = 91,
+    /// Pool has been flagged as disputed and cannot be modified.
+    PoolDisputed = 27,
+    // ── Prediction & balance (42-45) ────────────────────────────────────────
     /// Invalid amount provided (e.g., zero or negative).
     InvalidAmount = 42,
     /// Insufficient balance for the operation.
     InsufficientBalance = 44,
+    /// Stake amount is below the global protocol minimum.
+    InsufficientStake = 45,
+    // ── Claims (60) ─────────────────────────────────────────────────────────
+    /// The user has already claimed winnings for this pool.
+    AlreadyClaimed = 60,
+    // ── Time / pause (80-84) ────────────────────────────────────────────────
+    /// The provided timestamp is invalid (e.g., end_time too far in the future).
+    InvalidTimestamp = 80,
+    /// The resolution delay has not yet elapsed.
+    ResolutionDelayNotMet = 81,
+    /// Staking is still open for this pool.
+    StakingStillOpen = 82,
+    /// The contract is currently paused; all state-mutating operations are blocked.
+    ContractPaused = 83,
+    /// A time-window constraint (e.g. resolution window, claim window) is not met
+    /// for the requested operation.
+    TimeConstraintError = 84,
+    // ── Data / validation (90-97) ───────────────────────────────────────────
+    /// Generic invalid input data (e.g., a zero value where a positive value is required).
+    InvalidData = 90,
+    /// Token is not on the allowed betting whitelist.
+    TokenNotWhitelisted = 91,
+    /// The pagination offset + limit combination overflows u32 or is otherwise invalid.
+    InvalidPagination = 92,
+    /// The fee basis points exceed the maximum allowed value (10000).
+    InvalidFeeBps = 93,
+    /// The provided address or token is invalid.
+    InvalidAddressOrToken = 94,
+    /// A protocol fee change is already pending and cannot be overridden.
+    FeeChangePending = 95,
+    /// No protocol fee change is pending to apply or cancel.
+    NoFeeChangePending = 96,
+    /// The timelock for a pending operation has not yet expired.
+    TimelockNotExpired = 97,
+    /// The proposed fee exceeds the maximum allowed fee cap.
+    FeeExceedsCap = 98,
+    /// The proposed fee change delay is below the minimum required delay.
+    FeeDelayTooShort = 99,
+    // ── Oracle / price (100-116) ────────────────────────────────────────────
     /// Oracle not initialized.
     OracleNotInitialized = 100,
     /// Price feed not found.
     PriceFeedNotFound = 101,
-    /// Price data expired or invalid.
+    /// Price data is invalid, stale, missing, or confidence too wide.
     PriceDataInvalid = 102,
-    /// Price data is older than the configured `max_price_age`.
-    PriceStale = 113,
     /// Price condition not set for pool.
     PriceConditionNotSet = 103,
     /// Total pool stake cap reached or would be exceeded.
@@ -289,10 +408,14 @@ pub enum PredifiError {
     StakeBelowMinimum = 107,
     /// Stake amount exceeds the pool maximum.
     StakeAboveMaximum = 108,
-    /// Stake amount is below the global protocol minimum.
-    InsufficientStake = 45,
+    /// Metadata URL exceeds maximum length (512 bytes).
+    MetadataUrlInvalid = 109,
+    /// An arithmetic overflow, underflow, or division by zero occurred.
+    ArithmeticError = 110,
     /// User has exceeded the maximum number of predictions allowed per pool.
     MaxPredictionsExceeded = 111,
+    /// Price data is older than the configured `max_price_age`.
+    PriceStale = 113,
     /// A pool requested more outcomes than `MAX_OUTCOMES_PER_POOL`.
     MaxOutcomesExceeded = 114,
     /// A pool reached `MAX_PREDICTIONS_PER_POOL` distinct predictors.
@@ -300,147 +423,113 @@ pub enum PredifiError {
     /// Adding this stake would exceed `MAX_AGGREGATE_STAKE_PER_POOL`
     /// (or the aggregate addition would overflow `i128`).
     MaxAggregateStakeExceeded = 116,
-    /// The fee basis points exceed the maximum allowed value (10000).
-    InvalidFeeBps = 93,
-    /// Metadata URL exceeds maximum length (512 bytes).
-    MetadataUrlInvalid = 109,
-    /// An arithmetic overflow, underflow, or division by zero occurred.
-    ArithmeticError = 110,
-    /// required_resolutions exceeds the number of active operators; pool can never be resolved.
-    RequiredResolutionsExceedOperators = 200,
-    /// Rate limit exceeded, cooldown active, or suspicious activity detected.
-    RateLimitOrSuspiciousActivity = 190,
-    /// The pagination offset + limit combination overflows u32 or is otherwise invalid.
-    InvalidPagination = 92,
-    /// Generic invalid input data (e.g., a zero value where a positive value is required).
-    InvalidData = 90,
-    /// The provided timestamp is invalid (e.g., end_time too far in the future).
-    InvalidTimestamp = 80,
-    /// The proposed fee exceeds the maximum allowed fee cap.
-    FeeExceedsCap = 98,
-    /// The proposed fee change delay is below the minimum required delay.
-    FeeDelayTooShort = 99,
-    /// Pool has been flagged as disputed and cannot be modified.
-    PoolDisputed = 27,
-    // ── Prediction & balance (42-45) ────────────────────────────────────────
-    InvalidAmount = 42,
-    InsufficientBalance = 44,
-    InsufficientStake = 45,
-    // ── Claims (60) ─────────────────────────────────────────────────────────
-    AlreadyClaimed = 60,
-    // ── Time / pause (80-84) ────────────────────────────────────────────────
-    InvalidTimestamp = 80,
-    ResolutionDelayNotMet = 81,
-    StakingStillOpen = 82,
-    /// A time-window
-    PoolDisputed = 27,
-    // ── Prediction & balance (42-45) ────────────────────────────────────────
-    InvalidAmount = 42,
-    InsufficientBalance = 44,
-    InsufficientStake = 45,
-    // ── Claims (60) ─────────────────────────────────────────────────────────
-    AlreadyClaimed = 60,
-    // ── Time / pause (80-84) ────────────────────────────────────────────────
-    InvalidTimestamp = 80,
-    ResolutionDelayNotMet = 81,
-    StakingStillOpen = 82,
-    /// A time-window constraint (e.g. resolution window, claim window) is
-    /// not met for the requested operation.
-    TimeConstraintError = 84,
-    /// One of the `outcome_descriptions` exceeds `MAX_OUTCOME_DESCRIPTION_LEN`
-    /// (issue #1122).
+    // ── Outcome descriptions (130-131) ──────────────────────────────────────
+    /// One of the `outcome_descriptions` exceeds `MAX_OUTCOME_DESCRIPTION_LEN`.
     OutcomeDescriptionTooLong = 130,
     /// One of the `outcome_descriptions` is empty / shorter than
-    /// `MIN_OUTCOME_DESCRIPTION_LEN` (issue #1122).
+    /// `MIN_OUTCOME_DESCRIPTION_LEN`.
     OutcomeDescriptionEmpty = 131,
+    // ── Deadline & liquidity (132-133) ──────────────────────────────────────
     /// A timestamp that must be in the future is in the past or equal to
-    /// `env.ledger().timestamp()` (issue #1130).
+    /// `env.ledger().timestamp()`.
     DeadlineInPast = 132,
     /// `initial_liquidity` is less than the required safety margin
-    /// relative to `max_total_stake` (issue #1131).
+    /// relative to `max_total_stake`.
     InitialLiquidityBelowSafetyMargin = 133,
-    /// The caller has already approved this emergency-cancel proposal
-    /// (issue #1119).
-    EmergencyCancelAlreadyApproved = 135,
-    /// The contract is currently paused; all state-mutating operations are blocked.
-    ///
-    /// Callers should check `is_contract_paused()` before submitting a transaction,
-    /// or listen for `PauseEvent` / `UnpauseEvent` on-chain to stay in sync.
-    ///
-    /// NOTE: With scoped pause controls, this error is only returned for
-    /// operations whose pause scope is active. See [`PauseScope`] and
-    /// [`PredifiContract::is_operation_paused`] for the operation matrix.
-    ContractPaused = 83,
-    TimeConstraintError = 84,
-    // ── Data / validation (90-97) ───────────────────────────────────────────
-    /// Generic invalid input data. Also covers: invalid target price,
-    /// metadata URL too long, outcome description issues, liquidity margin,
-    /// token not whitelisted, and unknown recovery steps.
-    InvalidData = 90,
-    InvalidPagination = 92,
-    InvalidFeeBps = 93,
-    InvalidAddressOrToken = 94,
-    FeeChangePending = 95,
-    NoFeeChangePending = 96,
-    TimelockNotExpired = 97,
-    // ── Oracle / price (100-106) ─────────────────────────────────────────────
-    OracleNotInitialized = 100,
-    /// Price data is invalid, stale, missing, or confidence too wide.
-    /// Also covers: price condition not set, unsupported exponent.
-    PriceDataInvalid = 102,
-    MaxTotalStakeExceeded = 104,
-    ResolutionConflict = 105,
-    OracleAlreadyVoted = 106,
-    // ── Stake limits (107-108, 111, 116) ────────────────────────────────────
-    StakeBelowMinimum = 107,
-    StakeAboveMaximum = 108,
-    MaxPredictionsExceeded = 111,
-    MaxAggregateStakeExceeded = 116,
-    // ── Arithmetic (110) ────────────────────────────────────────────────────
-    ArithmeticError = 110,
     // ── Emergency cancel (134-135) ──────────────────────────────────────────
+    /// An emergency-cancel proposal is pending for this pool.
     EmergencyCancelPending = 134,
+    /// The caller has already approved this emergency-cancel proposal.
     EmergencyCancelAlreadyApproved = 135,
+    // ── Refunds (140-141) ────────────────────────────────────────────────────
+    /// The pool is not in a state that permits a refund claim.
+    RefundNotAvailable = 140,
+    /// A refund has already been claimed for this (user, pool) pair.
+    RefundAlreadyClaimed = 141,
+    // ── Schema (181-182) ────────────────────────────────────────────────────
+    /// The stored schema version is not supported by this contract binary.
+    UnsupportedSchemaVersion = 181,
+    /// `migrate_state` was called but the schema version already matches
+    /// `CURRENT_SCHEMA_VERSION`.
+    SchemaMigrationAlreadyRun = 182,
     // ── Rate limiting (190) ─────────────────────────────────────────────────
+    /// Rate limit exceeded, cooldown active, or suspicious activity detected.
     RateLimitOrSuspiciousActivity = 190,
-    // ── Pool configuration (200) ────────────────────────────────────────────
+    // ── Pool configuration (200-206) ────────────────────────────────────────
+    /// `required_resolutions` exceeds the number of active operators.
     RequiredResolutionsExceedOperators = 200,
-    // ── Recovery checklist (210-212) ────────────────────────────────────────
-    /// No recovery checklist has been configured; call `configure_recovery_checklist` before unpausing.
+    /// Feed identifier is not in the governed supported feeds list.
+    UnsupportedFeed = 202,
+    /// Freshness policy value is outside valid configuration bounds.
+    InvalidFreshness = 203,
+    /// Oracle configuration is immutable after market creation.
+    ConfigurationImmutable = 204,
+    /// The provider price exponent is outside the supported range, or the value
+    /// cannot be represented in `PRICE_DECIMALS` fixed-point.
+    UnsupportedPriceExponent = 205,
+    /// The oracle confidence interval is too wide to resolve on.
+    PriceConfidenceTooWide = 206,
+    // ── Recovery checklist (210-212) ───────────────────────────────────────
+    /// No recovery checklist has been configured; call
+    /// `configure_recovery_checklist` before unpause.
     RecoveryChecklistNotConfigured = 210,
     /// Not all required recovery attestations have been provided yet.
     RecoveryChecklistIncomplete = 211,
     /// This recovery step has already been attested in the current pause cycle.
     RecoveryStepAlreadyAttested = 212,
-    /// The stored schema version is not supported by this contract binary.
-    /// Emitted when `migrate_state` is called on a contract whose on-chain
-    /// schema version is ahead of (or otherwise incompatible with) the deployed
-    /// binary.  The deployer must upgrade to a compatible binary first.
-    UnsupportedSchemaVersion = 181,
-    /// `migrate_state` was called but the on-chain schema version already
-    /// matches `CURRENT_SCHEMA_VERSION`.  This is a no-op guard to prevent
-    /// accidental repeated migrations from corrupting state.
-    SchemaMigrationAlreadyRun = 182,
-    /// The pool is not in a state that permits a refund claim (e.g. it has
-    /// not been canceled/no-contested, or the refund window has closed).
-    RefundNotAvailable = 140,
-    /// A refund has already been claimed for this (user, pool) pair.
-    RefundAlreadyClaimed = 141,
-    /// Feed identifier is not in the governed supported feeds list.
-    UnsupportedFeed = 202,
-    /// Freshness policy value is outside valid configuration bounds.
-    InvalidFreshness = 203,
-    /// Oracle configuration is immutable after market creation and cannot be modified.
-    ConfigurationImmutable = 204,
-    /// The provider price exponent is outside
-    /// `[MIN_PRICE_EXPONENT, MAX_PRICE_EXPONENT]`, or the value cannot be
-    /// represented in `PRICE_DECIMALS` fixed-point without becoming zero.
-    UnsupportedPriceExponent = 205,
-    /// The oracle confidence interval is too wide to resolve on: either
-    /// `confidence / price` exceeds the `min_confidence_ratio` policy, or the
-    /// interval crosses the price-condition boundary. Resolution is deferred
-    /// until a tighter price is published.
-    PriceConfidenceTooWide = 206,
+    // ── Recurring market series (220-221) ───────────────────────────────────
+    /// The referenced market series does not exist (issue #241).
+    SeriesNotFound = 220,
+    /// A child market window overlaps an existing sibling window and the series
+    /// template does not permit overlapping windows (issue #241).
+    SeriesWindowOverlap = 221,
+    // ── Bootstrap depth limits (230-231, issue #275) ────────────────────────
+    /// The `initial_liquidity` supplied at pool creation is non-zero but below
+    /// `MIN_POOL_BOOTSTRAP_DEPTH`.  Pools with sub-minimum bootstrap depth
+    /// cannot initialise the share model without arithmetic errors.
+    BootstrapDepthTooLow = 230,
+    /// The `initial_liquidity` supplied at pool creation exceeds
+    /// `MAX_POOL_BOOTSTRAP_DEPTH`.  This prevents overflow in the share-mint
+    /// arithmetic and ensures the bootstrap path stays within the aggregate
+    /// stake ceiling.
+    BootstrapDepthTooHigh = 231,
+    // ── Oracle price conditions (240) ────────────────────────────────────────
+    /// The oracle target price specified in a price condition is invalid
+    /// (e.g. zero, negative, or out of representable range).
+    InvalidTargetPrice = 240,
+}
+
+/// Convert errors raised by the shared `safe_math` / `payouts` helpers into the
+/// contract's own error type so callers can use `?` without manual mapping.
+///
+/// The shared crates intentionally use a single protocol-wide error enum,
+/// while the contract exposes a stable, externally-documented code set.  This
+/// impl is the single bridge between the two and preserves the numeric code
+/// wherever the two enums agree.
+impl From<predifi_errors::PrediFiError> for PredifiError {
+    fn from(err: predifi_errors::PrediFiError) -> Self {
+        use predifi_errors::PrediFiError as E;
+        match err {
+            E::Unauthorized => PredifiError::Unauthorized,
+            E::PoolNotFound => PredifiError::PoolNotFound,
+            E::PoolNotResolved => PredifiError::PoolNotResolved,
+            E::InvalidPoolState => PredifiError::InvalidPoolState,
+            E::InvalidOutcome => PredifiError::InvalidOutcome,
+            E::InvalidData => PredifiError::InvalidData,
+            E::InvalidAddressOrToken => PredifiError::InvalidAddressOrToken,
+            E::InvalidPagination => PredifiError::InvalidPagination,
+            E::InvalidFeeBps => PredifiError::InvalidFeeBps,
+            E::ArithmeticError | E::FeeExceedsAmount | E::InvalidAmount => {
+                PredifiError::ArithmeticError
+            }
+            E::ConsistencyError => PredifiError::InvalidData,
+            E::OracleError => PredifiError::PriceDataInvalid,
+            E::RateLimitOrSuspiciousActivity => PredifiError::RateLimitOrSuspiciousActivity,
+            E::UnsupportedSchemaVersion => PredifiError::UnsupportedSchemaVersion,
+            E::SchemaMigrationAlreadyRun => PredifiError::SchemaMigrationAlreadyRun,
+            _ => PredifiError::InvalidData,
+        }
+    }
 }
 
 /// Explicit matrix of operations that can be individually paused.
@@ -792,6 +881,8 @@ pub struct FeeConfig {
     pub pending_fee_bps: Option<u32>,
     pub pending_fee_effective_at: Option<u64>,
     pub fee_change_timelock_seconds: u64,
+    /// Maximum fee that may ever be set via `set_fee_bps` (0 = no cap).
+    pub fee_cap_bps: u32,
 }
 
 /// Snapshot of a pending protocol fee change awaiting timelock expiry.
@@ -861,6 +952,8 @@ pub struct ContractInfo {
     pub max_predictions_per_user: u32,
     /// Minimum cooldown in seconds between consecutive predictions from the same address.
     pub prediction_cooldown_seconds: u64,
+    /// Maximum fee cap in basis points (0 = no cap).
+    pub fee_cap_bps: u32,
 }
 
 /// Represents a fee tier within the protocol's dynamic fee system.
@@ -1020,7 +1113,7 @@ pub struct ResolutionEvidence {
 /// - New variants added after the initial deployment use full PascalCase names
 ///   (e.g. `OracleConfig`, `PriceFeed`, `PriceCondition`).
 /// - All variants are documented with their storage type mapping.
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone)]
 pub enum DataKey {
     // ── Pool data ────────────────────────────────────────────────────────────
@@ -1223,6 +1316,72 @@ pub enum DataKey {
     /// Written once at price-feed resolution and never updated. Contains the
     /// feed observation and comparison rule that produced the outcome.
     ResolutionEvidence(u64),
+
+    // ── Liquidity share accounting (issues #268 / #275 / #276) ─────────────
+    /// Aggregate LP ledger for a pool: `LpLedger(pool_id)` -> `LpLedger`.
+    ///
+    /// Written on the first liquidity deposit and updated on every subsequent
+    /// deposit, withdrawal, fee accrual, or loss allocation.
+    LpLedger(u64),
+    /// Per-provider LP share balance: `LpShares(pool_id, provider)` -> `i128`.
+    ///
+    /// Removed when the balance reaches zero to avoid phantom storage entries.
+    LpShares(u64, Address),
+    /// Aggregate liquidity accounting (guarded accounting path, issue #271 / #272):
+    /// `LiquidityAccounting(pool_id)` -> `LiquidityAccounting`.
+    LiquidityAccounting(u64),
+    /// Per-provider share balance under the guarded accounting path:
+    /// `LiquidityShares(pool_id, provider)` -> `i128`.
+    LiquidityShares(u64, Address),
+    /// Per-pool reserve snapshot for the quote engine:
+    /// `PoolReserve(pool_id)` -> `i128`.
+    PoolReserve(u64),
+    /// Per-pool total-shares snapshot for the quote engine:
+    /// `PoolTotalShares(pool_id)` -> `i128`.
+    PoolTotalShares(u64),
+    /// Timestamp of the last pool accounting update:
+    /// `PoolStateUpdatedAt(pool_id)` -> `u64`.
+    PoolStateUpdatedAt(u64),
+    /// Global total liquidity shares outstanding (schema v2):
+    /// `TotalLiquidityShares` -> `i128`.
+    TotalLiquidityShares,
+    /// Per-provider accumulated fee attribution (issue #276):
+    /// `ProviderFeeAccrued(pool_id, provider)` -> `i128`.
+    ///
+    /// Tracks how much of the pool's accrued LP fees are attributable to this
+    /// provider based on their time-weighted share balance.  Updated whenever
+    /// fees are accrued or the provider's share balance changes.
+    ProviderFeeAccrued(u64, Address),
+    /// Deterministically allocated, currently claimable LP fees (issue #276):
+    /// `ProviderFeeClaimable(pool_id, provider)` -> `i128`.
+    ProviderFeeClaimable(u64, Address),
+    /// Canonical list of providers that have ever held shares in a pool:
+    /// `LpProviders(pool_id)` -> `Vec<Address>`.
+    ///
+    /// Appended on a provider's first deposit so fee allocation can enumerate
+    /// participants without relying on host iteration order.
+    LpProviders(u64),
+    /// Total fees allocated in the most recent deterministic allocation round:
+    /// `AllocatedLpFees(pool_id)` -> `i128`.
+    AllocatedLpFees(u64),
+    /// Global LP fee basis points (issue #276):
+    /// `LiquidityFeeBps` -> `u32`.
+    ///
+    /// When non-zero, this fraction of the protocol fee collected at resolution
+    /// is redistributed to liquidity providers in proportion to their shares.
+    /// Absent means 0 (no LP fee share; all fees go to the treasury).
+    LiquidityFeeBps,
+    /// Pending fee-change value and activation ledger:
+    /// `PendingFeeChange` -> `(u32, u32)`.
+    PendingFeeChange,
+    /// Maximum protocol fee cap (basis points) set by admin:
+    /// `FeeCapBps` -> `u32`.
+    ///
+    /// When non-zero, no protocol fee can exceed this value.
+    FeeCapBps,
+    /// Snapshot of the previous fee (before a pending change) for rollback:
+    /// `FeeSnapshot` -> `u32`.
+    FeeSnapshot,
 }
 
 /// Represents a user's individual stake in a prediction market.
@@ -1494,6 +1653,253 @@ pub struct InitialLiquidityProvidedEvent {
     pub pool_id: u64,
     pub creator: Address,
     pub amount: i128,
+}
+
+/// Emitted when a liquidity provider deposits assets into a pool and receives
+/// liquidity shares in return.
+///
+/// `event_version` is bumped whenever the payload layout changes so that
+/// off-chain indexers can decode historical events unambiguously.
+#[contractevent(topics = ["liquidity_deposited"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityDepositedEvent {
+    /// Schema version of this event payload.
+    pub version: u32,
+    /// The pool that received liquidity.
+    pub pool_id: u64,
+    /// The liquidity provider.
+    pub provider: Address,
+    /// Asset amount transferred into the pool escrow.
+    pub amount: i128,
+    /// Shares minted to the provider.
+    pub shares_minted: i128,
+    /// Total outstanding shares after the deposit.
+    pub total_shares: i128,
+    /// Total liabilities (what LPs are owed) after the deposit.
+    pub total_liabilities: i128,
+    /// Total escrowed tokens after the deposit.
+    pub total_escrow: i128,
+}
+
+/// Emitted when a liquidity provider burns shares and withdraws assets.
+#[contractevent(topics = ["liquidity_withdrawn"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityWithdrawnEvent {
+    /// Schema version of this event payload.
+    pub version: u32,
+    /// The pool that released liquidity.
+    pub pool_id: u64,
+    /// The liquidity provider.
+    pub provider: Address,
+    /// Shares burned.
+    pub shares_burned: i128,
+    /// Asset amount transferred out of the pool escrow.
+    pub amount: i128,
+    /// Total outstanding shares after the withdrawal.
+    pub total_shares: i128,
+    /// Total liabilities (what LPs are owed) after the withdrawal.
+    pub total_liabilities: i128,
+    /// Total escrowed tokens after the withdrawal.
+    pub total_escrow: i128,
+}
+
+// ── Liquidity share accounting types (issues #268 / #275 / #276) ─────────────
+
+/// Version tag embedded in `LiquidityDepositedEvent` and `LiquidityWithdrawnEvent`
+/// payloads.  Bumped whenever the event layout changes.
+pub const LIQUIDITY_EVENT_VERSION: u32 = 1;
+
+/// Default liquidity fee share in basis points (0 = disabled).
+///
+/// When non-zero, this fraction of the protocol fee collected at pool resolution
+/// is redistributed to liquidity providers in proportion to their time-weighted
+/// share balances.  Set via the `LiquidityFeeBps` DataKey by admin.
+pub const DEFAULT_LIQUIDITY_FEE_BPS: u32 = 0;
+
+/// LP accounting ledger for a single pool (issue #268).
+///
+/// Tracks the aggregate state of all LP positions for a pool:
+/// total outstanding shares, total LP-contributed assets, cumulative accrued
+/// fees, and cumulative allocated losses.  The conservation invariant is:
+///
+/// ```text
+/// total_assets == lp_principal + accrued_fees - allocated_losses
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpLedger {
+    /// Total outstanding LP shares across all providers.
+    pub total_shares: i128,
+    /// Total LP-contributed assets (principal).
+    pub total_assets: i128,
+    /// Cumulative assets contributed as principal (gross deposits minus
+    /// gross proportional principal withdrawals).
+    pub lp_principal: i128,
+    /// Cumulative protocol fees accrued to the LP pool.
+    pub accrued_fees: i128,
+    /// Cumulative losses allocated to LPs (from under-funded resolutions).
+    pub allocated_losses: i128,
+}
+
+impl LpLedger {
+    /// Return a zeroed ledger for pools that have no LP activity yet.
+    pub fn empty(_env: &soroban_sdk::Env) -> Self {
+        LpLedger {
+            total_shares: 0,
+            total_assets: 0,
+            lp_principal: 0,
+            accrued_fees: 0,
+            allocated_losses: 0,
+        }
+    }
+}
+
+/// Aggregate liquidity accounting for the guarded deposit/withdraw path
+/// (issues #271 / #272).
+///
+/// Tracks escrow (token balance held for LP redemptions), liabilities (what
+/// the pool owes providers), and outstanding shares.  Invariant:
+///
+/// ```text
+/// total_liabilities <= total_escrow
+/// ```
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityAccounting {
+    /// Total outstanding LP shares.
+    pub total_shares: i128,
+    /// Assets owed to LP providers (sum of pro-rata claims at current price).
+    pub total_liabilities: i128,
+    /// Actual token balance escrowed for LP redemptions.
+    pub total_escrow: i128,
+}
+
+/// Per-provider fee attribution record (issue #276).
+///
+/// Tracks how much of the pool's accrued LP fees are attributable to this
+/// provider.  Updated whenever fees are accrued into the LP ledger.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderFeeRecord {
+    /// Total fees attributed to this provider so far.
+    pub total_attributed: i128,
+    /// Provider's share balance at the time of the last attribution update.
+    pub last_share_balance: i128,
+    /// Total LP shares outstanding at the time of the last attribution update.
+    pub last_total_shares: i128,
+}
+
+/// Emitted when protocol fees are accrued to the LP ledger at pool resolution.
+#[contractevent(topics = ["lp_fees_accrued"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpFeesAccruedEvent {
+    /// The pool whose LP ledger received the fee.
+    pub pool_id: u64,
+    /// Fee amount added to the ledger.
+    pub fee_amount: i128,
+    /// Total cumulative accrued fees after this operation.
+    pub accrued_fees: i128,
+    /// Total LP assets after this operation.
+    pub total_assets: i128,
+}
+
+/// Emitted when a loss is allocated to the LP pool at resolution.
+#[contractevent(topics = ["lp_loss_allocated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpLossAllocatedEvent {
+    /// The pool that absorbed the loss.
+    pub pool_id: u64,
+    /// Effective loss amount (may be less than requested if capped by assets).
+    pub loss_amount: i128,
+    /// Total cumulative allocated losses after this operation.
+    pub allocated_losses: i128,
+    /// Total LP assets after absorbing the loss.
+    pub total_assets: i128,
+}
+
+/// Emitted when fees are deterministically attributed to a liquidity provider
+/// (issue #276).
+#[contractevent(topics = ["lp_fee_attributed"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LpFeeAttributedEvent {
+    /// Pool for which fees are being attributed.
+    pub pool_id: u64,
+    /// The liquidity provider receiving the attribution.
+    pub provider: Address,
+    /// Fee amount attributed to this provider in this operation.
+    pub attributed_amount: i128,
+    /// Provider's total attributed fees after this update.
+    pub total_attributed: i128,
+    /// Provider's share balance used to compute the attribution.
+    pub provider_shares: i128,
+    /// Total outstanding shares at time of attribution.
+    pub total_shares: i128,
+}
+
+/// Emitted when a provider's liquidity shares are minted.
+#[contractevent(topics = ["liquidity_shares_minted"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquiditySharesMintedEvent {
+    pub pool_id: u64,
+    pub provider: Address,
+    pub shares_minted: i128,
+    pub provider_total_shares: i128,
+    pub total_shares_after: i128,
+    pub reserve_after: i128,
+    pub timestamp: u64,
+}
+
+/// Emitted when a provider's liquidity shares are burned.
+#[contractevent(topics = ["liquidity_shares_burned"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquiditySharesBurnedEvent {
+    pub pool_id: u64,
+    pub provider: Address,
+    pub shares_burned: i128,
+    pub provider_remaining_shares: i128,
+    pub total_shares_after: i128,
+    pub reserve_after: i128,
+    pub timestamp: u64,
+}
+
+/// Emitted when pool liquidity reserves are updated.
+#[contractevent(topics = ["liquidity_reserves_updated"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityReservesUpdatedEvent {
+    pub pool_id: u64,
+    pub reserve_before: i128,
+    pub reserve_after: i128,
+    pub total_shares: i128,
+    pub operation: Symbol,
+    pub timestamp: u64,
+}
+
+/// Emitted when a quote is served for a pool, so that clients can reconcile
+/// their pre-signing estimate with the executed trade.
+#[contractevent(topics = ["quote_served"])]
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuoteServedEvent {
+    /// The pool the quote was computed for.
+    pub pool_id: u64,
+    /// Input amount in base token units.
+    pub amount_in: i128,
+    /// Estimated output in base token units.
+    pub amount_out: i128,
+    /// Price impact in basis points.
+    pub price_impact_bps: u32,
+    /// Fee charged, in base token units.
+    pub fee: i128,
+    /// Ledger timestamp at which the quote was produced.
+    pub timestamp: u64,
 }
 
 #[contractevent(topics = ["pool_resolved"])]
@@ -2144,6 +2550,8 @@ pub struct ContractMetadata {
     pub fee_tiers_count: u32,
     /// Whether oracle/price-feed resolution has been initialized.
     pub oracle_initialized: bool,
+    /// Maximum fee cap in basis points (0 = no cap).
+    pub fee_cap_bps: u32,
 }
 
 /// Canonical void reasons used by `void_pool` / `claim_refund`.
@@ -2990,6 +3398,114 @@ impl PredifiContract {
         applied_fee
     }
 
+    /// Read-only deterministic quote for a liquidity pool.
+    ///
+    /// Uses the same pricing math as the reference model in [`quote`] so that
+    /// off-chain clients can reproduce the estimate exactly before asking a
+    /// wallet to sign. Rejects pools whose state is stale or unsupported.
+    ///
+    /// # Arguments
+    /// * `pool_id` — pool to quote against.
+    /// * `amount_in` — input amount in base token units (must be > 0).
+    ///
+    /// # Returns
+    /// A [`LiquidityQuote`] carrying input units, output estimate, price
+    /// impact, fee and the quote timestamp.
+    ///
+    /// # Errors
+    /// * [`PredifiError::PoolNotFound`] — no such pool.
+    /// * [`PredifiError::InvalidPoolState`] — pool is not quotable (closed,
+    ///   resolved, canceled, or has no liquidity).
+    /// * [`PredifiError::InvalidAmount`] — `amount_in <= 0`.
+    /// * [`PredifiError::PriceStale`] — pool state is older than
+    ///   [`MAX_QUOTE_STALENESS_SECONDS`].
+    pub fn quote_liquidity(
+        env: Env,
+        pool_id: u64,
+        amount_in: i128,
+    ) -> Result<LiquidityQuote, PredifiError> {
+        if amount_in <= 0 {
+            return Err(PredifiError::InvalidAmount);
+        }
+
+        let pool: Pool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Pool(pool_id))
+            .ok_or(PredifiError::PoolNotFound)?;
+        Self::extend_persistent(&env, &DataKey::Pool(pool_id));
+
+        // Only active pools with an open staking window are quotable.
+        if Self::is_pool_resolved(&pool) || pool.state == MarketState::Canceled {
+            return Err(PredifiError::InvalidPoolState);
+        }
+        let now = env.ledger().timestamp();
+        if now >= pool.end_time {
+            return Err(PredifiError::InvalidPoolState);
+        }
+
+        let state = Self::load_quote_pool_state(&env, pool_id, &pool)?;
+        if now.saturating_sub(state.updated_at) > MAX_QUOTE_STALENESS_SECONDS {
+            return Err(PredifiError::PriceStale);
+        }
+
+        let pure_state = state.to_pure();
+        let pure_quote = compute_quote(&pure_state, amount_in).map_err(|e| match e {
+            QuoteError::InvalidAmount => PredifiError::InvalidAmount,
+            QuoteError::UnsupportedState => PredifiError::InvalidPoolState,
+            QuoteError::StaleState => PredifiError::PriceStale,
+            QuoteError::Overflow => PredifiError::InvalidData,
+        })?;
+        let quote = LiquidityQuote::from_pure(pure_quote);
+
+        QuoteServedEvent {
+            pool_id,
+            amount_in: quote.amount_in,
+            amount_out: quote.amount_out,
+            price_impact_bps: quote.price_impact_bps,
+            fee: quote.fee,
+            timestamp: quote.timestamp,
+        }
+        .publish(&env);
+
+        Ok(quote)
+    }
+
+    /// Load the pricing-relevant pool state used by [`Self::quote_liquidity`].
+    ///
+    /// Kept separate so the quote path never mutates reserves and so the
+    /// reference model can be exercised against identical inputs.
+    fn load_quote_pool_state(
+        env: &Env,
+        pool_id: u64,
+        pool: &Pool,
+    ) -> Result<QuotePoolState, PredifiError> {
+        let reserve: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolReserve(pool_id))
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolTotalShares(pool_id))
+            .unwrap_or(0);
+        let updated_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolStateUpdatedAt(pool_id))
+            .unwrap_or_else(|| env.ledger().timestamp());
+
+        let fee_bps = Self::calculate_dynamic_fee(env, pool_id, pool);
+        Ok(QuotePoolState {
+            reserve,
+            total_shares,
+            total_stake: pool.total_stake,
+            fee_bps,
+            updated_at,
+        })
+    }
+
     /// Current protocol fee schedule version (1 until the first change).
     fn current_fee_schedule_version(env: &Env) -> u32 {
         env.storage()
@@ -3019,6 +3535,8 @@ impl PredifiContract {
 mod issues_1446_1447_1448_1449_boundary_tests;
 #[cfg(test)]
 mod lifecycle_invariants_tests;
+#[cfg(test)]
+mod liquidity_quote_tests;
 #[cfg(test)]
 mod referral_integration_tests;
 #[cfg(test)]

@@ -36,6 +36,9 @@ import {
   ShareButton,
 } from "@/components/ui";
 import { sanitizeRichText } from "@/lib/security";
+import { useDemoMode } from "@/lib/demo/DemoModeProvider";
+import { demoPoolDetail } from "@/lib/demo/fixtures";
+import { useMarketEvents, type MarketEvent } from "@/lib/hooks/useMarketEvents";
 
 const SITE_URL = "https://predifi.app";
 
@@ -47,6 +50,33 @@ function outcomeLabel(outcome: number, labels?: string[]): string {
   return sanitizeRichText(labels?.[outcome] ?? `Outcome ${outcome + 1}`);
 }
 
+const EVENT_LABELS: Record<MarketEvent["type"], string> = {
+  creation: "Market created",
+  trade: "Trade",
+  close: "Market closed",
+  resolution: "Market resolved",
+  claim: "Winnings claimed",
+};
+
+function formatEventTimestamp(timestamp: string | number | undefined): string {
+  if (timestamp === undefined || timestamp === null || timestamp === "") {
+    return "Timestamp unavailable";
+  }
+  const date =
+    typeof timestamp === "number" ? new Date(timestamp) : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return "Timestamp unavailable";
+  }
+  return date.toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+function eventKey(event: MarketEvent): string {
+  return event.id;
+}
+
 export interface PoolDetailClientProps {
   poolId: string;
   /** Server-rendered pool used as SWR fallback data for the first paint. */
@@ -54,10 +84,15 @@ export interface PoolDetailClientProps {
 }
 
 export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps) {
+  const { isDemoMode, exitDemoMode } = useDemoMode();
+
+  // In demo mode the SWR key is null: no request is ever issued to the pool
+  // API, so demo exploration can never be mistaken for (or leak into) live
+  // market data. All demo values come from local fixtures.
   const { data, error, isLoading, mutate } = useSWR<PoolDetail>(
-    poolDetailUrl(poolId),
+    isDemoMode ? null : poolDetailUrl(poolId),
     fetchPoolDetail,
-    { fallbackData: initialPool ?? undefined },
+    { fallbackData: isDemoMode ? undefined : (initialPool ?? undefined) },
   );
 
   // Dialog state + focus restoration. Each dialog remembers the control that
@@ -69,14 +104,25 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
   const tradeTriggerRef = useRef<HTMLButtonElement | null>(null);
   const claimTriggerRef = useRef<HTMLButtonElement | null>(null);
 
-  const openDialog = useCallback((dialog: "trade" | "claim") => {
-    setActiveDialog(dialog);
-    setAnnouncement(
-      dialog === "trade"
-        ? "Trade confirmation dialog opened."
-        : "Claim dialog opened.",
-    );
-  }, []);
+  const openDialog = useCallback(
+    (dialog: "trade" | "claim") => {
+      // Wallet signing is prohibited from demo state: never open the
+      // trade/claim dialogs while exploring illustrative data.
+      if (isDemoMode) {
+        setAnnouncement(
+          "Demo mode is read-only. Exit demo mode to trade or claim.",
+        );
+        return;
+      }
+      setActiveDialog(dialog);
+      setAnnouncement(
+        dialog === "trade"
+          ? "Trade confirmation dialog opened."
+          : "Claim dialog opened.",
+      );
+    },
+    [isDemoMode],
+  );
 
   const closeDialog = useCallback(() => {
     const trigger =
@@ -91,10 +137,21 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
     trigger?.focus();
   }, [activeDialog]);
 
-  const pool = data ?? initialPool ?? undefined;
-  const isStale = Boolean(error && pool);
+  const {
+    events,
+    isLoading: eventsLoading,
+    error: eventsError,
+    mutate: mutateEvents,
+  } = useMarketEvents(poolId);
+
+  const pool = isDemoMode
+    ? demoPoolDetail(poolId)
+    : (data ?? initialPool ?? undefined);
+  const isStale = !isDemoMode && Boolean(error && pool);
   const isMissing =
-    !pool && (error instanceof ApiError ? error.status === 404 : false);
+    !isDemoMode &&
+    !pool &&
+    (error instanceof ApiError ? error.status === 404 : false);
 
   if (isLoading && !pool) {
     return (
@@ -168,6 +225,27 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
           {announcement}
         </div>
 
+        {isDemoMode && (
+          <div
+            role="note"
+            aria-label="Illustrative data"
+            className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3"
+          >
+            <p className="text-sm text-amber-200">
+              <span className="font-semibold">Illustrative data.</span> You are
+              exploring a read-only demo. These values are not live markets and
+              no wallet signing is possible.
+            </p>
+            <button
+              type="button"
+              onClick={exitDemoMode}
+              className="inline-flex items-center gap-2 rounded-lg border border-amber-500/50 bg-amber-500/20 px-3 py-1.5 text-sm font-medium text-amber-100 transition-colors hover:bg-amber-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
+            >
+              Exit demo — view live data
+            </button>
+          </div>
+        )}
+
         {isStale && (
           <PartialDataBanner
             message="Showing cached pool data — the pool service is unreachable."
@@ -205,7 +283,13 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
             onClick={() => openDialog("trade")}
             aria-haspopup="dialog"
             aria-expanded={activeDialog === "trade"}
-            className="inline-flex items-center gap-2 rounded-lg bg-[#7DE3EC] px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-[#5fd0d8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7DE3EC] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0A0A]"
+            aria-disabled={isDemoMode || undefined}
+            title={
+              isDemoMode
+                ? "Unavailable in demo mode — exit demo to trade"
+                : undefined
+            }
+            className="inline-flex items-center gap-2 rounded-lg bg-[#7DE3EC] px-4 py-2 text-sm font-semibold text-black transition-colors hover:bg-[#5fd0d8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7DE3EC] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0A0A] disabled:cursor-not-allowed disabled:opacity-50"
           >
             Confirm trade
           </button>
@@ -215,7 +299,13 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
             onClick={() => openDialog("claim")}
             aria-haspopup="dialog"
             aria-expanded={activeDialog === "claim"}
-            className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-800/50 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
+            aria-disabled={isDemoMode || undefined}
+            title={
+              isDemoMode
+                ? "Unavailable in demo mode — exit demo to claim"
+                : undefined
+            }
+            className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-800/50 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Claim winnings
           </button>
@@ -241,6 +331,11 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
                 ? "Review your position before submitting the trade."
                 : "Review the outcome before claiming your winnings."}
             </p>
+            {isDemoMode && (
+              <p className="text-sm text-amber-300">
+                Illustrative data — wallet signing is disabled in demo mode.
+              </p>
+            )}
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -253,9 +348,94 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
           </div>
         )}
 
+        <section
+          aria-labelledby="pool-activity-heading"
+          className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-3"
+        >
+          <h2
+            id="pool-activity-heading"
+            className="text-sm font-semibold text-white uppercase tracking-wide"
+          >
+            Activity
+          </h2>
+          {eventsLoading && events.length === 0 ? (
+            <p role="status" className="text-sm text-zinc-400">
+              Loading activity…
+            </p>
+          ) : eventsError && events.length === 0 ? (
+            <div role="alert" className="space-y-2">
+              <p className="text-sm text-zinc-400">
+                Couldn&apos;t load this market&apos;s activity.
+              </p>
+              <button
+                type="button"
+                onClick={() => void mutateEvents()}
+                className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-800/50 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
+              >
+                Retry activity
+              </button>
+            </div>
+          ) : events.length === 0 ? (
+            <p className="text-sm text-zinc-400">
+              No activity has been recorded for this market yet.
+            </p>
+          ) : (
+            <ol className="space-y-2">
+              {events.map((event) => (
+                <li
+                  key={eventKey(event)}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-800 bg-zinc-800/40 px-4 py-3"
+                >
+                  <div className="space-y-0.5">
+                    <p className="text-sm text-zinc-200">
+                      {EVENT_LABELS[event.type] ?? event.type}
+                      {event.outcome != null && (
+                        <span className="ml-2 text-xs text-zinc-400">
+                          {outcomeLabel(
+                            event.outcome,
+                            pool.outcome_descriptions,
+                          )}
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-xs text-zinc-500">
+                      <time dateTime={event.timestamp || undefined}>
+                        {formatEventTimestamp(event.timestamp)}
+                      </time>
+                    </p>
+                  </div>
+                  {event.txHash ? (
+                    <a
+                      href={`https://stellar.expert/explorer/public/tx/${event.txHash}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs font-medium text-[#7DE3EC] underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7DE3EC] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0A0A0A] rounded"
+                    >
+                      View transaction
+                      <span className="sr-only">
+                        {" "}
+                        for {EVENT_LABELS[event.type] ?? event.type}
+                      </span>
+                    </a>
+                  ) : (
+                    <span className="text-xs text-zinc-500">
+                      Transaction unavailable
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+
         <div className="rounded-xl border border-zinc-800 bg-zinc-900 p-5 space-y-3">
           <h2 className="text-sm font-semibold text-white uppercase tracking-wide">
             Outcomes &amp; Odds
+            {isDemoMode && (
+              <span className="ml-2 rounded bg-amber-500/20 px-2 py-0.5 text-xs font-medium normal-case tracking-normal text-amber-200">
+                Illustrative data
+              </span>
+            )}
           </h2>
           {pool.odds.length === 0 ? (
             <PartialDataBanner

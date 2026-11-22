@@ -10,6 +10,13 @@ requirements, see the maintainer handbook:
 [`docs/maintainer-handbook.md`](../maintainer-handbook.md). Any contract
 interface change must follow that workflow before it reaches production.
 
+Liquidity-provider accounting (shares, deposits, withdrawals, fee accrual,
+rounding, loss allocation, and lifecycle edge cases) is specified in
+[RFC 0001: Liquidity-Provider Accounting](../rfcs/0001-liquidity-provider-accounting.md).
+That RFC is the normative reference for LP behaviour; implementation approval
+requires contract maintainer review and passing conservation property tests as
+described there.
+
 ---
 
 ## ContractInteractionFailures
