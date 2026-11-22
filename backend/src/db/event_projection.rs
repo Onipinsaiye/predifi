@@ -378,6 +378,15 @@ pub async fn project_event_tx(
                     &event.key.canonical(),
                 )
                 .await?;
+                    tx,
+                    user,
+                    NotifType::PoolResolved,
+                    "Pool resolved",
+                    &format!("Pool #{pool_id} has been resolved. Check your result."),
+                    *pool_id as i64,
+                    &event.key.canonical(),
+                )
+                .await?;
             }
         }
     }
