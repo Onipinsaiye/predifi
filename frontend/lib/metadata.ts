@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 
 import { getPoolById, isValidPoolId, type Pool } from "./pools";
+import { sanitizeRichText } from "./security";
 
 const SITE_NAME = "Markets";
 const DEFAULT_TITLE = "Market not found";
@@ -16,15 +17,7 @@ export const MAX_DESCRIPTION_LENGTH = 300;
  * control characters and excessive length in share previews.
  */
 export function sanitizeText(input: unknown, maxLength: number): string {
-  if (typeof input !== "string") return "";
-  const cleaned = input
-    // remove control characters and line separators
-    .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, " ")
-    // collapse whitespace
-    .replace(/\s+/g, " ")
-    .trim();
-  if (cleaned.length <= maxLength) return cleaned;
-  return `${cleaned.slice(0, maxLength - 1).trimEnd()}\u2026`;
+  return sanitizeRichText(input, maxLength);
 }
 
 export function buildCanonicalUrl(id: string, baseUrl?: string): string {

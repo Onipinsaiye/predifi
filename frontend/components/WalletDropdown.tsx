@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { cn } from "@/lib/utils";
+import { SafeExternalLink, normalizeExternalUrl } from "@/lib/security";
 import {
   Copy,
   Check,
@@ -150,6 +151,7 @@ export function WalletDropdown({
   const explorerUrl = address
     ? `${explorerBaseUrl.replace(/\/$/, "")}/${address}`
     : null;
+  const safeExplorerUrl = normalizeExternalUrl(explorerUrl);
 
   const truncated = address ? truncateAddress(address) : "—";
   const avatarLabel = address ? getAvatarLabel(address) : "W";
@@ -304,17 +306,14 @@ export function WalletDropdown({
               </span>
             </button>
 
-            <a
+            <SafeExternalLink
               role="menuitem"
               aria-label="View in explorer"
-              href={explorerUrl ?? undefined}
-              aria-disabled={!explorerUrl || isMismatch ? "true" : undefined}
-              tabIndex={!explorerUrl || isMismatch ? -1 : undefined}
-
-              target="_blank"
-              rel="noreferrer noopener"
+              href={safeExplorerUrl}
+              aria-disabled={!safeExplorerUrl || isMismatch ? "true" : undefined}
+              tabIndex={!safeExplorerUrl || isMismatch ? -1 : undefined}
               onClick={(e) => {
-                if (!explorerUrl || isMismatch) e.preventDefault();
+                if (!safeExplorerUrl || isMismatch) e.preventDefault();
                 close();
               }}
               className={cn(
@@ -332,7 +331,7 @@ export function WalletDropdown({
               {isMismatch && (
                 <span className="text-xs text-amber-300/80">Wrong network</span>
               )}
-            </a>
+            </SafeExternalLink>
           </div>
         </div>
 

@@ -35,6 +35,7 @@ import {
   PoolDetailSkeleton,
   ShareButton,
 } from "@/components/ui";
+import { sanitizeRichText } from "@/lib/security";
 
 const SITE_URL = "https://predifi.app";
 
@@ -43,7 +44,7 @@ function formatStake(amount: number, token: string): string {
 }
 
 function outcomeLabel(outcome: number, labels?: string[]): string {
-  return labels?.[outcome] ?? `Outcome ${outcome + 1}`;
+  return sanitizeRichText(labels?.[outcome] ?? `Outcome ${outcome + 1}`);
 }
 
 export interface PoolDetailClientProps {
@@ -152,6 +153,7 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
 
   const shareUrl = `${SITE_URL}/user/pool-market/${pool.pool_id}`;
   const shareTitle = `${pool.name} — predict on PrediFi`;
+  const description = sanitizeRichText(pool.description);
 
   return (
     <div className="min-h-screen bg-[#0A0A0A] p-6 lg:p-8">
@@ -193,6 +195,8 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
             <ShareButton url={shareUrl} title={shareTitle} text={pool.name} />
           </div>
         </div>
+
+        {description && <p className="text-sm text-zinc-400">{description}</p>}
 
         <div className="flex flex-wrap items-center gap-2">
           <button

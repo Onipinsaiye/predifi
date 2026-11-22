@@ -1,5 +1,14 @@
 # Content Security Policy and response headers
 
+## Untrusted text and external links
+
+API-backed descriptions, bios, comments, and labels are treated as plain text
+by default. The frontend does not enable raw HTML rendering; use
+`sanitizeRichText` at a boundary when introducing a new untrusted text
+surface. External destinations must pass `normalizeExternalUrl` or be
+rendered with `SafeExternalLink`, which only permits `http` and `https` URLs
+and adds `noopener noreferrer`.
+
 `middleware.ts` generates a fresh 128-bit random nonce for each document/RSC
 request. It overwrites incoming CSP/nonce headers, forwards the trusted policy
 to Next.js, and sends the same enforced policy to the browser. The root layout
