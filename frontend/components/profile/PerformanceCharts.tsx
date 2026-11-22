@@ -12,7 +12,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui";
+import { Card, CardContent, CardHeader, CardTitle, ChartAlternative } from "@/components/ui";
 import { formatChartValue } from "@/lib/stakeFilters";
 import type { PerformancePoint, ProfileStats } from "@/lib/api/profile";
 
@@ -94,6 +94,7 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
               No activity yet.
             </div>
           ) : (
+            <div aria-hidden="true" className="h-full w-full">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={cumulative} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                 <defs>
@@ -137,8 +138,25 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
                 />
               </AreaChart>
             </ResponsiveContainer>
+            </div>
           )}
         </CardContent>
+        {cumulative.length > 0 && (
+          <div className="px-6 pb-4 space-y-3">
+            <ChartAlternative
+              title="Cumulative staked"
+              unit="USD"
+              rangeLabel={`${cumulative[0].day} to ${cumulative[cumulative.length - 1].day}`}
+              data={cumulative.map((p) => ({ label: p.day, value: p.staked }))}
+            />
+            <ChartAlternative
+              title="Cumulative earnings"
+              unit="USD"
+              rangeLabel={`${cumulative[0].day} to ${cumulative[cumulative.length - 1].day}`}
+              data={cumulative.map((p) => ({ label: p.day, value: p.earnings }))}
+            />
+          </div>
+        )}
       </Card>
 
       <Card className="bg-[#121212] border-none text-white">
@@ -150,6 +168,7 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
             <div className="text-zinc-600 text-sm">No settled predictions yet.</div>
           ) : (
             <>
+              <div aria-hidden="true" className="w-full">
               <ResponsiveContainer width="100%" height={180}>
                 <PieChart>
                   <Pie
@@ -175,7 +194,8 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
                   />
                 </PieChart>
               </ResponsiveContainer>
-              <div className="flex items-center gap-4 mt-2 text-xs">
+              </div>
+              <div aria-hidden="true" className="flex items-center gap-4 mt-2 text-xs">
                 {winLossData.map((entry) => (
                   <div key={entry.name} className="flex items-center gap-1.5">
                     <span
@@ -188,6 +208,15 @@ export function PerformanceCharts({ stats, performance }: PerformanceChartsProps
                   </div>
                 ))}
               </div>
+              <ChartAlternative
+                className="mt-3 w-full"
+                title="Win / Loss"
+                unit="predictions"
+                rangeLabel="all settled and pending predictions"
+                showShare
+                formatValue={(v) => String(v)}
+                data={winLossData.map((d) => ({ label: d.name, value: d.value }))}
+              />
             </>
           )}
         </CardContent>
