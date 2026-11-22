@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 
 import { generatePoolMetadata } from "../../../lib/metadata";
 import { getPoolById, isValidPoolId } from "../../../lib/pools";
+import { sanitizeRichText } from "../../../lib/security";
 
 type PageProps = {
   params: { [key: string]: string | string[] | undefined };
@@ -62,7 +63,7 @@ export default async function MarketPage({ params, searchParams }: PageProps) {
         </p>
       ) : null}
       {pool.description ? (
-        <p className="mt-4 text-gray-600">{pool.description}</p>
+        <p className="mt-4 text-gray-600">{sanitizeRichText(pool.description)}</p>
       ) : null}
       <dl className="mt-8 grid grid-cols-1 gap-4 sm:grid-cols-3">
         <div className="rounded-border p-4">
