@@ -71,6 +71,8 @@ mod challenge;
 #[cfg(test)]
 mod fee_schedule_snapshot_tests;
 #[cfg(test)]
+mod liquidity_adversarial_tests;
+#[cfg(test)]
 mod gas_budget_tests;
 #[cfg(test)]
 mod oracle_feed_fixture;

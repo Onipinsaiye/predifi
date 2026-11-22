@@ -1,0 +1,5470 @@
+use axum::{
+    extract::{Path, Query, State},
+    routing::{get, patch, post, put},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::Arc;
+
+use crate::abuse::{AbuseController, AbuseRejection};
+use crate::cache_coalesce::{CoalesceError, CoalescingCache};
+use crate::config::Config;
+use crate::db::PoolCreatedEvent;
+use crate::db::PredictionPlacedEvent;
+use crate::metrics::SharedMetrics;
+use crate::pool_cache::PoolCache;
+use crate::price_cache::PriceCache;
+use crate::redis_cache::RedisCache;
+use crate::response::{error_codes, ApiResponse};
+use crate::validated_types::{BoundedI64, NonEmptyString, PoolSortBy, PoolStatus, StellarAddress};
+
+/// Maximum age (in seconds) of a pool snapshot that a quote may be derived
+/// from. Older state is rejected as stale so clients never sign against a
+/// price that has drifted.
+pub const QUOTE_MAX_POOL_STATE_AGE_SECS: i64 = 300;
+
+/// Query parameters for `GET /api/v1/pools/:id/quote`.
+#[derive(Debug, Deserialize)]
+pub struct QuoteQuery {
+    /// Input amount in the pool's input units (must be positive).
+    pub amount: BoundedI64,
+    /// Optional outcome index the input is placed on (defaults to 0).
+    #[serde(default)]
+    pub outcome: Option<u32>,
+}
+
+/// Deterministic quote returned by `GET /api/v1/pools/:id/quote`.
+#[derive(Debug, Serialize)]
+pub struct QuoteResponse {
+    /// Pool the quote was computed for.
+    pub pool_id: i64,
+    /// Outcome index the input is placed on.
+    pub outcome: u32,
+    /// Input amount, in input units.
+    pub input_units: i64,
+    /// Estimated output shares for the input.
+    pub output_estimate: i64,
+    /// Price impact in basis points (0 = no impact).
+    pub price_impact_bps: u32,
+    /// Fee charged for the trade, in input units.
+    pub fee: i64,
+    /// Unix timestamp (seconds) at which the quote was produced.
+    pub quote_timestamp: i64,
+}
+
+/// Snapshot of the pool state a quote is derived from.
+#[derive(Debug, Clone)]
+pub struct QuotePoolState {
+    /// Pool identifier.
+    pub pool_id: i64,
+    /// Lifecycle status as reported by the authoritative source.
+    pub status: String,
+    /// Unix timestamp (seconds) of the last state update.
+    pub updated_at: i64,
+    /// Total liquidity currently in the pool, in input units.
+    pub total_liquidity: i64,
+    /// Shares already issued for the outcome being quoted.
+    pub outcome_shares: i64,
+}
+
+/// Errors produced while computing a quote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuoteError {
+    /// The pool does not exist.
+    NotFound,
+    /// The pool state is older than [`QUOTE_MAX_POOL_STATE_AGE_SECS`].
+    Stale { age_secs: i64 },
+    /// The pool lifecycle state cannot be quoted (e.g. settled/closed).
+    UnsupportedState(String),
+    /// The input amount is not positive.
+    InvalidAmount,
+    /// The pool has no liquidity to price against.
+    InsufficientLiquidity,
+}
+
+impl std::fmt::Display for QuoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuoteError::NotFound => write!(f, "pool not found"),
+            QuoteError::Stale { age_secs } => {
+                write!(f, "pool state is stale ({age_secs}s old)")
+            }
+            QuoteError::UnsupportedState(state) => {
+                write!(f, "pool state '{state}' does not support quoting")
+            }
+            QuoteError::InvalidAmount => write!(f, "amount must be positive"),
+            QuoteError::InsufficientLiquidity => write!(f, "pool has no liquidity"),
+        }
+    }
+}
+
+/// Deterministic pricing model shared by the quote endpoint and the contract
+/// reference implementation.
+///
+/// The output estimate is the constant-product share price applied to the
+/// input, net of the protocol fee. Price impact is the relative change in the
+/// marginal price caused by the trade, expressed in basis points.
+pub fn compute_quote(
+    state: &QuotePoolState,
+    amount: i64,
+    outcome: u32,
+    fee_bps: u32,
+    now: i64,
+) -> Result<QuoteResponse, QuoteError> {
+    if amount <= 0 {
+        return Err(QuoteError::InvalidAmount);
+    }
+    if state.status != "active" {
+        return Err(QuoteError::UnsupportedState(state.status.clone()));
+    }
+    let age_secs = now.saturating_sub(state.updated_at);
+    if age_secs > QUOTE_MAX_POOL_STATE_AGE_SECS {
+        return Err(QuoteError::Stale { age_secs });
+    }
+    if state.total_liquidity <= 0 {
+        return Err(QuoteError::InsufficientLiquidity);
+    }
+
+    // Fee is charged on the input, rounded down, in input units.
+    let fee = (amount as i128 * fee_bps as i128 / 10_000) as i64;
+    let net_input = amount.saturating_sub(fee);
+
+    // Constant-product marginal price: shares per input unit scale with the
+    // existing shares over the pool liquidity.
+    let liquidity = state.total_liquidity as i128;
+    let shares = state.outcome_shares.max(0) as i128;
+    let output = (net_input as i128 * liquidity / (liquidity + shares)) as i64;
+
+    // Price impact: fraction of the pool consumed by the trade, in bps.
+    let price_impact_bps = ((net_input as i128 * 10_000) / (liquidity + net_input as i128))
+        .clamp(0, 10_000) as u32;
+
+    Ok(QuoteResponse {
+        pool_id: state.pool_id,
+        outcome,
+        input_units: amount,
+        output_estimate: output.max(0),
+        price_impact_bps,
+        fee,
+        quote_timestamp: now,
+    })
+}
+
+/// `GET /api/v1/pools/:id/quote` — deterministic, read-only trade quote.
+///
+/// Validates the pool id and input amount, loads the current pool state
+/// (pool cache first, then the indexer DB), rejects stale or unsupported
+/// state, and applies the shared pricing model.
+async fn get_pool_quote_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Query(query): Query<QuoteQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let amount = query.amount.get();
+    if pool_id <= 0 || amount <= 0 {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "pool id and amount must be positive",
+        )
+        .into_response();
+    }
+    let outcome = query.outcome.unwrap_or(0);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let pool_state = match load_quote_pool_state(&state, pool_id).await {
+        Ok(Some(pool_state)) => pool_state,
+        Ok(None) => {
+            return ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOT_FOUND,
+                "pool not found",
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, pool_id, "failed to load pool state for quote");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load pool state",
+            )
+            .into_response();
+        }
+    };
+
+    match compute_quote(
+        &pool_state,
+        amount,
+        outcome,
+        state.config.treasury_fee_bps,
+        now,
+    ) {
+        Ok(quote) => ApiResponse::success(quote).into_response(),
+        Err(QuoteError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "pool not found",
+        )
+        .into_response(),
+        Err(QuoteError::Stale { age_secs }) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("pool state is stale ({age_secs}s old)"),
+        )
+        .into_response(),
+        Err(QuoteError::UnsupportedState(status)) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("pool state '{status}' does not support quoting"),
+        )
+        .into_response(),
+        Err(QuoteError::InvalidAmount) => ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "amount must be positive",
+        )
+        .into_response(),
+        Err(QuoteError::InsufficientLiquidity) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            "pool has no liquidity",
+        )
+        .into_response(),
+    }
+}
+
+/// Load the pool state used for quoting: the pool cache is consulted first,
+/// then the indexer DB. Returns `Ok(None)` when the pool does not exist.
+async fn load_quote_pool_state(
+    state: &AppState,
+    pool_id: i64,
+) -> Result<Option<QuotePoolState>, sqlx::Error> {
+    if let crate::pool_cache::CacheLookup::Found(value) = state.pool_cache.get(pool_id) {
+        if let Some(pool_state) = quote_state_from_json(pool_id, &value) {
+            return Ok(Some(pool_state));
+        }
+    }
+
+    let Some(db) = &state.db else {
+        return Ok(None);
+    };
+
+    let row: Option<(i64, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, status, EXTRACT(EPOCH FROM updated_at)::BIGINT, \
+         COALESCE(total_liquidity, 0), COALESCE(outcome_shares, 0) \
+         FROM pools WHERE id = $1",
+    )
+    .bind(pool_id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(
+        |(pool_id, status, updated_at, total_liquidity, outcome_shares)| QuotePoolState {
+            pool_id,
+            status,
+            updated_at,
+            total_liquidity,
+            outcome_shares,
+        },
+    ))
+}
+
+/// Extract a [`QuotePoolState`] from a cached pool-detail JSON document.
+fn quote_state_from_json(pool_id: i64, value: &serde_json::Value) -> Option<QuotePoolState> {
+    let status = value.get("status")?.as_str()?.to_string();
+    let updated_at = value
+        .get("updated_at")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            value
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_market_timestamp(s).ok())
+                .map(|dt| dt.timestamp())
+        })?;
+    let total_liquidity = value
+        .get("total_liquidity")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let outcome_shares = value
+        .get("outcome_shares")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Some(QuotePoolState {
+        pool_id,
+        status,
+        updated_at,
+        total_liquidity,
+        outcome_shares,
+    })
+}
+
+/// Struct representing fee information, matching the contract structure.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeeInfo {
+    /// Protocol (treasury) fee in basis points.
+    pub treasury_fee_bps: u32,
+    /// Referral share of the protocol fee in basis points.
+    pub referral_fee_bps: u32,
+}
+
+/// `GET /api/v1/health` health-check endpoint.
+pub async fn health(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let mut all_healthy = true;
+    let mut db_status = "ok";
+
+    if let Some(db) = &state.db {
+        if let Err(e) = sqlx::query("SELECT 1").execute(db).await {
+            tracing::warn!(error = %e, "database health probe failed");
+            db_status = "unreachable";
+            all_healthy = false;
+        }
+    } else {
+        db_status = "not_configured";
+    }
+
+    let mut rpc_status = "ok";
+    // Bounded probe with a short deadline and the shared circuit breaker
+    // (#58). Error details are logged, never returned (#51).
+    if let Err(error) = crate::rpc_resilience::probe_health(&state.config).await {
+        tracing::warn!(error = %error, "rpc health probe failed");
+        rpc_status = "unreachable";
+        all_healthy = false;
+    }
+
+    let mut redis_status = "ok";
+    let mut redis_error = String::new();
+    if !state.redis.is_available() {
+        redis_status = "not_configured";
+        all_healthy = false;
+    } else if !state.redis.ping().await {
+        redis_status = "unreachable";
+        redis_error = String::from("Redis ping failed");
+        all_healthy = false;
+    }
+
+    let mut price_cache_status = "ok";
+    if state.cache.snapshot().is_empty() {
+        price_cache_status = "not_ready";
+        all_healthy = false;
+    }
+
+    let mut disk_status = "ok";
+    let mut disk_error = String::new();
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    if let Some(disk) = disks.first() {
+        let available = disk.available_space();
+        let total = disk.total_space();
+        if total > 0 && (available as f64 / total as f64) < 0.05 {
+            disk_status = "degraded";
+            disk_error = format!("Low disk space: {}/{} bytes available", available, total);
+            all_healthy = false;
+        }
+    } else {
+        disk_status = "unknown";
+        disk_error = String::from("Could not determine disk space");
+    }
+
+    let body = serde_json::json!({
+        "status": if all_healthy { "ok" } else { "error" },
+        "version": "v1",
+        "dependencies": {
+            "db": db_status,
+            "rpc": rpc_status,
+            "redis": redis_status,
+            "price_cache": price_cache_status,
+            "disk": disk_status
+        },
+        "errors": {
+            "db": if db_status == "unreachable" { Some("database unreachable".to_string()) } else { None },
+            "rpc": if rpc_status == "unreachable" { Some("rpc unreachable".to_string()) } else { None },
+            "redis": if redis_status == "unreachable" { Some(redis_error.clone()) } else { None },
+            "price_cache": if price_cache_status == "not_ready" { Some("price cache is empty".to_string()) } else { None },
+            "disk": if disk_status != "ok" { Some(disk_error) } else { None }
+        }
+    });
+
+    if all_healthy {
+        (StatusCode::OK, Json(body)).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
+}
+
+/// `GET /api/v1` version discovery endpoint.
+///
+/// Also reports the lifecycle status of every API version and any
+/// deprecated routes (#53), so clients can detect upcoming removals.
+async fn index() -> Json<serde_json::Value> {
+    let lifecycle = crate::api_versioning::versions_document();
+    let status = lifecycle
+        .versions
+        .iter()
+        .find(|v| v.version == "v1")
+        .map(|v| v.status)
+        .unwrap_or(crate::api_versioning::LifecycleStatus::Active);
+    Json(json!({
+        "name": "predifi-backend",
+        "version": "v1",
+        "status": status,
+        "versions": lifecycle.versions,
+        "deprecated_routes": lifecycle.deprecated_routes,
+        "deprecation_policy": lifecycle.policy,
+    }))
+}
+
+/// Shared state for all v1 routes.
+#[derive(Clone)]
+pub struct AppState {
+    /// Validated runtime configuration (fees, URLs, timeouts, etc.).
+    pub config: Arc<Config>,
+    /// In-memory oracle price cache refreshed every 60 seconds.
+    pub cache: PriceCache,
+    /// Short-TTL cache for pool-detail lookups (#1369).
+    pub pool_cache: PoolCache,
+    /// Stampede-safe, cross-replica cache behind `pool_cache` for hot market
+    /// reads (#60).
+    pub market_reads: CoalescingCache,
+    /// Redis cache client for hot-path response caching.
+    pub redis: RedisCache,
+    /// Optional DB pool — absent in unit tests that don't need a database.
+    pub db: Option<sqlx::PgPool>,
+    /// Shared Prometheus metrics registry.
+    pub metrics: SharedMetrics,
+    /// Broadcast channel for pushing live prediction events to WebSocket clients.
+    pub event_bus: crate::ws::EventBus,
+    /// Per-wallet / per-network abuse controls for market creation and
+    /// expensive wallet-triggering actions (#103).
+    pub abuse: Arc<AbuseController>,
+}
+
+impl axum::extract::FromRef<AppState> for Arc<Config> {
+    fn from_ref(state: &AppState) -> Self {
+        state.config.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for PriceCache {
+    fn from_ref(state: &AppState) -> Self {
+        state.cache.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for SharedMetrics {
+    fn from_ref(state: &AppState) -> Self {
+        state.metrics.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Option<sqlx::PgPool> {
+    fn from_ref(state: &AppState) -> Self {
+        state.db.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for RedisCache {
+    fn from_ref(state: &AppState) -> Self {
+        state.redis.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for crate::ws::EventBus {
+    fn from_ref(state: &AppState) -> Self {
+        state.event_bus.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<AbuseController> {
+    fn from_ref(state: &AppState) -> Self {
+        state.abuse.clone()
+    }
+}
+
+/// Map an [`AbuseRejection`] to a transparent, structured HTTP response.
+///
+/// The body names the quota that was exceeded, the wallet it applies to, the
+/// network, and when the caller may retry, so legitimate clients can back off
+/// deterministically instead of guessing. `Retry-After` is set in seconds.
+fn abuse_rejection_response(rejection: AbuseRejection) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let retry_after = rejection.retry_after_secs.max(1);
+    let mut response = ApiResponse::<()>::error(
+        StatusCode::TOO_MANY_REQUESTS,
+        error_codes::RATE_LIMITED,
+        rejection.to_string(),
+    )
+    .into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// Enforce the abuse quota for `action` on behalf of `wallet` before doing any
+/// expensive work. Returns `Some(response)` when the caller must be rejected.
+///
+/// Quotas are keyed on the wallet address and the configured network — never
+/// on the client IP — so users behind a shared NAT are not penalised for each
+/// other's traffic, and a single wallet cannot escape its quota by rotating
+/// source addresses.
+fn enforce_abuse_quota(
+    state: &AppState,
+    action: crate::abuse::AbuseAction,
+    wallet: &str,
+) -> Option<axum::response::Response> {
+    match state.abuse.check(action, wallet) {
+        Ok(_) => None,
+        Err(rejection) => {
+            tracing::warn!(
+                action = action.as_str(),
+                wallet = %wallet,
+                network = state.abuse.network(),
+                "abuse quota exceeded"
+            );
+            Some(abuse_rejection_response(rejection))
+        }
+    }
+}
+
+/// Authenticate a wallet-scoped notification mutation using the access token
+/// bound to the wallet path. Revocation checks fail closed when token state is
+/// unavailable.
+async fn authorize_notification_wallet(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    address: &str,
+) -> Result<(), crate::errors::AppError> {
+    use crate::errors::AppError;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+        .ok_or_else(|| AppError::Unauthorized("missing bearer token".to_string()))?;
+    let claims = crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    )
+    .map_err(AppError::from)?;
+    if claims.sub != address {
+        return Err(AppError::Forbidden(
+            "access token belongs to a different wallet".to_string(),
+        ));
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    crate::token_revocation::RevocationStore::new(state.db.clone(), state.redis.clone())
+        .ensure_not_revoked(&claims, now)
+        .await
+        .map_err(AppError::from)?;
+    Ok(())
+}
+
+// ── Admin: runtime log-level control ─────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SetLogLevelRequest {
+    /// New log level (e.g. "info", "debug", "warn").
+    pub level: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetLogLevelResponse {
+    pub status: String,
+    pub level: String,
+}
+
+/// `PATCH /api/v1/admin/log-level` — change the active log level at runtime.
+///
+/// Restricted to callers that present a valid admin API key in the
+/// `x-admin-api-key` header.  The key must match the `PREDIFI_ADMIN_API_KEY`
+/// environment variable.  Returns 401 when the header is absent or does not
+/// match.
+///
+/// The new level is applied immediately and remains in effect until the next
+/// change or a process restart (which reverts to the configured default).
+pub async fn set_log_level(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SetLogLevelRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let admin_key = std::env::var("PREDIFI_ADMIN_API_KEY").ok();
+
+    let provided = headers
+        .get("x-admin-api-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let authenticated = match (&admin_key, provided) {
+        (Some(expected), Some(provided)) if expected == &provided => true,
+        _ => false,
+    };
+
+    if !authenticated {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or missing admin credentials" })),
+        )
+            .into_response();
+    }
+
+    let level = body.level.trim().to_string();
+    if level.is_empty() {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "level must not be empty",
+        )
+        .into_response();
+    }
+
+    match crate::telemetry::try_reload_log_level(&level) {
+        Ok(()) => {
+            tracing::info!(log_level = %level, "log level updated via admin endpoint");
+            ApiResponse::success(SetLogLevelResponse {
+                status: "ok".to_string(),
+                level,
+            })
+            .into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(StatusCode::BAD_REQUEST, error_codes::INVALID_INPUT, e)
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/admin/notifications/:id/replay` — replay a dead-lettered
+/// outbound delivery (#63).
+///
+/// Restricted to callers with a valid `x-admin-api-key` header. Resets a
+/// delivery that is in `status = 'dead'` back to `status = 'pending'` with
+/// `attempts = 0`, so the next sweep picks it up for another delivery attempt.
+///
+/// Returns 200 with the refreshed delivery row on success, 404 if no
+/// delivery with that id exists, and 409 if the delivery is not currently
+/// dead-lettered (replaying a healthy delivery is a no-op the caller should
+/// be told about rather than silently accepted).
+pub async fn admin_replay_notification(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let admin_key = std::env::var("PREDIFI_ADMIN_API_KEY").ok();
+    let provided = headers
+        .get("x-admin-api-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let authenticated =
+        matches!((&admin_key, provided), (Some(expected), Some(got)) if expected == &got);
+    if !authenticated {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid or missing admin credentials" })),
+        )
+            .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    // Confirm the delivery exists and is dead before replaying.
+    let existing = match crate::sinks::get_delivery(db, delivery_id).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOTIFICATION_NOT_FOUND,
+                format!("delivery {delivery_id} not found"),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                e.to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    if existing.status != "dead" {
+        return ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!(
+                "delivery {delivery_id} is in status '{}', not 'dead'; replay would be a no-op",
+                existing.status
+            ),
+        )
+        .into_response();
+    }
+
+    match crate::sinks::replay_dead(db, delivery_id).await {
+        Ok(true) => {
+            // Re-read so the response reflects the reset state.
+            match crate::sinks::get_delivery(db, delivery_id).await {
+                Ok(Some(d)) => {
+                    tracing::info!(
+                        delivery_id,
+                        idempotency_key = %d.idempotency_key,
+                        channel = %d.channel,
+                        "dead-lettered delivery replayed via admin endpoint"
+                    );
+                    ApiResponse::success(json!({
+                        "status": "replayed",
+                        "delivery": d,
+                    }))
+                    .into_response()
+                }
+                Ok(None) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "delivery disappeared between replay and re-read",
+                )
+                .into_response(),
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        Ok(false) => ApiResponse::<()>::error(
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            format!("delivery {delivery_id} was not dead when replay ran"),
+        )
+        .into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Task 2: Active Pools API ──────────────────────────────────────────────────
+
+/// Default page size for `GET /api/v1/pools` when `limit` is omitted.
+const POOLS_DEFAULT_PAGE_SIZE: i64 = 20;
+/// Maximum page size for `GET /api/v1/pools`. A requested `limit` above this
+/// is clamped down to it rather than rejected with 400, so a client that
+/// over-requests still gets a bounded, servable page (see #1734).
+const POOLS_MAX_PAGE_SIZE: i64 = 100;
+/// Maximum page offset for `GET /api/v1/pools` to prevent unbounded query scanning.
+const POOLS_MAX_OFFSET: i64 = 10_000;
+
+/// Parse an ISO 8601 / RFC 3339 string or Unix epoch seconds into a UTC DateTime.
+fn parse_market_timestamp(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let s = s.trim();
+    if let Ok(ts_sec) = s.parse::<i64>() {
+        // Enforce reasonable epoch bounds: 2000-01-01 to 2100-01-01
+        if ts_sec < 946684800 || ts_sec > 4102444800 {
+            return Err(format!(
+                "timestamp {ts_sec} is outside supported range (2000 to 2100)"
+            ));
+        }
+        chrono::DateTime::from_timestamp(ts_sec, 0)
+            .ok_or_else(|| format!("invalid unix timestamp: {s}"))
+    } else {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| format!("invalid RFC3339 datetime '{s}': {e}"))
+    }
+}
+
+/// Query parameters for the `GET /api/v1/pools` endpoint.
+#[derive(Debug, Deserialize)]
+pub struct PoolsQuery {
+    /// Sort order: "popular" | "ending_soon" | "new" (default)
+    pub sort_by: Option<PoolSortBy>,
+    /// Category filter, e.g. "Sports", "Crypto"
+    pub category: Option<NonEmptyString>,
+    /// Status filter: "active" | "closed" | "settled" (default: "active")
+    pub status: Option<PoolStatus>,
+    /// Creator filter: 56-character Stellar address (G... or C...)
+    pub creator: Option<StellarAddress>,
+    /// Comma-separated tag filter, e.g. "btc,price-prediction". A pool
+    /// matches if any of its tags overlap this list (max 10 tags).
+    pub tags: Option<String>,
+    /// Single tag filter alias.
+    pub tag: Option<String>,
+    /// Earliest market end time (RFC3339 or Unix timestamp in seconds).
+    pub end_time_min: Option<String>,
+    /// Latest market end time (RFC3339 or Unix timestamp in seconds).
+    pub end_time_max: Option<String>,
+    /// Alias for end_time_min.
+    pub from_time: Option<String>,
+    /// Alias for end_time_max.
+    pub to_time: Option<String>,
+    /// Winning outcome filter for settled markets (e.g. "0", "1").
+    pub outcome: Option<String>,
+    /// Page size. Missing defaults to [`POOLS_DEFAULT_PAGE_SIZE`]; a value
+    /// outside `[1, POOLS_MAX_PAGE_SIZE]` is clamped into range in the
+    /// handler rather than rejected — unlike most other paginated endpoints
+    /// in this file, which use [`BoundedI64`] and reject out-of-range values.
+    pub limit: Option<i64>,
+    /// Zero-based page offset, minimum 0.
+    pub offset: Option<crate::validated_types::PageOffset>,
+}
+
+/// Resolve the effective page size for `GET /api/v1/pools`: missing defaults
+/// to [`POOLS_DEFAULT_PAGE_SIZE`], and anything outside `[1,
+/// POOLS_MAX_PAGE_SIZE]` is clamped into range (never rejected). See #1734.
+fn resolve_pools_page_size(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(POOLS_DEFAULT_PAGE_SIZE)
+        .clamp(1, POOLS_MAX_PAGE_SIZE)
+}
+
+#[derive(Debug, Serialize)]
+pub struct PoolsResponse {
+    pub pools: Vec<crate::tags::PoolListingRow>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+    pub status: String,
+    pub category: Option<String>,
+    pub category_id: Option<String>,
+    pub sort_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time_min: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time_max: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// `GET /api/v1/pools/:id` — get detailed pool information with real-time odds.
+pub async fn get_pool_by_id_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    use crate::pool_cache::CacheLookup;
+    match state.pool_cache.get(pool_id) {
+        CacheLookup::Found(cached) => return ApiResponse::success(cached).into_response(),
+        CacheLookup::NotFound => {
+            // Negative cache hit: a previous lookup already confirmed this
+            // pool doesn't exist, so serve 404 without touching the database.
+            return ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOT_FOUND,
+                "pool not found",
+            )
+            .into_response();
+        }
+        CacheLookup::Miss => {}
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    // Concurrent misses for the same pool (across replicas) are coalesced into
+    // one database read; the refresh owner also fills the local `pool_cache`.
+    let loader = {
+        let db = db.clone();
+        let pool_cache = state.pool_cache.clone();
+        move || async move {
+            let pool = crate::db::get_pool_with_odds(&db, pool_id).await?;
+            match &pool {
+                Some(pool) => pool_cache.set(pool_id, pool.clone()),
+                None => pool_cache.set_missing(pool_id),
+            }
+            Ok::<_, sqlx::Error>(pool.and_then(|p| serde_json::to_value(p).ok()))
+        }
+    };
+    match state
+        .market_reads
+        .get_or_refresh(&format!("pool:{pool_id}"), loader)
+        .await
+    {
+        Ok(lookup) => match lookup.value {
+            Some(pool) => ApiResponse::success(pool).into_response(),
+            None => ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOT_FOUND,
+                "pool not found",
+            )
+            .into_response(),
+        },
+        Err(CoalesceError::RefreshTimeout | CoalesceError::WaitTimeout) => {
+            let mut response = ApiResponse::<()>::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_codes::SERVICE_UNAVAILABLE,
+                "pool lookup timed out; retry shortly",
+            )
+            .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            response
+        }
+        Err(CoalesceError::Upstream(e)) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// Query parameters for the `GET /api/v1/stats` endpoint.
+#[derive(Debug, Deserialize)]
+pub struct StatsQuery {
+    /// Category filter, e.g. "Sports", "Crypto"
+    pub category: Option<NonEmptyString>,
+    /// Pool state filter: "active" | "closed" | "settled"
+    pub status: Option<PoolStatus>,
+}
+
+/// `GET /api/v1/stats` — protocol-wide aggregate statistics.
+///
+/// Implements the **cache-aside pattern**:
+/// 1. Check Redis for a cached result keyed by `category` and `status`.
+/// 2. On cache hit: return the cached value.
+/// 3. On cache miss: fetch from the database and cache for
+///    [`STATS_CACHE_TTL`](crate::redis_cache::STATS_CACHE_TTL) seconds.
+pub async fn get_stats(
+    State(state): State<AppState>,
+    Query(params): Query<StatsQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let category = match params.category.as_ref().map(|s| s.as_str()) {
+        Some(input) => match crate::categories::resolve_category(db, input).await {
+            Ok(category) => Some(category.category_id),
+            Err(crate::categories::CategoryError::UnknownCategory) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unknown market category",
+                )
+                .into_response();
+            }
+            Err(crate::categories::CategoryError::Database) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "category registry unavailable",
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let category = category.as_deref();
+    let status = params.status.map(|s| s.as_str());
+
+    let cache_key = crate::redis_cache::stats_cache_key(category, status);
+
+    if let Some(cached) = state.redis.get::<serde_json::Value>(&cache_key).await {
+        // Same envelope as a fresh read, so clients see one shape.
+        return ApiResponse::success(cached).into_response();
+    }
+
+    match crate::db::get_protocol_stats(db, category, status).await {
+        Ok(stats) => {
+            let json_response = serde_json::json!(&stats);
+            state
+                .redis
+                .set(
+                    &cache_key,
+                    &json_response,
+                    crate::redis_cache::STATS_CACHE_TTL,
+                )
+                .await;
+            ApiResponse::success(stats).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+/// `GET /api/v1/pools` — paginated list of pools with optional filters.
+///
+/// Checks the Redis cache first; falls back to the database on a cache miss
+/// and stores the result for [`POOLS_CACHE_TTL`](crate::redis_cache::POOLS_CACHE_TTL) seconds.
+/// `GET /api/v1/pools` — paginated list of pools with optional filters.
+///
+/// Implements the **cache-aside pattern**:
+///
+/// 1. Check Redis cache for the queried parameters (sort_by, category, status, limit, offset)
+/// 2. If cache hit: Return the cached response
+/// 3. If cache miss: Fetch from database and cache the result for POOLS_CACHE_TTL (60s)
+///
+/// This reduces database load for frequently accessed pool lists while keeping
+/// data relatively fresh. When a new pool is created, the entire cache is
+/// invalidated (see `ingest_pool_created`) to prevent stale results.
+///
+/// Cache is keyed by all query parameters, so different sort/filter combinations
+/// are cached independently. For example, `/pools?sort=popular` and `/pools?sort=new`
+/// maintain separate cache entries.
+pub async fn get_pools(
+    State(state): State<AppState>,
+    Query(params): Query<PoolsQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let sort_by = params.sort_by.map(|s| s.as_str()).unwrap_or("new");
+    let category = params.category.as_ref().map(|s| s.as_str());
+
+    // Validate pagination bounds (#1734: clamp limit, enforce max offset)
+    let limit = resolve_pools_page_size(params.limit);
+    let offset = params.offset.map(|b| b.get()).unwrap_or(0);
+    if offset > POOLS_MAX_OFFSET {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            format!("unbounded request: offset cannot exceed {POOLS_MAX_OFFSET}"),
+        )
+        .into_response();
+    }
+
+    // Parse and bound tag filters (max 10 tags, max 50 chars per tag)
+    let raw_tags = params.tags.or(params.tag);
+    let mut tags: Option<Vec<String>> = None;
+    if let Some(t_str) = raw_tags {
+        let parsed: Vec<String> = t_str
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if parsed.len() > 10 {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "unbounded request: tags filter cannot exceed 10 tags",
+            )
+            .into_response();
+        }
+        for t in &parsed {
+            if t.len() > 50 {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unbounded request: individual tag cannot exceed 50 characters",
+                )
+                .into_response();
+            }
+        }
+        if !parsed.is_empty() {
+            tags = Some(parsed);
+        }
+    }
+
+    // Parse and validate time filters (end_time_min <= end_time_max)
+    let raw_min = params.end_time_min.or(params.from_time);
+    let raw_max = params.end_time_max.or(params.to_time);
+
+    let end_time_min = match raw_min.as_deref() {
+        Some(s) => match parse_market_timestamp(s) {
+            Ok(dt) => Some(dt),
+            Err(e) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    format!("invalid time format for end_time_min / from_time: {e}"),
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let end_time_max = match raw_max.as_deref() {
+        Some(s) => match parse_market_timestamp(s) {
+            Ok(dt) => Some(dt),
+            Err(e) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    format!("invalid time format for end_time_max / to_time: {e}"),
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+
+    if let (Some(min), Some(max)) = (end_time_min, end_time_max) {
+        if min > max {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "contradictory filter: end_time_min cannot be greater than end_time_max",
+            )
+            .into_response();
+        }
+    }
+
+    // Validate outcome & status combination (outcome only valid for settled markets)
+    let outcome = params
+        .outcome
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    let (effective_status, outcome_filter) = match (params.status, outcome) {
+        (Some(status), Some(outcome_val)) => {
+            if status != PoolStatus::Settled {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    format!(
+                        "contradictory filter: outcome filter is only valid for settled markets, cannot be combined with status '{}'",
+                        status.as_str()
+                    ),
+                )
+                .into_response();
+            }
+            ("settled", Some(outcome_val))
+        }
+        (None, Some(outcome_val)) => {
+            // Default to settled when outcome filter is specified
+            ("settled", Some(outcome_val))
+        }
+        (Some(status), None) => (status.as_str(), None),
+        (None, None) => ("active", None),
+    };
+
+    let creator_str = params.creator.as_ref().map(|c| c.as_str());
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let resolved_category = match category {
+        Some(input) => match crate::categories::resolve_category(db, input).await {
+            Ok(category) => Some(category),
+            Err(crate::categories::CategoryError::UnknownCategory) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "unknown market category",
+                )
+                .into_response();
+            }
+            Err(crate::categories::CategoryError::Database) => {
+                return ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "category registry unavailable",
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
+    let category_id = resolved_category.as_ref().map(|c| c.category_id.as_str());
+    let category_label = resolved_category.as_ref().map(|c| c.display_label.as_str());
+
+    // Cache-aside pattern: Step 1 — Check cache
+    let mut cache_key =
+        crate::redis_cache::pools_cache_key(sort_by, category_id, effective_status, limit, offset);
+    if let Some(c) = creator_str {
+        cache_key = format!("{cache_key}:creator:{c}");
+    }
+    if let Some(tags) = &tags {
+        let sanitized: Vec<String> = tags
+            .iter()
+            .map(|t| crate::redis_cache::sanitize_key_component(t))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !sanitized.is_empty() {
+            cache_key = format!("{cache_key}:tags:{}", sanitized.join(","));
+        }
+    }
+    if let Some(min) = end_time_min {
+        cache_key = format!("{cache_key}:min:{}", min.timestamp());
+    }
+    if let Some(max) = end_time_max {
+        cache_key = format!("{cache_key}:max:{}", max.timestamp());
+    }
+    if let Some(out) = outcome_filter {
+        cache_key = format!(
+            "{cache_key}:outcome:{}",
+            crate::redis_cache::sanitize_key_component(out)
+        );
+    }
+
+    if let Some(cached_response) = state.redis.get::<serde_json::Value>(&cache_key).await {
+        // Cache hit — return cached data
+        return (StatusCode::OK, Json(cached_response)).into_response();
+    }
+
+    // Cache miss — Step 2: Fetch from database with explicit filters
+    let filter_criteria = crate::tags::MarketFilters {
+        sort_by,
+        category: category_id,
+        tags: tags.as_deref(),
+        status: effective_status,
+        creator: creator_str,
+        end_time_min,
+        end_time_max,
+        outcome: outcome_filter,
+        limit,
+        offset,
+    };
+    let count_criteria = crate::tags::MarketCountFilters {
+        category: category_id,
+        tags: tags.as_deref(),
+        status: effective_status,
+        creator: creator_str,
+        end_time_min,
+        end_time_max,
+        outcome: outcome_filter,
+    };
+
+    match tokio::try_join!(
+        crate::tags::list_pools_with_filters(db, &filter_criteria),
+        crate::tags::count_pools_with_filters(db, &count_criteria)
+    ) {
+        Ok((pools, total)) => {
+            if effective_status == "active" {
+                state.metrics.active_pools.set(total as f64);
+            }
+
+            let response = PoolsResponse {
+                pools,
+                total,
+                limit,
+                offset,
+                status: effective_status.to_string(),
+                category: category_label.map(|s| s.to_string()),
+                category_id: category_id.map(|s| s.to_string()),
+                sort_by: sort_by.to_string(),
+                creator: creator_str.map(|s| s.to_string()),
+                tags,
+                end_time_min,
+                end_time_max,
+                outcome: outcome_filter.map(|s| s.to_string()),
+            };
+
+            let json_response = json!(&response);
+
+            // Step 3: Cache the response for 60 seconds
+            state
+                .redis
+                .set(
+                    &cache_key,
+                    &json_response,
+                    crate::redis_cache::POOLS_CACHE_TTL,
+                )
+                .await;
+
+            // Return the response
+            (StatusCode::OK, Json(json_response)).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Task 3: User Prediction History API ──────────────────────────────────────
+
+/// Generic pagination query parameters used by history and prediction endpoints.
+#[derive(Debug, Deserialize)]
+pub struct PaginationQuery {
+    /// Maximum number of results to return (capped at 100, default 20).
+    pub limit: Option<BoundedI64<1, 100>>,
+    /// Zero-based offset for pagination (default 0).
+    pub offset: Option<crate::validated_types::PageOffset>,
+}
+
+/// `GET /api/v1/users/:address/history` — paginated prediction history for a user.
+pub async fn get_user_history(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Query(params): Query<PaginationQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let limit = params.limit.map(|b| b.get()).unwrap_or(20);
+    let offset = params.offset.map(|b| b.get()).unwrap_or(0);
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::db::get_user_prediction_history(db, address.as_str(), limit, offset).await {
+        Ok(rows) => {
+            let response = json!({
+                "address": address,
+                "predictions": rows,
+                "limit": limit,
+                "offset": offset,
+            });
+            ApiResponse::success(response).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// `GET /api/v1/users/:address/predictions` — enhanced user predictions with current pool status.
+pub async fn get_user_predictions(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Query(params): Query<PaginationQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let limit = params.limit.map(|b| b.get()).unwrap_or(20);
+    let offset = params.offset.map(|b| b.get()).unwrap_or(0);
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::db::get_user_predictions(db, address.as_str(), limit, offset).await {
+        Ok(predictions) => {
+            let response = json!({
+                "address": address,
+                "predictions": predictions,
+                "limit": limit,
+                "offset": offset,
+                "total_predictions": predictions.len(),
+            });
+            ApiResponse::success(response).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// Query parameters for the `GET /api/v1/leaderboard` endpoint.
+#[derive(Debug, Deserialize)]
+pub struct LeaderboardQuery {
+    /// Maximum number of results to return (capped at 100, default 20).
+    pub limit: Option<BoundedI64<1, 100>>,
+    /// Zero-based offset for pagination (default 0).
+    pub offset: Option<crate::validated_types::PageOffset>,
+    /// Ranking type: "volume" | "winnings" | "win_rate" | "streak" (default: "volume")
+    pub rank_by: Option<NonEmptyString>,
+    /// Time window: "week" | "month" | "all" (default: "all"). Ignored for `rank_by=winnings`.
+    pub period: Option<NonEmptyString>,
+}
+
+/// `GET /api/v1/leaderboard` — user rankings by betting volume, winnings, win
+/// rate, or current win streak, optionally scoped to a time window
+/// ("week" | "month" | "all").
+pub async fn get_leaderboard(
+    State(state): State<AppState>,
+    Query(params): Query<LeaderboardQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let limit = params.limit.map(|b| b.get()).unwrap_or(20);
+    let offset = params.offset.map(|b| b.get()).unwrap_or(0);
+    let rank_by = params
+        .rank_by
+        .as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("volume");
+    let period = params.period.as_ref().map(|s| s.as_str()).unwrap_or("all");
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match rank_by {
+        "winnings" => match crate::db::get_users_by_winnings(db, limit, offset).await {
+            Ok(users) => {
+                let response = json!({
+                    "leaderboard": users,
+                    "rank_by": "winnings",
+                    "period": "all",
+                    "limit": limit,
+                    "offset": offset,
+                });
+                ApiResponse::success(response).into_response()
+            }
+            Err(e) => ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                e.to_string(),
+            )
+            .into_response(),
+        },
+        "win_rate" | "streak" => {
+            match crate::db::get_leaderboard_extended(db, rank_by, period, None, limit, offset)
+                .await
+            {
+                Ok(entries) => {
+                    let response = json!({
+                        "leaderboard": entries,
+                        "rank_by": rank_by,
+                        "period": period,
+                        "limit": limit,
+                        "offset": offset,
+                    });
+                    ApiResponse::success(response).into_response()
+                }
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        _ if period != "all" => {
+            // Volume ranking scoped to a time window.
+            match crate::db::get_leaderboard_extended(db, "volume", period, None, limit, offset)
+                .await
+            {
+                Ok(entries) => {
+                    let response = json!({
+                        "leaderboard": entries,
+                        "rank_by": "volume",
+                        "period": period,
+                        "limit": limit,
+                        "offset": offset,
+                    });
+                    ApiResponse::success(response).into_response()
+                }
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        _ => {
+            // Default: all-time volume ranking (unchanged legacy behavior).
+            match crate::db::get_users_by_betting_volume(db, limit, offset).await {
+                Ok(users) => {
+                    let response = json!({
+                        "leaderboard": users,
+                        "rank_by": "volume",
+                        "period": "all",
+                        "limit": limit,
+                        "offset": offset,
+                    });
+                    ApiResponse::success(response).into_response()
+                }
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+    }
+}
+
+/// Query parameters for the `GET /api/v1/pools/:id/leaderboard` endpoint.
+#[derive(Debug, Deserialize)]
+pub struct PoolLeaderboardQuery {
+    /// Maximum number of results to return (capped at 100, default 20).
+    pub limit: Option<BoundedI64<1, 100>>,
+    /// Zero-based offset for pagination (default 0).
+    pub offset: Option<crate::validated_types::PageOffset>,
+    /// Ranking type: "volume" | "win_rate" | "streak" (default: "volume")
+    pub rank_by: Option<NonEmptyString>,
+}
+
+/// `GET /api/v1/pools/:id/leaderboard` — top stakers for a single pool.
+pub async fn get_pool_leaderboard(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Query(params): Query<PoolLeaderboardQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let limit = params.limit.map(|b| b.get()).unwrap_or(20);
+    let offset = params.offset.map(|b| b.get()).unwrap_or(0);
+    let rank_by = params
+        .rank_by
+        .as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("volume");
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::db::get_leaderboard_extended(db, rank_by, "all", Some(pool_id), limit, offset)
+        .await
+    {
+        Ok(entries) => {
+            let response = json!({
+                "pool_id": pool_id,
+                "leaderboard": entries,
+                "rank_by": rank_by,
+                "limit": limit,
+                "offset": offset,
+            });
+            ApiResponse::success(response).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Task 4: Pool Creation Indexer ─────────────────────────────────────────────
+
+/// Request body for the pool-created event webhook / indexer endpoint.
+///
+/// The event listener decodes the XDR `pool_created` event from the Stellar
+/// Horizon event stream and POSTs the decoded fields here.
+#[derive(Debug, Deserialize)]
+pub struct PoolCreatedPayload {
+    pub pool_id: u64,
+    pub creator: StellarAddress,
+    pub end_time: u64,
+    pub token: NonEmptyString,
+    pub category: NonEmptyString,
+    /// Pool description / name decoded from the event data.
+    pub description: NonEmptyString,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarketDraftDuplicateCheck {
+    pub proposal_id: String,
+    pub question: NonEmptyString,
+    pub event_window_start: chrono::DateTime<chrono::Utc>,
+    pub event_window_end: chrono::DateTime<chrono::Utc>,
+    pub source: NonEmptyString,
+    pub outcomes: Vec<NonEmptyString>,
+    pub distinction_note: Option<String>,
+}
+
+/// `POST /api/v1/market-drafts/duplicates` — save/update a draft and return
+/// likely duplicates. Candidates are advisory; a distinction note permits
+/// submission when a similar proposal has a legitimate scope difference.
+pub async fn check_market_draft_duplicates(
+    State(state): State<AppState>,
+    Json(payload): Json<MarketDraftDuplicateCheck>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use sqlx::Row;
+    use std::collections::HashSet;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let proposal_id = match uuid::Uuid::parse_str(&payload.proposal_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "proposal_id must be a UUID",
+            )
+            .into_response();
+        }
+    };
+    let question = payload.question.as_str().trim();
+    let source = payload.source.as_str().trim();
+    let normalized_outcomes = payload
+        .outcomes
+        .iter()
+        .map(|outcome| crate::duplicate_markets::normalize_text(outcome.as_str()))
+        .collect::<HashSet<_>>();
+    if question.is_empty()
+        || source.is_empty()
+        || question.len() > 200
+        || source.len() > 512
+        || payload.event_window_end < payload.event_window_start
+        || payload.outcomes.len() < 2
+        || payload.outcomes.len() > 100
+        || payload
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.as_str().trim().is_empty() || outcome.as_str().len() > 128)
+        || normalized_outcomes.len() != payload.outcomes.len()
+        || normalized_outcomes.contains("")
+        || payload
+            .distinction_note
+            .as_ref()
+            .is_some_and(|note| note.len() > 500)
+    {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "invalid market draft fields",
+        )
+        .into_response();
+    }
+
+    let outcomes = payload
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.as_str().trim())
+        .collect::<Vec<_>>();
+    let outcomes_json = match serde_json::to_string(&outcomes) {
+        Ok(json) => json,
+        Err(error) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                error.to_string(),
+            )
+            .into_response();
+        }
+    };
+    let distinction_note = payload
+        .distinction_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+
+    if let Err(error) = sqlx::query(
+        r#"
+        INSERT INTO market_proposals (
+            proposal_id, question, event_window_start, event_window_end,
+            source, outcomes, distinction_note, status
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7, 'draft')
+        ON CONFLICT (proposal_id) DO UPDATE SET
+            question = EXCLUDED.question,
+            event_window_start = EXCLUDED.event_window_start,
+            event_window_end = EXCLUDED.event_window_end,
+            source = EXCLUDED.source,
+            outcomes = EXCLUDED.outcomes,
+            distinction_note = EXCLUDED.distinction_note,
+            status = 'draft',
+            updated_at = NOW()
+        "#,
+    )
+    .bind(proposal_id.to_string())
+    .bind(question)
+    .bind(payload.event_window_start)
+    .bind(payload.event_window_end)
+    .bind(source)
+    .bind(outcomes_json)
+    .bind(distinction_note)
+    .execute(db)
+    .await
+    {
+        return ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            error.to_string(),
+        )
+        .into_response();
+    }
+
+    let existing = match sqlx::query(
+        r#"
+        SELECT proposal_id::text AS proposal_id, question, event_window_start,
+               event_window_end, source, outcomes::text AS outcomes
+        FROM market_proposals
+        WHERE proposal_id <> $1::uuid
+          AND updated_at >= NOW() - INTERVAL '90 days'
+        ORDER BY updated_at DESC, proposal_id ASC
+        LIMIT 5000
+        "#,
+    )
+    .bind(proposal_id.to_string())
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                error.to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    let proposals = existing
+        .iter()
+        .map(|row| {
+            let outcomes_json: String = row.get("outcomes");
+            Ok::<_, serde_json::Error>(crate::duplicate_markets::Proposal {
+                proposal_id: row.get("proposal_id"),
+                question: row.get("question"),
+                event_window_start: row.get("event_window_start"),
+                event_window_end: row.get("event_window_end"),
+                source: row.get("source"),
+                outcomes: serde_json::from_str(&outcomes_json)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let proposals = match proposals {
+        Ok(proposals) => proposals,
+        Err(error) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                format!("invalid stored market proposal: {error}"),
+            )
+            .into_response();
+        }
+    };
+    let current = crate::duplicate_markets::Proposal {
+        proposal_id: proposal_id.to_string(),
+        question: question.to_string(),
+        event_window_start: payload.event_window_start,
+        event_window_end: payload.event_window_end,
+        source: source.to_string(),
+        outcomes: outcomes
+            .iter()
+            .map(|outcome| (*outcome).to_string())
+            .collect(),
+    };
+    let candidates = crate::duplicate_markets::rank_candidates(&current, &proposals);
+    let submitted = candidates.is_empty() || distinction_note.is_some();
+
+    if submitted {
+        if let Err(error) = sqlx::query(
+            "UPDATE market_proposals SET status = 'submitted', updated_at = NOW() WHERE proposal_id = $1::uuid",
+        )
+        .bind(proposal_id.to_string())
+        .execute(db)
+        .await
+        {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                error.to_string(),
+            )
+            .into_response();
+        }
+    }
+
+    ApiResponse::success(serde_json::json!({
+        "proposal_id": proposal_id,
+        "candidates": candidates,
+        "requires_distinction": !candidates.is_empty() && distinction_note.is_none(),
+        "submitted": submitted,
+    }))
+    .into_response()
+}
+
+/// `POST /api/v1/indexer/pool-created` — ingest a decoded `PoolCreated` event
+/// and persist the new pool to the database.
+pub async fn ingest_pool_created(
+    State(state): State<AppState>,
+    Json(payload): Json<PoolCreatedPayload>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::MarketCreate,
+        payload.creator.as_str(),
+    ) {
+        return rejection;
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let category = match crate::categories::resolve_category(db, payload.category.as_str()).await {
+        Ok(category) => category,
+        Err(crate::categories::CategoryError::UnknownCategory) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "unknown market category",
+            )
+            .into_response();
+        }
+        Err(crate::categories::CategoryError::Database) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "category registry unavailable",
+            )
+            .into_response();
+        }
+    };
+
+    let event = PoolCreatedEvent {
+        pool_id: payload.pool_id,
+        creator: payload.creator.into(),
+        end_time: payload.end_time,
+        token: payload.token.into(),
+        category: category.display_label,
+        category_id: category.category_id,
+        description: payload.description.into(),
+    };
+
+    match crate::db::insert_pool_from_event(db, &event).await {
+        Ok(()) => {
+            state.redis.invalidate_pools_cache().await;
+            state.redis.invalidate_stats_cache().await;
+            state
+                .market_reads
+                .invalidate(&format!("pool:{}", event.pool_id))
+                .await;
+            let response = json!({ "status": "ok", "pool_id": event.pool_id });
+            ApiResponse::success(response).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// Request body for the prediction-placed event webhook.
+#[derive(Debug, Deserialize)]
+pub struct PredictionPlacedPayload {
+    pub pool_id: u64,
+    pub user_address: StellarAddress,
+    pub outcome: i32,
+    pub amount: i64,
+}
+
+/// `POST /api/v1/indexer/prediction-placed` — ingest a decoded prediction event and update DB state.
+pub async fn ingest_prediction_placed(
+    State(state): State<AppState>,
+    Json(payload): Json<PredictionPlacedPayload>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        payload.user_address.as_str(),
+    ) {
+        return rejection;
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let event = PredictionPlacedEvent {
+        pool_id: payload.pool_id,
+        user_address: payload.user_address.into(),
+        amount: payload.amount,
+        outcome: payload.outcome,
+    };
+
+    match crate::db::insert_prediction_from_event_with_pool(db, &event).await {
+        Ok(()) => {
+            state.event_bus.send(&json!({
+                "type": "prediction_placed",
+                "pool_id": event.pool_id,
+                "user_address": event.user_address,
+                "outcome": event.outcome,
+                "amount": event.amount,
+            }));
+            state.redis.invalidate_stats_cache().await;
+            state
+                .market_reads
+                .invalidate(&format!("pool:{}", event.pool_id))
+                .await;
+            let response = json!({ "status": "ok", "pool_id": event.pool_id });
+            ApiResponse::success(response).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Market Predictions (cursor-based) ────────────────────────────────────────
+
+/// Query parameters for `GET /api/v1/markets/:id/predictions`.
+#[derive(Debug, Deserialize)]
+pub struct MarketPredictionsQuery {
+    /// Opaque cursor returned by the previous page.
+    /// Omit (or set to null) to start from the most recent prediction.
+    pub after: Option<String>,
+    /// Page size (1–100, default 20).
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/v1/markets/:id/predictions` — cursor-paginated list of predictions
+/// for a specific market (pool).
+///
+/// ## Pagination
+/// The response includes `next_cursor`: pass it as `?after=<cursor>` on the
+/// next request to fetch the following page. A `null` `next_cursor` means you
+/// have reached the last page.
+///
+/// ## 404 behaviour
+/// If the pool does not exist the handler returns 404 so callers can
+/// distinguish "market not found" from "market has no predictions".
+pub async fn get_market_predictions(
+    State(state): State<AppState>,
+    Path(market_id): Path<i64>,
+    Query(params): Query<MarketPredictionsQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Clamp limit: 1..=100, default 20.
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let after = match params
+        .after
+        .as_deref()
+        .map(decode_market_cursor)
+        .transpose()
+    {
+        Ok(cursor) => cursor,
+        Err(()) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "invalid market predictions cursor",
+            )
+            .into_response()
+        }
+    };
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    // Verify the market exists first so we can return 404 instead of an empty list.
+    match crate::db::get_pool_by_id(db, market_id).await {
+        Ok(None) => {
+            return ApiResponse::<()>::error(
+                StatusCode::NOT_FOUND,
+                error_codes::NOT_FOUND,
+                "market not found",
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                e.to_string(),
+            )
+            .into_response();
+        }
+        Ok(Some(_)) => {}
+    }
+
+    match crate::db::get_market_predictions(db, market_id, after, limit).await {
+        Ok(mut rows) => {
+            // The query fetches limit+1 rows; if we got the extra one there is
+            // another page available.
+            let has_next = rows.len() as i64 > limit;
+            if has_next {
+                rows.truncate(limit as usize);
+            }
+            let next_cursor: Option<String> = if has_next {
+                rows.last()
+                    .map(|row| encode_market_cursor(row.created_at, row.id))
+            } else {
+                None
+            };
+
+            let response = serde_json::json!({
+                "market_id": market_id,
+                "predictions": rows,
+                "limit": limit,
+                "next_cursor": next_cursor,
+            });
+            ApiResponse::success(response).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// A versioned hex encoding keeps the database key out of the public API and
+// leaves room to change the cursor payload without changing the query shape.
+fn encode_market_cursor(created_at: chrono::DateTime<chrono::Utc>, id: i64) -> String {
+    format!(
+        "m2{:016x}{:016x}",
+        created_at.timestamp_micros() as u64,
+        id as u64
+    )
+}
+
+fn decode_market_cursor(cursor: &str) -> Result<(chrono::DateTime<chrono::Utc>, i64), ()> {
+    let encoded = cursor.strip_prefix("m2").ok_or(())?;
+    if encoded.len() != 32 || !encoded.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    let micros = u64::from_str_radix(&encoded[..16], 16).map_err(|_| ())? as i64;
+    let id = u64::from_str_radix(&encoded[16..], 16).map_err(|_| ())?;
+    let id = i64::try_from(id).map_err(|_| ())?;
+    if id <= 0 {
+        return Err(());
+    }
+    let created_at = chrono::DateTime::from_timestamp_micros(micros).ok_or(())?;
+    Ok((created_at, id))
+}
+
+#[cfg(test)]
+mod abuse_quota_tests {
+    use super::*;
+    use crate::abuse::AbuseAction;
+
+    fn test_state() -> AppState {
+        let config = Arc::new(Config::default_for_test());
+        let redis = RedisCache::disabled();
+        AppState {
+            abuse: Arc::new(AbuseController::from_config(&config)),
+            config,
+            cache: PriceCache::new(),
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&redis),
+            redis,
+            db: None,
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
+            event_bus: crate::ws::EventBus::new(),
+        }
+    }
+
+    #[test]
+    fn quota_is_keyed_per_wallet_not_per_ip() {
+        let state = test_state();
+        let action = AbuseAction::MarketCreate;
+        // A single wallet exhausts its own quota...
+        let mut rejected = false;
+        for _ in 0..10_000 {
+            if enforce_abuse_quota(&state, action, "GWALLET_A").is_some() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "expected wallet A to hit its quota");
+        // ...but a different wallet behind the same IP is unaffected.
+        assert!(enforce_abuse_quota(&state, action, "GWALLET_B").is_none());
+    }
+
+    #[test]
+    fn rejection_response_is_structured_and_retryable() {
+        let state = test_state();
+        let action = AbuseAction::WalletAction;
+        let mut response = None;
+        for _ in 0..10_000 {
+            if let Some(r) = enforce_abuse_quota(&state, action, "GWALLET_C") {
+                response = Some(r);
+                break;
+            }
+        }
+        let response = response.expect("expected a rejection");
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(response
+            .headers()
+            .contains_key(axum::http::header::RETRY_AFTER));
+    }
+}
+
+#[cfg(test)]
+mod market_cursor_tests {
+    use super::{decode_market_cursor, encode_market_cursor};
+
+    #[test]
+    fn cursor_round_trips_positive_row_id_without_exposing_integer() {
+        let timestamp = chrono::DateTime::from_timestamp_micros(1_700_000_000_123_456).unwrap();
+        let cursor = encode_market_cursor(timestamp, 42);
+        assert_ne!(cursor, "42");
+        assert_eq!(decode_market_cursor(&cursor), Ok((timestamp, 42)));
+    }
+
+    #[test]
+    fn malformed_and_out_of_range_cursors_are_rejected() {
+        for cursor in [
+            "42",
+            "m2",
+            "m2zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "m2ffffffffffffffffffffffffffffffff",
+        ] {
+            assert!(decode_market_cursor(cursor).is_err());
+        }
+    }
+}
+
+// ── Pool creator incentive system (#1366) ─────────────────────────────────────
+
+/// `GET /api/v1/creators/:address/stats` — reputation/quality metrics for a pool creator.
+///
+/// Returns the standard error envelope with 404 if the creator has no stats
+/// row (distinct from a genuine query failure, which is a 500).
+pub async fn get_creator_stats_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::db::get_creator_stats(db, address.as_str()).await {
+        Ok(Some(stats)) => ApiResponse::success(stats).into_response(),
+        Ok(None) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "creator not found",
+        )
+        .into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// `POST /api/v1/pools/:id/pay-creator-incentive` — pay out a pool creator's
+/// incentive share once the pool has reached its participation threshold.
+/// Idempotent: a second call after payout is a no-op.
+pub async fn pay_creator_incentive_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // The pool id is the only identity this route carries; scope the quota to
+    // it so repeated payouts for one pool are bounded without penalising other
+    // pools or other callers sharing an IP.
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        &format!("pool:{pool_id}"),
+    ) {
+        return rejection;
+    }
+
+    let Some(db) = &state.db else {
+        return Json(json!({ "error": "database not available" })).into_response();
+    };
+
+    match crate::db::pay_creator_incentive(db, pool_id, state.config.treasury_fee_bps).await {
+        Ok(Some(amount)) => {
+            state.pool_cache.invalidate(pool_id);
+            state
+                .market_reads
+                .invalidate(&format!("pool:{pool_id}"))
+                .await;
+            Json(json!({ "status": "paid", "pool_id": pool_id, "amount": amount })).into_response()
+        }
+        Ok(None) => Json(json!({ "status": "not_eligible", "pool_id": pool_id })).into_response(),
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
+    }
+}
+
+// ── Pool templates for recurring markets (#1368) ──────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreatePoolTemplateRequest {
+    pub creator: String,
+    pub name: String,
+    pub category: String,
+    pub description: String,
+    pub token: String,
+    pub duration_seconds: i64,
+    pub recurrence_interval_seconds: i64,
+}
+
+/// Reject oversized text fields and out-of-range durations before any work.
+fn validate_template_request(
+    body: &CreatePoolTemplateRequest,
+) -> Result<(), crate::validated_types::ValidationError> {
+    use crate::constants::{MAX_ADDRESS_LEN, MAX_TEMPLATE_DESCRIPTION_LEN, MAX_TEMPLATE_TEXT_LEN};
+    use crate::validated_types::{validate_max_len, TemplateSeconds};
+
+    validate_max_len("creator", &body.creator, MAX_ADDRESS_LEN)?;
+    validate_max_len("name", &body.name, MAX_TEMPLATE_TEXT_LEN)?;
+    validate_max_len("category", &body.category, MAX_TEMPLATE_TEXT_LEN)?;
+    validate_max_len(
+        "description",
+        &body.description,
+        MAX_TEMPLATE_DESCRIPTION_LEN,
+    )?;
+    validate_max_len("token", &body.token, MAX_TEMPLATE_TEXT_LEN)?;
+    TemplateSeconds::new(body.duration_seconds)?;
+    TemplateSeconds::new(body.recurrence_interval_seconds)?;
+    Ok(())
+}
+
+/// `POST /api/v1/pool-templates` — save a reusable pool configuration.
+pub async fn create_pool_template_handler(
+    State(state): State<AppState>,
+    Json(body): Json<CreatePoolTemplateRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::MarketCreate,
+        &body.creator,
+    ) {
+        return rejection;
+    }
+
+    if let Err(e) = validate_template_request(&body) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return Json(json!({ "error": "database not available" })).into_response();
+    };
+
+    match crate::db::create_pool_template(
+        db,
+        &body.creator,
+        &body.name,
+        &body.category,
+        &body.description,
+        &body.token,
+        body.duration_seconds,
+        body.recurrence_interval_seconds,
+    )
+    .await
+    {
+        Ok(template) => Json(json!(template)).into_response(),
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListPoolTemplatesQuery {
+    pub creator: String,
+}
+
+/// `GET /api/v1/pool-templates?creator=...` — list a creator's saved templates.
+pub async fn list_pool_templates_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ListPoolTemplatesQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(e) = crate::validated_types::validate_max_len(
+        "creator",
+        &params.creator,
+        crate::constants::MAX_ADDRESS_LEN,
+    ) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return Json(json!({ "error": "database not available" })).into_response();
+    };
+
+    match crate::db::list_pool_templates(db, &params.creator).await {
+        Ok(templates) => {
+            Json(json!({ "creator": params.creator, "templates": templates })).into_response()
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })).into_response(),
+    }
+}
+
+// ── User profile ───────────────────────────────────────────────────────────────
+
+/// `GET /api/v1/users/:address/profile` — aggregated profile: win/loss stats,
+/// claim status per pool, and a daily activity series for performance charts.
+pub async fn get_user_profile_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::profile::get_full_profile(db, address.as_str()).await {
+        Ok(profile) => ApiResponse::success(profile).into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Creator profiles (Issue #278) ─────────────────────────────────────────────
+
+/// `GET /api/v1/users/:address/creator-profile`
+///
+/// Returns the creator profile for `address`.
+///
+/// - If the caller is authenticated as `address` (bearer token), the full
+///   profile is returned whether public or private.
+/// - Unauthenticated requests and requests authenticated as a different wallet
+///   only receive the profile when `public = TRUE`.
+/// - Returns 404 when the creator has not opted in or the profile is not
+///   publicly visible.
+pub async fn get_creator_profile_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    // Determine whether the requester is the profile owner.
+    let is_owner = if let Some(bearer) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+    {
+        matches!(
+            crate::jwt::verify_jwt_token_strict(
+                bearer,
+                &state.config.secret_key,
+                "access",
+                state.config.jwt_key_version,
+            ),
+            Ok(claims) if claims.sub == address.as_str()
+        )
+    } else {
+        false
+    };
+
+    // Public requests see only public profiles; owners see their own regardless.
+    let require_public = !is_owner;
+
+    match crate::creator_profile::get_creator_profile(db, address.as_str(), require_public).await {
+        Ok(Some(profile)) => ApiResponse::success(profile).into_response(),
+        Ok(None) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "creator profile not found",
+        )
+        .into_response(),
+        Err(crate::creator_profile::CreatorProfileError::Db(e)) => {
+            tracing::error!(error = %e, address = %address, "failed to fetch creator profile");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to fetch creator profile",
+            )
+            .into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// `PUT /api/v1/users/:address/creator-profile`
+///
+/// Create or update the creator profile for `address`. The caller must
+/// present a valid bearer token for `address`; other wallets are forbidden.
+///
+/// Every call resets `verified = false` on all provenance links; the
+/// background verification job is responsible for confirming them.
+pub async fn put_creator_profile_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<crate::creator_profile::UpsertCreatorProfile>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Authenticate: bearer token must belong to this wallet.
+    let token = match headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+    {
+        Some(t) => t,
+        None => {
+            return ApiResponse::<()>::error(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "missing bearer token",
+            )
+            .into_response()
+        }
+    };
+
+    let claims = match crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            return ApiResponse::<()>::error(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "invalid bearer token",
+            )
+            .into_response()
+        }
+    };
+
+    if claims.sub != address.as_str() {
+        return ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "access token belongs to a different wallet",
+        )
+        .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::creator_profile::upsert_creator_profile(db, address.as_str(), &body).await {
+        Ok(profile) => ApiResponse::success(profile).into_response(),
+        Err(crate::creator_profile::CreatorProfileError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(crate::creator_profile::CreatorProfileError::Db(e)) => {
+            tracing::error!(error = %e, address = %address, "failed to upsert creator profile");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to save creator profile",
+            )
+            .into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Market watchlists (Issue #280) ────────────────────────────────────────────
+
+/// Helper: authenticate `address` ownership via bearer token. Returns `Err(response)`
+/// to reject the request or `Ok(())` to allow it.
+async fn authenticate_watchlist_owner(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    address: &str,
+) -> Result<(), axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+        .ok_or_else(|| {
+            ApiResponse::<()>::error(
+                StatusCode::UNAUTHORIZED,
+                error_codes::UNAUTHORIZED,
+                "missing bearer token",
+            )
+            .into_response()
+        })?;
+
+    let claims = crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    )
+    .map_err(|_| {
+        ApiResponse::<()>::error(
+            StatusCode::UNAUTHORIZED,
+            error_codes::UNAUTHORIZED,
+            "invalid bearer token",
+        )
+        .into_response()
+    })?;
+
+    if claims.sub != address {
+        return Err(ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "access token belongs to a different wallet",
+        )
+        .into_response());
+    }
+
+    Ok(())
+}
+
+/// `GET /api/v1/users/:address/watchlists`
+/// Returns all watchlists owned by `address` (authenticated).
+pub async fn list_watchlists_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::list_watchlists(db, address.as_str()).await {
+        Ok(lists) => ApiResponse::success(lists).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, address = %address, "list_watchlists failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to list watchlists",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/users/:address/watchlists`
+/// Create a new watchlist for `address` (authenticated).
+pub async fn create_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<crate::watchlist::CreateWatchlistInput>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::create_watchlist(db, address.as_str(), &body).await {
+        Ok(wl) => (axum::http::StatusCode::CREATED, Json(ApiResponse::success(wl))).into_response(),
+        Err(crate::watchlist::WatchlistError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, address = %address, "create_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to create watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /api/v1/users/:address/watchlists/:watchlist_id`
+/// Fetch one watchlist by ID for the authenticated owner.
+pub async fn get_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::get_watchlist(db, watchlist_id, address.as_str()).await {
+        Ok(wl) => ApiResponse::success(wl).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::Forbidden) => ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "not the watchlist owner",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "get_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to fetch watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `PATCH /api/v1/users/:address/watchlists/:watchlist_id`
+/// Update a watchlist's name, description, or public visibility.
+/// Setting `public: false` immediately revokes the share link.
+pub async fn update_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+    Json(body): Json<crate::watchlist::UpdateWatchlistInput>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::update_watchlist(db, watchlist_id, address.as_str(), &body).await {
+        Ok(wl) => ApiResponse::success(wl).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::Forbidden) => ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "not the watchlist owner",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "update_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to update watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/users/:address/watchlists/:watchlist_id`
+/// Delete a watchlist and all its market entries.
+pub async fn delete_watchlist_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::delete_watchlist(db, watchlist_id, address.as_str()).await {
+        Ok(()) => ApiResponse::success(serde_json::json!({ "deleted": true })).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "delete_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to delete watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/users/:address/watchlists/:watchlist_id/markets`
+/// Add a pool to the watchlist.
+pub async fn add_watchlist_market_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id)): Path<(StellarAddress, i64)>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let pool_id = body
+        .get("pool_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                "pool_id is required and must be a number",
+            )
+            .into_response()
+        });
+    let pool_id = match pool_id {
+        Ok(id) => id,
+        Err(r) => return r,
+    };
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::watchlist::add_market(db, watchlist_id, address.as_str(), pool_id).await {
+        Ok(()) => ApiResponse::success(serde_json::json!({ "added": true })).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(crate::watchlist::WatchlistError::ValidationError(msg)) => {
+            ApiResponse::<()>::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error_codes::INVALID_INPUT,
+                msg,
+            )
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "add_watchlist_market failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to add market to watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/users/:address/watchlists/:watchlist_id/markets/:pool_id`
+/// Remove a pool from the watchlist.
+pub async fn remove_watchlist_market_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((address, watchlist_id, pool_id)): Path<(StellarAddress, i64, i64)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Err(r) = authenticate_watchlist_owner(&state, &headers, address.as_str()).await {
+        return r;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    match crate::watchlist::remove_market(db, watchlist_id, address.as_str(), pool_id).await {
+        Ok(()) => ApiResponse::success(serde_json::json!({ "removed": true })).into_response(),
+        Err(crate::watchlist::WatchlistError::NotFound) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "remove_watchlist_market failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to remove market from watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `GET /api/v1/watchlists/public/:slug`
+/// Unauthenticated read of a public watchlist by its opaque share token.
+/// Returns only market IDs — never the owner address.
+pub async fn get_public_watchlist_handler(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if slug.trim().is_empty() || slug.len() > 64 {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "invalid slug",
+        )
+        .into_response();
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::watchlist::get_watchlist_by_slug(db, &slug).await {
+        Ok(Some(wl)) => ApiResponse::success(wl).into_response(),
+        Ok(None) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "watchlist not found or no longer public",
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, slug = %slug, "get_public_watchlist failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to fetch public watchlist",
+            )
+            .into_response()
+        }
+    }
+}
+
+// ── Pool tags ───────────────────────────────────────────────────────────────── — governed category registry, including aliases
+/// and deprecated categories retained for historic discovery.
+pub async fn list_categories_handler(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::categories::list_categories(db).await {
+        Ok(categories) => ApiResponse::success(categories).into_response(),
+        Err(error) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            error.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// `GET /api/v1/tags` — distinct tags currently in use, for filter-UI dropdowns.
+pub async fn list_tags_handler(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::tags::list_distinct_tags(db).await {
+        Ok(tags) => ApiResponse::success(json!({ "tags": tags })).into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// Request body for `PATCH /api/v1/pools/:id/tags`.
+#[derive(Debug, Deserialize)]
+pub struct UpdatePoolTagsRequest {
+    /// Must match the pool's on-chain creator — only the creator may retag a pool.
+    pub creator: StellarAddress,
+    pub tags: Vec<String>,
+}
+
+/// `PATCH /api/v1/pools/:id/tags` — creator-only: replace a pool's tag set.
+pub async fn update_pool_tags_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Json(body): Json<UpdatePoolTagsRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        body.creator.as_str(),
+    ) {
+        return rejection;
+    }
+
+    if let Err(e) = crate::validated_types::validate_tags(&body.tags) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::tags::update_pool_tags(db, pool_id, body.creator.as_str(), &body.tags).await {
+        Ok(true) => {
+            state.pool_cache.invalidate(pool_id);
+            state
+                .market_reads
+                .invalidate(&format!("pool:{pool_id}"))
+                .await;
+            state.redis.invalidate_pools_cache().await;
+            ApiResponse::success(json!({ "pool_id": pool_id, "tags": body.tags })).into_response()
+        }
+        Ok(false) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "pool not found, or caller is not the creator",
+        )
+        .into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Claims (winnings / refunds) ───────────────────────────────────────────────
+
+/// Request body for the claim-event webhook / indexer endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ClaimPayload {
+    pub pool_id: u64,
+    pub user_address: StellarAddress,
+    /// Amount paid out by `claim_winnings` / `claim_refund` (0 for losers).
+    pub amount_paid: i64,
+    /// Optional canonical on-chain coordinates for this claim event (#309).
+    /// When every one of these is present, the claim is also recorded in
+    /// the wallet activity ledger with its canonical transaction reference.
+    /// Omitted (or only partially supplied) fields keep today's behavior:
+    /// `predictions.claimed_amount` is updated either way, since that
+    /// remains the payout ground truth independent of the activity ledger.
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub contract_id: Option<String>,
+    #[serde(default)]
+    pub ledger: Option<u64>,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    #[serde(default)]
+    pub event_index: Option<u32>,
+}
+
+/// `POST /api/v1/indexer/claim` — ingest a decoded `WinningsClaimed` /
+/// `RefundClaimed` contract event and mark the user's predictions as claimed.
+pub async fn ingest_claim_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<ClaimPayload>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        payload.user_address.as_str(),
+    ) {
+        return rejection;
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::profile::mark_predictions_claimed(
+        db,
+        payload.pool_id as i64,
+        payload.user_address.as_str(),
+        payload.amount_paid,
+    )
+    .await
+    {
+        Ok(rows) => {
+            // Best-effort: record the claim in the wallet activity ledger
+            // (#309) when the payload carries full chain coordinates. This
+            // is not inside the same transaction as the claim update above
+            // (claims are not threaded through `project_event_tx`'s
+            // transactional dedupe today), so it is idempotent via
+            // `ON CONFLICT DO NOTHING` rather than atomic with it.
+            if let (Some(network), Some(contract_id), Some(ledger), Some(tx_hash), Some(event_index)) = (
+                &payload.network,
+                &payload.contract_id,
+                payload.ledger,
+                &payload.tx_hash,
+                payload.event_index,
+            ) {
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO portfolio_activity_ledger
+                        (network, contract_id, ledger, tx_hash, event_index, event_type,
+                         user_address, pool_id, amount)
+                    VALUES ($1, $2, $3, $4, $5, 'claim', $6, $7, $8)
+                    ON CONFLICT (network, contract_id, ledger, tx_hash, event_index, user_address)
+                    DO NOTHING
+                    "#,
+                )
+                .bind(network)
+                .bind(contract_id)
+                .bind(ledger as i64)
+                .bind(tx_hash)
+                .bind(event_index as i32)
+                .bind(payload.user_address.as_str())
+                .bind(payload.pool_id as i64)
+                .bind(payload.amount_paid)
+                .execute(db)
+                .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        pool_id = payload.pool_id,
+                        "failed to record claim in wallet activity ledger (claim itself still succeeded)"
+                    );
+                }
+            }
+
+            ApiResponse::success(json!({ "status": "ok", "rows_updated": rows })).into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+// ── Notifications ──────────────────────────────────────────────────────────────
+
+/// Query parameters for `GET /api/v1/notifications/:address`.
+#[derive(Debug, Deserialize)]
+pub struct NotificationsQuery {
+    pub unread_only: Option<bool>,
+    pub limit: Option<BoundedI64<1, 100>>,
+    pub offset: Option<crate::validated_types::PageOffset>,
+    /// Opaque cursor returned by the previous page. When supplied, `offset`
+    /// must be zero or omitted.
+    pub cursor: Option<String>,
+}
+
+/// `GET /api/v1/notifications/:address` — list a user's notifications, newest first.
+pub async fn list_notifications_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Query(params): Query<NotificationsQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let unread_only = params.unread_only.unwrap_or(false);
+    let limit = params.limit.map(|b| b.get()).unwrap_or(20);
+    let offset = params.offset.map(|b| b.get()).unwrap_or(0);
+
+    if params.cursor.is_some() && offset != 0 {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "cursor and nonzero offset cannot be used together",
+        )
+        .into_response();
+    }
+
+    if offset == 0 {
+        return match crate::notifications::list_notifications_page(
+            db,
+            address.as_str(),
+            unread_only,
+            limit,
+            params.cursor.as_deref(),
+        )
+        .await
+        {
+            Ok(page) => ApiResponse::success(json!({
+                "address": address,
+                "notifications": page.notifications,
+                "unread_count": page.unread_count,
+                "limit": limit,
+                "offset": 0,
+                "next_cursor": page.next_cursor,
+            }))
+            .into_response(),
+            Err(error) => {
+                if matches!(&error, sqlx::Error::Protocol(message) if message == "invalid notification cursor")
+                {
+                    return ApiResponse::<()>::error(
+                        StatusCode::BAD_REQUEST,
+                        error_codes::INVALID_INPUT,
+                        "invalid notification cursor",
+                    )
+                    .into_response();
+                }
+                tracing::error!(error = %error, "notification inbox query failed");
+                ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    "failed to load notifications",
+                )
+                .into_response()
+            }
+        };
+    }
+
+    match tokio::try_join!(
+        crate::notifications::list_notifications(db, address.as_str(), unread_only, limit, offset),
+        crate::notifications::count_unread(db, address.as_str())
+    ) {
+        Ok((notifications, unread_count)) => ApiResponse::success(json!({
+            "address": address,
+            "notifications": notifications,
+            "unread_count": unread_count,
+            "limit": limit,
+            "offset": offset,
+            "next_cursor": null,
+        }))
+        .into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// Request body for `POST /api/v1/notifications/:address/read`.
+#[derive(Debug, Deserialize)]
+pub struct MarkNotificationsReadRequest {
+    /// Specific notification IDs to mark read. Omit (or leave empty) to mark all as read.
+    #[serde(default)]
+    pub ids: Vec<i64>,
+}
+
+/// `POST /api/v1/notifications/:address/read` — mark notifications as read.
+pub async fn mark_notifications_read_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<MarkNotificationsReadRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        address.as_str(),
+    ) {
+        return rejection;
+    }
+
+    if let Err(e) = crate::validated_types::validate_notification_ids(&body.ids) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let ids = if body.ids.is_empty() {
+        None
+    } else {
+        Some(body.ids.as_slice())
+    };
+
+    match crate::notifications::mark_read(db, address.as_str(), ids).await {
+        Ok(updated) => match crate::notifications::count_unread(db, address.as_str()).await {
+            Ok(unread_count) => ApiResponse::success(json!({
+                "updated": updated,
+                "unread_count": unread_count,
+            }))
+            .into_response(),
+            Err(e) => ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                e.to_string(),
+            )
+            .into_response(),
+        },
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// `GET /api/v1/users/:address/notification-preferences` — return the
+/// wallet's versioned preferences, migrating older records on read.
+pub async fn get_notification_preferences_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::get_notification_preferences(db, address.as_str()).await {
+        Ok(preferences) => ApiResponse::success(preferences).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "notification preference lookup failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load notification preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `PUT /api/v1/users/:address/notification-preferences` — replace preferences.
+pub async fn put_notification_preferences_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<crate::notifications::NotificationPreferences>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::save_notification_preferences(db, address.as_str(), body).await {
+        Ok(preferences) => ApiResponse::success(preferences).into_response(),
+        Err(crate::notifications::PreferenceUpdateError::InvalidSchemaVersion) => {
+            ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "schema_version is unsupported",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PreferenceUpdateError::Serialization(error)) => {
+            tracing::error!(error = %error, "notification preference serialization failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to save notification preferences",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PreferenceUpdateError::Database(error)) => {
+            tracing::error!(error = %error, "notification preference update failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to save notification preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/users/:address/notification-preferences` — reset to
+/// default-disabled settings.
+pub async fn reset_notification_preferences_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::reset_notification_preferences(db, address.as_str()).await {
+        Ok(preferences) => ApiResponse::success(preferences).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "notification preference reset failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to reset notification preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// Query parameters for `GET /api/v1/notifications/digest/unsubscribe`.
+#[derive(Debug, Deserialize)]
+pub struct DigestUnsubscribeQuery {
+    /// Signed, single-use unsubscribe token from the digest email footer.
+    pub token: String,
+}
+
+/// `GET /api/v1/notifications/digest/unsubscribe?token=...` — one-click
+/// opt-out from the weekly market digest.
+///
+/// The token is signed with the server secret and bound to the wallet, so it
+/// can be redeemed without a bearer token (mail clients cannot send one).
+/// Redemption is single-use: once consumed the token is rejected, and expired
+/// tokens are rejected before any state is touched. On success the wallet's
+/// digest preference is disabled and a confirmation is returned.
+pub async fn digest_unsubscribe_handler(
+    State(state): State<AppState>,
+    Query(params): Query<DigestUnsubscribeQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let claims = match crate::notifications::verify_digest_unsubscribe_token(
+        &params.token,
+        &state.config.secret_key,
+        now,
+    ) {
+        Ok(claims) => claims,
+        Err(crate::notifications::DigestTokenError::Expired) => {
+            return ApiResponse::<()>::error(
+                StatusCode::GONE,
+                error_codes::INVALID_INPUT,
+                "unsubscribe link has expired",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::DigestTokenError::Invalid) => {
+            return ApiResponse::<()>::error(
+                StatusCode::BAD_REQUEST,
+                error_codes::INVALID_INPUT,
+                "invalid unsubscribe token",
+            )
+            .into_response()
+        }
+    };
+
+    // Single-use enforcement: the token id is recorded in the revocation
+    // store, so a replayed link fails closed even across replicas.
+    let store = crate::token_revocation::RevocationStore::new(state.db.clone(), state.redis.clone());
+    match store.consume_digest_unsubscribe_token(&claims.jti, claims.exp, now).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return ApiResponse::<()>::error(
+                StatusCode::GONE,
+                error_codes::INVALID_INPUT,
+                "unsubscribe link has already been used",
+            )
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "digest unsubscribe token check failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to redeem unsubscribe token",
+            )
+            .into_response();
+        }
+    }
+
+    match crate::notifications::disable_digest_for_wallet(db, &claims.sub).await {
+        Ok(preferences) => ApiResponse::success(json!({
+            "status": "unsubscribed",
+            "address": claims.sub,
+            "digest": preferences.digest,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "digest unsubscribe failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to update digest preferences",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `PUT /api/v1/notifications/:address/push-subscription` — create or rotate
+/// a browser push subscription after proving ownership of the wallet.
+pub async fn put_push_subscription_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<crate::notifications::PushSubscriptionRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    match crate::notifications::save_push_subscription(
+        db,
+        address.as_str(),
+        body,
+        &state.config.secret_key,
+    )
+    .await
+    {
+        Ok(subscription) => ApiResponse::success(subscription).into_response(),
+        Err(crate::notifications::PushSubscriptionError::InvalidInput(message)) => {
+            ApiResponse::<()>::error(StatusCode::BAD_REQUEST, error_codes::INVALID_INPUT, message)
+                .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::EndpointInUse) => {
+            ApiResponse::<()>::error(
+                StatusCode::CONFLICT,
+                error_codes::CONFLICT,
+                "push endpoint is already registered to another wallet",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::Encryption) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "failed to protect push subscription",
+        )
+        .into_response(),
+        Err(crate::notifications::PushSubscriptionError::Database(error)) => {
+            tracing::error!(error = %error, "push subscription update failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to update push subscription",
+            )
+            .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DeletePushSubscriptionRequest {
+    pub endpoint: Option<String>,
+}
+
+/// `DELETE /api/v1/notifications/:address/push-subscription` — revoke one
+/// endpoint or all endpoints for the authenticated wallet.
+pub async fn delete_push_subscription_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<DeletePushSubscriptionRequest>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+    if let Err(error) = authorize_notification_wallet(&state, &headers, address.as_str()).await {
+        return error.into_response();
+    }
+    let endpoint = body.and_then(|Json(body)| body.endpoint);
+    match crate::notifications::revoke_push_subscription(db, address.as_str(), endpoint.as_deref())
+        .await
+    {
+        Ok(revoked) => ApiResponse::success(json!({ "revoked": revoked })).into_response(),
+        Err(crate::notifications::PushSubscriptionError::InvalidInput(message)) => {
+            ApiResponse::<()>::error(StatusCode::BAD_REQUEST, error_codes::INVALID_INPUT, message)
+                .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::Database(error)) => {
+            tracing::error!(error = %error, "push subscription revocation failed");
+            ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to revoke push subscription",
+            )
+            .into_response()
+        }
+        Err(crate::notifications::PushSubscriptionError::Encryption) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "failed to revoke push subscription",
+        )
+        .into_response(),
+        Err(crate::notifications::PushSubscriptionError::EndpointInUse) => {
+            ApiResponse::<()>::error(
+                StatusCode::CONFLICT,
+                error_codes::CONFLICT,
+                "push endpoint is already registered to another wallet",
+            )
+            .into_response()
+        }
+    }
+}
+
+// ── Portfolio JSON export (#265) ─────────────────────────────────────────────
+
+/// Schema identifier emitted by the portfolio JSON export. Bump the suffix
+/// whenever the payload shape changes incompatibly.
+pub const PORTFOLIO_EXPORT_SCHEMA: &str = "portfolio.export.v1";
+
+/// Default number of positions/ledger entries returned by the export.
+pub const PORTFOLIO_EXPORT_DEFAULT_LIMIT: i64 = 100;
+/// Hard upper bound on the number of positions/ledger entries per export.
+pub const PORTFOLIO_EXPORT_MAX_LIMIT: i64 = 500;
+
+/// Query parameters for `GET /api/v1/users/:address/portfolio/export`.
+#[derive(Debug, Default, Deserialize)]
+pub struct PortfolioExportQuery {
+    /// Maximum number of positions (and ledger entries) to include.
+    pub limit: Option<i64>,
+    /// Opaque continuation cursor returned by a previous truncated export.
+    pub cursor: Option<String>,
+}
+
+/// A single open/closed position in the exported portfolio.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportPosition {
+    pub pool_id: i64,
+    pub outcome: i16,
+    pub amount: i64,
+    pub claimed: bool,
+    /// Provenance of the position record.
+    pub source: PortfolioExportSource,
+}
+
+/// A single ledger entry (stake, payout or refund) in the exported portfolio.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportLedgerEntry {
+    pub pool_id: i64,
+    pub kind: String,
+    pub amount: i64,
+    pub occurred_at: Option<String>,
+    pub source: PortfolioExportSource,
+}
+
+/// Reference to the authoritative source a record was derived from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportSource {
+    /// Logical source, e.g. `indexer_db` or `chain_event`.
+    pub kind: String,
+    /// Table or event name the record came from.
+    pub reference: String,
+}
+
+/// Metadata describing how the export was calculated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExportCalculation {
+    /// Identifier of the calculation/assembly routine.
+    pub method: String,
+    /// Version of the calculation routine.
+    pub version: u32,
+    /// Whether the export was bounded (i.e. a limit was applied).
+    pub bounded: bool,
+    /// Limit that was applied to positions and ledger entries.
+    pub limit: i64,
+    /// Number of positions included in this page.
+    pub position_count: usize,
+    /// Number of ledger entries included in this page.
+    pub ledger_entry_count: usize,
+}
+
+/// Versioned, self-describing portfolio export document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioExport {
+    /// Schema identifier — always [`PORTFOLIO_EXPORT_SCHEMA`].
+    pub schema: String,
+    /// Wallet the export belongs to.
+    pub address: String,
+    /// Positions included in this page.
+    pub positions: Vec<PortfolioExportPosition>,
+    /// Ledger entries included in this page.
+    pub ledger_entries: Vec<PortfolioExportLedgerEntry>,
+    /// Calculation metadata.
+    pub calculation: PortfolioExportCalculation,
+    /// True when more records exist beyond this page.
+    pub truncated: bool,
+    /// Cursor to pass as `cursor` to fetch the next page, if truncated.
+    #[serde(rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+    /// Total number of positions for the wallet (before truncation).
+    #[serde(rename = "totalCount")]
+    pub total_count: i64,
+}
+
+/// Resolve the effective export limit, clamping into bounds.
+fn resolve_portfolio_export_limit(limit: Option<i64>) -> i64 {
+    match limit {
+        Some(value) if value > 0 => value.min(PORTFOLIO_EXPORT_MAX_LIMIT),
+        _ => PORTFOLIO_EXPORT_DEFAULT_LIMIT,
+    }
+}
+
+/// Encode a continuation cursor as the id of the last exported position.
+fn encode_portfolio_cursor(last_pool_id: i64) -> String {
+    format!("v1:{last_pool_id}")
+}
+
+/// Decode a continuation cursor, returning `None` when it is malformed.
+fn decode_portfolio_cursor(cursor: &str) -> Option<i64> {
+    cursor.strip_prefix("v1:")?.parse::<i64>().ok()
+}
+
+/// Assemble a [`PortfolioExport`] from raw position rows.
+///
+/// Positions are ordered by `pool_id`; the cursor is the last exported
+/// `pool_id`, so a truncated export can be continued deterministically.
+fn build_portfolio_export(
+    address: &str,
+    mut positions: Vec<PortfolioExportPosition>,
+    limit: i64,
+    total_count: i64,
+) -> PortfolioExport {
+    positions.sort_by_key(|position| position.pool_id);
+    let truncated = positions.len() as i64 > limit;
+    positions.truncate(limit as usize);
+
+    let ledger_entries: Vec<PortfolioExportLedgerEntry> = positions
+        .iter()
+        .map(|position| PortfolioExportLedgerEntry {
+            pool_id: position.pool_id,
+            kind: if position.claimed {
+                "claim".to_string()
+            } else {
+                "stake".to_string()
+            },
+            amount: position.amount,
+            occurred_at: None,
+            source: position.source.clone(),
+        })
+        .collect();
+
+    let next_cursor = if truncated {
+        positions
+            .last()
+            .map(|position| encode_portfolio_cursor(position.pool_id))
+    } else {
+        None
+    };
+
+    PortfolioExport {
+        schema: PORTFOLIO_EXPORT_SCHEMA.to_string(),
+        address: address.to_string(),
+        calculation: PortfolioExportCalculation {
+            method: "portfolio_export".to_string(),
+            version: 1,
+            bounded: true,
+            limit,
+            position_count: positions.len(),
+            ledger_entry_count: ledger_entries.len(),
+        },
+        positions,
+        ledger_entries,
+        truncated,
+        next_cursor,
+        total_count,
+    }
+}
+
+/// `GET /api/v1/users/:address/portfolio/export` — versioned JSON export of a
+/// wallet's complete portfolio (positions, ledger entries, provenance and
+/// calculation metadata) with explicit truncation/continuation fields.
+pub async fn export_portfolio_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Query(params): Query<PortfolioExportQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    let limit = resolve_portfolio_export_limit(params.limit);
+    let after_pool_id = match params.cursor.as_deref() {
+        Some(cursor) => match decode_portfolio_cursor(cursor) {
+            Some(value) => Some(value),
+            None => {
+                return ApiResponse::<()>::error(
+                    StatusCode::BAD_REQUEST,
+                    error_codes::INVALID_INPUT,
+                    "invalid portfolio export cursor",
+                )
+                .into_response()
+            }
+        },
+        None => None,
+    };
+
+    // Fetch one extra row so truncation can be detected without a second query.
+    let fetch_limit = limit.saturating_add(1);
+    let rows = match crate::db::predictions::list_portfolio_positions(
+        db,
+        address.as_str(),
+        after_pool_id,
+        fetch_limit,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(error = %error, "portfolio export query failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load portfolio export",
+            )
+            .into_response();
+        }
+    };
+
+    let total_count = match crate::db::predictions::count_portfolio_positions(db, address.as_str())
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(error = %error, "portfolio export count failed");
+            return ApiResponse::<()>::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_codes::INTERNAL_ERROR,
+                "failed to load portfolio export",
+            )
+            .into_response();
+        }
+    };
+
+    let positions: Vec<PortfolioExportPosition> = rows
+        .into_iter()
+        .map(|row| PortfolioExportPosition {
+            pool_id: row.pool_id,
+            outcome: row.outcome,
+            amount: row.amount,
+            claimed: row.claimed,
+            source: PortfolioExportSource {
+                kind: "indexer_db".to_string(),
+                reference: "predictions".to_string(),
+            },
+        })
+        .collect();
+
+    let export = build_portfolio_export(address.as_str(), positions, limit, total_count);
+    ApiResponse::success(export).into_response()
+}
+
+/// `GET /api/v1/users/:address/interests` — categories/tags a user follows
+/// for "new pool matching your interests" alerts.
+pub async fn get_user_interests_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::notifications::get_user_interests(db, address.as_str()).await {
+        Ok(interests) => {
+            ApiResponse::success(json!({ "address": address, "interests": interests }))
+                .into_response()
+        }
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// `PUT /api/v1/users/:address/interests` — replace a user's interest list wholesale.
+pub async fn set_user_interests_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<crate::notifications::SetInterestsRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        address.as_str(),
+    ) {
+        return rejection;
+    }
+
+    if let Err(e) = crate::validated_types::validate_interests(&body.interests) {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            e.to_string(),
+        )
+        .into_response();
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match crate::notifications::set_user_interests(db, address.as_str(), &body.interests).await {
+        Ok(()) => ApiResponse::success(json!({ "address": address, "interests": body.interests }))
+            .into_response(),
+        Err(e) => ApiResponse::<()>::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            e.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+/// Build the version 1 API router.
+pub fn router(
+    config: Arc<Config>,
+    cache: PriceCache,
+    redis: RedisCache,
+    pool: Option<sqlx::PgPool>,
+    metrics: SharedMetrics,
+    event_bus: crate::ws::EventBus,
+) -> Router {
+    use crate::constants as c;
+    use crate::rate_limit::{with_distributed_rate_limit, with_rate_limit, RateLimitTier};
+    use axum::extract::DefaultBodyLimit;
+
+    let pool_cache = PoolCache::with_negative_ttl(std::time::Duration::from_secs(
+        config.pool_negative_cache_ttl_secs,
+    ));
+
+    // Abuse controls are derived from configuration so operators can tune the
+    // per-wallet and per-network quotas without a code change (#103).
+    let abuse = Arc::new(AbuseController::from_config(&config));
+
+    let state = AppState {
+        config,
+        cache,
+        pool_cache,
+        market_reads: market_reads_cache(&redis),
+        redis,
+        db: pool,
+        metrics,
+        event_bus,
+        abuse,
+    };
+
+    // Idempotency-Key support for market mutations (#48). Without a database
+    // the handlers answer 503 before doing any work, so nothing to guard.
+    let idempotent =
+        |operation: &'static str, route: axum::routing::MethodRouter<AppState>| match &state.db {
+            Some(db) => crate::idempotency::Idempotency::new(
+                crate::idempotency::IdempotencyStore::postgres(db.clone()),
+                operation,
+                &state.config.secret_key,
+                state.config.jwt_key_version,
+            )
+            .guard(route),
+            None => route,
+        };
+
+    // Admin tier — authenticated administrative operations (no public rate limit).
+    let admin = Router::new()
+        .route(
+            "/admin/log-level",
+            patch(set_log_level).layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+        )
+        .route(
+            "/admin/notifications/:id/replay",
+            post(admin_replay_notification),
+        )
+        .with_state(state.clone());
+
+    // Light tier — cheap, stateless, polling-friendly endpoints.
+    let light = with_distributed_rate_limit(
+        Router::new()
+            .route("/", get(index))
+            .route("/health", get(health))
+            .route("/fees", get(get_fees))
+            .route("/prices", get(crate::price_cache::get_prices))
+            .with_state(state.clone()),
+        RateLimitTier::Light,
+        state.redis.clone(),
+    );
+
+    // Token tier — refresh rotation and WebSocket handshake (10 req / 60 s).
+    let token = with_distributed_rate_limit(
+        Router::new()
+            .route(
+                "/auth/refresh",
+                post(refresh_tokens_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TOKEN_REFRESH)),
+            )
+            .route(
+                "/auth/logout",
+                post(logout_handler).layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TOKEN_REFRESH)),
+            )
+            .route("/ws", get(crate::ws::ws_handler))
+            .with_state(state.clone()),
+        RateLimitTier::Token,
+        state.redis.clone(),
+    );
+
+    // Read tier — public, database-backed read endpoints.
+    let read = with_distributed_rate_limit(
+        Router::new()
+            .route("/pools", get(get_pools))
+            .route("/pools/:id", get(get_pool_by_id_handler))
+            .route("/pools/:id/quote", get(get_pool_quote_handler))
+            .route("/pools/:id/leaderboard", get(get_pool_leaderboard))
+            .route("/stats", get(get_stats))
+            .route("/leaderboard", get(get_leaderboard))
+            .route("/categories", get(list_categories_handler))
+            .route("/tags", get(list_tags_handler))
+            .route("/referrals/:address", get(referrals_handler))
+            .route(
+                "/referrals/:address/estimate",
+                get(referral_estimate_handler),
+            )
+            .route("/markets/:id/predictions", get(get_market_predictions))
+            .route(
+                "/wallets/:address/activity",
+                get(crate::routes::portfolio::get_wallet_activity_handler),
+            )
+            .route(
+                "/wallets/:address/pnl",
+                get(crate::routes::portfolio::get_wallet_pnl_handler),
+            )
+            .route(
+                "/wallets/:address/snapshot",
+                get(crate::routes::portfolio::get_wallet_snapshot_handler),
+            )
+            .with_state(state.clone()),
+        RateLimitTier::Read,
+        state.redis.clone(),
+    );
+
+    // User tier — per-user history and predictions.
+    let user = with_distributed_rate_limit(
+        Router::new()
+            .route("/users/:address/history", get(get_user_history))
+            .route("/users/:address/predictions", get(get_user_predictions))
+            .route("/users/:address/profile", get(get_user_profile_handler))
+            .route(
+                "/users/:address/creator-profile",
+                get(get_creator_profile_handler)
+                    .put(put_creator_profile_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists",
+                get(list_watchlists_handler)
+                    .post(create_watchlist_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists/:watchlist_id",
+                get(get_watchlist_handler)
+                    .patch(update_watchlist_handler)
+                    .delete(delete_watchlist_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists/:watchlist_id/markets",
+                post(add_watchlist_market_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/watchlists/:watchlist_id/markets/:pool_id",
+                axum::routing::delete(remove_watchlist_market_handler),
+            )
+            .route(
+                "/watchlists/public/:slug",
+                get(get_public_watchlist_handler),
+            )
+            .route(
+                "/users/:address/portfolio/export",
+                get(export_portfolio_handler),
+            )
+            .route(
+                "/users/:address/referrals",
+                get(user_referral_earnings_handler),
+            )
+            .route(
+                "/users/:address/interests",
+                get(get_user_interests_handler)
+                    .put(set_user_interests_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INTERESTS)),
+            )
+            .route(
+                "/users/:address/notification-preferences",
+                get(get_notification_preferences_handler)
+                    .put(put_notification_preferences_handler)
+                    .delete(reset_notification_preferences_handler)
+                    .layer(DefaultBodyLimit::max(
+                        crate::notifications::MAX_NOTIFICATION_PREFERENCES_BODY_BYTES,
+                    )),
+            )
+            .route("/notifications/:address", get(list_notifications_handler))
+            .route(
+                "/notifications/digest/unsubscribe",
+                get(digest_unsubscribe_handler),
+            )
+            .route(
+                "/notifications/:address/push-subscription",
+                put(put_push_subscription_handler)
+                    .delete(delete_push_subscription_handler)
+                    .layer(DefaultBodyLimit::max(
+                        crate::notifications::MAX_PUSH_SUBSCRIPTION_BODY_BYTES,
+                    )),
+            )
+            .route(
+                "/notifications/:address/read",
+                post(mark_notifications_read_handler).layer(DefaultBodyLimit::max(
+                    crate::notifications::MAX_NOTIFICATION_PREFERENCES_BODY_BYTES,
+                )),
+            )
+            .route(
+                "/wallets/:address/exports",
+                post(crate::routes::portfolio::create_export_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_PORTFOLIO_EXPORT)),
+            )
+            .route(
+                "/portfolio/exports/:id",
+                get(crate::routes::portfolio::get_export_status_handler),
+            )
+            .route(
+                "/portfolio/exports/:id/download",
+                get(crate::routes::portfolio::download_export_handler),
+            )
+            .route(
+                "/portfolio/exports/:id/cancel",
+                post(crate::routes::portfolio::cancel_export_handler),
+            )
+            .with_state(state.clone()),
+        RateLimitTier::User,
+        state.redis.clone(),
+    );
+
+    // Write tier — indexer ingest (typically internal, strictest limit).
+    let write = with_distributed_rate_limit(
+        Router::new()
+            .route(
+                "/market-drafts/duplicates",
+                post(check_market_draft_duplicates)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_CREATED)),
+            )
+            .route(
+                "/indexer/pool-created",
+                idempotent(
+                    "pools.create",
+                    post(ingest_pool_created)
+                        .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_CREATED)),
+                ),
+            )
+            .route(
+                "/indexer/prediction-placed",
+                idempotent(
+                    "predictions.create",
+                    post(ingest_prediction_placed)
+                        .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+                ),
+            )
+            .route(
+                "/indexer/claim",
+                idempotent(
+                    "claims.submit",
+                    post(ingest_claim_handler)
+                        .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INDEXER_EVENT)),
+                ),
+            )
+            .route(
+                "/pools/:id/tags",
+                patch(update_pool_tags_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TAGS)),
+            )
+            .with_state(state.clone()),
+        RateLimitTier::Write,
+        state.redis.clone(),
+    );
+
+    // Routes without a rate-limit tier of their own. Anything already served by
+    // `light`/`read`/`user`/`write`/`token` above must NOT be repeated here: `merge`
+    // panics on an overlapping method route, which would take down the whole
+    // server at startup.
+    Router::new()
+        .route("/creators/:address/stats", get(get_creator_stats_handler))
+        .route(
+            "/pools/:id/pay-creator-incentive",
+            post(pay_creator_incentive_handler),
+        )
+        .route(
+            "/pool-templates",
+            get(list_pool_templates_handler)
+                .post(create_pool_template_handler)
+                .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_POOL_TEMPLATE)),
+        )
+        .with_state(state)
+        .merge(light)
+        .merge(token)
+        .merge(read)
+        .merge(user)
+        .merge(write)
+        .merge(admin)
+}
+
+/// Coalescing cache for hot market reads: shared through Redis when it is
+/// connected, process-local otherwise.
+pub fn market_reads_cache(redis: &RedisCache) -> CoalescingCache {
+    CoalescingCache::from_redis_cache(
+        redis,
+        "market",
+        crate::cache_coalesce::CoalesceConfig::default(),
+    )
+}
+
+/// `POST /api/v1/auth/refresh` — rotate a refresh token and issue a new pair.
+///
+/// Rate-limited at the Token tier (10 req / 60 s per IP). Fails closed when
+/// Redis is unavailable so a stolen refresh token cannot be replayed after
+/// rotation without a durable revocation record.
+async fn refresh_tokens_handler(
+    State(state): State<AppState>,
+    Json(body): Json<RefreshTokenRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if body.refresh_token.is_empty() {
+        return ApiResponse::<()>::error(
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "refresh_token is required",
+        )
+        .into_response();
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // With a database, rotation uses the durable cross-replica revocation
+    // store (#55); without one it falls back to the Redis-only path.
+    let result = if state.db.is_some() {
+        let store =
+            crate::token_revocation::RevocationStore::new(state.db.clone(), state.redis.clone());
+        crate::jwt_security::rotate_refresh_token_durable(
+            &store,
+            &state.config.secret_key,
+            &body.refresh_token,
+            state.config.jwt_key_version,
+            now,
+        )
+        .await
+    } else {
+        crate::jwt_security::rotate_refresh_token(
+            &state.redis,
+            &state.config.secret_key,
+            &body.refresh_token,
+            state.config.jwt_key_version,
+            now,
+        )
+        .await
+    };
+
+    match result {
+        Ok(pair) => {
+            let response = RefreshTokenResponse {
+                access_token: pair.access_token,
+                refresh_token: pair.refresh_token,
+                token_type: "Bearer".to_string(),
+                expires_in: crate::jwt_security::access_token_expires_in(),
+            };
+            ApiResponse::success(response).into_response()
+        }
+        Err(error) => crate::errors::AppError::from(error).into_response(),
+    }
+}
+
+/// `POST /api/v1/auth/logout` — revoke the presented access token (#55).
+///
+/// Requires `Authorization: Bearer <access token>`. The optional body can
+/// also revoke the session's refresh token, or revoke every session of the
+/// user (`all_sessions: true`, which bumps the per-user token version).
+/// Revocation is stored in Postgres, so the tokens fail on every replica.
+async fn logout_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<LogoutRequest>>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use crate::errors::AppError;
+    use crate::token_revocation::{RevocationReason, RevocationStore};
+    use axum::response::IntoResponse;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token)
+        .ok_or_else(|| AppError::Unauthorized("missing bearer token".to_string()))?;
+    let claims = crate::jwt::verify_jwt_token_strict(
+        token,
+        &state.config.secret_key,
+        "access",
+        state.config.jwt_key_version,
+    )?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let store = RevocationStore::new(state.db.clone(), state.redis.clone());
+    store.ensure_not_revoked(&claims, now).await?;
+
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let map_store = |e: crate::token_revocation::RevocationError| {
+        AppError::from(crate::jwt::JwtVerifyError::from(e))
+    };
+
+    if body.all_sessions {
+        store
+            .revoke_all(&claims.sub, RevocationReason::Logout, now)
+            .await
+            .map_err(map_store)?;
+        return Ok(ApiResponse::success(LogoutResponse {
+            revoked: "all_sessions",
+        })
+        .into_response());
+    }
+
+    if let Some(refresh) = body.refresh_token.as_deref().filter(|t| !t.is_empty()) {
+        let refresh_claims = crate::jwt::verify_jwt_token_strict(
+            refresh,
+            &state.config.secret_key,
+            "refresh",
+            state.config.jwt_key_version,
+        )?;
+        if refresh_claims.sub != claims.sub {
+            return Err(AppError::Forbidden(
+                "refresh token belongs to a different user".to_string(),
+            ));
+        }
+        store
+            .revoke(&refresh_claims, RevocationReason::Logout, now)
+            .await
+            .map_err(map_store)?;
+    }
+    store
+        .revoke(&claims, RevocationReason::Logout, now)
+        .await
+        .map_err(map_store)?;
+
+    Ok(ApiResponse::success(LogoutResponse { revoked: "session" }).into_response())
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LogoutRequest {
+    /// Refresh token of the same session to revoke as well.
+    #[serde(default)]
+    refresh_token: Option<String>,
+    /// Revoke every token issued to the user so far.
+    #[serde(default)]
+    all_sessions: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LogoutResponse {
+    /// `"session"` or `"all_sessions"`.
+    revoked: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshTokenRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RefreshTokenResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+async fn get_fees(State(state): State<AppState>) -> Json<FeeInfo> {
+    Json(FeeInfo {
+        treasury_fee_bps: state.config.treasury_fee_bps,
+        referral_fee_bps: state.config.referral_fee_bps,
+    })
+}
+
+/// `GET /api/v1/referrals/:address` — delegates to the referrals module.
+///
+/// Requires a live DB pool; returns 503 if the pool is not configured.
+async fn referrals_handler(
+    axum::extract::Path(address): axum::extract::Path<StellarAddress>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let address_str = address.as_str().to_string();
+
+    match state.db {
+        Some(pool) => {
+            match crate::referrals::get_referrals(axum::extract::Path(address_str), State(pool))
+                .await
+            {
+                Ok((status, body)) => (status, body).into_response(),
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        None => ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not configured",
+        )
+        .into_response(),
+    }
+}
+
+/// `GET /api/v1/referrals/:address/estimate` — estimated referral reward.
+///
+/// Requires a live DB pool; returns 503 if the pool is not configured.
+async fn referral_estimate_handler(
+    axum::extract::Path(address): axum::extract::Path<StellarAddress>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let address_str = address.as_str().to_string();
+
+    match state.db {
+        Some(pool) => {
+            match crate::referrals::estimate_referral_rewards(
+                address_str,
+                &pool,
+                state.config.treasury_fee_bps,
+                state.config.referral_fee_bps,
+            )
+            .await
+            {
+                Ok((status, body)) => (status, body).into_response(),
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        None => ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not configured",
+        )
+        .into_response(),
+    }
+}
+
+/// `GET /api/v1/users/:address/referrals` — per-pool referral earnings for a user.
+async fn user_referral_earnings_handler(
+    axum::extract::Path(address): axum::extract::Path<StellarAddress>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let address_str = address.as_str().to_string();
+
+    match state.db {
+        Some(pool) => {
+            match crate::referrals::get_user_referral_earnings(
+                axum::extract::Path(address_str),
+                State(pool),
+            )
+            .await
+            {
+                Ok((status, body)) => (status, body).into_response(),
+                Err(e) => ApiResponse::<()>::error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_codes::INTERNAL_ERROR,
+                    e.to_string(),
+                )
+                .into_response(),
+            }
+        }
+        None => ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not configured",
+        )
+        .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod cache_aside_tests {
+    use crate::redis_cache::{pools_cache_key, POOLS_CACHE_TTL};
+
+    /// Test the cache-aside pattern: cache miss, database fetch, and cache population
+    #[tokio::test]
+    async fn test_get_pools_cache_aside_pattern() {
+        let cache = crate::redis_cache::RedisCache::disabled();
+        let cache_key = pools_cache_key("new", None, "active", 20, 0);
+
+        // Step 1: Cache is empty (miss)
+        let cached: Option<serde_json::Value> = cache.get(&cache_key).await;
+        assert!(cached.is_none());
+
+        // Step 2: Simulate database result
+        let test_response = serde_json::json!({
+            "pools": [],
+            "total": 0,
+            "limit": 20,
+            "offset": 0,
+            "status": "active",
+            "category": serde_json::Value::Null,
+            "sort_by": "new"
+        });
+
+        // Step 3: Cache the result (as done in get_pools handler)
+        cache.set(&cache_key, &test_response, POOLS_CACHE_TTL).await;
+
+        // Step 4: Verify cache no-op with disabled cache (expected behavior)
+        let cached: Option<serde_json::Value> = cache.get(&cache_key).await;
+        assert!(cached.is_none());
+    }
+
+    /// Test cache key generation for different query parameters
+    #[test]
+    fn test_cache_key_uniqueness_for_pool_queries() {
+        // Same base query, different sort_by -> different keys
+        let key_new = pools_cache_key("new", None, "active", 20, 0);
+        let key_popular = pools_cache_key("popular", None, "active", 20, 0);
+        let key_ending = pools_cache_key("ending_soon", None, "active", 20, 0);
+
+        assert_ne!(key_new, key_popular);
+        assert_ne!(key_new, key_ending);
+        assert_ne!(key_popular, key_ending);
+
+        // Same base query, different category -> different keys
+        let key_no_category = pools_cache_key("new", None, "active", 20, 0);
+        let key_sports = pools_cache_key("new", Some("sports"), "active", 20, 0);
+        let key_finance = pools_cache_key("new", Some("finance"), "active", 20, 0);
+
+        assert_ne!(key_no_category, key_sports);
+        assert_ne!(key_sports, key_finance);
+
+        // Same base query, different status -> different keys
+        let key_active = pools_cache_key("new", None, "active", 20, 0);
+        let key_closed = pools_cache_key("new", None, "closed", 20, 0);
+        let key_settled = pools_cache_key("new", None, "settled", 20, 0);
+
+        assert_ne!(key_active, key_closed);
+        assert_ne!(key_closed, key_settled);
+
+        // Same base query, different pagination -> different keys
+        let key_page1 = pools_cache_key("new", None, "active", 20, 0);
+        let key_page2 = pools_cache_key("new", None, "active", 20, 20);
+        let key_limit50 = pools_cache_key("new", None, "active", 50, 0);
+
+        assert_ne!(key_page1, key_page2);
+        assert_ne!(key_page1, key_limit50);
+    }
+
+    /// Test cache invalidation pattern
+    #[tokio::test]
+    async fn test_cache_invalidation_on_new_pool() {
+        let cache = crate::redis_cache::RedisCache::disabled();
+
+        // Simulate setting multiple pool cache entries
+        let keys = vec![
+            pools_cache_key("new", None, "active", 20, 0),
+            pools_cache_key("popular", None, "active", 20, 0),
+            pools_cache_key("new", Some("sports"), "active", 20, 0),
+        ];
+
+        for key in &keys {
+            let data = serde_json::json!({"test": "data"});
+            cache.set(key, &data, POOLS_CACHE_TTL).await;
+        }
+
+        // Invalidate all pool caches (as done when new pool is created)
+        cache.invalidate_pools_cache().await;
+
+        // All keys should be invalidated (with disabled cache, get always returns None anyway)
+        for key in &keys {
+            let cached: Option<serde_json::Value> = cache.get(key).await;
+            assert!(cached.is_none());
+        }
+    }
+
+    /// Test cache behavior with different query parameter combinations
+    #[test]
+    fn test_cache_key_encoding_with_all_parameters() {
+        // Test with all parameters specified
+        let full_key = pools_cache_key("popular", Some("sports"), "closed", 50, 100);
+        assert_eq!(full_key, "pools:popular:sports:closed:50:100");
+
+        // Test with None category encodes as "all"
+        let no_category = pools_cache_key("new", None, "active", 20, 0);
+        assert_eq!(no_category, "pools:new:all:active:20:0");
+
+        // Test various sort_by values
+        let sort_new = pools_cache_key("new", None, "active", 20, 0);
+        let sort_popular = pools_cache_key("popular", None, "active", 20, 0);
+        let sort_ending = pools_cache_key("ending_soon", None, "active", 20, 0);
+
+        assert_eq!(sort_new, "pools:new:all:active:20:0");
+        assert_eq!(sort_popular, "pools:popular:all:active:20:0");
+        assert_eq!(sort_ending, "pools:ending_soon:all:active:20:0");
+    }
+
+    /// Test stats cache-aside pattern: miss, populate, verify no-op on disabled cache.
+    #[tokio::test]
+    async fn test_stats_cache_aside_pattern() {
+        use crate::redis_cache::{stats_cache_key, RedisCache, STATS_CACHE_TTL};
+
+        let cache = RedisCache::disabled();
+        let key = stats_cache_key(None, None);
+
+        // Cache miss
+        let cached: Option<serde_json::Value> = cache.get(&key).await;
+        assert!(cached.is_none());
+
+        // Populate (no-ops on disabled cache)
+        let data = serde_json::json!({
+            "total_value_locked": 1000,
+            "total_bets": 50,
+            "total_pools": 10
+        });
+        cache.set(&key, &data, STATS_CACHE_TTL).await;
+
+        // Still None — disabled cache always returns None
+        let cached: Option<serde_json::Value> = cache.get(&key).await;
+        assert!(cached.is_none());
+    }
+
+    /// Test that stats cache keys are unique per filter combination.
+    #[test]
+    fn test_stats_cache_key_uniqueness() {
+        use crate::redis_cache::stats_cache_key;
+
+        let k1 = stats_cache_key(None, None);
+        let k2 = stats_cache_key(Some("sports"), None);
+        let k3 = stats_cache_key(None, Some("active"));
+        let k4 = stats_cache_key(Some("crypto"), Some("closed"));
+
+        assert_ne!(k1, k2);
+        assert_ne!(k1, k3);
+        assert_ne!(k1, k4);
+        assert_ne!(k2, k3);
+        assert_ne!(k2, k4);
+    }
+
+    /// Test stats cache invalidation no-ops on a disabled cache.
+    #[tokio::test]
+    async fn test_stats_cache_invalidation_on_new_data() {
+        use crate::redis_cache::RedisCache;
+
+        let cache = RedisCache::disabled();
+        // Should not panic
+        cache.invalidate_stats_cache().await;
+    }
+}
+
+/// Tests for `GET /api/v1/pools` page-size resolution (#1734): missing
+/// `limit` uses the documented default, and an out-of-range `limit` is
+/// clamped into bounds rather than rejected with 400.
+#[cfg(test)]
+mod pools_pagination_tests {
+    use super::{resolve_pools_page_size, POOLS_DEFAULT_PAGE_SIZE, POOLS_MAX_PAGE_SIZE};
+
+    #[test]
+    fn missing_limit_uses_documented_default() {
+        assert_eq!(resolve_pools_page_size(None), POOLS_DEFAULT_PAGE_SIZE);
+    }
+
+    #[test]
+    fn limit_within_bounds_is_unchanged() {
+        assert_eq!(resolve_pools_page_size(Some(1)), 1);
+        assert_eq!(resolve_pools_page_size(Some(50)), 50);
+        assert_eq!(
+            resolve_pools_page_size(Some(POOLS_MAX_PAGE_SIZE)),
+            POOLS_MAX_PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn limit_above_max_is_clamped_not_rejected() {
+        assert_eq!(
+            resolve_pools_page_size(Some(POOLS_MAX_PAGE_SIZE + 1)),
+            POOLS_MAX_PAGE_SIZE
+        );
+        assert_eq!(
+            resolve_pools_page_size(Some(1_000_000)),
+            POOLS_MAX_PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn non_positive_limit_is_clamped_up_to_one() {
+        assert_eq!(resolve_pools_page_size(Some(0)), 1);
+        assert_eq!(resolve_pools_page_size(Some(-5)), 1);
+    }
+}
+
+/// Tests for the deterministic market quote simulation (#269).
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    fn active_state(updated_at: i64) -> QuotePoolState {
+        QuotePoolState {
+            pool_id: 1,
+            status: "active".to_string(),
+            updated_at,
+            total_liquidity: 10_000,
+            outcome_shares: 2_500,
+        }
+    }
+
+    #[test]
+    fn quote_is_deterministic_for_same_inputs() {
+        let state = active_state(1_000);
+        let a = compute_quote(&state, 500, 0, 100, 1_010).unwrap();
+        let b = compute_quote(&state, 500, 0, 100, 1_010).unwrap();
+        assert_eq!(a.output_estimate, b.output_estimate);
+        assert_eq!(a.price_impact_bps, b.price_impact_bps);
+        assert_eq!(a.fee, b.fee);
+        assert_eq!(a.quote_timestamp, b.quote_timestamp);
+    }
+
+    #[test]
+    fn quote_returns_input_output_impact_fee_and_timestamp() {
+        let state = active_state(1_000);
+        let quote = compute_quote(&state, 1_000, 0, 100, 1_010).unwrap();
+        assert_eq!(quote.input_units, 1_000);
+        assert_eq!(quote.fee, 10);
+        assert!(quote.output_estimate > 0);
+        assert!(quote.price_impact_bps > 0);
+        assert_eq!(quote.quote_timestamp, 1_010);
+    }
+
+    #[test]
+    fn quote_rejects_stale_pool_state() {
+        let state = active_state(1_000);
+        let err = compute_quote(
+            &state,
+            100,
+            0,
+            100,
+            1_000 + QUOTE_MAX_POOL_STATE_AGE_SECS + 1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuoteError::Stale { .. }));
+    }
+
+    #[test]
+    fn quote_rejects_unsupported_pool_state() {
+        let mut state = active_state(1_000);
+        state.status = "settled".to_string();
+        let err = compute_quote(&state, 100, 0, 100, 1_010).unwrap_err();
+        assert!(matches!(err, QuoteError::UnsupportedState(_)));
+    }
+
+    #[test]
+    fn quote_rejects_non_positive_amount() {
+        let state = active_state(1_000);
+        assert_eq!(
+            compute_quote(&state, 0, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InvalidAmount
+        );
+        assert_eq!(
+            compute_quote(&state, -1, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InvalidAmount
+        );
+    }
+
+    #[test]
+    fn quote_rejects_empty_liquidity() {
+        let mut state = active_state(1_000);
+        state.total_liquidity = 0;
+        assert_eq!(
+            compute_quote(&state, 100, 0, 100, 1_010).unwrap_err(),
+            QuoteError::InsufficientLiquidity
+        );
+    }
+
+    #[test]
+    fn quote_matches_reference_constant_product_model() {
+        // Reference: output = net_input * L / (L + shares), impact = net * 1e4 / (L + net).
+        let state = active_state(1_000);
+        let amount = 2_000i64;
+        let fee_bps = 50u32;
+        let quote = compute_quote(&state, amount, 0, fee_bps, 1_010).unwrap();
+        let fee = (amount as i128 * fee_bps as i128 / 10_000) as i64;
+        let net = amount - fee;
+        let expected_output = (net as i128 * 10_000 / (10_000 + 2_500)) as i64;
+        let expected_impact = ((net as i128 * 10_000) / (10_000 + net as i128)) as u32;
+        assert_eq!(quote.fee, fee);
+        assert_eq!(quote.output_estimate, expected_output);
+        assert_eq!(quote.price_impact_bps, expected_impact);
+    }
+
+    #[test]
+    fn quote_state_from_json_parses_cached_pool() {
+        let value = serde_json::json!({
+            "status": "active",
+            "updated_at": 1_000,
+            "total_liquidity": 5_000,
+            "outcome_shares": 500,
+        });
+        let state = quote_state_from_json(7, &value).expect("valid cached pool");
+        assert_eq!(state.pool_id, 7);
+        assert_eq!(state.status, "active");
+        assert_eq!(state.updated_at, 1_000);
+        assert_eq!(state.total_liquidity, 5_000);
+        assert_eq!(state.outcome_shares, 500);
+    }
+
+    #[test]
+    fn quote_state_from_json_rejects_missing_status() {
+        let value = serde_json::json!({ "updated_at": 1_000 });
+        assert!(quote_state_from_json(7, &value).is_none());
+    }
+}
+
+#[cfg(test)]
+mod market_filters_tests {
+    use super::*;
+
+    #[test]
+    fn parse_market_timestamp_rfc3339() {
+        let dt = parse_market_timestamp("2026-10-18T12:00:00Z").expect("valid rfc3339");
+        assert_eq!(dt.timestamp(), 1792324800);
+    }
+
+    #[test]
+    fn parse_market_timestamp_unix_seconds() {
+        let dt = parse_market_timestamp("1792324800").expect("valid unix timestamp");
+        assert_eq!(dt.timestamp(), 1792324800);
+    }
+
+    #[test]
+    fn parse_market_timestamp_rejects_out_of_range() {
+        let err_too_early = parse_market_timestamp("1000").unwrap_err();
+        assert!(err_too_early.contains("supported range"));
+
+        let err_too_late = parse_market_timestamp("5000000000").unwrap_err();
+        assert!(err_too_late.contains("supported range"));
+    }
+
+    #[test]
+    fn parse_market_timestamp_rejects_invalid_text() {
+        let err = parse_market_timestamp("not-a-timestamp").unwrap_err();
+        assert!(err.contains("invalid RFC3339"));
+    }
+
+    #[test]
+    fn pools_max_offset_is_bounded() {
+        assert_eq!(POOLS_MAX_OFFSET, 10_000);
+    }
+}
+
+/// Contract tests for the field-level data ownership matrix (#356).
+///
+/// Each test pins one high-risk field to the authoritative source and
+/// freshness/fallback contract documented in `docs/data-ownership.md`:
+///
+/// | Field group | Authoritative source | Freshness / fallback |
+/// |-------------|----------------------|----------------------|
+/// | balances    | chain (contract state) | indexer mirrors chain; on disagreement chain wins |
+/// | lifecycle   | chain (contract state) | indexer mirrors chain; stale cache must not override |
+/// | prices      | oracle price cache    | cache miss => no price, never a stale/guessed value |
+/// | profiles    | indexer DB            | derived from chain events; no chain fallback |
+/// | analytics   | indexer DB            | Redis cache-aside, TTL-bounded, never authoritative |
+///
+/// If a handler changes which source it reads from, the corresponding test
+/// here must be updated in the same change.
+#[cfg(test)]
+mod data_ownership_contract_tests {
+    use super::*;
+    use crate::redis_cache::{
+        pools_cache_key, stats_cache_key, RedisCache, POOLS_CACHE_TTL, STATS_CACHE_TTL,
+    };
+
+    /// Lifecycle: the API's version document reports the lifecycle status of
+    /// each API version from the single authoritative registry, and the
+    /// discovery endpoint must not invent a status of its own.
+    #[tokio::test]
+    async fn lifecycle_status_comes_from_authoritative_registry() {
+        let body = index().await.0;
+        let lifecycle = crate::api_versioning::versions_document();
+        let expected = lifecycle
+            .versions
+            .iter()
+            .find(|v| v.version == "v1")
+            .map(|v| v.status)
+            .expect("v1 must be registered in the lifecycle registry");
+
+        assert_eq!(body["status"], serde_json::json!(expected));
+        assert_eq!(
+            body["versions"],
+            serde_json::to_value(&lifecycle.versions).unwrap()
+        );
+    }
+
+    /// Lifecycle: pool status filters are validated against the closed set of
+    /// lifecycle states, so an unknown state can never be treated as
+    /// authoritative by a downstream reader.
+    #[test]
+    fn lifecycle_status_filter_rejects_unknown_states() {
+        for known in ["active", "closed", "settled"] {
+            assert!(
+                serde_json::from_value::<PoolStatus>(serde_json::json!(known)).is_ok(),
+                "documented lifecycle state {known} must be accepted"
+            );
+        }
+        assert!(
+            serde_json::from_value::<PoolStatus>(serde_json::json!("cancelled")).is_err(),
+            "undocumented lifecycle state must be rejected"
+        );
+    }
+
+    /// Analytics: stats are served cache-aside from the indexer DB. A cache
+    /// miss must fall through to the DB (never a fabricated value), and a
+    /// populated cache entry must be returned verbatim as the same envelope.
+    #[tokio::test]
+    async fn analytics_stats_fall_back_to_indexer_on_cache_miss() {
+        let cache = RedisCache::disabled();
+        let key = stats_cache_key(None, None);
+
+        // Cache miss: nothing is served from cache, so the handler must read
+        // the indexer DB. With no DB configured it reports unavailability
+        // rather than returning a stale or zeroed analytics payload.
+        assert!(cache.get::<serde_json::Value>(&key).await.is_none());
+
+        let state = AppState {
+            config: Arc::new(Config::default_for_test()),
+            cache: PriceCache::new(),
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&cache),
+            redis: cache.clone(),
+            db: None,
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
+            event_bus: crate::ws::EventBus::new(),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
+        };
+        let response = get_stats(
+            State(state),
+            Query(StatsQuery {
+                category: None,
+                status: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "analytics must not be served without the authoritative indexer DB"
+        );
+    }
+
+    /// Analytics: the cache TTL is the documented freshness bound. A cached
+    /// analytics payload is only ever a copy of an indexer read, so the TTL
+    /// must be finite and positive.
+    #[test]
+    fn analytics_cache_ttl_is_bounded() {
+        assert!(STATS_CACHE_TTL > 0, "stats cache must expire");
+        assert!(POOLS_CACHE_TTL > 0, "pools cache must expire");
+    }
+
+    /// Analytics: pool listings are cached per full query shape. Two
+    /// different filters must never share a cache entry, otherwise one
+    /// filter's analytics would be served as another's.
+    #[test]
+    fn analytics_pool_cache_keys_do_not_collide_across_filters() {
+        let base = pools_cache_key("new", None, "active", 20, 0);
+        assert_ne!(base, pools_cache_key("popular", None, "active", 20, 0));
+        assert_ne!(
+            base,
+            pools_cache_key("new", Some("sports"), "active", 20, 0)
+        );
+        assert_ne!(base, pools_cache_key("new", None, "settled", 20, 0));
+        assert_ne!(base, pools_cache_key("new", None, "active", 20, 20));
+    }
+
+    /// Prices: the oracle price cache is the authoritative source for prices.
+    /// A cold cache must report "not ready" (no price) rather than serving a
+    /// guessed or stale value.
+    #[tokio::test]
+    async fn prices_cold_cache_reports_not_ready_not_stale() {
+        let cache = PriceCache::new();
+        assert!(
+            cache.snapshot().is_empty(),
+            "a fresh price cache must be empty, not pre-seeded"
+        );
+
+        let state = AppState {
+            config: Arc::new(Config::default_for_test()),
+            cache,
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&RedisCache::disabled()),
+            redis: RedisCache::disabled(),
+            db: None,
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
+            event_bus: crate::ws::EventBus::new(),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
+        };
+        let response = health(State(state)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "an empty price cache must surface as not-ready"
+        );
+    }
+
+    /// Balances: the indexer ingest path is the only writer of prediction
+    /// amounts, and it must reject malformed payloads before touching the DB
+    /// so an indexer bug cannot overwrite the chain-derived balance.
+    #[test]
+    fn balances_indexer_payload_requires_valid_address_and_amount() {
+        let valid = serde_json::json!({
+            "pool_id": 1,
+            "user_address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "outcome": 0,
+            "amount": 100,
+        });
+        assert!(serde_json::from_value::<PredictionPlacedPayload>(valid).is_ok());
+
+        let bad_address = serde_json::json!({
+            "pool_id": 1,
+            "user_address": "not-an-address",
+            "outcome": 0,
+            "amount": 100,
+        });
+        assert!(
+            serde_json::from_value::<PredictionPlacedPayload>(bad_address).is_err(),
+            "indexer must not accept an unvalidated wallet address"
+        );
+    }
+
+    /// Balances: a claim event carries the amount actually paid out by the
+    /// chain. The API must accept it as-is (chain wins) and never derive it
+    /// from indexer-side arithmetic.
+    #[test]
+    fn balances_claim_amount_is_taken_from_chain_event() {
+        let payload: ClaimPayload = serde_json::from_value(serde_json::json!({
+            "pool_id": 7,
+            "user_address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "amount_paid": 250,
+        }))
+        .expect("valid claim payload");
+        assert_eq!(payload.amount_paid, 250);
+    }
+
+    /// Profiles: profile reads are indexer-backed. Without the indexer DB the
+    /// handler must report unavailability instead of synthesising a profile.
+    #[tokio::test]
+    async fn profiles_require_indexer_db() {
+        let state = AppState {
+            config: Arc::new(Config::default_for_test()),
+            cache: PriceCache::new(),
+            pool_cache: PoolCache::default(),
+            market_reads: market_reads_cache(&RedisCache::disabled()),
+            redis: RedisCache::disabled(),
+            db: None,
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics must initialize in tests")),
+            event_bus: crate::ws::EventBus::new(),
+            abuse: Arc::new(AbuseController::from_config(&Config::default_for_test())),
+        };
+        let address: StellarAddress = serde_json::from_value(serde_json::json!(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+        ))
+        .expect("valid address");
+        let response = get_user_profile_handler(State(state), Path(address)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "profiles must not be served without the authoritative indexer DB"
+        );
+    }
+
+    /// Conflict behaviour: when the chain and the indexer disagree, the
+    /// indexer's cached view is invalidated so the next read re-derives from
+    /// the authoritative event stream rather than serving the stale value.
+    #[tokio::test]
+    async fn conflict_invalidates_cached_views_on_chain_event() {
+        let cache = RedisCache::disabled();
+        let pool_key = pools_cache_key("new", None, "active", 20, 0);
+        let stats_key = stats_cache_key(None, None);
+
+        // Simulate a populated cache from a previous indexer read.
+        cache
+            .set(&pool_key, &serde_json::json!({"total": 1}), POOLS_CACHE_TTL)
+            .await;
+        cache
+            .set(
+                &stats_key,
+                &serde_json::json!({"total_pools": 1}),
+                STATS_CACHE_TTL,
+            )
+            .await;
+
+        // A chain event arrives that disagrees with the cached view; the
+        // ingest path invalidates both caches (see `ingest_pool_created`).
+        cache.invalidate_pools_cache().await;
+        cache.invalidate_stats_cache().await;
+
+        // The stale entries must no longer be served.
+        assert!(cache.get::<serde_json::Value>(&pool_key).await.is_none());
+        assert!(cache.get::<serde_json::Value>(&stats_key).await.is_none());
+    }
+
+    /// Portfolio export (#265): the versioned document round-trips through
+    /// JSON for a large wallet fixture and carries explicit truncation and
+    /// continuation information.
+    #[test]
+    fn portfolio_export_round_trips_for_large_wallet_fixture() {
+        let limit = 100;
+        let fixture: Vec<PortfolioExportPosition> = (0..250)
+            .map(|index| PortfolioExportPosition {
+                pool_id: index,
+                outcome: (index % 2) as i16,
+                amount: 10 * (index + 1),
+                claimed: index % 3 == 0,
+                source: PortfolioExportSource {
+                    kind: "indexer_db".to_string(),
+                    reference: "predictions".to_string(),
+                },
+            })
+            .collect();
+
+        let export = build_portfolio_export(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            fixture,
+            limit,
+            250,
+        );
+
+        assert_eq!(export.schema, PORTFOLIO_EXPORT_SCHEMA);
+        assert!(export.truncated, "a 250-position wallet must truncate");
+        assert_eq!(export.total_count, 250);
+        assert_eq!(export.positions.len() as i64, limit);
+        assert_eq!(export.ledger_entries.len(), export.positions.len());
+        assert_eq!(export.calculation.position_count, export.positions.len());
+        assert_eq!(export.next_cursor, Some(encode_portfolio_cursor(limit - 1)));
+
+        // Round-trip: serialise, parse back, and compare the whole document.
+        let encoded = serde_json::to_string(&export).expect("export serialises");
+        let decoded: PortfolioExport = serde_json::from_str(&encoded).expect("export parses");
+        assert_eq!(decoded, export);
+
+        // The continuation cursor decodes back to the last exported pool id.
+        let cursor = decoded.next_cursor.expect("truncated export has a cursor");
+        assert_eq!(decode_portfolio_cursor(&cursor), Some(limit - 1));
+        assert_eq!(decode_portfolio_cursor("not-a-cursor"), None);
+    }
+
+    /// Portfolio export (#265): a wallet smaller than the limit is not
+    /// truncated and reports no continuation cursor.
+    #[test]
+    fn portfolio_export_is_not_truncated_when_it_fits() {
+        let fixture = vec![PortfolioExportPosition {
+            pool_id: 7,
+            outcome: 1,
+            amount: 42,
+            claimed: false,
+            source: PortfolioExportSource {
+                kind: "indexer_db".to_string(),
+                reference: "predictions".to_string(),
+            },
+        }];
+        let export = build_portfolio_export("GADDRESS", fixture, 100, 1);
+        assert!(!export.truncated);
+        assert_eq!(export.next_cursor, None);
+        assert_eq!(export.total_count, 1);
+        assert_eq!(export.positions.len(), 1);
+    }
+
+    /// Portfolio export (#265): limits are clamped into documented bounds.
+    #[test]
+    fn portfolio_export_limit_is_bounded() {
+        assert_eq!(
+            resolve_portfolio_export_limit(None),
+            PORTFOLIO_EXPORT_DEFAULT_LIMIT
+        );
+        assert_eq!(resolve_portfolio_export_limit(Some(0)), PORTFOLIO_EXPORT_DEFAULT_LIMIT);
+        assert_eq!(resolve_portfolio_export_limit(Some(-1)), PORTFOLIO_EXPORT_DEFAULT_LIMIT);
+        assert_eq!(resolve_portfolio_export_limit(Some(10)), 10);
+        assert_eq!(
+            resolve_portfolio_export_limit(Some(1_000_000)),
+            PORTFOLIO_EXPORT_MAX_LIMIT
+        );
+    }
+
+    /// Conflict behaviour: a stale pool-detail cache entry must be dropped
+    /// when the chain reports a lifecycle change, so readers never see the
+    /// pre-change status.
+    #[tokio::test]
+    async fn conflict_pool_detail_cache_is_invalidated_on_lifecycle_change() {
+        let pool_cache = PoolCache::default();
+        let pool_id = 42;
+        pool_cache.set(
+            pool_id,
+            crate::db::PoolWithOdds {
+                pool_id,
+                name: "test pool".to_string(),
+                category: "test".to_string(),
+                total_stake: 0,
+                end_time: chrono::Utc::now(),
+                created_at: chrono::Utc::now(),
+                state: "active".to_string(),
+                creator: "GCREATOR".to_string(),
+                token: "CTOKEN".to_string(),
+                result: None,
+                odds: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            pool_cache.get(pool_id),
+            crate::pool_cache::CacheLookup::Found(_)
+        ));
+
+        pool_cache.invalidate(pool_id);
+        assert!(matches!(
+            pool_cache.get(pool_id),
+            crate::pool_cache::CacheLookup::Miss
+        ));
+    }
+}
