@@ -487,6 +487,7 @@ impl SafeMath {
     /// * `lp_shares`    - Individual LP shares.
     /// * `total_shares` - Sum of all LP shares (must be > 0 when non-empty).
     /// * `amount`       - Fee or loss amount to distribute (must be >= 0).
+    #[cfg(test)]
     pub fn lp_distribute(
         lp_shares: &[i128],
         total_shares: i128,
@@ -1582,8 +1583,6 @@ mod tests {
                     prop_assert_eq!(shares.unwrap() * total_assets + remainder, deposit * total_shares);
                 }
             }
-                }
-            }
 
             #[test]
             fn assets_for_shares_rounds_down_and_conserves(
@@ -1732,7 +1731,6 @@ mod tests {
                 let new_shares = total_shares + shares;
                 let withdrawn = SafeMath::lp_assets_for_withdrawal(shares, new_assets, new_shares).unwrap();
                 prop_assert!(withdrawn <= deposit);
-            }
             }
         }
     }
