@@ -4,6 +4,7 @@ import { memo } from "react";
 import { CheckCircle2, Loader2, XCircle, Send, RotateCcw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { usePrefersReducedMotion } from "@/lib/hooks/usePrefersReducedMotion";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,8 +62,19 @@ const STATUS_ORDER: Record<TxStatus, number> = {
 
 type StepState = "done" | "active" | "failed" | "idle";
 
-const StepIcon = memo(function StepIcon({ state }: { state: StepState }) {
-  const base = "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 transition-[background-color,border-color,box-shadow] duration-300";
+const StepIcon = memo(function StepIcon({
+  state,
+  reducedMotion = false,
+}: {
+  state: StepState;
+  reducedMotion?: boolean;
+}) {
+  const base = cn(
+    "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0",
+    reducedMotion
+      ? "transition-none"
+      : "transition-[background-color,border-color,box-shadow] duration-300",
+  );
 
   if (state === "done") {
     return (
@@ -74,7 +86,7 @@ const StepIcon = memo(function StepIcon({ state }: { state: StepState }) {
   if (state === "active") {
     return (
       <span className={cn(base, "border-2 border-[#37B7C3] bg-[#37B7C3]/10 shadow-[0_0_10px_rgba(55,183,195,0.3)]")}>
-        <Loader2 className="w-4 h-4 text-[#37B7C3] animate-spin" />
+        <Loader2 className={cn("w-4 h-4 text-[#37B7C3]", !reducedMotion && "animate-spin")} />
       </span>
     );
   }
@@ -99,14 +111,25 @@ StepIcon.displayName = "StepIcon";
 // Connector line between steps
 // ---------------------------------------------------------------------------
 
-const Connector = memo(function Connector({ filled, animated }: { filled: boolean; animated?: boolean }) {
+const Connector = memo(function Connector({
+  filled,
+  animated,
+  reducedMotion = false,
+}: {
+  filled: boolean;
+  animated?: boolean;
+  reducedMotion?: boolean;
+}) {
   return (
     <div className="flex-1 h-[2px] mx-1 rounded-full bg-white/[0.07] overflow-hidden relative">
       <div
         className={cn(
-          "absolute inset-y-0 left-0 rounded-full transition-[width] duration-500 ease-out",
+          "absolute inset-y-0 left-0 rounded-full",
+          reducedMotion ? "transition-none" : "transition-[width] duration-500 ease-out",
           filled ? "bg-[#37B7C3] w-full" : "w-0",
-          animated && !filled && "bg-gradient-to-r from-[#37B7C3]/60 to-transparent animate-pulse w-full",
+          animated && !filled && (reducedMotion
+            ? "bg-[#37B7C3]/60 w-full"
+            : "bg-gradient-to-r from-[#37B7C3]/60 to-transparent animate-pulse w-full"),
         )}
       />
     </div>
@@ -127,6 +150,8 @@ export const TransactionProgress = memo(function TransactionProgress({
   onRetry,
   isRetrying = false,
 }: TransactionProgressProps) {
+  const prefersReducedMotion = usePrefersReducedMotion();
+
   if (status === "idle") return null;
 
   const order = STATUS_ORDER[status];
@@ -151,7 +176,8 @@ export const TransactionProgress = memo(function TransactionProgress({
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className={cn(
-            "w-8 h-8 rounded-lg flex items-center justify-center transition-colors duration-300",
+            "w-8 h-8 rounded-lg flex items-center justify-center",
+            prefersReducedMotion ? "transition-none" : "transition-colors duration-300",
             isFailed ? "bg-red-500/15" : "bg-[#37B7C3]/15",
           )}>
             <Send className={cn("w-4 h-4", isFailed ? "text-red-400" : "text-[#37B7C3]")} />
@@ -171,7 +197,9 @@ export const TransactionProgress = memo(function TransactionProgress({
           status === "failed" && "bg-red-400/10 text-red-400",
         )}>
           {status === "confirmed" && <CheckCircle2 className="w-3 h-3" />}
-          {(status === "processing" || status === "submitted") && <Loader2 className="w-3 h-3 animate-spin" />}
+          {(status === "processing" || status === "submitted") && (
+            <Loader2 className={cn("w-3 h-3", !prefersReducedMotion && "animate-spin")} />
+          )}
           {status === "failed" && <XCircle className="w-3 h-3" />}
           {status.charAt(0).toUpperCase() + status.slice(1)}
         </span>
@@ -182,7 +210,8 @@ export const TransactionProgress = memo(function TransactionProgress({
         <div className="h-1.5 w-full rounded-full bg-white/[0.06] overflow-hidden">
           <div
             className={cn(
-              "h-full rounded-full transition-[width] duration-700 ease-out",
+              "h-full rounded-full",
+              prefersReducedMotion ? "transition-none" : "transition-[width] duration-700 ease-out",
               isFailed ? "bg-red-500" : "bg-[#37B7C3]",
             )}
             style={{ width: `${progressPct}%` }}
@@ -199,11 +228,12 @@ export const TransactionProgress = memo(function TransactionProgress({
       <div className="flex items-center">
         {STEPS.map((step, idx) => (
           <div key={step.id} className="flex items-center flex-1 min-w-0">
-            <StepIcon state={stepState(step, idx)} />
+            <StepIcon state={stepState(step, idx)} reducedMotion={prefersReducedMotion} />
             {idx < STEPS.length - 1 && (
               <Connector
                 filled={idx < order && !isFailed}
                 animated={idx === order - 1 && status === "processing"}
+                reducedMotion={prefersReducedMotion}
               />
             )}
           </div>
@@ -217,7 +247,8 @@ export const TransactionProgress = memo(function TransactionProgress({
           return (
             <div key={step.id} className="flex flex-col items-center text-center" style={{ width: "33.33%" }}>
               <span className={cn(
-                "text-xs font-medium transition-colors duration-300",
+                "text-xs font-medium",
+                prefersReducedMotion ? "transition-none" : "transition-colors duration-300",
                 state === "done" && "text-[#37B7C3]",
                 state === "active" && "text-white",
                 state === "failed" && "text-red-400",
@@ -254,7 +285,8 @@ export const TransactionProgress = memo(function TransactionProgress({
               onClick={onRetry}
               disabled={isRetrying}
               className={cn(
-                "w-full h-9 rounded-lg font-medium text-sm transition-all duration-200",
+                "w-full h-9 rounded-lg font-medium text-sm",
+                prefersReducedMotion ? "transition-none" : "transition-all duration-200",
                 "bg-[#37B7C3] hover:bg-[#37B7C3]/90 text-[#001112]",
                 "disabled:opacity-50 disabled:cursor-not-allowed",
                 "flex items-center justify-center gap-2"
@@ -262,7 +294,7 @@ export const TransactionProgress = memo(function TransactionProgress({
             >
               {isRetrying ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className={cn("w-4 h-4", !prefersReducedMotion && "animate-spin")} />
                   <span>Retrying...</span>
                 </>
               ) : (
