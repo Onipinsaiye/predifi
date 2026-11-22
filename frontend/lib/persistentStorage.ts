@@ -154,3 +154,247 @@ export function persistDemoMode(): boolean {
 export function clearDemoMode(): void {
   removePersistedValue(DEMO_MODE_STORAGE_KEY, DEMO_MODE_SCOPE);
 }
+
+/**
+ * Storage key for the user's saved personal market-list views. Entries are
+ * scoped by wallet identity so views never leak between accounts.
+ */
+export const SAVED_VIEWS_STORAGE_KEY = "saved-market-views";
+
+/**
+ * Schema version for the persisted saved-views payload. Bump this whenever the
+ * stored shape changes so older payloads can be migrated or discarded.
+ */
+export const SAVED_VIEWS_SCHEMA_VERSION = 1;
+
+/** Upper bound on the number of named views a single wallet may store. */
+export const MAX_SAVED_VIEWS = 20;
+
+/** Upper bound on the length of a view name. */
+export const MAX_VIEW_NAME_LENGTH = 60;
+
+const SAVED_VIEWS_SCOPE_PREFIX = "views";
+
+export type MarketSortDirection = "asc" | "desc";
+
+export interface MarketViewFilters {
+  search: string;
+  category: string | null;
+  status: string | null;
+  sortBy: string;
+  sortDirection: MarketSortDirection;
+}
+
+export interface SavedMarketView {
+  id: string;
+  name: string;
+  filters: MarketViewFilters;
+  createdAt: number;
+}
+
+interface SavedViewsPayload {
+  version: number;
+  views: SavedMarketView[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeString(value: unknown, maxLength: number): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > maxLength) return null;
+  return trimmed;
+}
+
+function sanitizeNullableString(
+  value: unknown,
+  maxLength: number,
+): string | null {
+  if (value === null || value === undefined) return null;
+  return sanitizeString(value, maxLength);
+}
+
+/**
+ * Validates and normalizes an untrusted filter/sort state. Returns null when
+ * the state is unusable so callers can discard it instead of persisting junk.
+ */
+export function validateMarketViewFilters(
+  value: unknown,
+): MarketViewFilters | null {
+  if (!isRecord(value)) return null;
+
+  const search = sanitizeNullableString(value.search, 200) ?? "";
+  const category = sanitizeNullableString(value.category, 80);
+  const status = sanitizeNullableString(value.status, 80);
+  const sortBy = sanitizeString(value.sortBy, 80);
+  const sortDirection = value.sortDirection;
+
+  if (!sortBy) return null;
+  if (sortDirection !== "asc" && sortDirection !== "desc") return null;
+
+  return { search, category, status, sortBy, sortDirection };
+}
+
+function validateSavedView(value: unknown): SavedMarketView | null {
+  if (!isRecord(value)) return null;
+
+  const id = sanitizeString(value.id, 80);
+  const name = sanitizeString(value.name, MAX_VIEW_NAME_LENGTH);
+  const filters = validateMarketViewFilters(value.filters);
+  const createdAt =
+    typeof value.createdAt === "number" && Number.isFinite(value.createdAt)
+      ? value.createdAt
+      : Date.now();
+
+  if (!id || !name || !filters) return null;
+
+  return { id, name, filters, createdAt };
+}
+
+/**
+ * Parses a raw persisted payload into a validated list of views. Corrupted or
+ * incompatible payloads yield an empty list so the caller can recover safely.
+ */
+export function parseSavedViewsPayload(raw: string | null): SavedMarketView[] {
+  if (!raw) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+
+  if (!isRecord(parsed)) return [];
+
+  // Unknown/newer schema versions are discarded rather than guessed at.
+  if (parsed.version !== SAVED_VIEWS_SCHEMA_VERSION) return [];
+  if (!Array.isArray(parsed.views)) return [];
+
+  const seenIds = new Set<string>();
+  const seenNames = new Set<string>();
+  const views: SavedMarketView[] = [];
+
+  for (const entry of parsed.views) {
+    const view = validateSavedView(entry);
+    if (!view) continue;
+
+    const nameKey = view.name.toLowerCase();
+    if (seenIds.has(view.id) || seenNames.has(nameKey)) continue;
+
+    seenIds.add(view.id);
+    seenNames.add(nameKey);
+    views.push(view);
+
+    if (views.length >= MAX_SAVED_VIEWS) break;
+  }
+
+  return views;
+}
+
+export function serializeSavedViews(views: SavedMarketView[]): string {
+  const payload: SavedViewsPayload = {
+    version: SAVED_VIEWS_SCHEMA_VERSION,
+    views: views.slice(0, MAX_SAVED_VIEWS),
+  };
+  return JSON.stringify(payload);
+}
+
+function savedViewsScope(walletAddress: string): string {
+  return `${SAVED_VIEWS_SCOPE_PREFIX}:${walletAddress.toLowerCase()}`;
+}
+
+/**
+ * Loads the saved views for a wallet. Corrupted payloads are cleared from
+ * storage and reported as an empty list.
+ */
+export function loadSavedViews(walletAddress: string | null): SavedMarketView[] {
+  if (!walletAddress) return [];
+
+  const raw = getPersistedValue(
+    SAVED_VIEWS_STORAGE_KEY,
+    savedViewsScope(walletAddress),
+  );
+  if (raw === null) return [];
+
+  const views = parseSavedViewsPayload(raw);
+  if (views.length === 0) {
+    // Either empty or corrupted; drop the bad payload so it cannot resurface.
+    removePersistedValue(
+      SAVED_VIEWS_STORAGE_KEY,
+      savedViewsScope(walletAddress),
+    );
+  }
+  return views;
+}
+
+/**
+ * Persists the saved views for a wallet. Returns the stored list, which may be
+ * truncated to MAX_SAVED_VIEWS, or null when storage is unavailable.
+ */
+export function saveSavedViews(
+  walletAddress: string | null,
+  views: SavedMarketView[],
+): SavedMarketView[] | null {
+  if (!walletAddress) return null;
+
+  const bounded = views.slice(0, MAX_SAVED_VIEWS);
+  const ok = setPersistedValue(
+    SAVED_VIEWS_STORAGE_KEY,
+    serializeSavedViews(bounded),
+    DEFAULT_MAX_AGE_SECONDS,
+    savedViewsScope(walletAddress),
+  );
+
+  return ok ? bounded : null;
+}
+
+/**
+ * Adds or replaces a named view for a wallet. Names are unique per wallet
+ * (case-insensitive) and the list is bounded to MAX_SAVED_VIEWS entries.
+ */
+export function upsertSavedView(
+  walletAddress: string | null,
+  view: SavedMarketView,
+): SavedMarketView[] | null {
+  if (!walletAddress) return null;
+
+  const validated = validateSavedView(view);
+  if (!validated) return null;
+
+  const existing = loadSavedViews(walletAddress);
+  const nameKey = validated.name.toLowerCase();
+  const withoutDuplicate = existing.filter(
+    (entry) =>
+      entry.id !== validated.id && entry.name.toLowerCase() !== nameKey,
+  );
+
+  return saveSavedViews(walletAddress, [validated, ...withoutDuplicate]);
+}
+
+export function removeSavedView(
+  walletAddress: string | null,
+  viewId: string,
+): SavedMarketView[] | null {
+  if (!walletAddress) return null;
+
+  const existing = loadSavedViews(walletAddress);
+  return saveSavedViews(
+    walletAddress,
+    existing.filter((entry) => entry.id !== viewId),
+  );
+}
+
+/**
+ * Clears all saved views for a wallet. Called on wallet disconnect so a
+ * reconnect starts from a clean, isolated state.
+ */
+export function clearSavedViews(walletAddress: string | null): void {
+  if (!walletAddress) return;
+  removePersistedValue(
+    SAVED_VIEWS_STORAGE_KEY,
+    savedViewsScope(walletAddress),
+  );
+}

@@ -1,12 +1,14 @@
 "use client";
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, Skeleton, SearchBar } from "@/components/ui";
 import { SearchResultHighlighter } from "@/components/search/SearchResultHighlighter";
 import { usePools } from "@/lib/hooks/usePools";
 import { usePoolsQuery, type SortBy, type PoolStatus } from "@/lib/hooks/usePoolsQuery";
 import type { Pool } from "@/lib/api/pools";
 import { searchMarkets, type SearchExplanation } from "@/lib/search/marketSearch";
+import { useSavedMarketViews } from "@/lib/hooks/useSavedMarketViews";
+import type { SavedMarketView } from "@/lib/search/savedMarketViews";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,6 +77,38 @@ export function SearchablePools({
   // ── Query state ─────────────────────────────────────────────────────────
   const { search, debouncedSearch, sortBy, status, poolsQuery, setSearch, setSortBy, setStatus } =
     usePoolsQuery({ defaultSortBy, defaultStatus });
+
+  // ── Saved private views ──────────────────────────────────────────────────
+  const {
+    views,
+    isAtLimit,
+    wasDiscarded,
+    saveView,
+    deleteView,
+    dismissDiscardedNotice,
+  } = useSavedMarketViews();
+
+  const [viewName, setViewName] = useState("");
+  const [viewError, setViewError] = useState<string | null>(null);
+
+  const handleSaveView = useCallback(() => {
+    const result = saveView(viewName, { search, sortBy, status });
+    if (!result.ok) {
+      setViewError(result.error);
+      return;
+    }
+    setViewError(null);
+    setViewName("");
+  }, [saveView, viewName, search, sortBy, status]);
+
+  const handleApplyView = useCallback(
+    (view: SavedMarketView) => {
+      setSearch(view.filters.search);
+      setSortBy(view.filters.sortBy);
+      setStatus(view.filters.status);
+    },
+    [setSearch, setSortBy, setStatus],
+  );
 
   // ── Data fetching ────────────────────────────────────────────────────────
   const {
@@ -156,6 +190,23 @@ export function SearchablePools({
           status={status}
           onSortChange={setSortBy}
           onStatusChange={setStatus}
+        />
+
+        {/* Saved private views */}
+        <SavedViewsBar
+          views={views}
+          viewName={viewName}
+          viewError={viewError}
+          isAtLimit={isAtLimit}
+          wasDiscarded={wasDiscarded}
+          onNameChange={(value) => {
+            setViewName(value);
+            if (viewError) setViewError(null);
+          }}
+          onSave={handleSaveView}
+          onApply={handleApplyView}
+          onDelete={deleteView}
+          onDismissDiscarded={dismissDiscardedNotice}
         />
       </CardHeader>
 
@@ -254,6 +305,123 @@ function FilterBar({ sortBy, status, onSortChange, onStatusChange }: FilterBarPr
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SavedViewsBar
+// ---------------------------------------------------------------------------
+
+interface SavedViewsBarProps {
+  views: SavedMarketView[];
+  viewName: string;
+  viewError: string | null;
+  isAtLimit: boolean;
+  wasDiscarded: boolean;
+  onNameChange: (value: string) => void;
+  onSave: () => void;
+  onApply: (view: SavedMarketView) => void;
+  onDelete: (id: string) => void;
+  onDismissDiscarded: () => void;
+}
+
+function SavedViewsBar({
+  views,
+  viewName,
+  viewError,
+  isAtLimit,
+  wasDiscarded,
+  onNameChange,
+  onSave,
+  onApply,
+  onDelete,
+  onDismissDiscarded,
+}: SavedViewsBarProps) {
+  return (
+    <div className="space-y-2" aria-label="Saved views">
+      {wasDiscarded && (
+        <div
+          role="status"
+          className="flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"
+        >
+          <span>Saved views couldn&apos;t be read and were discarded.</span>
+          <button
+            type="button"
+            onClick={onDismissDiscarded}
+            className="font-medium underline hover:text-amber-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={viewName}
+          onChange={(e) => onNameChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              onSave();
+            }
+          }}
+          placeholder="Name this view…"
+          aria-label="Saved view name"
+          aria-invalid={viewError ? true : undefined}
+          disabled={isAtLimit}
+          className="min-w-0 flex-1 rounded-lg bg-zinc-900 px-3 py-1 text-xs text-white placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#37B7C3] disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={isAtLimit}
+          className="rounded-md bg-[#37B7C3]/20 px-3 py-1 text-xs font-medium text-[#7DE3EC] transition-colors hover:bg-[#37B7C3]/30 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Save view
+        </button>
+      </div>
+
+      {viewError && (
+        <p role="alert" className="text-xs text-red-400">
+          {viewError}
+        </p>
+      )}
+
+      {isAtLimit && (
+        <p role="status" className="text-xs text-amber-300">
+          Saved view limit reached. Delete a view to save a new one.
+        </p>
+      )}
+
+      {views.length > 0 && (
+        <ul className="flex flex-wrap gap-2">
+          {views.map((view) => (
+            <li
+              key={view.id}
+              className="flex items-center gap-1 rounded-full bg-zinc-900 px-2 py-1 text-xs"
+            >
+              <button
+                type="button"
+                onClick={() => onApply(view)}
+                className="max-w-[12rem] truncate font-medium text-zinc-300 hover:text-[#7DE3EC]"
+                title={`Apply view "${view.name}"`}
+              >
+                {view.name}
+              </button>
+              <button
+                type="button"
+                onClick={() => onDelete(view.id)}
+                aria-label={`Delete view ${view.name}`}
+                className="rounded-full px-1 text-zinc-500 hover:text-red-400"
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

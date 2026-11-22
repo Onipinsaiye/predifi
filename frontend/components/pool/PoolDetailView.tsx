@@ -10,7 +10,7 @@ import {
 } from "react";
 import useSWR from "swr";
 import Link from "next/link";
-import { ArrowLeft, Radio, Users, Coins, Info } from "lucide-react";
+import { ArrowLeft, Radio, Users, Coins, Info, AlertTriangle } from "lucide-react";
 import {
   fetchPoolDetail,
   poolDetailUrl,
@@ -133,6 +133,106 @@ export function PoolDetailView({
     [pool],
   );
 
+  // Trade dialog state: the confirmation must communicate post-trade exposure
+  // before any wallet prompt is opened.
+  const [tradeOpen, setTradeOpen] = useState(false);
+  const [tradeOutcome, setTradeOutcome] = useState<number | null>(null);
+  const [tradeAmount, setTradeAmount] = useState("");
+  const [availableBalance, setAvailableBalance] = useState<number | null>(null);
+  const [slippageBps, setSlippageBps] = useState<number>(50);
+  const [simulation, setSimulation] = useState<TradeSimulation | null>(null);
+  const [simulating, setSimulating] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  const openTrade = useCallback((outcome: number) => {
+    setTradeOutcome(outcome);
+    setTradeAmount("");
+    setSimulation(null);
+    setSubmitted(false);
+    setTradeOpen(true);
+  }, []);
+
+  const closeTrade = useCallback(() => {
+    setTradeOpen(false);
+    setSimulation(null);
+    setSimulating(false);
+    setSubmitted(false);
+  }, []);
+
+  const parsedAmount = useMemo(() => {
+    const n = Number(tradeAmount);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }, [tradeAmount]);
+
+  // Fingerprint of the current inputs. A preview may only be submitted while
+  // its fingerprint matches the live inputs, so stale previews are rejected.
+  const previewFingerprint = useMemo(
+    () =>
+      tradeOutcome === null
+        ? ""
+        : `${pool?.pool_id ?? poolId}:${tradeOutcome}:${parsedAmount}:${slippageBps}`,
+    [pool?.pool_id, poolId, tradeOutcome, parsedAmount, slippageBps],
+  );
+
+  // Invalidate any previous simulation whenever inputs change.
+  useEffect(() => {
+    setSimulation(null);
+  }, [previewFingerprint]);
+
+  const runSimulation = useCallback(async () => {
+    if (tradeOutcome === null || parsedAmount <= 0) return;
+    const fingerprint = previewFingerprint;
+    setSimulating(true);
+    try {
+      const result = await simulateTrade({
+        poolId: pool?.pool_id ?? poolId,
+        outcome: tradeOutcome,
+        amount: parsedAmount,
+        availableBalance,
+        slippageBps,
+        odds: pool?.odds ?? [],
+        totalStake: pool?.total_stake ?? 0,
+      });
+      // Drop the result if inputs changed while simulating.
+      setSimulation((prev) =>
+        fingerprint === previewFingerprintRef.current
+          ? result
+          : prev,
+      );
+    } finally {
+      setSimulating(false);
+    }
+  }, [
+    tradeOutcome,
+    parsedAmount,
+    previewFingerprint,
+    pool?.pool_id,
+    pool?.odds,
+    pool?.total_stake,
+    poolId,
+    availableBalance,
+    slippageBps,
+  ]);
+
+  const previewFingerprintRef = useRef(previewFingerprint);
+  useEffect(() => {
+    previewFingerprintRef.current = previewFingerprint;
+  }, [previewFingerprint]);
+
+  const canSubmit =
+    !submitted &&
+    !simulating &&
+    simulation !== null &&
+    simulation.status === "success" &&
+    simulation.fingerprint === previewFingerprint &&
+    parsedAmount > 0;
+
+  const handleConfirm = useCallback(() => {
+    if (!canSubmit) return;
+    // Wallet prompt would open here; the preview above is final for these inputs.
+    setSubmitted(true);
+  }, [canSubmit]);
+
   if (!demo && isLoading && !pool) {
     return (
       <div className="mx-auto max-w-3xl space-y-4 p-6">
@@ -253,6 +353,14 @@ export function PoolDetailView({
                           className="text-[#37B7C3]"
                         />
                       </span>
+                      <button
+                        type="button"
+                        onClick={() => openTrade(o.outcome)}
+                        disabled={demo}
+                        className="rounded bg-[#37B7C3]/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[#37B7C3] transition hover:bg-[#37B7C3]/25 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Trade
+                      </button>
                     </span>
                   </div>
                   <div className="h-1.5 overflow-hidden rounded-full bg-zinc-800">
@@ -270,12 +378,360 @@ export function PoolDetailView({
           </ul>
         </section>
 
+        {tradeOpen && tradeOutcome !== null && (
+          <TradeDialog
+            outcome={tradeOutcome}
+            amount={tradeAmount}
+            onAmountChange={setTradeAmount}
+            availableBalance={availableBalance}
+            onAvailableBalanceChange={setAvailableBalance}
+            slippageBps={slippageBps}
+            onSlippageChange={setSlippageBps}
+            simulation={simulation}
+            simulating={simulating}
+            fingerprint={previewFingerprint}
+            onSimulate={runSimulation}
+            canSubmit={canSubmit}
+            submitted={submitted}
+            onConfirm={handleConfirm}
+            onClose={closeTrade}
+          />
+        )}
+
         <p className="text-[11px] text-zinc-600">
           Creator {pool.creator.slice(0, 6)}…{pool.creator.slice(-4)} · token{" "}
           {pool.token.slice(0, 6)}…
           {demo && " · illustrative only"}
         </p>
       </div>
+    </div>
+  );
+}
+
+export interface TradeSimulation {
+  status: "success" | "failed";
+  /** Fingerprint of the inputs this simulation was computed for. */
+  fingerprint: string;
+  /** Estimated position received (in outcome shares). */
+  estimatedReceived: number;
+  /** Fee deducted from the input amount. */
+  fee: number;
+  /** Balance remaining after amount + fee. */
+  balanceAfterFees: number;
+  /** Slippage bound applied to the estimate (in basis points). */
+  slippageBps: number;
+  /** Worst-case received position at the slippage bound. */
+  minReceived: number;
+  error?: string;
+}
+
+interface SimulateTradeArgs {
+  poolId: number;
+  outcome: number;
+  amount: number;
+  availableBalance: number | null;
+  slippageBps: number;
+  odds: PoolDetail["odds"];
+  totalStake: number;
+}
+
+const TRADE_FEE_BPS = 30; // 0.30% protocol fee
+
+/** Rounds to a fixed number of decimals without floating-point drift. */
+export function roundTo(value: number, decimals: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const factor = 10 ** decimals;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
+/**
+ * Deterministic local simulation used to preview post-trade exposure. In a
+ * production build this would call the backend simulation endpoint; the
+ * contract (status + fingerprint + estimates) is identical.
+ */
+export async function simulateTrade(
+  args: SimulateTradeArgs,
+): Promise<TradeSimulation> {
+  const { amount, availableBalance, slippageBps, odds, outcome } = args;
+  const fingerprint = `${args.poolId}:${outcome}:${amount}:${slippageBps}`;
+  const fee = roundTo((amount * TRADE_FEE_BPS) / 10_000, 6);
+  const balanceAfterFees = roundTo(
+    (availableBalance ?? 0) - amount - fee,
+    6,
+  );
+
+  if (availableBalance !== null && amount + fee > availableBalance) {
+    return {
+      status: "failed",
+      fingerprint,
+      estimatedReceived: 0,
+      fee,
+      balanceAfterFees,
+      slippageBps,
+      minReceived: 0,
+      error: "Insufficient balance to cover amount plus fees.",
+    };
+  }
+
+  const row = odds.find((o) => o.outcome === outcome);
+  const price = row && row.odds > 0 ? row.odds : 0;
+  if (price <= 0) {
+    return {
+      status: "failed",
+      fingerprint,
+      estimatedReceived: 0,
+      fee,
+      balanceAfterFees,
+      slippageBps,
+      minReceived: 0,
+      error: "Simulation failed: no price available for this outcome.",
+    };
+  }
+
+  const estimatedReceived = roundTo(amount / price, 6);
+  const minReceived = roundTo(
+    estimatedReceived * (1 - slippageBps / 10_000),
+    6,
+  );
+
+  return {
+    status: "success",
+    fingerprint,
+    estimatedReceived,
+    fee,
+    balanceAfterFees,
+    slippageBps,
+    minReceived,
+  };
+}
+
+interface TradeDialogProps {
+  outcome: number;
+  amount: string;
+  onAmountChange: (value: string) => void;
+  availableBalance: number | null;
+  onAvailableBalanceChange: (value: number | null) => void;
+  slippageBps: number;
+  onSlippageChange: (value: number) => void;
+  simulation: TradeSimulation | null;
+  simulating: boolean;
+  fingerprint: string;
+  onSimulate: () => void;
+  canSubmit: boolean;
+  submitted: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}
+
+function TradeDialog({
+  outcome,
+  amount,
+  onAmountChange,
+  availableBalance,
+  onAvailableBalanceChange,
+  slippageBps,
+  onSlippageChange,
+  simulation,
+  simulating,
+  fingerprint,
+  onSimulate,
+  canSubmit,
+  submitted,
+  onConfirm,
+  onClose,
+}: TradeDialogProps) {
+  const isFinal =
+    simulation !== null &&
+    simulation.status === "success" &&
+    simulation.fingerprint === fingerprint;
+  const insufficient =
+    simulation !== null && simulation.status === "failed";
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Trade preview for outcome ${outcome}`}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+    >
+      <div className="w-full max-w-md space-y-4 rounded-2xl border border-white/10 bg-[#121212] p-5">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-white">
+            Trade preview · Outcome {outcome}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs text-zinc-500 transition hover:text-white"
+          >
+            Close
+          </button>
+        </div>
+
+        <label className="block space-y-1 text-xs text-zinc-400">
+          <span>Input amount</span>
+          <input
+            type="number"
+            min="0"
+            step="any"
+            inputMode="decimal"
+            value={amount}
+            onChange={(e) => onAmountChange(e.target.value)}
+            className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-[#37B7C3]"
+          />
+        </label>
+
+        <div className="grid grid-cols-2 gap-3">
+          <label className="block space-y-1 text-xs text-zinc-400">
+            <span>Available balance</span>
+            <input
+              type="number"
+              min="0"
+              step="any"
+              inputMode="decimal"
+              value={availableBalance ?? ""}
+              onChange={(e) =>
+                onAvailableBalanceChange(
+                  e.target.value === "" ? null : Number(e.target.value),
+                )
+              }
+              className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-[#37B7C3]"
+            />
+          </label>
+          <label className="block space-y-1 text-xs text-zinc-400">
+            <span>Slippage bound (bps)</span>
+            <input
+              type="number"
+              min="0"
+              step="1"
+              inputMode="numeric"
+              value={slippageBps}
+              onChange={(e) => onSlippageChange(Number(e.target.value) || 0)}
+              className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-[#37B7C3]"
+            />
+          </label>
+        </div>
+
+        <TradePreview
+          amount={Number(amount) || 0}
+          simulation={simulation}
+          simulating={simulating}
+          fingerprint={fingerprint}
+          slippageBps={slippageBps}
+          insufficient={insufficient}
+        />
+
+        <div className="flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onSimulate}
+            disabled={simulating || !(Number(amount) > 0)}
+            className="rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-300 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {simulating ? "Simulating…" : "Simulate"}
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={!canSubmit}
+            className="rounded-lg bg-[#37B7C3] px-3 py-2 text-xs font-semibold text-black transition hover:bg-[#37B7C3]/90 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {submitted ? "Submitted" : "Confirm & sign"}
+          </button>
+        </div>
+        {!isFinal && !submitted && (
+          <p className="text-[10px] text-amber-300">
+            Estimates are non-final until simulation succeeds.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface TradePreviewProps {
+  amount: number;
+  simulation: TradeSimulation | null;
+  simulating: boolean;
+  fingerprint: string;
+  slippageBps: number;
+  insufficient: boolean;
+}
+
+/**
+ * Presentational preview of post-trade exposure. Every value is labelled as a
+ * non-final estimate until a simulation matching the current inputs succeeds.
+ */
+export function TradePreview({
+  amount,
+  simulation,
+  simulating,
+  fingerprint,
+  slippageBps,
+  insufficient,
+}: TradePreviewProps) {
+  const matches =
+    simulation !== null && simulation.fingerprint === fingerprint;
+  const final = matches && simulation.status === "success";
+  const estimateLabel = final ? "estimate" : "non-final estimate";
+
+  const received = matches ? simulation.estimatedReceived : null;
+  const balanceAfter = matches ? simulation.balanceAfterFees : null;
+  const minReceived = matches ? simulation.minReceived : null;
+
+  return (
+    <div className="space-y-2 rounded-xl border border-white/10 bg-black/30 p-3 text-xs">
+      <div className="flex items-center justify-between">
+        <span className="text-zinc-400">Input amount</span>
+        <span className="text-white">{roundTo(amount, 6)}</span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-zinc-400">
+          Estimated received position{" "}
+          <span className="text-[10px] text-amber-300">({estimateLabel})</span>
+        </span>
+        <span className="text-white">
+          {received === null ? "—" : roundTo(received, 6)}
+        </span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-zinc-400">
+          Available balance after fees{" "}
+          <span className="text-[10px] text-amber-300">({estimateLabel})</span>
+        </span>
+        <span className="text-white">
+          {balanceAfter === null ? "—" : roundTo(balanceAfter, 6)}
+        </span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-zinc-400">Slippage bound</span>
+        <span className="text-white">
+          {(slippageBps / 100).toFixed(2)}%
+          {minReceived !== null && (
+            <span className="ml-1 text-zinc-500">
+              (min {roundTo(minReceived, 6)})
+            </span>
+          )}
+        </span>
+      </div>
+
+      {simulating && (
+        <p className="text-[10px] text-zinc-500">Simulating…</p>
+      )}
+      {insufficient && (
+        <p
+          role="alert"
+          className="flex items-center gap-1 text-[10px] text-red-400"
+        >
+          <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+          {simulation?.error ?? "Insufficient balance."}
+        </p>
+      )}
+      {!final && !simulating && !insufficient && (
+        <p className="text-[10px] text-amber-300">
+          Non-final: run simulation to confirm these estimates.
+        </p>
+      )}
     </div>
   );
 }
