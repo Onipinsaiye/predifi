@@ -32,7 +32,7 @@ pub fn odds_from_stakes(env: &Env, stakes: &Vec<i128>, total_stake: i128) -> Vec
     let len = stakes.len();
     while i < len {
         let stake = stakes.get(i).unwrap_or(0);
-        current_odds.push_back(calculate_odds_bps(stake, total_stake));
+        current_odds.push_back(calculate_odds_bps(stake, total_stake) as u64);
         i += 1;
     }
     current_odds

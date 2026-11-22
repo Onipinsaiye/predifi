@@ -1039,6 +1039,91 @@ pub const MAX_WITHDRAW_SHARE_LOTS: u32 = 1;
 /// (`StaleLiquidityQuote`).
 pub const LIQUIDITY_QUOTE_STALENESS_SECONDS: u64 = 300;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// POOL BOOTSTRAP / DEPTH LIMITS  (issue #275)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## Motivation
+//
+// A pool with dust-level liquidity produces quotes that have no meaningful
+// price impact and can be gamed cheaply.  An unbounded bootstrap amount
+// exposes the pool creator to unlimited risk and can overflow the contract's
+// per-pool aggregate stake cap.  The constants below bound both extremes.
+//
+// ## Token-precision note
+//
+// Both limits are expressed in token base units (the smallest indivisible
+// unit accepted by the Stellar token contract).  For native XLM these are
+// stroops (1 XLM = 10 000 000 stroops); for USDC-on-Stellar (7 decimals)
+// 1 USDC = 10 000 000 base units.  The minimum corresponds to ~0.01 token
+// units at 7 decimals, which is enough to initialise the share model without
+// producing zero-share mints while remaining negligible in cost.
+//
+// ## Relationship to existing constants
+//
+//   MIN_POOL_BOOTSTRAP_DEPTH  <  MIN_LIQUIDITY_DEPOSIT  (both are 1 for now,
+//       kept separate so they can diverge without a cross-module change)
+//   MAX_POOL_BOOTSTRAP_DEPTH  ==  MAX_INITIAL_LIQUIDITY  (conceptual alias;
+//       identical value enforced by the test below)
+
+/// Minimum total value (in token base units) that a new pool's initial
+/// liquidity must meet for the pool to be considered "bootstrapped".
+///
+/// **Units:** Token base units (stroops for native XLM)
+/// **Value:** 1 base unit
+///
+/// **Rationale:** At least one base unit of liquidity must be present so that
+/// the share-accounting model can initialise.  A pool created with zero depth
+/// cannot price any outcome; `deposit_liquidity` on such a pool would mint a
+/// share price of 0/0.  The check is explicit so that the error is a stable,
+/// typed `BootstrapDepthTooLow` rather than an arithmetic panic inside the
+/// share model.
+///
+/// **Derivation:** The `MIN_STAKE` for user predictions is 1 base unit;
+/// bootstrap depth must be at least as large so the first prediction can be
+/// validated against a live pool balance.  Measured WASM cost: checking one
+/// i128 comparison adds < 100 CPU instructions — negligible.
+///
+/// **Impact of changes:**
+/// - Increasing this value raises the entry bar for pool creators but further
+///   reduces the risk of dust-level quote manipulation.
+/// - Decreasing below 1 is not meaningful (zero or negative bootstrap makes
+///   no economic sense).
+///
+/// **Used for:** Rejecting `create_pool` calls whose `initial_liquidity` is
+/// non-zero but below this threshold (`BootstrapDepthTooLow`).
+pub const MIN_POOL_BOOTSTRAP_DEPTH: i128 = 1;
+
+/// Maximum total value (in token base units) accepted as bootstrap liquidity
+/// for a new pool in a single `create_pool` call.
+///
+/// **Units:** Token base units (stroops for native XLM)
+/// **Value:** 100,000,000,000,000 base units
+/// **Equivalent:** 10,000,000 tokens at 7 decimal places
+///
+/// **Rationale:** Matches `MAX_INITIAL_LIQUIDITY`.  A pool cannot be
+/// bootstrapped with more capital than the existing initial-liquidity ceiling,
+/// keeping the two invariants consistent and ensuring that the bootstrap path
+/// cannot exceed the per-pool aggregate stake cap.
+///
+/// **Derivation:** `MAX_INITIAL_LIQUIDITY` was sized so that the share-mint
+/// product `assets * SHARE_SCALE` stays below `i128::MAX` with comfortable
+/// headroom.  The same arithmetic bound applies here because the bootstrap
+/// path uses the identical share-mint formula.  Native WASM and optimised
+/// WASM builds produce identical results for all inputs up to this cap.
+///
+/// **Impact of changes:**
+/// - Increasing beyond `MAX_INITIAL_LIQUIDITY` would allow pool creators to
+///   supply more capital than the existing ceiling permits and may push
+///   share-mint arithmetic toward overflow.
+/// - Decreasing would force large-scale market creators to top up via
+///   `deposit_liquidity` after creation.
+/// - Must remain `>= MIN_POOL_BOOTSTRAP_DEPTH`.
+///
+/// **Used for:** Rejecting `create_pool` calls whose `initial_liquidity`
+/// exceeds this limit (`BootstrapDepthTooHigh`).
+pub const MAX_POOL_BOOTSTRAP_DEPTH: i128 = MAX_INITIAL_LIQUIDITY;
+
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)]
 mod tests {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import type { PoolsQuery } from "@/lib/api/pools";
 import { useDebounce } from "@/lib/hooks/useDebounce";
@@ -83,6 +83,298 @@ const DEFAULT_PAGE_SIZE = 20;
 
 const VALID_SORT_OPTIONS: readonly SortBy[] = ["new", "popular", "ending_soon"];
 const VALID_STATUS_OPTIONS: readonly PoolStatus[] = ["active", "closed", "settled"];
+
+// ---------------------------------------------------------------------------
+// Saved market views
+// ---------------------------------------------------------------------------
+
+/**
+ * Version of the persisted saved-views payload. Bump this whenever the stored
+ * shape changes so old entries can be migrated or safely discarded.
+ */
+export const SAVED_VIEWS_STORAGE_VERSION = 1;
+
+/** Maximum number of saved views a single wallet may keep. */
+export const MAX_SAVED_VIEWS = 20;
+
+/** Maximum length of a saved view's name. */
+export const MAX_SAVED_VIEW_NAME_LENGTH = 40;
+
+/** The validated filter/sort state captured by a saved view. */
+export interface SavedViewFilters {
+  search: string;
+  sortBy: SortBy;
+  status: PoolStatus;
+  category: string;
+  pageSize: number;
+}
+
+/** A single named, private saved view. */
+export interface SavedMarketView {
+  id: string;
+  name: string;
+  filters: SavedViewFilters;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** The versioned payload persisted to storage. */
+export interface SavedViewsPayload {
+  version: number;
+  views: SavedMarketView[];
+}
+
+/** Actions returned by {@link useSavedMarketViews}. */
+export interface SavedMarketViewsActions {
+  /** Save the current filters under a new name. Returns the new view or null. */
+  saveView: (name: string, filters: SavedViewFilters) => SavedMarketView | null;
+  /** Rename an existing view. Returns true when the rename succeeded. */
+  renameView: (id: string, name: string) => boolean;
+  /** Delete a saved view. */
+  deleteView: (id: string) => void;
+  /** Select a view, returning its validated filters (or null if missing). */
+  selectView: (id: string) => SavedViewFilters | null;
+}
+
+/** Result of {@link useSavedMarketViews}. */
+export interface UseSavedMarketViewsResult extends SavedMarketViewsActions {
+  views: SavedMarketView[];
+  /** True once the persisted state has been read on the client. */
+  isLoaded: boolean;
+  /** True when the wallet is connected (views are wallet-scoped). */
+  isWalletConnected: boolean;
+  /** True when the saved-view limit has been reached. */
+  isAtCapacity: boolean;
+}
+
+/** Validates and normalises a view name. Returns null when invalid. */
+export function normalizeViewName(name: unknown): string | null {
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, MAX_SAVED_VIEW_NAME_LENGTH);
+}
+
+/** Validates and normalises a filter/sort state. Returns null when invalid. */
+export function validateSavedViewFilters(input: unknown): SavedViewFilters | null {
+  if (!input || typeof input !== "object") return null;
+  const raw = input as Record<string, unknown>;
+
+  const search = typeof raw.search === "string" ? raw.search.trim().slice(0, 200) : "";
+  const sortBy = VALID_SORT_OPTIONS.includes(raw.sortBy as SortBy)
+    ? (raw.sortBy as SortBy)
+    : DEFAULT_SORT_BY;
+  const status = VALID_STATUS_OPTIONS.includes(raw.status as PoolStatus)
+    ? (raw.status as PoolStatus)
+    : DEFAULT_STATUS;
+  const category = typeof raw.category === "string" ? raw.category.trim().slice(0, 100) : "";
+  const rawPageSize = Number(raw.pageSize);
+  const pageSize =
+    Number.isFinite(rawPageSize) && rawPageSize > 0
+      ? Math.min(Math.floor(rawPageSize), 100)
+      : DEFAULT_PAGE_SIZE;
+
+  return { search, sortBy, status, category, pageSize };
+}
+
+/** Validates a single persisted view entry. Returns null when invalid. */
+function validateSavedView(input: unknown): SavedMarketView | null {
+  if (!input || typeof input !== "object") return null;
+  const raw = input as Record<string, unknown>;
+  if (typeof raw.id !== "string" || !raw.id) return null;
+  const name = normalizeViewName(raw.name);
+  if (!name) return null;
+  const filters = validateSavedViewFilters(raw.filters);
+  if (!filters) return null;
+  const createdAt = Number.isFinite(Number(raw.createdAt)) ? Number(raw.createdAt) : Date.now();
+  const updatedAt = Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : createdAt;
+  return { id: raw.id, name, filters, createdAt, updatedAt };
+}
+
+/**
+ * Serialises saved views into a versioned payload string.
+ * Exported for testing.
+ */
+export function serializeSavedViews(views: SavedMarketView[]): string {
+  const payload: SavedViewsPayload = {
+    version: SAVED_VIEWS_STORAGE_VERSION,
+    views: views.slice(0, MAX_SAVED_VIEWS),
+  };
+  return JSON.stringify(payload);
+}
+
+/**
+ * Parses a persisted payload, recovering safely from corrupted or
+ * version-mismatched state. Exported for testing.
+ */
+export function parseSavedViews(raw: string | null): SavedMarketView[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object") return [];
+  const payload = parsed as Record<string, unknown>;
+  // Discard payloads written by an incompatible version.
+  if (payload.version !== SAVED_VIEWS_STORAGE_VERSION) return [];
+  if (!Array.isArray(payload.views)) return [];
+  const views: SavedMarketView[] = [];
+  for (const entry of payload.views) {
+    const view = validateSavedView(entry);
+    if (view) views.push(view);
+    if (views.length >= MAX_SAVED_VIEWS) break;
+  }
+  return views;
+}
+
+/** Builds the wallet-scoped storage key. */
+function savedViewsStorageKey(identityKey: string): string {
+  return `pools:saved-views:${SAVED_VIEWS_STORAGE_VERSION}:${identityKey}`;
+}
+
+/** Generates a reasonably unique id without external dependencies. */
+function generateViewId(): string {
+  return `view_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * useSavedMarketViews — wallet-scoped, versioned persistence of named private
+ * market-list views.
+ *
+ * Views are stored per wallet identity so disconnecting/reconnecting to a
+ * different account never exposes another wallet's saved views. Stored state
+ * is versioned and validated on read, so corrupted or outdated payloads are
+ * safely discarded rather than crashing the UI.
+ *
+ * @example
+ * const { views, saveView, selectView } = useSavedMarketViews();
+ * saveView("Active ETH", { search: "", sortBy: "new", status: "active", category: "eth", pageSize: 20 });
+ */
+export function useSavedMarketViews(identityKeyOption?: string): UseSavedMarketViewsResult {
+  const { network, address } = useWallet();
+  const identityKey = identityKeyOption ?? `${network ?? "none"}:${address ?? "none"}`;
+  const isWalletConnected = Boolean(address);
+
+  const [views, setViews] = useState<SavedMarketView[]>([]);
+  const [isLoaded, setIsLoaded] = useState(false);
+  const currentIdentityRef = useRef(identityKey);
+
+  // Load persisted views whenever the identity changes. Switching wallets
+  // resets in-memory state so no cross-wallet leakage occurs.
+  useEffect(() => {
+    currentIdentityRef.current = identityKey;
+    setIsLoaded(false);
+    if (typeof window === "undefined" || !isWalletConnected) {
+      setViews([]);
+      setIsLoaded(true);
+      return;
+    }
+    let stored: string | null = null;
+    try {
+      stored = window.localStorage.getItem(savedViewsStorageKey(identityKey));
+    } catch {
+      stored = null;
+    }
+    setViews(parseSavedViews(stored));
+    setIsLoaded(true);
+  }, [identityKey, isWalletConnected]);
+
+  // Persist on change, but only for the identity currently in memory.
+  const persist = useCallback(
+    (next: SavedMarketView[]) => {
+      if (typeof window === "undefined" || !isWalletConnected) return;
+      try {
+        window.localStorage.setItem(
+          savedViewsStorageKey(currentIdentityRef.current),
+          serializeSavedViews(next),
+        );
+      } catch {
+        // Storage may be unavailable (private mode / quota) — fail silently.
+      }
+    },
+    [isWalletConnected],
+  );
+
+  const saveView = useCallback(
+    (name: string, filters: SavedViewFilters): SavedMarketView | null => {
+      const normalizedName = normalizeViewName(name);
+      const validatedFilters = validateSavedViewFilters(filters);
+      if (!normalizedName || !validatedFilters) return null;
+      if (!isWalletConnected) return null;
+
+      let created: SavedMarketView | null = null;
+      setViews((prev) => {
+        if (prev.length >= MAX_SAVED_VIEWS) return prev;
+        const now = Date.now();
+        created = {
+          id: generateViewId(),
+          name: normalizedName,
+          filters: validatedFilters,
+          createdAt: now,
+          updatedAt: now,
+        };
+        const next = [created, ...prev];
+        persist(next);
+        return next;
+      });
+      return created;
+    },
+    [isWalletConnected, persist],
+  );
+
+  const renameView = useCallback(
+    (id: string, name: string): boolean => {
+      const normalizedName = normalizeViewName(name);
+      if (!normalizedName) return false;
+      let renamed = false;
+      setViews((prev) => {
+        const next = prev.map((view) => {
+          if (view.id !== id) return view;
+          renamed = true;
+          return { ...view, name: normalizedName, updatedAt: Date.now() };
+        });
+        if (renamed) persist(next);
+        return renamed ? next : prev;
+      });
+      return renamed;
+    },
+    [persist],
+  );
+
+  const deleteView = useCallback(
+    (id: string) => {
+      setViews((prev) => {
+        const next = prev.filter((view) => view.id !== id);
+        if (next.length === prev.length) return prev;
+        persist(next);
+        return next;
+      });
+    },
+    [persist],
+  );
+
+  const selectView = useCallback(
+    (id: string): SavedViewFilters | null => {
+      const view = views.find((entry) => entry.id === id);
+      if (!view) return null;
+      return validateSavedViewFilters(view.filters);
+    },
+    [views],
+  );
+
+  return {
+    views,
+    isLoaded,
+    isWalletConnected,
+    isAtCapacity: views.length >= MAX_SAVED_VIEWS,
+    saveView,
+    renameView,
+    deleteView,
+    selectView,
+  };
+}
 
 /**
  * usePoolsQuery — centralised SWR query-parameter state for pool lists.

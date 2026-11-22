@@ -30,6 +30,11 @@ import {
   setPersistedStellarTransaction,
 } from "@/lib/stellarTransactionStorage";
 import { useNetworkGuard } from "@/lib/hooks/useNetworkGuard";
+import {
+  buildTradePreview,
+  type TradePreview,
+  type TradePreviewInputs,
+} from "@/lib/tradePreview";
 
 export type StellarTxStatus = "idle" | "running" | "confirmed" | "ambiguous" | "failed";
 
@@ -82,6 +87,17 @@ export interface UseStellarTransactionResult<TParams> {
   /** Retry an ambiguous outcome after explicit user confirmation. */
   confirmRetry: () => Promise<TransactionRunResult<TParams> | null>;
   reset: () => void;
+  /**
+   * Pre-trade balance and position impact preview. `null` until the caller
+   * supplies preview inputs via `setPreviewInputs`. Estimates are marked
+   * non-final until simulation succeeds, and a stale preview (inputs changed
+   * since it was built) is rejected by `run`.
+   */
+  preview: TradePreview | null;
+  /** True when the current preview is stale and must not be submitted. */
+  previewStale: boolean;
+  /** Update the inputs the preview is derived from. */
+  setPreviewInputs: (inputs: TradePreviewInputs | null) => void;
 }
 
 let intentCounter = 0;
@@ -163,6 +179,18 @@ export function useStellarTransaction<TParams>(
   const [intent, setIntent] = useState<TransactionIntent<TParams> | null>(null);
   const [requiresUserConfirmation, setRequiresUserConfirmation] = useState(false);
   const [accountState, setAccountState] = useState<AccountState | null>(null);
+  const [previewInputs, setPreviewInputsState] = useState<TradePreviewInputs | null>(
+    null,
+  );
+  const [preview, setPreview] = useState<TradePreview | null>(null);
+  const [previewStale, setPreviewStale] = useState(false);
+  const previewRef = useRef<TradePreview | null>(null);
+  previewRef.current = preview;
+  const previewInputsRef = useRef<TradePreviewInputs | null>(null);
+  previewInputsRef.current = previewInputs;
+  const previewStaleRef = useRef(false);
+  previewStaleRef.current = previewStale;
+  const previewSimulationRef = useRef(0);
 
   const intentRef = useRef<TransactionIntent<TParams> | null>(null);
   const activeRunRef = useRef<Promise<TransactionRunResult<TParams>> | null>(null);
@@ -194,6 +222,10 @@ export function useStellarTransaction<TParams>(
     setIntent(null);
     setRequiresUserConfirmation(false);
     setAccountState(null);
+    setPreviewInputsState(null);
+    setPreview(null);
+    setPreviewStale(false);
+    previewSimulationRef.current += 1;
 
     if (!persistTransaction || !address) return;
 
@@ -419,6 +451,16 @@ export function useStellarTransaction<TParams>(
         );
       }
 
+      // Refuse to submit a stale preview: the inputs changed after the
+      // preview was built, so the user has not confirmed these values.
+      if (previewInputsRef.current && previewStaleRef.current) {
+        return Promise.reject(
+          new Error(
+            "The trade preview is out of date. Review the updated estimate before submitting.",
+          ),
+        );
+      }
+
       const txIntent = (createIntent ?? defaultIntent)(params);
       return startExecution(txIntent, false);
     },
@@ -483,7 +525,72 @@ export function useStellarTransaction<TParams>(
     setIntent(null);
     setRequiresUserConfirmation(false);
     setAccountState(null);
+    setPreviewInputsState(null);
+    setPreview(null);
+    setPreviewStale(false);
+    previewSimulationRef.current += 1;
   }, [address, network, persistTransaction]);
+
+  const setPreviewInputs = useCallback(
+    (inputs: TradePreviewInputs | null) => {
+      // Any input change invalidates the previously built preview so a stale
+      // estimate can never be submitted.
+      previewSimulationRef.current += 1;
+      setPreviewInputsState(inputs);
+      setPreviewStale(false);
+      if (!inputs) {
+        setPreview(null);
+        return;
+      }
+      setPreview(buildTradePreview(inputs));
+    },
+    [],
+  );
+
+  // Re-run the simulation whenever the inputs change, marking the preview as
+  // an estimate until the simulation resolves.
+  useEffect(() => {
+    if (!previewInputs) {
+      setPreview(null);
+      setPreviewStale(false);
+      return;
+    }
+
+    const simulationId = ++previewSimulationRef.current;
+    setPreview(buildTradePreview(previewInputs));
+    setPreviewStale(false);
+
+    const simulate = previewInputs.simulate;
+    if (!simulate) {
+      return;
+    }
+
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => simulate(previewInputs))
+      .then((result) => {
+        if (cancelled || previewSimulationRef.current !== simulationId) return;
+        setPreview(
+          buildTradePreview(previewInputs, {
+            simulationStatus: "succeeded",
+            estimatedPosition: result.estimatedPosition,
+            balanceAfterFees: result.balanceAfterFees,
+          }),
+        );
+        setPreviewStale(false);
+      })
+      .catch(() => {
+        if (cancelled || previewSimulationRef.current !== simulationId) return;
+        setPreview(
+          buildTradePreview(previewInputs, { simulationStatus: "failed" }),
+        );
+        setPreviewStale(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [previewInputs]);
 
   // Surface the identity diagnostic through the existing error banner while
   // idle, without clobbering a real transaction error.
@@ -505,6 +612,9 @@ export function useStellarTransaction<TParams>(
       run,
       confirmRetry,
       reset,
+      preview,
+      previewStale,
+      setPreviewInputs,
     }),
     [
       status,
@@ -517,6 +627,9 @@ export function useStellarTransaction<TParams>(
       run,
       confirmRetry,
       reset,
+      preview,
+      previewStale,
+      setPreviewInputs,
     ],
   );
 }
