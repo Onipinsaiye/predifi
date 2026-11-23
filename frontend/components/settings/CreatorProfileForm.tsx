@@ -15,6 +15,7 @@ import { Button, Input } from "@/components/ui";
 import {
   type CreatorProfile,
   type ProvenancePlatform,
+  type CreatorProfileProof,
   CREATOR_PROFILE_MAX_BIO,
   CREATOR_PROFILE_MAX_DISPLAY_NAME,
   CREATOR_PROFILE_MAX_HANDLE_OR_URL,
@@ -87,6 +88,34 @@ function validate(values: FormValues): FormErrors {
   return errors;
 }
 
+// ─── Save error mapping ───────────────────────────────────────────────────────
+
+/**
+ * Maps backend error codes for ownership-proof failures to user-facing copy.
+ * Falls back to the error message for unknown failures.
+ */
+function describeSaveError(err: unknown): string {
+  const code =
+    err && typeof err === "object" && "code" in err
+      ? String((err as { code?: unknown }).code)
+      : undefined;
+
+  switch (code) {
+    case "invalid_signature":
+      return "Wallet signature could not be verified. Please sign again with the wallet that owns this profile.";
+    case "replayed_proof":
+    case "proof_replayed":
+      return "This signature has already been used. Please sign a fresh challenge and try again.";
+    case "revision_conflict":
+    case "stale_revision":
+      return "This profile was updated elsewhere. Reload the latest revision before saving.";
+    case "wallet_mismatch":
+      return "The signing wallet does not match the profile owner. Switch wallets and try again.";
+    default:
+      return err instanceof Error ? err.message : "Failed to save creator profile.";
+  }
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 interface CreatorProfileFormProps {
@@ -96,14 +125,27 @@ interface CreatorProfileFormProps {
   bearerToken: string;
   /** Stellar address of the authenticated wallet. */
   address: string;
+  /**
+   * Requests a fresh wallet signature over the server-issued proof challenge
+   * (nonce + timestamp). Must return the signed payload for the current wallet.
+   */
+  signProof: (challenge: CreatorProfileProofChallenge) => Promise<CreatorProfileProof>;
   /** Called after a successful save with the updated profile. */
   onSave?: (profile: CreatorProfile) => void;
+}
+
+/** Challenge material the backend issues for a fresh ownership proof. */
+export interface CreatorProfileProofChallenge {
+  nonce: string;
+  timestamp: number;
+  address: string;
 }
 
 export function CreatorProfileForm({
   initialProfile,
   bearerToken,
   address,
+  signProof,
   onSave,
 }: CreatorProfileFormProps) {
   const [values, setValues] = useState<FormValues>(() => ({
@@ -123,6 +165,7 @@ export function CreatorProfileForm({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [profile, setProfile] = useState<CreatorProfile | null>(initialProfile ?? null);
 
   // ─── Field helpers ──────────────────────────────────────────────────────────
 
@@ -179,7 +222,21 @@ export function CreatorProfileForm({
     setSaving(true);
     setSaveError(null);
     try {
-      const { upsertCreatorProfile } = await import("@/lib/api/creatorProfile");
+      const { upsertCreatorProfile, requestCreatorProfileChallenge } = await import(
+        "@/lib/api/creatorProfile"
+      );
+
+      // 1. Obtain a fresh, single-use challenge from the backend.
+      const challenge = await requestCreatorProfileChallenge(address, bearerToken);
+
+      // 2. Have the wallet sign the fresh challenge (nonce + timestamp).
+      const proof = await signProof({
+        nonce: challenge.nonce,
+        timestamp: challenge.timestamp,
+        address,
+      });
+
+      // 3. Submit the profile together with the proof and expected revision.
       const updated = await upsertCreatorProfile(address, bearerToken, {
         display_name: values.display_name.trim() || null,
         avatar_url: values.avatar_url.trim() || null,
@@ -189,11 +246,14 @@ export function CreatorProfileForm({
           handle_or_url: l.handle_or_url.trim(),
         })),
         public: values.public,
+        expected_revision: profile?.revision ?? null,
+        proof,
       });
+      setProfile(updated);
       setSaved(true);
       onSave?.(updated);
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Failed to save creator profile.");
+      setSaveError(describeSaveError(err));
     } finally {
       setSaving(false);
     }
@@ -209,6 +269,12 @@ export function CreatorProfileForm({
           Opt in to show your identity alongside markets you create. Private by
           default — toggle public visibility when you're ready.
         </p>
+        {profile && (
+          <p className="text-xs text-zinc-500" data-testid="creator-profile-state">
+            Revision {profile.revision} ·{" "}
+            {profile.public ? "Public" : "Private"}
+          </p>
+        )}
       </div>
 
       {/* Display name */}

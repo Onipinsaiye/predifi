@@ -4278,6 +4278,16 @@ pub fn router(
                     .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
             )
             .route(
+                "/users/:address/creator-profile/signed",
+                post(create_creator_profile_signed_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/users/:address/creator-profile/signed/update",
+                post(update_creator_profile_signed_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
                 "/users/:address/watchlists",
                 get(list_watchlists_handler)
                     .post(create_watchlist_handler)
@@ -4403,6 +4413,29 @@ pub fn router(
                 "/pools/:id/tags",
                 patch(update_pool_tags_handler)
                     .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_TAGS)),
+            )
+            .route(
+                "/pools/:id/discussions",
+                get(list_market_discussions_handler)
+                    .post(create_market_discussion_handler)
+                    .layer(DefaultBodyLimit::max(
+                        crate::discussions::MAX_DISCUSSION_BODY_BYTES,
+                    )),
+            )
+            .route(
+                "/pools/:id/discussions/:comment_id",
+                patch(update_market_discussion_handler)
+                    .delete(delete_market_discussion_handler)
+                    .layer(DefaultBodyLimit::max(
+                        crate::discussions::MAX_DISCUSSION_BODY_BYTES,
+                    )),
+            )
+            .route(
+                "/pools/:id/discussions/:comment_id/report",
+                post(report_market_discussion_handler)
+                    .layer(DefaultBodyLimit::max(
+                        crate::discussions::MAX_DISCUSSION_BODY_BYTES,
+                    )),
             )
             .with_state(state.clone()),
         RateLimitTier::Write,
@@ -4612,6 +4645,435 @@ struct RefreshTokenResponse {
     refresh_token: String,
     token_type: String,
     expires_in: u64,
+}
+
+/// Signed creator-profile payload (#298).
+///
+/// Public fields are stored separately from the proof material: the wallet
+/// address, nonce, timestamp and signature are only used to authorise the
+/// write and are never echoed back in the profile document.
+#[derive(Debug, Deserialize)]
+struct SignedCreatorProfilePayload {
+    /// Wallet that controls the profile; must match the path address.
+    address: String,
+    /// Single-use nonce issued for this write.
+    nonce: String,
+    /// Unix timestamp (seconds) at which the payload was signed.
+    timestamp: i64,
+    /// Wallet signature over the canonical payload.
+    signature: String,
+    /// Normalized public profile fields.
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    bio: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
+    website_url: Option<String>,
+    /// Visibility state requested by the owner.
+    #[serde(default)]
+    visibility: Option<String>,
+    /// Revision the client believes it is editing (optimistic concurrency).
+    #[serde(default)]
+    expected_revision: Option<i64>,
+}
+
+/// Map a creator-profile persistence error onto the API error surface.
+fn map_creator_profile_error(error: crate::creator_profiles::CreatorProfileError) -> crate::errors::AppError {
+    use crate::creator_profiles::CreatorProfileError;
+    use crate::errors::AppError;
+
+    match error {
+        CreatorProfileError::InvalidSignature => {
+            AppError::Unauthorized("invalid wallet signature".to_string())
+        }
+        CreatorProfileError::ReplayedProof => {
+            AppError::Conflict("signature proof has already been used".to_string())
+        }
+        CreatorProfileError::StaleTimestamp => {
+            AppError::BadRequest("signed payload timestamp is outside the accepted window".to_string())
+        }
+        CreatorProfileError::WalletMismatch => {
+            AppError::Forbidden("signature does not match the profile wallet".to_string())
+        }
+        CreatorProfileError::RevisionConflict { expected, actual } => AppError::Conflict(format!(
+            "profile revision conflict: expected {expected}, current {actual}"
+        )),
+        CreatorProfileError::InvalidVisibility(value) => {
+            AppError::BadRequest(format!("unsupported visibility state '{value}'"))
+        }
+        CreatorProfileError::InvalidField(message) => AppError::BadRequest(message),
+        CreatorProfileError::NotFound => AppError::NotFound("creator profile not found".to_string()),
+        CreatorProfileError::Database(error) => AppError::from(error),
+    }
+}
+
+/// `POST /api/v1/users/:address/creator-profile/signed` — create a creator
+/// profile after verifying a fresh wallet signature (#298).
+async fn create_creator_profile_signed_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<SignedCreatorProfilePayload>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return Err(crate::errors::AppError::ServiceUnavailable(
+            "database not configured".to_string(),
+        ));
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let request = crate::creator_profiles::SignedProfileRequest {
+        address: address.as_str().to_string(),
+        nonce: body.nonce,
+        timestamp: body.timestamp,
+        signature: body.signature,
+        fields: crate::creator_profiles::ProfileFields {
+            display_name: body.display_name,
+            bio: body.bio,
+            avatar_url: body.avatar_url,
+            website_url: body.website_url,
+        },
+        visibility: body.visibility,
+    };
+
+    let profile = crate::creator_profiles::create_profile(db, &request, now)
+        .await
+        .map_err(map_creator_profile_error)?;
+
+    Ok(ApiResponse::success(profile).into_response())
+}
+
+/// `POST /api/v1/users/:address/creator-profile/signed/update` — update a
+/// creator profile after verifying a fresh wallet signature (#298).
+async fn update_creator_profile_signed_handler(
+    State(state): State<AppState>,
+    Path(address): Path<StellarAddress>,
+    Json(body): Json<SignedCreatorProfilePayload>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return Err(crate::errors::AppError::ServiceUnavailable(
+            "database not configured".to_string(),
+        ));
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let request = crate::creator_profiles::SignedProfileRequest {
+        address: address.as_str().to_string(),
+        nonce: body.nonce,
+        timestamp: body.timestamp,
+        signature: body.signature,
+        fields: crate::creator_profiles::ProfileFields {
+            display_name: body.display_name,
+            bio: body.bio,
+            avatar_url: body.avatar_url,
+            website_url: body.website_url,
+        },
+        visibility: body.visibility,
+    };
+
+    let profile = crate::creator_profiles::update_profile(
+        db,
+        &request,
+        body.expected_revision,
+        now,
+    )
+    .await
+    .map_err(map_creator_profile_error)?;
+
+    Ok(ApiResponse::success(profile).into_response())
+}
+
+/// Map a market-discussion persistence error onto the API error surface.
+fn map_discussion_error(error: crate::discussions::DiscussionError) -> crate::errors::AppError {
+    use crate::discussions::DiscussionError;
+    use crate::errors::AppError;
+
+    match error {
+        DiscussionError::NotFound => AppError::NotFound("discussion comment not found".to_string()),
+        DiscussionError::ParentNotFound => {
+            AppError::BadRequest("parent comment does not exist".to_string())
+        }
+        DiscussionError::MaxDepthExceeded { max } => {
+            AppError::BadRequest(format!("thread depth exceeds the maximum of {max}"))
+        }
+        DiscussionError::BodyTooLarge { max } => {
+            AppError::BadRequest(format!("comment body exceeds {max} bytes"))
+        }
+        DiscussionError::EmptyBody => AppError::BadRequest("comment body is required".to_string()),
+        DiscussionError::RevisionConflict { expected, actual } => AppError::Conflict(format!(
+            "comment revision conflict: expected {expected}, current {actual}"
+        )),
+        DiscussionError::Forbidden => {
+            AppError::Forbidden("wallet does not own this comment".to_string())
+        }
+        DiscussionError::InvalidSignature => {
+            AppError::Unauthorized("invalid wallet signature".to_string())
+        }
+        DiscussionError::ReplayedProof => {
+            AppError::Conflict("signature proof has already been used".to_string())
+        }
+        DiscussionError::InvalidModerationState(value) => {
+            AppError::BadRequest(format!("unsupported moderation state '{value}'"))
+        }
+        DiscussionError::Database(error) => AppError::from(error),
+    }
+}
+
+/// Query parameters for `GET /api/v1/pools/:id/discussions`.
+#[derive(Debug, Deserialize)]
+struct DiscussionListQuery {
+    /// Only return comments created after this comment id.
+    #[serde(default)]
+    after: Option<i64>,
+    /// Maximum number of comments to return.
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// `GET /api/v1/pools/:id/discussions` — versioned discussion thread (#299).
+async fn list_market_discussions_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Query(query): Query<DiscussionListQuery>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return Err(crate::errors::AppError::ServiceUnavailable(
+            "database not configured".to_string(),
+        ));
+    };
+
+    let comments = crate::discussions::list_comments(db, pool_id, query.after, query.limit)
+        .await
+        .map_err(map_discussion_error)?;
+
+    Ok(ApiResponse::success(comments).into_response())
+}
+
+/// Body for creating a discussion comment.
+#[derive(Debug, Deserialize)]
+struct CreateDiscussionBody {
+    /// Wallet authoring the comment.
+    address: String,
+    /// Parent comment id for replies (bounded depth).
+    #[serde(default)]
+    parent_id: Option<i64>,
+    /// Comment body (bounded size).
+    body: String,
+    /// Single-use nonce for the write proof.
+    nonce: String,
+    /// Unix timestamp (seconds) at which the payload was signed.
+    timestamp: i64,
+    /// Wallet signature over the canonical payload.
+    signature: String,
+}
+
+/// `POST /api/v1/pools/:id/discussions` — create a comment (#299).
+async fn create_market_discussion_handler(
+    State(state): State<AppState>,
+    Path(pool_id): Path<i64>,
+    Json(body): Json<CreateDiscussionBody>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return Err(crate::errors::AppError::ServiceUnavailable(
+            "database not configured".to_string(),
+        ));
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let request = crate::discussions::CreateCommentRequest {
+        pool_id,
+        address: body.address,
+        parent_id: body.parent_id,
+        body: body.body,
+        nonce: body.nonce,
+        timestamp: body.timestamp,
+        signature: body.signature,
+    };
+
+    let comment = crate::discussions::create_comment(db, &request, now)
+        .await
+        .map_err(map_discussion_error)?;
+
+    Ok(ApiResponse::success(comment).into_response())
+}
+
+/// Body for editing a discussion comment.
+#[derive(Debug, Deserialize)]
+struct UpdateDiscussionBody {
+    /// Wallet performing the edit; must own the comment.
+    address: String,
+    /// New comment body (bounded size).
+    body: String,
+    /// Revision the client is editing from (optimistic concurrency).
+    expected_revision: i64,
+    /// Single-use nonce for the write proof.
+    nonce: String,
+    /// Unix timestamp (seconds) at which the payload was signed.
+    timestamp: i64,
+    /// Wallet signature over the canonical payload.
+    signature: String,
+}
+
+/// `PATCH /api/v1/pools/:id/discussions/:comment_id` — edit a comment (#299).
+async fn update_market_discussion_handler(
+    State(state): State<AppState>,
+    Path((pool_id, comment_id)): Path<(i64, i64)>,
+    Json(body): Json<UpdateDiscussionBody>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return Err(crate::errors::AppError::ServiceUnavailable(
+            "database not configured".to_string(),
+        ));
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let request = crate::discussions::UpdateCommentRequest {
+        pool_id,
+        comment_id,
+        address: body.address,
+        body: body.body,
+        expected_revision: body.expected_revision,
+        nonce: body.nonce,
+        timestamp: body.timestamp,
+        signature: body.signature,
+    };
+
+    let comment = crate::discussions::update_comment(db, &request, now)
+        .await
+        .map_err(map_discussion_error)?;
+
+    Ok(ApiResponse::success(comment).into_response())
+}
+
+/// Body for deleting a discussion comment.
+#[derive(Debug, Deserialize)]
+struct DeleteDiscussionBody {
+    /// Wallet performing the delete; must own the comment.
+    address: String,
+    /// Revision the client is deleting from (optimistic concurrency).
+    expected_revision: i64,
+    /// Single-use nonce for the write proof.
+    nonce: String,
+    /// Unix timestamp (seconds) at which the payload was signed.
+    timestamp: i64,
+    /// Wallet signature over the canonical payload.
+    signature: String,
+}
+
+/// `DELETE /api/v1/pools/:id/discussions/:comment_id` — soft-delete a
+/// comment while preserving replies (#299).
+async fn delete_market_discussion_handler(
+    State(state): State<AppState>,
+    Path((pool_id, comment_id)): Path<(i64, i64)>,
+    Json(body): Json<DeleteDiscussionBody>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return Err(crate::errors::AppError::ServiceUnavailable(
+            "database not configured".to_string(),
+        ));
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let request = crate::discussions::DeleteCommentRequest {
+        pool_id,
+        comment_id,
+        address: body.address,
+        expected_revision: body.expected_revision,
+        nonce: body.nonce,
+        timestamp: body.timestamp,
+        signature: body.signature,
+    };
+
+    let comment = crate::discussions::delete_comment(db, &request, now)
+        .await
+        .map_err(map_discussion_error)?;
+
+    Ok(ApiResponse::success(comment).into_response())
+}
+
+/// Body for reporting a discussion comment.
+#[derive(Debug, Deserialize)]
+struct ReportDiscussionBody {
+    /// Wallet filing the report.
+    address: String,
+    /// Reason for the report.
+    reason: String,
+    /// Single-use nonce for the write proof.
+    nonce: String,
+    /// Unix timestamp (seconds) at which the payload was signed.
+    timestamp: i64,
+    /// Wallet signature over the canonical payload.
+    signature: String,
+}
+
+/// `POST /api/v1/pools/:id/discussions/:comment_id/report` — moderation
+/// report that never touches indexed contract event tables (#299).
+async fn report_market_discussion_handler(
+    State(state): State<AppState>,
+    Path((pool_id, comment_id)): Path<(i64, i64)>,
+    Json(body): Json<ReportDiscussionBody>,
+) -> Result<axum::response::Response, crate::errors::AppError> {
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return Err(crate::errors::AppError::ServiceUnavailable(
+            "database not configured".to_string(),
+        ));
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let request = crate::discussions::ReportCommentRequest {
+        pool_id,
+        comment_id,
+        address: body.address,
+        reason: body.reason,
+        nonce: body.nonce,
+        timestamp: body.timestamp,
+        signature: body.signature,
+    };
+
+    let comment = crate::discussions::report_comment(db, &request, now)
+        .await
+        .map_err(map_discussion_error)?;
+
+    Ok(ApiResponse::success(comment).into_response())
 }
 async fn get_fees(State(state): State<AppState>) -> Json<FeeInfo> {
     Json(FeeInfo {

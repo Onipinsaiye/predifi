@@ -18,6 +18,7 @@ mod predictions;
 mod referrals;
 pub mod market_history;
 pub mod market_history_archive;
+pub mod discussions;
 pub mod outbox;
 pub mod metrics;
 pub mod portfolio_exports;
@@ -145,6 +146,12 @@ pub use market_history::{
 
 pub use market_history_archive::{
     archive_market_history, restore_market_history_archive, ArchiveError,
+};
+
+pub use discussions::{
+    create_comment, edit_comment, list_thread, report_comment, set_moderation_state,
+    soft_delete_comment, Comment, CommentError, CommentReport, ModerationState, ThreadNode,
+    DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_DEPTH, MAX_BODY_BYTES_LIMIT, MAX_DEPTH_LIMIT,
 };
 
 use std::time::Duration;

@@ -74,6 +74,215 @@ CREATE TABLE IF NOT EXISTS moderation_reviewer_role (
     PRIMARY KEY (actor_id, role)
 );
 
+-- Explicit moderation states for reports, reviews, actions and appeals.
+-- States are modelled as a single enumerated domain so that transitions can
+-- be validated uniformly across the moderation lifecycle.
+CREATE TABLE IF NOT EXISTS moderation_state (
+    state               TEXT        PRIMARY KEY,
+    description         TEXT        NOT NULL
+);
+
+INSERT INTO moderation_state (state, description) VALUES
+    ('reported',        'A report has been submitted and awaits triage'),
+    ('under_review',    'A reviewer is actively evaluating the report'),
+    ('action_taken',    'A moderation action has been applied to the subject'),
+    ('appealed',        'The subject has appealed the moderation action'),
+    ('appeal_upheld',   'The appeal was reviewed and the action stands'),
+    ('appeal_reversed', 'The appeal was reviewed and the action was reversed'),
+    ('dismissed',       'The report was dismissed without action')
+ON CONFLICT (state) DO NOTHING;
+
+-- Legal state transitions. Each row declares an allowed (from_state,
+-- to_state) edge together with the reviewer role permitted to perform it.
+-- The service layer consults this table (and moderation_reviewer_role) to
+-- enforce reviewer permissions; the database enforces the edge itself.
+CREATE TABLE IF NOT EXISTS moderation_transition_rule (
+    from_state          TEXT        NOT NULL
+                            REFERENCES moderation_state (state),
+    to_state            TEXT        NOT NULL
+                            REFERENCES moderation_state (state),
+    required_role       TEXT        NOT NULL,
+    PRIMARY KEY (from_state, to_state),
+    CONSTRAINT moderation_transition_rule_distinct
+        CHECK (from_state <> to_state)
+);
+
+INSERT INTO moderation_transition_rule (from_state, to_state, required_role) VALUES
+    ('reported',        'under_review',    'moderator'),
+    ('reported',        'dismissed',        'moderator'),
+    ('under_review',    'action_taken',     'moderator_senior'),
+    ('under_review',    'dismissed',        'moderator'),
+    ('action_taken',    'appealed',         'moderator'),
+    ('appealed',        'appeal_upheld',    'moderator_senior'),
+    ('appealed',        'appeal_reversed',  'moderator_senior')
+ON CONFLICT (from_state, to_state) DO NOTHING;
+
+-- Transition history for moderation subjects. Every state change is recorded
+-- with the actor, the actor's role, the prior state and a timestamp. The
+-- unique constraint on (subject_type, subject_id, from_state, to_state,
+-- actor_id, transition_seq) makes duplicate submissions idempotent: a retry
+-- that re-submits the same transition for the same subject is rejected
+-- rather than double-recorded.
+CREATE TABLE IF NOT EXISTS moderation_transitions (
+    id                 BIGSERIAL
+                           GENERATED ALWAYS AS IDENTITY,
+    subject_type       TEXT        NOT NULL,
+    subject_id         TEXT        NOT NULL,
+    transition_seq     BIGINT      NOT NULL,
+    from_state         TEXT        NOT NULL
+                           REFERENCES moderation_state (state),
+    to_state           TEXT        NOT NULL
+                           REFERENCES moderation_state (state),
+    prior_state        TEXT
+                           REFERENCES moderation_state (state),
+    actor_id           TEXT        NOT NULL,
+    actor_role         TEXT        NOT NULL,
+    reason             TEXT,
+    transitioned_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT moderation_transitions_unique
+        UNIQUE (subject_type, subject_id, transition_seq),
+    CONSTRAINT moderation_transitions_idempotent
+        UNIQUE (subject_type, subject_id, from_state, to_state, actor_id),
+    CONSTRAINT moderation_transitions_legal_edge
+        FOREIGN KEY (from_state, to_state)
+            REFERENCES moderation_transition_rule (from_state, to_state)
+);
+
+CREATE INDEX IF NOT EXISTS moderation_transitions_subject_idx
+    ON moderation_transitions (subject_type, subject_id, transition_seq DESC);
+
+-- Record a moderation state transition. Validates the edge against
+-- moderation_transition_rule, enforces that the actor holds the required
+-- role, checks that from_state matches the subject's current state (or that
+-- the subject has no prior transitions when from_state is 'reported'), and
+-- rejects duplicate submissions via the unique constraints. The transition
+-- is also appended to the hash-chained audit log so the full history is
+-- tamper-evident and survives retries.
+CREATE OR REPLACE FUNCTION moderation_record_transition(
+    p_subject_type TEXT,
+    p_subject_id   TEXT,
+    p_from_state   TEXT,
+    p_to_state     TEXT,
+    p_actor_id     TEXT,
+    p_actor_role   TEXT,
+    p_reason       TEXT DEFAULT NULL
+) RETURNS moderation_transitions AS $$
+DECLARE
+    v_required_role TEXT;
+    v_current_state TEXT;
+    v_prior_state   TEXT;
+    v_next_seq      BIGINT;
+    v_row           moderation_transitions;
+BEGIN
+    SELECT required_role
+      INTO v_required_role
+      FROM moderation_transition_rule
+     WHERE from_state = p_from_state AND to_state = p_to_state;
+
+    IF v_required_role IS NULL THEN
+        RAISE EXCEPTION 'illegal moderation transition % -> %',
+            p_from_state, p_to_state;
+    END IF;
+
+    IF p_actor_role IS DISTINCT FROM v_required_role THEN
+        RAISE EXCEPTION 'actor % with role % may not perform % -> % (requires %)',
+            p_actor_id, p_actor_role, p_from_state, p_to_state, v_required_role;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM moderation_reviewer_role
+         WHERE actor_id = p_actor_id AND role = p_actor_role
+    ) THEN
+        RAISE EXCEPTION 'actor % does not hold granted role %',
+            p_actor_id, p_actor_role;
+    END IF;
+
+    -- Serialize transitions per subject so sequence numbers are contiguous.
+    PERFORM pg_advisory_xact_lock(
+        hashtext('moderation_transitions'),
+        hashtext(p_subject_type || ':' || p_subject_id)
+    );
+
+    SELECT to_state, transition_seq
+      INTO v_current_state, v_next_seq
+      FROM moderation_transitions
+     WHERE subject_type = p_subject_type AND subject_id = p_subject_id
+     ORDER BY transition_seq DESC
+     LIMIT 1;
+
+    IF v_current_state IS NULL THEN
+        IF p_from_state <> 'reported' THEN
+            RAISE EXCEPTION 'subject %:% has no history; first transition must start from reported',
+                p_subject_type, p_subject_id;
+        END IF;
+        v_prior_state := NULL;
+        v_next_seq := 1;
+    ELSE
+        IF v_current_state <> p_from_state THEN
+            RAISE EXCEPTION 'subject %:% is in state %, not %',
+                p_subject_type, p_subject_id, v_current_state, p_from_state;
+        END IF;
+        v_prior_state := v_current_state;
+        v_next_seq := v_next_seq + 1;
+    END IF;
+
+    BEGIN
+        INSERT INTO moderation_transitions (
+            subject_type, subject_id, transition_seq,
+            from_state, to_state, prior_state,
+            actor_id, actor_role, reason
+        ) VALUES (
+            p_subject_type, p_subject_id, v_next_seq,
+            p_from_state, p_to_state, v_prior_state,
+            p_actor_id, p_actor_role, p_reason
+        )
+        RETURNING * INTO v_row;
+    EXCEPTION WHEN unique_violation THEN
+        RAISE EXCEPTION 'duplicate moderation transition % -> % for %:% by %',
+            p_from_state, p_to_state, p_subject_type, p_subject_id, p_actor_id;
+    END;
+
+    -- Mirror the transition into the tamper-evident audit chain.
+    PERFORM moderation_audit_append(
+        'moderation:' || p_subject_type || ':' || p_subject_id,
+        'moderation_transition',
+        p_actor_id,
+        p_subject_type,
+        p_subject_id,
+        jsonb_build_object(
+            'from_state', p_from_state,
+            'to_state', p_to_state,
+            'prior_state', v_prior_state,
+            'actor_role', p_actor_role,
+            'transition_seq', v_next_seq,
+            'reason', p_reason
+        )
+    );
+
+    RETURN v_row;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Transition history is append-only, consistent with the audit log.
+CREATE OR REPLACE FUNCTION moderation_transitions_immutable()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'moderation_transitions is append-only';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS moderation_transitions_no_update
+  ON moderation_transitions;
+CREATE TRIGGER moderation_transitions_no_update
+    BEFORE UPDATE ON moderation_transitions
+    FOR EACH ROW EXECUTE FUNCTION moderation_transitions_immutable();
+
+DROP TRIGGER IF EXISTS moderation_transitions_no_delete
+  ON moderation_transitions;
+CREATE TRIGGER moderation_transitions_no_delete
+    BEFORE DELETE ON moderation_transitions
+    FOR EACH ROW EXECUTE FUNCTION moderation_transitions_immutable();
+
 -- Consumed step-up proofs. A proof digest may be used exactly once.
 CREATE TABLE IF NOT EXISTS moderation_stepup_proof (
     proof_digest        TEXT        PRIMARY KEY,

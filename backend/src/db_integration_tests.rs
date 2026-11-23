@@ -596,4 +596,407 @@ mod tests {
         pool.close().await;
         drop(container);
     }
+
+    // ------------------------------------------------------------------
+    // #298 — Creator profiles with wallet ownership proofs
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn creator_profile_rejects_invalid_signature_and_replayed_proof() {
+        let (pool, container) = setup().await;
+
+        let profile = crate::db::upsert_creator_profile(
+            &pool,
+            "GCREATOR298",
+            "alice",
+            "Alice",
+            "bio",
+            "avatar.png",
+            "sig-create-1",
+            "nonce-1",
+        )
+        .await
+        .expect("create profile");
+        assert_eq!(profile.revision, 1);
+        assert_eq!(profile.visibility, "public");
+
+        // An invalid signature must be rejected and leave the profile untouched.
+        let invalid = crate::db::upsert_creator_profile(
+            &pool,
+            "GCREATOR298",
+            "alice",
+            "Alice Updated",
+            "bio",
+            "avatar.png",
+            "sig-invalid",
+            "nonce-2",
+        )
+        .await;
+        assert!(invalid.is_err(), "invalid signature must be rejected");
+
+        let unchanged = crate::db::get_creator_profile(&pool, "GCREATOR298")
+            .await
+            .expect("fetch profile")
+            .expect("profile exists");
+        assert_eq!(unchanged.display_name, "Alice");
+        assert_eq!(unchanged.revision, 1);
+
+        // Replaying an already-consumed proof must be rejected.
+        let replay = crate::db::upsert_creator_profile(
+            &pool,
+            "GCREATOR298",
+            "alice",
+            "Alice Replay",
+            "bio",
+            "avatar.png",
+            "sig-create-1",
+            "nonce-1",
+        )
+        .await;
+        assert!(replay.is_err(), "replayed proof must be rejected");
+
+        pool.close().await;
+        drop(container);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn creator_profile_wallet_rotation_and_revision_ordering() {
+        let (pool, container) = setup().await;
+
+        crate::db::upsert_creator_profile(
+            &pool,
+            "GOLDWALLET298",
+            "bob",
+            "Bob",
+            "bio",
+            "avatar.png",
+            "sig-old-1",
+            "nonce-old-1",
+        )
+        .await
+        .expect("create profile");
+
+        // Rotate ownership to a new wallet with a fresh signature.
+        crate::db::rotate_creator_wallet(
+            &pool,
+            "GOLDWALLET298",
+            "GNEWWALLET298",
+            "sig-rotate-1",
+            "nonce-rotate-1",
+        )
+        .await
+        .expect("rotate wallet");
+
+        // The old wallet can no longer edit the profile.
+        let old_edit = crate::db::upsert_creator_profile(
+            &pool,
+            "GOLDWALLET298",
+            "bob",
+            "Bob Hijacked",
+            "bio",
+            "avatar.png",
+            "sig-old-2",
+            "nonce-old-2",
+        )
+        .await;
+        assert!(old_edit.is_err(), "rotated-away wallet must not edit");
+
+        // The new wallet can, and revisions advance monotonically.
+        let updated = crate::db::upsert_creator_profile(
+            &pool,
+            "GNEWWALLET298",
+            "bob",
+            "Bob New",
+            "bio",
+            "avatar.png",
+            "sig-new-1",
+            "nonce-new-1",
+        )
+        .await
+        .expect("update with new wallet");
+        assert_eq!(updated.revision, 2);
+
+        // Out-of-order (stale) revision writes must be rejected.
+        let stale = crate::db::upsert_creator_profile_at_revision(
+            &pool,
+            "GNEWWALLET298",
+            "bob",
+            "Bob Stale",
+            "bio",
+            "avatar.png",
+            "sig-new-2",
+            "nonce-new-2",
+            1,
+        )
+        .await;
+        assert!(stale.is_err(), "stale revision must be rejected");
+
+        let revisions = crate::db::get_creator_profile_revisions(&pool, "bob")
+            .await
+            .expect("revision history");
+        let numbers: Vec<i64> = revisions.iter().map(|r| r.revision).collect();
+        let mut sorted = numbers.clone();
+        sorted.sort_unstable();
+        assert_eq!(numbers, sorted, "revisions must be ordered");
+        assert_eq!(numbers.last().copied(), Some(2));
+
+        pool.close().await;
+        drop(container);
+    }
+
+    // ------------------------------------------------------------------
+    // #299 — Versioned market discussions
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn discussion_migration_round_trip_keeps_contract_events_untouched() {
+        let (pool, container) = setup().await;
+
+        // Seed a contract-derived event row before the discussion migration
+        // round-trip and confirm it survives unchanged.
+        sqlx::query(
+            "INSERT INTO pools (pool_id, name, end_time) VALUES (991, 'disc', NOW() + INTERVAL '1 day')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert pool");
+        sqlx::query(
+            "INSERT INTO predictions (pool_id, user_address, outcome, amount) VALUES (991, 'GEVENT', 0, 5)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert event row");
+
+        let before: i64 = sqlx::query("SELECT COUNT(*) FROM predictions WHERE pool_id = 991")
+            .fetch_one(&pool)
+            .await
+            .expect("count before")
+            .get(0);
+
+        // Round-trip the discussion migration by reverting and re-applying it.
+        crate::db::revert_discussion_migration(&pool)
+            .await
+            .expect("revert discussion migration");
+        crate::db::apply_discussion_migration(&pool)
+            .await
+            .expect("re-apply discussion migration");
+
+        let after: i64 = sqlx::query("SELECT COUNT(*) FROM predictions WHERE pool_id = 991")
+            .fetch_one(&pool)
+            .await
+            .expect("count after")
+            .get(0);
+        assert_eq!(before, after, "contract event tables must be untouched");
+
+        pool.close().await;
+        drop(container);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn discussion_enforces_depth_and_body_size_and_handles_deleted_parents() {
+        let (pool, container) = setup().await;
+
+        sqlx::query(
+            "INSERT INTO pools (pool_id, name, end_time) VALUES (992, 'disc', NOW() + INTERVAL '1 day')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert pool");
+
+        // Oversized body is rejected.
+        let oversized = crate::db::create_discussion_comment(
+            &pool,
+            992,
+            None,
+            "GCOMMENTER",
+            &"x".repeat(10_000),
+        )
+        .await;
+        assert!(oversized.is_err(), "oversized body must be rejected");
+
+        // Build a thread to the maximum allowed depth.
+        let max_depth = crate::db::max_discussion_depth();
+        let mut parent: Option<i64> = None;
+        for depth in 0..max_depth {
+            let comment = crate::db::create_discussion_comment(
+                &pool,
+                992,
+                parent,
+                "GCOMMENTER",
+                &format!("depth {depth}"),
+            )
+            .await
+            .expect("create comment");
+            parent = Some(comment.id);
+        }
+
+        // One level beyond the maximum is rejected.
+        let too_deep = crate::db::create_discussion_comment(
+            &pool,
+            992,
+            parent,
+            "GCOMMENTER",
+            "too deep",
+        )
+        .await;
+        assert!(too_deep.is_err(), "exceeding max depth must be rejected");
+
+        // Deleting a parent keeps children readable but marks them orphaned.
+        let root = crate::db::create_discussion_comment(&pool, 992, None, "GCOMMENTER", "root")
+            .await
+            .expect("create root");
+        let child = crate::db::create_discussion_comment(
+            &pool,
+            992,
+            Some(root.id),
+            "GCOMMENTER",
+            "child",
+        )
+        .await
+        .expect("create child");
+        crate::db::delete_discussion_comment(&pool, root.id, "GCOMMENTER")
+            .await
+            .expect("delete parent");
+
+        let fetched = crate::db::get_discussion_comment(&pool, child.id)
+            .await
+            .expect("fetch child")
+            .expect("child exists");
+        assert_eq!(fetched.moderation_state, "visible");
+        assert!(fetched.parent_deleted, "child must see deleted parent");
+
+        pool.close().await;
+        drop(container);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn discussion_concurrent_edits_produce_ordered_revisions() {
+        let (pool, container) = setup().await;
+
+        sqlx::query(
+            "INSERT INTO pools (pool_id, name, end_time) VALUES (993, 'disc', NOW() + INTERVAL '1 day')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert pool");
+
+        let comment = crate::db::create_discussion_comment(&pool, 993, None, "GEDITOR", "v1")
+            .await
+            .expect("create comment");
+
+        // Two concurrent edits based on the same revision: exactly one wins.
+        let (a, b) = tokio::join!(
+            crate::db::edit_discussion_comment(&pool, comment.id, "GEDITOR", "v2a", 1),
+            crate::db::edit_discussion_comment(&pool, comment.id, "GEDITOR", "v2b", 1),
+        );
+        let successes = [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count();
+        assert_eq!(successes, 1, "concurrent edits must not both apply");
+
+        let revisions = crate::db::get_discussion_revisions(&pool, comment.id)
+            .await
+            .expect("revision history");
+        let numbers: Vec<i64> = revisions.iter().map(|r| r.revision).collect();
+        let mut sorted = numbers.clone();
+        sorted.sort_unstable();
+        assert_eq!(numbers, sorted, "revisions must be ordered");
+
+        pool.close().await;
+        drop(container);
+    }
+
+    // ------------------------------------------------------------------
+    // #300 — Auditable content moderation transitions
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn moderation_rejects_forbidden_transitions_and_duplicate_submissions() {
+        let (pool, container) = setup().await;
+
+        let report = crate::db::submit_moderation_report(&pool, "GREPORTER", "comment", 1, "spam")
+            .await
+            .expect("submit report");
+        assert_eq!(report.state, "submitted");
+
+        // Duplicate submission of the same report is rejected.
+        let duplicate =
+            crate::db::submit_moderation_report(&pool, "GREPORTER", "comment", 1, "spam").await;
+        assert!(duplicate.is_err(), "duplicate report must be rejected");
+
+        // A forbidden transition (submitted -> actioned) is rejected.
+        let forbidden =
+            crate::db::transition_moderation_report(&pool, report.id, "actioned", "GMOD").await;
+        assert!(forbidden.is_err(), "forbidden transition must be rejected");
+
+        // Reviewers without permission cannot transition.
+        let unauthorized =
+            crate::db::transition_moderation_report(&pool, report.id, "under_review", "GUSER").await;
+        assert!(unauthorized.is_err(), "non-reviewer must be rejected");
+
+        // The legal path succeeds.
+        crate::db::transition_moderation_report(&pool, report.id, "under_review", "GMOD")
+            .await
+            .expect("review transition");
+        crate::db::transition_moderation_report(&pool, report.id, "actioned", "GMOD")
+            .await
+            .expect("action transition");
+
+        pool.close().await;
+        drop(container);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Docker container for Postgres"]
+    async fn moderation_audit_history_is_complete_after_retries() {
+        let (pool, container) = setup().await;
+
+        let report = crate::db::submit_moderation_report(&pool, "GREPORTER", "comment", 2, "abuse")
+            .await
+            .expect("submit report");
+
+        crate::db::transition_moderation_report(&pool, report.id, "under_review", "GMOD")
+            .await
+            .expect("review transition");
+
+        // Retrying the same transition must be idempotent, not duplicate audit rows.
+        for _ in 0..3 {
+            let retry =
+                crate::db::transition_moderation_report(&pool, report.id, "under_review", "GMOD")
+                    .await;
+            assert!(retry.is_err(), "retried transition must be rejected");
+        }
+
+        crate::db::transition_moderation_report(&pool, report.id, "actioned", "GMOD")
+            .await
+            .expect("action transition");
+
+        let appeal = crate::db::submit_moderation_appeal(&pool, report.id, "GAPPEALER", "unfair")
+            .await
+            .expect("submit appeal");
+        crate::db::transition_moderation_appeal(&pool, appeal.id, "upheld", "GMOD")
+            .await
+            .expect("appeal transition");
+
+        let history = crate::db::get_moderation_audit_history(&pool, report.id)
+            .await
+            .expect("audit history");
+        let states: Vec<String> = history.iter().map(|h| h.to_state.clone()).collect();
+        assert_eq!(
+            states,
+            vec!["submitted", "under_review", "actioned"],
+            "audit history must record each transition exactly once"
+        );
+        assert!(
+            history.iter().all(|h| !h.actor.is_empty() && h.recorded_at.is_some()),
+            "each transition must record actor and timestamp"
+        );
+
+        pool.close().await;
+        drop(container);
+    }
 }
