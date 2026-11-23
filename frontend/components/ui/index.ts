@@ -58,4 +58,10 @@ export { WhitelistErrorBanner, type WhitelistErrorBannerProps } from "./whitelis
 export { SupportedTokensPicker, type SupportedTokensPickerProps, type Token } from "./supported-tokens-picker";
 export { ThemeToggle } from "./theme-toggle";
 export { OddsCalculator, type OddsCalculatorProps } from "./odds-calculator";
+export {
+  GlossaryTerm,
+  GlossaryPanel,
+  type GlossaryTermProps,
+  type GlossaryPanelProps,
+} from "../common/Glossary";
 export { ChartAlternative } from "./chart-alternative";
