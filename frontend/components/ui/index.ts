@@ -64,3 +64,4 @@ export {
   type GlossaryTermProps,
   type GlossaryPanelProps,
 } from "../common/Glossary";
+export { ChartAlternative } from "./chart-alternative";

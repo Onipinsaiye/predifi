@@ -20,9 +20,18 @@
 
 import { useMemo } from "react";
 import dynamic from "next/dynamic";
-import { Card, CardContent, CardHeader, CardTitle, Button, Skeleton } from "@/components/ui";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Button,
+  Skeleton,
+  ChartAlternative,
+} from "@/components/ui";
 import { ChevronDown } from "lucide-react";
 import { useContainerSize } from "@/lib/hooks/useContainerSize";
+import { STAKED_CHART_DATA } from "@/lib/stakedChartData";
 import type { StakedChartRendererProps } from "@/components/dashboard/StakedChartRenderer";
 
 /**
@@ -117,8 +126,18 @@ export function StakedChart({ isLoading = false }: StakedChartProps) {
         ref={chartAreaRef}
         className="flex-1 min-h-0 w-full mt-4 overflow-hidden"
       >
-        <StakedChartRenderer width={chartWidth} height={chartHeight} />
+        {/* Hidden from assistive tech: the table below carries the same data. */}
+        <div aria-hidden="true" className="h-full w-full">
+          <StakedChartRenderer width={chartWidth} height={chartHeight} />
+        </div>
       </CardContent>
+      <ChartAlternative
+        className="shrink-0 px-6 pb-4"
+        title="Total staked"
+        unit="USD"
+        rangeLabel="January to December"
+        data={STAKED_CHART_DATA.map((d) => ({ label: d.name, value: d.value }))}
+      />
     </Card>
   );
 }
