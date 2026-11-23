@@ -1,10 +1,10 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import { User, Shield, Bell, ChevronDown } from "lucide-react";
+import { User, Shield, Bell, ChevronDown, MessageSquare } from "lucide-react";
 import { useState } from "react";
 
-export type SettingsTab = "profile" | "security" | "notifications";
+export type SettingsTab = "profile" | "security" | "notifications" | "feedback";
 
 interface NavItem {
   id: SettingsTab;
@@ -31,6 +31,12 @@ const NAV_ITEMS: NavItem[] = [
     label: "Notifications",
     icon: <Bell className="h-4 w-4" />,
     description: "Alerts & preferences",
+  },
+  {
+    id: "feedback",
+    label: "Feedback",
+    icon: <MessageSquare className="h-4 w-4" />,
+    description: "Report issues & ideas",
   },
 ];
 

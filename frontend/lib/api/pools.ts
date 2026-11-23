@@ -579,3 +579,335 @@ export async function fetchMarketEvents(
     offset,
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* Editorial collections                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A single revision of an editorial collection.
+ *
+ * Collections are *versioned* lists of canonical market IDs. Each revision
+ * records who edited it (`editor`) and when (`updated_at`), so the update
+ * history is auditable. Ordering within `market_ids` is editorial: it is the
+ * display order and must be preserved verbatim — it never changes protocol
+ * state or market rankings.
+ */
+export interface CollectionRevision {
+  /** Monotonically increasing revision number (1-based). */
+  version: number;
+  /** Canonical market IDs in editorial display order. */
+  market_ids: number[];
+  /** Editor attribution (e.g. a Stellar address or editorial handle). */
+  editor: string;
+  /** When this revision was published, as an ISO timestamp. */
+  updated_at: string;
+  /** Optional human-readable note describing the change. */
+  note?: string | null;
+}
+
+/**
+ * A public editorial collection of markets.
+ *
+ * `revisions` is ordered oldest-first; the last entry is the current revision.
+ * `current` mirrors that last revision for convenience.
+ */
+export interface Collection {
+  /** Stable, URL-safe identifier. */
+  slug: string;
+  title: string;
+  description?: string | null;
+  /** Current revision number. */
+  version: number;
+  /** Canonical market IDs of the current revision, in editorial order. */
+  market_ids: number[];
+  /** Full update history, oldest-first. */
+  revisions: CollectionRevision[];
+}
+
+/** Response body of `GET /api/v1/collections`. */
+export interface CollectionsResponse {
+  collections: Collection[];
+  total: number;
+}
+
+/** Query parameters accepted by `GET /api/v1/collections`. */
+export interface CollectionsQuery {
+  limit?: number;
+  offset?: number;
+}
+
+/** Cache key / URL for the public collections list. */
+export function collectionsUrl(query: CollectionsQuery = {}): string {
+  const params = new URLSearchParams();
+  if (query.limit != null) params.set("limit", String(query.limit));
+  if (query.offset != null) params.set("offset", String(query.offset));
+  const qs = params.toString();
+  return `${API_BASE_URL}/api/v1/collections${qs ? `?${qs}` : ""}`;
+}
+
+/**
+ * Cache key / URL for a single collection.
+ *
+ * When `version` is provided the URL pins that specific revision, so SWR
+ * caches each revision separately and history views stay stable.
+ */
+export function collectionUrl(slug: string, version?: number): string {
+  const base = `${API_BASE_URL}/api/v1/collections/${encodeURIComponent(slug)}`;
+  return version != null ? `${base}?version=${version}` : base;
+}
+
+function normalizeCollectionRevision(raw: unknown): CollectionRevision | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const version = asFiniteNumber(obj.version);
+  if (version == null || !Array.isArray(obj.market_ids)) return null;
+
+  const marketIds = obj.market_ids
+    .map((id) => asFiniteNumber(id))
+    .filter((id): id is number => id != null);
+
+  return {
+    version,
+    market_ids: marketIds,
+    editor: typeof obj.editor === "string" ? obj.editor : "",
+    updated_at: typeof obj.updated_at === "string" ? obj.updated_at : "",
+    note: typeof obj.note === "string" ? obj.note : null,
+  };
+}
+
+/**
+ * Normalize a raw collection payload.
+ *
+ * Revisions are sorted by version ascending so the update history is
+ * deterministic regardless of backend ordering. When the payload omits
+ * `revisions`, the current `market_ids` are treated as a single revision.
+ * Returns `null` when the payload lacks a `slug`.
+ */
+export function normalizeCollection(raw: unknown): Collection | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.slug !== "string" || obj.slug === "") return null;
+
+  const rawRevisions = Array.isArray(obj.revisions) ? obj.revisions : [];
+  const revisions = rawRevisions
+    .map(normalizeCollectionRevision)
+    .filter((rev): rev is CollectionRevision => rev !== null)
+    .sort((a, b) => a.version - b.version);
+
+  const currentMarketIds = Array.isArray(obj.market_ids)
+    ? obj.market_ids.map((id) => asFiniteNumber(id)).filter((id): id is number => id != null)
+    : [];
+
+  const latest = revisions.length > 0 ? revisions[revisions.length - 1] : null;
+  const marketIds = currentMarketIds.length > 0 ? currentMarketIds : (latest?.market_ids ?? []);
+  const version = asFiniteNumber(obj.version) ?? latest?.version ?? 1;
+
+  return {
+    slug: obj.slug,
+    title: typeof obj.title === "string" ? obj.title : obj.slug,
+    description: typeof obj.description === "string" ? obj.description : null,
+    version,
+    market_ids: marketIds,
+    revisions,
+  };
+}
+
+/**
+ * Resolve a collection against the set of currently available markets.
+ *
+ * Unavailable markets are removed gracefully: the remaining IDs keep their
+ * editorial order, and the dropped IDs are reported so the UI can note them
+ * without failing the whole collection.
+ */
+export function resolveCollectionMarkets(
+  collection: Pick<Collection, "market_ids">,
+  availableMarketIds: Iterable<number>,
+): { market_ids: number[]; missing_market_ids: number[] } {
+  const available = new Set(availableMarketIds);
+  const market_ids: number[] = [];
+  const missing_market_ids: number[] = [];
+  for (const id of collection.market_ids) {
+    if (available.has(id)) market_ids.push(id);
+    else missing_market_ids.push(id);
+  }
+  return { market_ids, missing_market_ids };
+}
+
+/**
+ * Fetch the public list of editorial collections.
+ *
+ * @param url - A URL produced by {@link collectionsUrl}.
+ * @param timeout - Optional timeout in milliseconds. Defaults to DEFAULT_REQUEST_TIMEOUT.
+ * @throws {ApiError} When the response status is not 2xx or the shape is invalid.
+ * @throws {TimeoutError} When the request exceeds the timeout.
+ */
+export async function fetchCollections(
+  url: string,
+  timeout?: number,
+): Promise<CollectionsResponse> {
+  const res = await fetchWithTimeout(url, { headers: { Accept: "application/json" } }, timeout);
+
+  if (!res.ok) {
+    throw new ApiError(`Failed to load collections (HTTP ${res.status})`, res.status);
+  }
+
+  const body = await res.json();
+  if (!body || typeof body !== "object") {
+    throw new ApiError("Invalid collections response shape", 500);
+  }
+
+  const record = body as Record<string, unknown>;
+  const rawList = Array.isArray(record.collections)
+    ? record.collections
+    : Array.isArray(record.data)
+      ? record.data
+      : null;
+  if (!rawList) {
+    throw new ApiError("Invalid collections response shape", 500);
+  }
+
+  const collections = rawList
+    .map(normalizeCollection)
+    .filter((c): c is Collection => c !== null);
+
+  return {
+    collections,
+    total: asFiniteNumber(record.total) ?? collections.length,
+  };
+}
+
+/**
+ * Fetch a single collection, optionally pinned to a specific revision.
+ *
+ * @param url - A URL produced by {@link collectionUrl}.
+ * @param timeout - Optional timeout in milliseconds. Defaults to DEFAULT_REQUEST_TIMEOUT.
+ * @throws {ApiError} When the response status is not 2xx or the shape is invalid.
+ * @throws {TimeoutError} When the request exceeds the timeout.
+ */
+export async function fetchCollection(url: string, timeout?: number): Promise<Collection> {
+  const res = await fetchWithTimeout(url, { headers: { Accept: "application/json" } }, timeout);
+
+  if (!res.ok) {
+    throw new ApiError(`Failed to load collection (HTTP ${res.status})`, res.status);
+  }
+
+  const body = await res.json();
+  const payload =
+    body && typeof body === "object" && "data" in body && body.data ? body.data : body;
+
+  const collection = normalizeCollection(payload);
+  if (!collection) {
+    throw new ApiError("Invalid collection response shape", 500);
+  }
+  return collection;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public participation statistics                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A thresholded aggregate statistic.
+ *
+ * Only aggregates whose cohort size meets the privacy threshold are published;
+ * cohorts below the threshold are suppressed (`suppressed: true`) and carry no
+ * value. `denominator` documents what the aggregate is computed over and
+ * `sampled_at` records the sampling time (ISO timestamp).
+ */
+export interface ParticipationStat {
+  /** Stable metric key, e.g. `"unique_participants"`. */
+  metric: string;
+  /** Aggregate value, or `null` when the cohort was suppressed. */
+  value: number | null;
+  /** Whether the cohort fell below the privacy threshold. */
+  suppressed: boolean;
+  /** Documented denominator the aggregate is computed over. */
+  denominator: string;
+  /** Sampling time as an ISO timestamp. */
+  sampled_at: string;
+}
+
+/**
+ * Public participation statistics payload.
+ *
+ * Contains only thresholded aggregates — never wallet-level records. The
+ * `privacy_threshold` documents the minimum cohort size used for suppression.
+ */
+export interface ParticipationStats {
+  stats: ParticipationStat[];
+  /** Minimum cohort size required before an aggregate is published. */
+  privacy_threshold: number;
+  /** Sampling time for the whole payload, as an ISO timestamp. */
+  sampled_at: string;
+}
+
+/** Cache key / URL for public participation statistics. */
+export function participationStatsUrl(): string {
+  return `${API_BASE_URL}/api/v1/stats/participation`;
+}
+
+function normalizeParticipationStat(raw: unknown): ParticipationStat | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.metric !== "string" || obj.metric === "") return null;
+
+  const suppressed = obj.suppressed === true;
+  const value = suppressed ? null : asFiniteNumber(obj.value);
+
+  return {
+    metric: obj.metric,
+    value,
+    suppressed: suppressed || value == null,
+    denominator: typeof obj.denominator === "string" ? obj.denominator : "",
+    sampled_at: typeof obj.sampled_at === "string" ? obj.sampled_at : "",
+  };
+}
+
+/**
+ * Fetch opt-in public participation statistics.
+ *
+ * Only thresholded aggregates are returned; cohorts below the privacy
+ * threshold are suppressed and carry no value. Raw wallet-level records are
+ * never exposed by this endpoint.
+ *
+ * @param url - A URL produced by {@link participationStatsUrl}.
+ * @param timeout - Optional timeout in milliseconds. Defaults to DEFAULT_REQUEST_TIMEOUT.
+ * @throws {ApiError} When the response status is not 2xx or the shape is invalid.
+ * @throws {TimeoutError} When the request exceeds the timeout.
+ */
+export async function fetchParticipationStats(
+  url: string,
+  timeout?: number,
+): Promise<ParticipationStats> {
+  const res = await fetchWithTimeout(url, { headers: { Accept: "application/json" } }, timeout);
+
+  if (!res.ok) {
+    throw new ApiError(`Failed to load participation stats (HTTP ${res.status})`, res.status);
+  }
+
+  const body = await res.json();
+  if (!body || typeof body !== "object") {
+    throw new ApiError("Invalid participation stats response shape", 500);
+  }
+
+  const record = body as Record<string, unknown>;
+  const rawStats = Array.isArray(record.stats)
+    ? record.stats
+    : Array.isArray(record.data)
+      ? record.data
+      : null;
+  if (!rawStats) {
+    throw new ApiError("Invalid participation stats response shape", 500);
+  }
+
+  const stats = rawStats
+    .map(normalizeParticipationStat)
+    .filter((s): s is ParticipationStat => s !== null);
+
+  return {
+    stats,
+    privacy_threshold: asFiniteNumber(record.privacy_threshold) ?? 0,
+    sampled_at: typeof record.sampled_at === "string" ? record.sampled_at : "",
+  };
+}
