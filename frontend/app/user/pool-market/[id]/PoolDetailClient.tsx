@@ -33,8 +33,10 @@ import {
   EmptyState,
   PartialDataBanner,
   PoolDetailSkeleton,
+  PricingUnitsLegend,
   ShareButton,
 } from "@/components/ui";
+import { deriveOutcomePricing } from "@/lib/probabilityUnits";
 import { sanitizeRichText } from "@/lib/security";
 import { useDemoMode } from "@/lib/demo/DemoModeProvider";
 import { demoPoolDetail } from "@/lib/demo/fixtures";
@@ -443,29 +445,55 @@ export function PoolDetailClient({ poolId, initialPool }: PoolDetailClientProps)
               className="bg-zinc-800/40 border-zinc-700 text-zinc-400"
             />
           ) : (
-            <div className="space-y-2">
-              {pool.odds.map((o) => (
-                <div
-                  key={o.outcome}
-                  className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-800/40 px-4 py-3"
-                >
-                  <span className="text-sm text-zinc-200">
-                    {outcomeLabel(o.outcome, pool.outcome_descriptions)}
-                    {pool.result != null &&
-                      Number(pool.result) === o.outcome && (
-                        <span className="ml-2 text-xs font-medium text-emerald-400">
-                          Winner
+            <div className="space-y-3">
+              <div className="space-y-2">
+                {pool.odds.map((o) => {
+                  const pricing = deriveOutcomePricing(
+                    o.stake,
+                    pool.total_stake,
+                    pool.token,
+                  );
+                  return (
+                    <div
+                      key={o.outcome}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-800 bg-zinc-800/40 px-4 py-3"
+                    >
+                      <span className="text-sm text-zinc-200">
+                        {outcomeLabel(o.outcome, pool.outcome_descriptions)}
+                        {pool.result != null &&
+                          Number(pool.result) === o.outcome && (
+                            <span className="ml-2 text-xs font-medium text-emerald-400">
+                              Winner
+                            </span>
+                          )}
+                      </span>
+                      <div className="flex flex-wrap items-center gap-3 text-right">
+                        <span
+                          aria-label={pricing.probability.ariaLabel}
+                          className="text-xs font-mono text-[#7DE3EC]"
+                        >
+                          {pricing.probability.display}
                         </span>
-                      )}
-                  </span>
-                  <span className="text-sm font-medium text-white">
-                    {o.odds.toFixed(2)}x
-                    <span className="ml-2 text-zinc-500">
-                      ({formatStake(o.stake, pool.token)})
-                    </span>
-                  </span>
-                </div>
-              ))}
+                        <span
+                          aria-label={pricing.sharePrice.ariaLabel}
+                          className="text-xs font-mono text-zinc-400"
+                        >
+                          {pricing.sharePrice.status === "ok"
+                            ? `${pricing.sharePrice.display}/share`
+                            : pricing.sharePrice.display}
+                        </span>
+                        <span className="text-sm font-medium text-white">
+                          {o.odds.toFixed(2)}x
+                          <span className="ml-2 text-zinc-500">
+                            ({formatStake(o.stake, pool.token)})
+                          </span>
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <PricingUnitsLegend token={pool.token} />
             </div>
           )}
         </div>

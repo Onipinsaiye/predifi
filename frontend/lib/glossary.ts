@@ -56,7 +56,16 @@ export const GLOSSARY: Record<string, GlossaryEntry> = {
       "The market-implied chance of an outcome occurring, derived from the ratio of stakes across all outcomes. Not a guarantee of the result.",
     explanation:
       "Probability = stake on this outcome / total stake across all outcomes. It reflects where traders are placing their money, not the actual likelihood of the event.",
-    related: ["odds", "stake"],
+    related: ["price-unit", "odds", "stake"],
+  },
+  "price-unit": {
+    key: "price-unit",
+    term: "Price Unit",
+    definition:
+      "The implied cost denominated in the pool's quote token (for example, XLM or USDC) per 1.00 token of gross winning payout share before protocol fees.",
+    explanation:
+      "Implied unit price = implied probability × 1.00 quote token, always ranging from 0.00 to 1.00. Quote units match the market's settlement token, not USD unless the pool token is USD-pegged.",
+    related: ["probability", "odds", "stake"],
   },
   odds: {
     key: "odds",
@@ -123,6 +132,7 @@ export const DECISION_POINT_TERMS: readonly string[] = [
   "resolve",
   "claim",
   "probability",
+  "price-unit",
   "odds",
   "stake",
   "position",

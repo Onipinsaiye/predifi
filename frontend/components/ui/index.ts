@@ -65,3 +65,9 @@ export {
   type GlossaryPanelProps,
 } from "../common/Glossary";
 export { ChartAlternative } from "./chart-alternative";
+export {
+  PricingMetricValue,
+  PricingUnitsLegend,
+  type PricingMetricValueProps,
+  type PricingUnitsLegendProps,
+} from "./pricing-unit-explainer";
