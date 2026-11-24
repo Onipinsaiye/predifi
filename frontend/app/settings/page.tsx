@@ -45,11 +45,22 @@ const AccountDataSettings = dynamic(
   },
 );
 
+// FeedbackForm — below-the-fold, lazily loaded
+const FeedbackForm = dynamic(
+  () => import("@/components/settings/FeedbackForm").then((mod) => mod.FeedbackForm),
+  {
+    loading: () => (
+      <div className="h-[300px] w-full animate-pulse bg-zinc-800/50 rounded-xl" aria-hidden="true" />
+    ),
+  },
+);
+
 const PANEL_MAP: Record<SettingsTab, React.ReactNode> = {
   profile: <ProfileForm />,
   security: <SecuritySettings />,
   notifications: <NotificationPreferences />,
   "account-data": <AccountDataSettings />,
+  feedback: <FeedbackForm />,
 };
 
 const TAB_LABELS: Record<SettingsTab, string> = {
@@ -57,6 +68,7 @@ const TAB_LABELS: Record<SettingsTab, string> = {
   security: "Security",
   notifications: "Notifications",
   "account-data": "Account data",
+  feedback: "Feedback",
 };
 
 export default function SettingsPage() {
@@ -102,7 +114,7 @@ export default function SettingsPage() {
           <div className="space-y-1">
             <h1 className="text-3xl font-bold">Settings</h1>
             <p className="text-sm text-foreground/70">
-              Manage your profile, security, notification preferences, and account data.
+              Manage your profile, security, notification preferences, account data, and send product feedback.
             </p>
           </div>
           <button
