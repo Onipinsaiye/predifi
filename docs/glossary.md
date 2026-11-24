@@ -10,6 +10,9 @@ A unit of measure equal to one hundredth of one percentage point ($1 \text{ bps}
 ### **Claim**
 The transaction executed by a prediction participant to withdraw their proportional payout after a market pool resolves. Claims calculate winnings based on the user's stake in the winning outcome relative to the total winning outcome pool.
 
+### **Implied Probability**
+The percentage share of total pool stakes currently backing a given outcome (`outcome_stake / total_pool_stake × 100%`). Implied probabilities across all outcomes sum to 100% and represent an illustrative snapshot of pool participation rather than a forecast guarantee.
+
 ### **Ledger**
 The discrete sequence unit of time and state on the Stellar blockchain, equivalent to a block in other network architectures. Soroban smart contract storage entries and time-to-live (TTL) thresholds are measured in ledgers.
 
@@ -24,6 +27,9 @@ The core prediction market entity holding total staked collateral across all out
 
 ### **Price Condition**
 A structured rule specified for oracle-driven prediction pools comparing asset prices against target thresholds. Price conditions define the asset pair, target value, and comparison operator (e.g., GreaterThan, LessThan) evaluated at resolution time.
+
+### **Price Unit**
+The implied share price denominated in the pool's quote token (for example, `XLM` or `USDC`) per `1.00` token of gross winning payout share before protocol fees (`implied_probability × 1.00 <token>`, bounded to `0.00–1.00`). Displayed price units always match the market's settlement token rather than assuming USD.
 
 ### **Referral Cut**
 The percentage share (measured in basis points) of protocol fees awarded to the address that referred a prediction market participant. Referral rewards are calculated during payout processing and distributed to referrers.
