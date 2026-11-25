@@ -1,0 +1,40 @@
+{
+  "format_version": 1,
+  "manifest_id": "predifi-testnet-0.1.0-rc.1",
+  "example_only": true,
+  "profile": "testnet",
+  "network": "testnet",
+  "network_passphrase": "Test SDF Network ; September 2015",
+  "version": "0.1.0-rc.1",
+  "artifacts": [
+    {
+      "id": "access-control",
+      "filename": "access_control.wasm",
+      "fixture_wasm_hex": "0061736d0100000000020161",
+      "sha256": "ad7e07012b3bc61e217e1dddbba916d27799bc198c2f1d066a4562dd22513734"
+    },
+    {
+      "id": "predifi-contract",
+      "filename": "predifi_contract.wasm",
+      "fixture_wasm_hex": "0061736d0100000000020162",
+      "sha256": "76b54c92ad4dfa455958ee8b52624104db89ac16996be1aebaf8d85e4ddad6d7"
+    }
+  ],
+  "contracts": [
+    {
+      "id": "access-control",
+      "artifact_id": "access-control",
+      "contract_id": "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"
+    },
+    {
+      "id": "predifi-contract",
+      "artifact_id": "predifi-contract",
+      "contract_id": "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"
+    }
+  ],
+  "signature": {
+    "algorithm": "ed25519",
+    "public_key": "MCowBQYDK2VwAyEAvRyi9kBn8wk2F7uchg6VSUZaJemh21vvx3Qpe1cxpkI=",
+    "value": "H0ElYTqZh59v3DhY5W73zoC+bUoGtvlGL888mjJl+4yMaOIqyZ5tjl90El/CBWDX4D4B8Uza48YUWGNagRDnDA=="
+  }
+}
