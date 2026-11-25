@@ -12,10 +12,17 @@ use crate::cache_coalesce::{CoalesceError, CoalescingCache};
 use crate::config::Config;
 use crate::db::PoolCreatedEvent;
 use crate::db::PredictionPlacedEvent;
+use crate::editorial_collections::{
+    self, CollectionError, CollectionVersion, EditorialCollection, NewCollection, NewVersion,
+    ResolvedCollection,
+};
+use crate::feedback::{self, FeedbackError, FeedbackSubmission};
 use crate::metrics::SharedMetrics;
+use crate::participation::{self, ParticipationError, ParticipationStats};
 use crate::pool_cache::PoolCache;
 use crate::price_cache::PriceCache;
 use crate::redis_cache::RedisCache;
+use crate::reports::{self, AppealError, ReportError, ReportStatusView, ReviewerAction};
 use crate::response::{error_codes, ApiResponse};
 use crate::validated_types::{BoundedI64, NonEmptyString, PoolSortBy, PoolStatus, StellarAddress};
 
@@ -4142,6 +4149,604 @@ pub async fn set_user_interests_handler(
     }
 }
 
+/// `GET /api/v1/collections` — public list of published editorial collections.
+///
+/// Collections are versioned lists of canonical market IDs with editor
+/// attribution. The response carries an explicit `ordering` label so clients
+/// never mistake editorial ordering for a protocol ranking.
+async fn list_collections_handler(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match editorial_collections::list_collections(db).await {
+        Ok(collections) => ApiResponse::success(json!({
+            "collections": collections,
+            "ordering": editorial_collections::EDITORIAL_ORDERING_LABEL,
+        }))
+        .into_response(),
+        Err(error) => collection_error_response(error),
+    }
+}
+
+/// `GET /api/v1/collections/:slug` — current version with resolved markets.
+///
+/// Markets that are no longer available are dropped gracefully and reported
+/// in `unavailable_market_ids`; the remaining markets keep their editorial
+/// order.
+async fn get_collection_handler(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match editorial_collections::resolve_current(db, &slug).await {
+        Ok(resolved) => ApiResponse::success(resolved).into_response(),
+        Err(error) => collection_error_response(error),
+    }
+}
+
+/// `GET /api/v1/collections/:slug/versions/:version` — a specific revision.
+async fn get_collection_version_handler(
+    State(state): State<AppState>,
+    Path((slug, version)): Path<(String, i32)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match editorial_collections::resolve_version(db, &slug, version).await {
+        Ok(resolved) => ApiResponse::success(resolved).into_response(),
+        Err(error) => collection_error_response(error),
+    }
+}
+
+/// `POST /api/v1/collections` — editor-only creation of a collection.
+async fn create_collection_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<NewCollection>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = require_editor(&state, &headers) {
+        return rejection;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match editorial_collections::create_collection(db, body).await {
+        Ok(collection) => ApiResponse::success(collection).into_response(),
+        Err(error) => collection_error_response(error),
+    }
+}
+
+/// `POST /api/v1/collections/:slug/versions` — publish a new revision.
+async fn publish_collection_version_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(slug): Path<String>,
+    Json(body): Json<NewVersion>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = require_editor(&state, &headers) {
+        return rejection;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match editorial_collections::publish_version(db, &slug, body).await {
+        Ok(version) => ApiResponse::success(version).into_response(),
+        Err(error) => collection_error_response(error),
+    }
+}
+
+/// Map an [`CollectionError`] onto the shared API error envelope.
+fn collection_error_response(error: CollectionError) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let (status, code, message) = match &error {
+        CollectionError::NotFound => (
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "collection not found".to_string(),
+        ),
+        CollectionError::VersionNotFound => (
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "collection version not found".to_string(),
+        ),
+        CollectionError::InvalidInput(message) => (
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            message.clone(),
+        ),
+        CollectionError::Forbidden => (
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "editor access required".to_string(),
+        ),
+        CollectionError::Conflict(message) => (
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            message.clone(),
+        ),
+        CollectionError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "collection operation failed".to_string(),
+        ),
+    };
+    if let CollectionError::Internal(detail) = &error {
+        tracing::error!(error = %detail, "editorial collection operation failed");
+    }
+    ApiResponse::<()>::error(status, code, message).into_response()
+}
+
+/// Editor gate for collection mutations. Editors authenticate with the
+/// configured admin token; anything else is rejected before touching the DB.
+fn require_editor(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::jwt::extract_bearer_token);
+    let expected = state.config.admin_token.as_deref().unwrap_or_default();
+    let authorized = !expected.is_empty()
+        && presented
+            .map(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+            .unwrap_or(false);
+    if authorized {
+        return None;
+    }
+    Some(
+        ApiResponse::<()>::error(
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "editor access required",
+        )
+        .into_response(),
+    )
+}
+
+/// Length-independent comparison used for token checks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// `POST /api/v1/feedback` — opt-in structured product feedback (#294).
+///
+/// No authentication is required, but the endpoint is rate-limited. Wallet
+/// addresses are redacted by default, secret-like payloads are rejected, and
+/// the response only returns an opaque reference ID.
+async fn submit_feedback_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<FeedbackSubmission>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let client_key = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| "anonymous".to_string());
+    if let Some(rejection) = enforce_abuse_quota(
+        &state,
+        crate::abuse::AbuseAction::WalletAction,
+        &client_key,
+    ) {
+        return rejection;
+    }
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match feedback::submit(db, body).await {
+        Ok(reference_id) => ApiResponse::success(json!({ "reference_id": reference_id }))
+            .into_response(),
+        Err(error) => feedback_error_response(error),
+    }
+}
+
+/// Map a [`FeedbackError`] onto the shared API error envelope.
+fn feedback_error_response(error: FeedbackError) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let (status, code, message) = match &error {
+        FeedbackError::InvalidInput(message) => (
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            message.clone(),
+        ),
+        FeedbackError::ConsentRequired => (
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "consent is required to submit feedback".to_string(),
+        ),
+        FeedbackError::SecretDetected => (
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            "feedback must not contain secrets or credentials".to_string(),
+        ),
+        FeedbackError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "feedback submission failed".to_string(),
+        ),
+    };
+    if let FeedbackError::Internal(detail) = &error {
+        tracing::error!(error = %detail, "feedback submission failed");
+    }
+    ApiResponse::<()>::error(status, code, message).into_response()
+}
+
+/// `POST /api/v1/reports` — submit a content report (#295).
+///
+/// Reports are deduplicated per reporter and target. Submitting a report
+/// never alters on-chain funds or resolution.
+async fn submit_report_handler(
+    State(state): State<AppState>,
+    Json(body): Json<reports::NewReport>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match reports::submit_report(db, body).await {
+        Ok(view) => ApiResponse::success(view).into_response(),
+        Err(error) => report_error_response(error),
+    }
+}
+
+/// `GET /api/v1/reports/:id` — reporter-visible status of a report.
+async fn get_report_handler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match reports::get_report_status(db, id).await {
+        Ok(view) => ApiResponse::success(view).into_response(),
+        Err(error) => report_error_response(error),
+    }
+}
+
+/// `GET /api/v1/reports` — reviewer-only queue of reports.
+async fn list_reports_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = require_editor(&state, &headers) {
+        return rejection;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match reports::list_reports(db).await {
+        Ok(reports) => ApiResponse::success(json!({ "reports": reports })).into_response(),
+        Err(error) => report_error_response(error),
+    }
+}
+
+/// `PATCH /api/v1/reports/:id` — reviewer moderation action with audit trail.
+async fn review_report_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<ReviewerAction>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = require_editor(&state, &headers) {
+        return rejection;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match reports::review_report(db, id, body).await {
+        Ok(view) => ApiResponse::success(view).into_response(),
+        Err(error) => report_error_response(error),
+    }
+}
+
+/// `POST /api/v1/reports/:id/appeals` — bounded appeal of a moderation decision.
+async fn submit_appeal_handler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<reports::NewAppeal>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match reports::submit_appeal(db, id, body).await {
+        Ok(view) => ApiResponse::success(view).into_response(),
+        Err(error) => appeal_error_response(error),
+    }
+}
+
+/// `GET /api/v1/reports/:id/appeals` — appeal status for a report.
+async fn get_appeals_handler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match reports::list_appeals(db, id).await {
+        Ok(appeals) => ApiResponse::success(json!({ "appeals": appeals })).into_response(),
+        Err(error) => report_error_response(error),
+    }
+}
+
+/// Map a [`ReportError`] onto the shared API error envelope.
+fn report_error_response(error: ReportError) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let (status, code, message) = match &error {
+        ReportError::NotFound => (
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "report not found".to_string(),
+        ),
+        ReportError::InvalidInput(message) => (
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            message.clone(),
+        ),
+        ReportError::Forbidden => (
+            StatusCode::FORBIDDEN,
+            error_codes::FORBIDDEN,
+            "reviewer access required".to_string(),
+        ),
+        ReportError::Conflict(message) => (
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            message.clone(),
+        ),
+        ReportError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "report operation failed".to_string(),
+        ),
+    };
+    if let ReportError::Internal(detail) = &error {
+        tracing::error!(error = %detail, "report operation failed");
+    }
+    ApiResponse::<()>::error(status, code, message).into_response()
+}
+
+/// Map an [`AppealError`] onto the shared API error envelope.
+fn appeal_error_response(error: AppealError) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let (status, code, message) = match &error {
+        AppealError::NotFound => (
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "report not found".to_string(),
+        ),
+        AppealError::InvalidInput(message) => (
+            StatusCode::BAD_REQUEST,
+            error_codes::INVALID_INPUT,
+            message.clone(),
+        ),
+        AppealError::NotAppealable => (
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            "report is not in an appealable state".to_string(),
+        ),
+        AppealError::AppealLimitReached => (
+            StatusCode::CONFLICT,
+            error_codes::CONFLICT,
+            "appeal limit reached for this report".to_string(),
+        ),
+        AppealError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "appeal operation failed".to_string(),
+        ),
+    };
+    if let AppealError::Internal(detail) = &error {
+        tracing::error!(error = %detail, "appeal operation failed");
+    }
+    ApiResponse::<()>::error(status, code, message).into_response()
+}
+
+/// `GET /api/v1/stats/participation` — opt-in public participation statistics.
+///
+/// Only thresholded aggregates are published, with documented denominators
+/// and a sampling timestamp. Cohorts below the privacy threshold are
+/// suppressed and no wallet identifiers are ever returned.
+async fn get_participation_stats_handler(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match participation::latest_snapshot(db).await {
+        Ok(Some(stats)) => ApiResponse::success(stats).into_response(),
+        Ok(None) => ApiResponse::<()>::error(
+            StatusCode::NOT_FOUND,
+            error_codes::NOT_FOUND,
+            "no participation snapshot available",
+        )
+        .into_response(),
+        Err(error) => participation_error_response(error),
+    }
+}
+
+/// `POST /api/v1/admin/stats/participation/refresh` — recompute the snapshot.
+///
+/// Admin-only. The aggregation is deterministic for a given sampling time so
+/// repeated refreshes over the same data reproduce the same aggregates.
+async fn refresh_participation_stats_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = require_editor(&state, &headers) {
+        return rejection;
+    }
+    let Some(db) = &state.db else {
+        return ApiResponse::<()>::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::DATABASE_UNAVAILABLE,
+            "database not available",
+        )
+        .into_response();
+    };
+
+    match participation::refresh_snapshot(db).await {
+        Ok(stats) => ApiResponse::success(stats).into_response(),
+        Err(error) => participation_error_response(error),
+    }
+}
+
+/// Map a [`ParticipationError`] onto the shared API error envelope.
+fn participation_error_response(error: ParticipationError) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let (status, code, message) = match &error {
+        ParticipationError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_codes::INTERNAL_ERROR,
+            "participation aggregation failed".to_string(),
+        ),
+    };
+    if let ParticipationError::Internal(detail) = &error {
+        tracing::error!(error = %detail, "participation aggregation failed");
+    }
+    ApiResponse::<()>::error(status, code, message).into_response()
+}
+
 /// Build the version 1 API router.
 pub fn router(
     config: Arc<Config>,
@@ -4199,6 +4804,10 @@ pub fn router(
             "/admin/notifications/:id/replay",
             post(admin_replay_notification),
         )
+        .route(
+            "/admin/stats/participation/refresh",
+            post(refresh_participation_stats_handler),
+        )
         .with_state(state.clone());
 
     // Light tier — cheap, stateless, polling-friendly endpoints.
@@ -4239,9 +4848,18 @@ pub fn router(
             .route("/pools/:id/quote", get(get_pool_quote_handler))
             .route("/pools/:id/leaderboard", get(get_pool_leaderboard))
             .route("/stats", get(get_stats))
+            .route("/stats/participation", get(get_participation_stats_handler))
             .route("/leaderboard", get(get_leaderboard))
             .route("/categories", get(list_categories_handler))
             .route("/tags", get(list_tags_handler))
+            .route("/collections", get(list_collections_handler))
+            .route("/collections/:slug", get(get_collection_handler))
+            .route(
+                "/collections/:slug/versions/:version",
+                get(get_collection_version_handler),
+            )
+            .route("/reports/:id", get(get_report_handler))
+            .route("/reports/:id/appeals", get(get_appeals_handler))
             .route("/referrals/:address", get(referrals_handler))
             .route(
                 "/referrals/:address/estimate",
@@ -4437,8 +5055,47 @@ pub fn router(
                         crate::discussions::MAX_DISCUSSION_BODY_BYTES,
                     )),
             )
+            .route(
+                "/collections",
+                post(create_collection_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/collections/:slug/versions",
+                post(publish_collection_version_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/reports",
+                post(submit_report_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/reports/:id",
+                patch(review_report_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
+            .route(
+                "/reports/:id/appeals",
+                post(submit_appeal_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_ADMIN)),
+            )
             .with_state(state.clone()),
         RateLimitTier::Write,
+        state.redis.clone(),
+    );
+
+    // Feedback tier — opt-in structured product feedback (#294). Public but
+    // tightly rate-limited; no authentication required.
+    let feedback = with_distributed_rate_limit(
+        Router::new()
+            .route(
+                "/feedback",
+                post(submit_feedback_handler)
+                    .layer(DefaultBodyLimit::max(c::MAX_BODY_BYTES_INTERESTS)),
+            )
+            .with_state(state.clone()),
+        RateLimitTier::Token,
         state.redis.clone(),
     );
 
@@ -4464,6 +5121,7 @@ pub fn router(
         .merge(read)
         .merge(user)
         .merge(write)
+        .merge(feedback)
         .merge(admin)
 }
 

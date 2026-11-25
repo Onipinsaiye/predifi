@@ -10,7 +10,15 @@ import {
 } from "react";
 import useSWR from "swr";
 import Link from "next/link";
-import { ArrowLeft, Radio, Users, Coins, Info, AlertTriangle } from "lucide-react";
+import {
+  ArrowLeft,
+  Radio,
+  Users,
+  Coins,
+  Info,
+  AlertTriangle,
+  Flag,
+} from "lucide-react";
 import {
   fetchPoolDetail,
   poolDetailUrl,
@@ -26,6 +34,7 @@ import {
   getLifecycleExplanation,
   type LifecycleExplanation,
 } from "@/lib/i18n/lifecycleCatalog";
+import { ContentReportPanel } from "@/components/moderation/ContentReportPanel";
 
 export interface PoolDetailViewProps {
   poolId: number;
@@ -397,6 +406,13 @@ export function PoolDetailView({
             onClose={closeTrade}
           />
         )}
+
+        <ContentReportPanel
+          contentType="pool"
+          contentId={String(pool.pool_id ?? poolId)}
+          contentLabel={pool.name || `Pool #${pool.pool_id ?? poolId}`}
+          demo={demo}
+        />
 
         <p className="text-[11px] text-zinc-600">
           Creator {pool.creator.slice(0, 6)}…{pool.creator.slice(-4)} · token{" "}
@@ -833,6 +849,25 @@ function Metric({
       </div>
       {value}
     </div>
+  );
+}
+
+/**
+ * Moderation notice: content moderation is a presentation-layer concern and
+ * never mutates on-chain funds or market resolution.
+ */
+export function ModerationNotice() {
+  return (
+    <p
+      role="note"
+      className="flex items-start gap-1.5 text-[10px] text-zinc-500"
+    >
+      <Flag className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+      <span>
+        Reporting and moderation affect content visibility only. They never
+        alter on-chain funds, stakes, or market resolution.
+      </span>
+    </p>
   );
 }
 

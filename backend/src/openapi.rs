@@ -16,7 +16,8 @@ use crate::{
         PortfolioExposureRow,
     },
     routes::{
-        activity, claims, creators, discussions, moderation, portfolio,
+        activity, claims, content_reports, editorial_collections, feedback, participation_stats,
+        portfolio,
     },
 };
 
@@ -38,7 +39,7 @@ impl Modify for SecurityAddon {
 #[openapi(
     info(
         title = "Portfolio API",
-        description = "Portfolio exposure, claimable rewards, claim reconciliation, and activity export endpoints.",
+        description = "Portfolio exposure, claimable rewards, claim reconciliation, activity export, editorial collections, feedback, content reports, and participation statistics endpoints.",
         version = "1.0.0"
     ),
     paths(
@@ -57,6 +58,13 @@ impl Modify for SecurityAddon {
         moderation::submit_moderation_review,
         moderation::submit_moderation_appeal,
         moderation::list_moderation_transitions,
+        editorial_collections::list_editorial_collections,
+        editorial_collections::get_editorial_collection,
+        feedback::submit_feedback,
+        content_reports::submit_content_report,
+        content_reports::get_content_report_status,
+        content_reports::submit_content_report_appeal,
+        participation_stats::get_participation_statistics,
     ),
     components(
         schemas(
@@ -86,6 +94,23 @@ impl Modify for SecurityAddon {
             ModerationAppeal,
             ModerationAppealRequest,
             ModerationTransition,
+            editorial_collections::EditorialCollection,
+            editorial_collections::EditorialCollectionRevision,
+            editorial_collections::EditorialCollectionEntry,
+            editorial_collections::EditorialCollectionListQuery,
+            feedback::FeedbackSubmission,
+            feedback::FeedbackCategory,
+            feedback::FeedbackDiagnostics,
+            feedback::FeedbackReceipt,
+            content_reports::ContentReportSubmission,
+            content_reports::ContentReportReason,
+            content_reports::ContentReportStatus,
+            content_reports::ContentReportStatusResponse,
+            content_reports::ContentReportAppealSubmission,
+            content_reports::ContentReportAppeal,
+            participation_stats::ParticipationStatistics,
+            participation_stats::ParticipationStatisticsQuery,
+            participation_stats::ParticipationAggregate,
         )
     ),
     modifiers(&SecurityAddon),
@@ -95,6 +120,10 @@ impl Modify for SecurityAddon {
         (name = "Creators", description = "Creator profile endpoints with wallet ownership proofs"),
         (name = "Discussions", description = "Versioned market discussion endpoints"),
         (name = "Moderation", description = "Auditable content moderation transitions"),
+        (name = "Editorial Collections", description = "Versioned, editorially ordered market collections"),
+        (name = "Feedback", description = "Opt-in structured product feedback submissions"),
+        (name = "Content Reports", description = "Content report and appeal workflow endpoints"),
+        (name = "Participation Statistics", description = "Opt-in thresholded aggregate participation statistics"),
     )
 )]
 pub struct ApiDoc;

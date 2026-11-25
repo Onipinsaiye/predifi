@@ -31,3 +31,15 @@ This document summarizes recent key frontend feature implementations, architectu
 - **Features**:
   - Client-side validation for description length, timestamp logic (`end > start > now`), token selection, and min/max stake limits.
   - Real-time feedback with layout space reservation to prevent Cumulative Layout Shift (CLS).
+
+## 5. Consistent Probability & Price Unit Explanations (#248)
+- **Modules & Components**:
+  - `frontend/lib/probabilityUnits.ts`
+  - `frontend/components/ui/pricing-unit-explainer.tsx` (`PricingMetricValue`, `PricingUnitsLegend`)
+  - `frontend/app/user/pool-market/[id]/PoolDetailClient.tsx`
+  - `frontend/lib/glossary.ts` (`price-unit` entry)
+- **Features**:
+  - Single formatting and unit-derivation layer (`deriveOutcomePricing`, `formatImpliedProbability`, `formatPriceUnit`, `formatOddsMultiplier`, `formatStakeUnit`) guaranteeing consistent units (`%`, `<TOKEN>/share`, `×`, `<TOKEN>`) across market views.
+  - Accessible inline disclosure explanations documenting formulas, quote token semantics, Stellar stroop base-unit precision, and the on-chain settlement authority disclaimer.
+  - Explicit `unavailable` (zero-liquidity / unbacked outcome) and `invalid` (out-of-range / non-finite input) recovery states with `role="status"` / `role="alert"` guidance instead of `NaN` or `Infinity`.
+  - Covered by Jest unit, interaction, and `jest-axe` accessibility tests in `frontend/__tests__/probability-units.test.tsx`.
