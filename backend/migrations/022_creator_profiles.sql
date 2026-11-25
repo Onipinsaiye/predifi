@@ -52,9 +52,94 @@ CREATE TABLE IF NOT EXISTS creator_profiles (
     -- app layer detect "already opted in" vs "first save").
     opted_in_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+    -- Monotonic revision counter.  Incremented on every accepted update so
+    -- clients can detect stale writes and ordering can be audited.
+    revision            BIGINT      NOT NULL DEFAULT 1,
+
+    -- Explicit visibility state.  `public` is retained for backwards
+    -- compatibility; `visibility` is the authoritative state going forward.
+    --   'private'  — stored but never surfaced publicly (default)
+    --   'unlisted' — reachable by direct link only
+    --   'public'   — discoverable / listed
+    visibility          TEXT        NOT NULL DEFAULT 'private'
+        CHECK (visibility IN ('private', 'unlisted', 'public')),
+
+    -- Wallet rotation support: the address this profile was rotated from
+    -- (NULL = never rotated) and when the rotation was accepted.
+    rotated_from        TEXT,
+    wallet_rotated_at   TIMESTAMPTZ,
+
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Keep `visibility` and the legacy `public` flag consistent for rows written
+-- by older code paths that only set `public`.
+CREATE OR REPLACE FUNCTION sync_creator_profiles_visibility()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.visibility = 'public' THEN
+        NEW.public = TRUE;
+    ELSIF NEW.public = TRUE AND NEW.visibility = 'private' THEN
+        NEW.visibility = 'public';
+    ELSE
+        NEW.public = FALSE;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_creator_profiles_visibility ON creator_profiles;
+CREATE TRIGGER trg_creator_profiles_visibility
+    BEFORE INSERT OR UPDATE ON creator_profiles
+    FOR EACH ROW EXECUTE FUNCTION sync_creator_profiles_visibility();
+
+-- Proof material is stored separately from the normalized public fields.
+-- Each row records a fresh wallet signature authorizing a create/update.
+-- `nonce` is unique per address so a replayed proof cannot be consumed twice.
+CREATE TABLE IF NOT EXISTS creator_profile_proofs (
+    id                  BIGSERIAL   PRIMARY KEY,
+
+    -- Wallet address that produced the signature.
+    address             TEXT        NOT NULL,
+
+    -- Base64-encoded wallet signature over the canonical signed payload.
+    signature           TEXT        NOT NULL,
+
+    -- Hex digest (e.g. sha256) of the exact canonical payload that was signed.
+    payload_digest      TEXT        NOT NULL,
+
+    -- Single-use nonce embedded in the signed payload.  Unique per address.
+    nonce               TEXT        NOT NULL,
+
+    -- When the signature was produced (client-supplied, validated for freshness).
+    proof_timestamp     TIMESTAMPTZ NOT NULL,
+
+    -- Set TRUE once the proof has been accepted; prevents replay.
+    consumed            BOOLEAN     NOT NULL DEFAULT FALSE,
+    consumed_at         TIMESTAMPTZ,
+
+    -- Revision this proof authorized (NULL for the initial create).
+    revision            BIGINT,
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Reject replays: a given (address, nonce) may only ever appear once.
+    CONSTRAINT uq_creator_profile_proofs_address_nonce UNIQUE (address, nonce)
+);
+
+-- Fast lookup of the latest proof for an address.
+CREATE INDEX IF NOT EXISTS idx_creator_profile_proofs_address_created
+    ON creator_profile_proofs (address, created_at DESC);
+
+-- Background jobs scan for unconsumed proofs to expire / audit.
+CREATE INDEX IF NOT EXISTS idx_creator_profile_proofs_unconsumed
+    ON creator_profile_proofs (address)
+    WHERE consumed = FALSE;
+
+-- Revision ordering lookups (e.g. "give me the profile at revision N").
+CREATE INDEX IF NOT EXISTS idx_creator_profiles_revision
+    ON creator_profiles (address, revision DESC);
 
 -- Speed up the common query "fetch public creator profile by address".
 CREATE INDEX IF NOT EXISTS idx_creator_profiles_public
@@ -78,3 +163,7 @@ DROP TRIGGER IF EXISTS trg_creator_profiles_updated_at ON creator_profiles;
 CREATE TRIGGER trg_creator_profiles_updated_at
     BEFORE UPDATE ON creator_profiles
     FOR EACH ROW EXECUTE FUNCTION set_creator_profiles_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- Reversible: see 022_creator_profiles.down.sql for the rollback counterpart.
+-- ---------------------------------------------------------------------------

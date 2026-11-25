@@ -45,8 +45,30 @@ export interface CreatorProfile {
   provenance_links: ProvenanceLink[];
   /** True when the profile is publicly visible. */
   public: boolean;
+  /** Monotonically increasing revision, bumped on every accepted write. */
+  revision: number;
+  /** Visibility state retained alongside the revision. */
+  visibility: CreatorProfileVisibility;
   opted_in_at: string;
   updated_at: string;
+}
+
+export type CreatorProfileVisibility = "public" | "private";
+
+/**
+ * Wallet ownership proof attached to a create/update request.
+ *
+ * The signature must be produced by the wallet that controls `address` over a
+ * fresh, single-use `nonce` and `timestamp`; the backend rejects replayed or
+ * stale proofs.
+ */
+export interface CreatorProfileSignature {
+  /** Single-use nonce issued by the backend (or client-generated, per API). */
+  nonce: string;
+  /** ISO-8601 timestamp of when the signature was produced. */
+  timestamp: string;
+  /** Hex-encoded wallet signature over the canonical proof message. */
+  signature: string;
 }
 
 /** Payload for PUT /api/v1/users/:address/creator-profile */
@@ -57,6 +79,14 @@ export interface UpsertCreatorProfileInput {
   /** Backend resets all verified flags to false on save. */
   provenance_links: Omit<ProvenanceLink, "verified">[];
   public: boolean;
+  visibility: CreatorProfileVisibility;
+  /**
+   * Revision the client believes it is updating. Omit (or pass `null`) when
+   * creating; the backend rejects stale revisions with a 409 conflict.
+   */
+  expected_revision?: number | null;
+  /** Fresh wallet ownership proof for this write. */
+  proof: CreatorProfileSignature;
 }
 
 // ─── URL helpers ──────────────────────────────────────────────────────────────
@@ -88,9 +118,51 @@ function isCreatorProfile(obj: unknown): obj is CreatorProfile {
     Array.isArray(profile.provenance_links) &&
     profile.provenance_links.every(isProvenanceLink) &&
     typeof profile.public === "boolean" &&
+    typeof profile.revision === "number" &&
+    (profile.visibility === "public" || profile.visibility === "private") &&
     typeof profile.opted_in_at === "string" &&
     typeof profile.updated_at === "string"
   );
+}
+
+// ─── Error helpers ────────────────────────────────────────────────────────────
+
+/** Error codes the backend may return for rejected ownership proofs. */
+export type CreatorProfileErrorCode =
+  | "invalid_signature"
+  | "replayed_proof"
+  | "stale_timestamp"
+  | "revision_conflict"
+  | "wallet_mismatch";
+
+export class CreatorProfileError extends ApiError {
+  readonly code: CreatorProfileErrorCode | string | null;
+  /** Current server revision, present on revision conflicts. */
+  readonly currentRevision: number | null;
+
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    currentRevision: number | null,
+  ) {
+    super(message, status);
+    this.name = "CreatorProfileError";
+    this.code = code;
+    this.currentRevision = currentRevision;
+  }
+
+  get isReplay(): boolean {
+    return this.code === "replayed_proof";
+  }
+
+  get isRevisionConflict(): boolean {
+    return this.code === "revision_conflict" || this.status === 409;
+  }
+
+  get isInvalidSignature(): boolean {
+    return this.code === "invalid_signature" || this.code === "wallet_mismatch";
+  }
 }
 
 // ─── Fetch ────────────────────────────────────────────────────────────────────
@@ -142,9 +214,13 @@ export async function fetchCreatorProfile(
 /**
  * Create or update the creator profile for `address`.
  *
- * Requires a valid bearer token for `address`. Provenance-link `verified`
- * flags are always reset to `false` by the backend; pass the links without
- * `verified` to avoid confusion.
+ * Requires a valid bearer token for `address` and a fresh wallet ownership
+ * proof (`input.proof`) signed by the wallet controlling `address`. The
+ * backend rejects replayed proofs and stale revisions; those surface as
+ * `CreatorProfileError` with `isReplay` / `isRevisionConflict` set.
+ *
+ * Provenance-link `verified` flags are always reset to `false` by the backend;
+ * pass the links without `verified` to avoid confusion.
  */
 export async function upsertCreatorProfile(
   address: string,
@@ -155,6 +231,7 @@ export async function upsertCreatorProfile(
     provenance_links: ProvenanceLink[];
   } = {
     ...input,
+    expected_revision: input.expected_revision ?? null,
     // Explicit: strip any stale verified flags before sending.
     provenance_links: input.provenance_links.map((l) => ({
       ...l,
@@ -173,11 +250,25 @@ export async function upsertCreatorProfile(
   });
 
   if (!res.ok) {
-    const errorBody = await res.json().catch(() => ({}));
+    const errorBody = (await res.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
     const message =
-      (errorBody as Record<string, unknown>)?.error ??
+      errorBody?.error ??
       `Failed to save creator profile (HTTP ${res.status})`;
-    throw new ApiError(String(message), res.status);
+    const code =
+      typeof errorBody?.code === "string" ? errorBody.code : null;
+    const currentRevision =
+      typeof errorBody?.current_revision === "number"
+        ? errorBody.current_revision
+        : null;
+    throw new CreatorProfileError(
+      String(message),
+      res.status,
+      code,
+      currentRevision,
+    );
   }
 
   const body = await res.json();

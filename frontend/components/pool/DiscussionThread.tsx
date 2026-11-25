@@ -35,6 +35,7 @@ import { Button } from "@/components/ui/button";
 import {
   type Comment,
   COMMENT_MAX_LENGTH,
+  MAX_THREAD_DEPTH,
   addComment,
   editComment,
   deleteComment,
@@ -42,6 +43,7 @@ import {
   getComments,
   validateCommentContent,
   seedDemoComments,
+  DiscussionConflictError,
 } from "@/lib/discussion";
 
 /** Short wallet display: first 6 + … + last 4 chars. */
@@ -67,9 +69,12 @@ function relativeTime(isoString: string): string {
 interface CommentItemProps {
   comment: Comment;
   currentUserAddress: string | undefined;
-  onEdit: (commentId: string, newContent: string) => void;
+  onEdit: (commentId: string, newContent: string, revision: number) => void;
   onDelete: (commentId: string) => void;
   onReport: (commentId: string) => void;
+  onReply: (parentId: string) => void;
+  /** True when this comment is at the maximum allowed nesting depth. */
+  atMaxDepth: boolean;
 }
 
 function CommentItem({
@@ -78,6 +83,8 @@ function CommentItem({
   onEdit,
   onDelete,
   onReport,
+  onReply,
+  atMaxDepth,
 }: CommentItemProps) {
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState(comment.content);
@@ -100,7 +107,8 @@ function CommentItem({
       return;
     }
     setEditError(null);
-    onEdit(comment.id, editValue);
+    // Pass the revision we loaded so the backend can reject stale writes.
+    onEdit(comment.id, editValue, comment.revision);
     setEditing(false);
   };
 
@@ -121,7 +129,30 @@ function CommentItem({
   if (comment.status === "deleted") {
     return (
       <li className="py-3 border-b border-white/5 last:border-0">
-        <p className="text-sm italic text-zinc-600">[comment deleted]</p>
+        <p className="text-sm italic text-zinc-600">
+          [comment deleted]
+          {comment.children.length > 0 && (
+            <span className="ml-1 text-zinc-700">
+              — replies preserved
+            </span>
+          )}
+        </p>
+        {comment.children.length > 0 && (
+          <ul className="mt-2 ml-4 space-y-0 border-l border-white/5 pl-3">
+            {comment.children.map((child) => (
+              <CommentItem
+                key={child.id}
+                comment={child}
+                currentUserAddress={currentUserAddress}
+                onEdit={onEdit}
+                onDelete={onDelete}
+                onReport={onReport}
+                onReply={onReply}
+                atMaxDepth={comment.depth + 1 >= MAX_THREAD_DEPTH}
+              />
+            ))}
+          </ul>
+        )}
       </li>
     );
   }
@@ -275,7 +306,51 @@ function CommentItem({
                   {hasAlreadyReported ? "Reported" : "Report"}
                 </button>
               )}
+              {currentUserAddress && (
+                <button
+                  type="button"
+                  onClick={() => onReply(comment.id)}
+                  disabled={atMaxDepth}
+                  className={cn(
+                    "text-[11px] flex items-center gap-1 transition-colors",
+                    atMaxDepth
+                      ? "text-zinc-700 cursor-not-allowed"
+                      : "text-zinc-600 hover:text-[#37B7C3] cursor-pointer",
+                  )}
+                  aria-label={
+                    atMaxDepth
+                      ? "Maximum reply depth reached"
+                      : "Reply to comment"
+                  }
+                  title={
+                    atMaxDepth
+                      ? `Maximum thread depth (${MAX_THREAD_DEPTH}) reached`
+                      : undefined
+                  }
+                >
+                  <MessageSquare className="h-3 w-3" />
+                  Reply
+                </button>
+              )}
             </div>
+          )}
+
+          {/* Nested replies */}
+          {comment.children.length > 0 && (
+            <ul className="mt-2 ml-4 space-y-0 border-l border-white/5 pl-3">
+              {comment.children.map((child) => (
+                <CommentItem
+                  key={child.id}
+                  comment={child}
+                  currentUserAddress={currentUserAddress}
+                  onEdit={onEdit}
+                  onDelete={onDelete}
+                  onReport={onReport}
+                  onReply={onReply}
+                  atMaxDepth={comment.depth + 1 >= MAX_THREAD_DEPTH}
+                />
+              ))}
+            </ul>
           )}
         </div>
       </div>
@@ -291,12 +366,25 @@ interface ComposeBoxProps {
   onSubmit: (content: string) => void;
   disabled?: boolean;
   disabledReason?: string;
+  /** When set, the box is composing a reply to this comment. */
+  replyingTo?: string | null;
+  onCancelReply?: () => void;
 }
 
-function ComposeBox({ onSubmit, disabled, disabledReason }: ComposeBoxProps) {
+function ComposeBox({
+  onSubmit,
+  disabled,
+  disabledReason,
+  replyingTo,
+  onCancelReply,
+}: ComposeBoxProps) {
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (replyingTo) textareaRef.current?.focus();
+  }, [replyingTo]);
 
   const handleSubmit = () => {
     const err = validateCommentContent(value);
@@ -325,6 +413,18 @@ function ComposeBox({ onSubmit, disabled, disabledReason }: ComposeBoxProps) {
         </p>
       ) : (
         <div className="space-y-2">
+          {replyingTo && (
+            <div className="flex items-center justify-between rounded bg-white/5 px-3 py-1.5 text-[11px] text-zinc-400">
+              <span>Replying to a comment</span>
+              <button
+                type="button"
+                onClick={onCancelReply}
+                className="text-zinc-500 hover:text-zinc-300 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
           <textarea
             ref={textareaRef}
             value={value}
@@ -395,6 +495,7 @@ export function DiscussionThread({
 }: DiscussionThreadProps) {
   const [comments, setComments] = useState<Comment[]>([]);
   const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
+  const [replyTo, setReplyTo] = useState<string | null>(null);
 
   // Load comments on mount or when poolId changes.
   useEffect(() => {
@@ -414,19 +515,43 @@ export function DiscussionThread({
   const handlePost = useCallback(
     (content: string) => {
       if (!currentUserAddress) return;
-      addComment({ poolId, authorAddress: currentUserAddress, content });
-      refresh();
+      try {
+        addComment({
+          poolId,
+          authorAddress: currentUserAddress,
+          content,
+          parentId: replyTo ?? undefined,
+        });
+        setReplyTo(null);
+        refresh();
+      } catch (err) {
+        showFeedback(
+          err instanceof Error ? err.message : "Could not post comment.",
+        );
+      }
     },
-    [poolId, currentUserAddress, refresh],
+    [poolId, currentUserAddress, refresh, replyTo],
   );
 
   const handleEdit = useCallback(
-    (commentId: string, newContent: string) => {
+    (commentId: string, newContent: string, revision: number) => {
       if (!currentUserAddress) return;
       try {
-        editComment({ commentId, editorAddress: currentUserAddress, newContent });
+        editComment({
+          commentId,
+          editorAddress: currentUserAddress,
+          newContent,
+          revision,
+        });
         refresh();
       } catch (err) {
+        if (err instanceof DiscussionConflictError) {
+          showFeedback(
+            "This comment was edited elsewhere. Reloading the latest version.",
+          );
+          refresh();
+          return;
+        }
         showFeedback(err instanceof Error ? err.message : "Could not edit comment.");
       }
     },
@@ -461,7 +586,16 @@ export function DiscussionThread({
     [currentUserAddress, refresh],
   );
 
-  const visibleCount = comments.filter((c) => c.status !== "deleted").length;
+  const countVisible = (list: Comment[]): number =>
+    list.reduce(
+      (acc, c) =>
+        acc +
+        (c.status !== "deleted" ? 1 : 0) +
+        countVisible(c.children),
+      0,
+    );
+
+  const visibleCount = countVisible(comments);
 
   return (
     <section
@@ -525,6 +659,8 @@ export function DiscussionThread({
               onEdit={handleEdit}
               onDelete={handleDelete}
               onReport={handleReport}
+              onReply={setReplyTo}
+              atMaxDepth={comment.depth >= MAX_THREAD_DEPTH}
             />
           ))}
         </ul>
@@ -539,6 +675,8 @@ export function DiscussionThread({
             ? "Discussion is disabled in demo mode."
             : "Connect your wallet to join the discussion."
         }
+        replyingTo={replyTo}
+        onCancelReply={() => setReplyTo(null)}
       />
     </section>
   );

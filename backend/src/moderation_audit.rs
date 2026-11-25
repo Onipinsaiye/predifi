@@ -141,6 +141,167 @@ where
     }
 }
 
+/// Explicit lifecycle states for reports, reviews, actions, and appeals.
+///
+/// Reports and appeals move through an explicit state machine rather than
+/// mutable boolean flags so every transition is auditable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModerationState {
+    /// A report has been filed and awaits triage.
+    ReportSubmitted,
+    /// A reviewer has claimed the report for review.
+    UnderReview,
+    /// A moderation action (e.g. hide content) has been applied.
+    ActionTaken,
+    /// The report was dismissed without action.
+    Dismissed,
+    /// An appeal against an action has been filed.
+    AppealSubmitted,
+    /// The appeal was upheld (action reversed).
+    AppealUpheld,
+    /// The appeal was rejected (action stands).
+    AppealRejected,
+}
+
+impl ModerationState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModerationState::ReportSubmitted => "report_submitted",
+            ModerationState::UnderReview => "under_review",
+            ModerationState::ActionTaken => "action_taken",
+            ModerationState::Dismissed => "dismissed",
+            ModerationState::AppealSubmitted => "appeal_submitted",
+            ModerationState::AppealUpheld => "appeal_upheld",
+            ModerationState::AppealRejected => "appeal_rejected",
+        }
+    }
+
+    /// Returns true if `from -> to` is a legal moderation transition.
+    ///
+    /// Legal transitions:
+    /// - ReportSubmitted -> UnderReview | Dismissed
+    /// - UnderReview -> ActionTaken | Dismissed
+    /// - ActionTaken -> AppealSubmitted
+    /// - AppealSubmitted -> AppealUpheld | AppealRejected
+    /// - Dismissed, AppealUpheld, AppealRejected are terminal.
+    pub fn is_legal_transition(from: ModerationState, to: ModerationState) -> bool {
+        use ModerationState::*;
+        matches!(
+            (from, to),
+            (ReportSubmitted, UnderReview)
+                | (ReportSubmitted, Dismissed)
+                | (UnderReview, ActionTaken)
+                | (UnderReview, Dismissed)
+                | (ActionTaken, AppealSubmitted)
+                | (AppealSubmitted, AppealUpheld)
+                | (AppealSubmitted, AppealRejected)
+        )
+    }
+
+    /// Returns true if this state is terminal (no further transitions allowed).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ModerationState::Dismissed
+                | ModerationState::AppealUpheld
+                | ModerationState::AppealRejected
+        )
+    }
+}
+
+/// Reviewer roles permitted to perform moderation transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerRole {
+    /// Can triage reports and dismiss them.
+    Reviewer,
+    /// Can additionally take moderation actions.
+    SeniorReviewer,
+    /// Can additionally adjudicate appeals.
+    AppealJudge,
+}
+
+impl ReviewerRole {
+    /// Returns true if this role may perform the given transition.
+    pub fn can_perform(&self, from: ModerationState, to: ModerationState) -> bool {
+        use ModerationState::*;
+        match (from, to) {
+            (ReportSubmitted, UnderReview) | (ReportSubmitted, Dismissed) => true,
+            (UnderReview, ActionTaken) => matches!(
+                self,
+                ReviewerRole::SeniorReviewer | ReviewerRole::AppealJudge
+            ),
+            (UnderReview, Dismissed) => true,
+            (ActionTaken, AppealSubmitted) => true,
+            (AppealSubmitted, AppealUpheld) | (AppealSubmitted, AppealRejected) => {
+                matches!(self, ReviewerRole::AppealJudge)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Errors produced by the moderation state machine service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModerationTransitionError {
+    /// The requested transition is not part of the legal state machine.
+    ForbiddenTransition {
+        from: ModerationState,
+        to: ModerationState,
+    },
+    /// The actor's role is not permitted to perform this transition.
+    PermissionDenied {
+        role: ReviewerRole,
+        from: ModerationState,
+        to: ModerationState,
+    },
+    /// The transition was already recorded (idempotent duplicate submission).
+    DuplicateTransition {
+        from: ModerationState,
+        to: ModerationState,
+    },
+    /// No report with the given id exists.
+    UnknownReport { report_id: String },
+    /// The audit log rejected the record.
+    Audit(ModerationAuditError),
+}
+
+impl Display for ModerationTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ModerationTransitionError::ForbiddenTransition { from, to } => {
+                write!(f, "forbidden transition {} -> {}", from.as_str(), to.as_str())
+            }
+            ModerationTransitionError::PermissionDenied { role, from, to } => write!(
+                f,
+                "role {:?} may not perform {} -> {}",
+                role,
+                from.as_str(),
+                to.as_str()
+            ),
+            ModerationTransitionError::DuplicateTransition { from, to } => write!(
+                f,
+                "duplicate transition {} -> {}",
+                from.as_str(),
+                to.as_str()
+            ),
+            ModerationTransitionError::UnknownReport { report_id } => {
+                write!(f, "unknown report {report_id}")
+            }
+            ModerationTransitionError::Audit(e) => write!(f, "audit error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ModerationTransitionError {}
+
+impl From<ModerationAuditError> for ModerationTransitionError {
+    fn from(e: ModerationAuditError) -> Self {
+        ModerationTransitionError::Audit(e)
+    }
+}
+
 /// A single append-only moderation audit record.
 ///
 /// Each record is hashed together with the previous record's hash, forming a
@@ -154,6 +315,15 @@ pub struct ModerationRecord {
     pub action: String,
     pub target: String,
     pub reason: String,
+    /// Report this transition belongs to, if it is a state-machine transition.
+    #[serde(default)]
+    pub report_id: Option<String>,
+    /// State the report was in before this transition.
+    #[serde(default)]
+    pub from_state: Option<ModerationState>,
+    /// State the report moved to as a result of this transition.
+    #[serde(default)]
+    pub to_state: Option<ModerationState>,
     /// Timestamp of the step-up proof that authorized this decision, if privileged.
     #[serde(default)]
     pub proof_timestamp_unix_ms: Option<i64>,
@@ -339,6 +509,9 @@ impl ModerationAuditLog {
             action,
             target: target.into(),
             reason: reason.into(),
+            report_id: None,
+            from_state: None,
+            to_state: None,
             proof_timestamp_unix_ms,
             corrects_sequence,
             prev_hash,
@@ -363,6 +536,157 @@ impl ModerationAuditLog {
     pub fn verify_from_disk(&self) -> Result<VerificationResult, ModerationAuditError> {
         let records = load_records(&self.path)?;
         verify_records(&records).map_err(ModerationAuditError::VerificationFailed)
+    }
+
+    /// Append a state-machine transition record. Unlike `append`, this records
+    /// the report id and the from/to states so the full lifecycle is auditable.
+    #[allow(clippy::too_many_arguments)]
+    fn append_transition(
+        &mut self,
+        report_id: &str,
+        actor: &str,
+        from: ModerationState,
+        to: ModerationState,
+        reason: &str,
+        timestamp_unix_ms: i64,
+        proof_timestamp_unix_ms: Option<i64>,
+    ) -> Result<ModerationRecord, ModerationAuditError> {
+        let action = format!("transition:{}->{}", from.as_str(), to.as_str());
+        if PrivilegedAction::is_privileged(&action) && proof_timestamp_unix_ms.is_none() {
+            return Err(ModerationAuditError::VerificationFailed(VerificationError {
+                index: self.records.len(),
+                sequence: self.records.last().map(|r| r.sequence + 1).unwrap_or(1),
+                kind: VerificationErrorKind::MissingStepUpProof {
+                    action: action.clone(),
+                },
+            }));
+        }
+        let sequence = self.records.last().map(|r| r.sequence + 1).unwrap_or(1);
+        let prev_hash = self
+            .records
+            .last()
+            .map(|r| r.record_hash.clone())
+            .unwrap_or_else(|| GENESIS_PREV_HASH.to_string());
+        let mut record = ModerationRecord {
+            sequence,
+            timestamp_unix_ms,
+            actor: actor.to_string(),
+            action,
+            target: report_id.to_string(),
+            reason: reason.to_string(),
+            report_id: Some(report_id.to_string()),
+            from_state: Some(from),
+            to_state: Some(to),
+            proof_timestamp_unix_ms,
+            corrects_sequence: None,
+            prev_hash,
+            record_hash: String::new(),
+        };
+        record.record_hash = compute_record_hash(&record).map_err(|kind| {
+            ModerationAuditError::VerificationFailed(VerificationError {
+                index: self.records.len(),
+                sequence: record.sequence,
+                kind,
+            })
+        })?;
+        append_record_to_disk(&self.path, &record)?;
+        self.records.push(record.clone());
+        Ok(record)
+    }
+
+    /// Returns the current state of a report based on the audit history, if any.
+    pub fn current_state(&self, report_id: &str) -> Option<ModerationState> {
+        self.records
+            .iter()
+            .rev()
+            .find(|r| r.report_id.as_deref() == Some(report_id))
+            .and_then(|r| r.to_state)
+    }
+
+    /// Returns the ordered transition history for a report.
+    pub fn history(&self, report_id: &str) -> Vec<&ModerationRecord> {
+        self.records
+            .iter()
+            .filter(|r| r.report_id.as_deref() == Some(report_id))
+            .collect()
+    }
+
+    /// Apply a moderation state transition on behalf of `actor` with `role`.
+    ///
+    /// Enforces, in order:
+    /// 1. The transition is legal in the state machine.
+    /// 2. The actor's role is permitted to perform it.
+    /// 3. The transition is not a duplicate of the report's current state
+    ///    (idempotent: retries return the existing record without appending).
+    ///
+    /// On success, appends exactly one audit record capturing actor, timestamp,
+    /// and from/to states, and returns it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transition(
+        &mut self,
+        report_id: &str,
+        actor: &str,
+        role: ReviewerRole,
+        to: ModerationState,
+        reason: &str,
+        timestamp_unix_ms: i64,
+        proof_timestamp_unix_ms: Option<i64>,
+    ) -> Result<ModerationRecord, ModerationTransitionError> {
+        let from = self
+            .current_state(report_id)
+            .ok_or_else(|| ModerationTransitionError::UnknownReport {
+                report_id: report_id.to_string(),
+            })?;
+
+        // Idempotent duplicate: the report is already in the requested state.
+        if from == to {
+            return Err(ModerationTransitionError::DuplicateTransition { from, to });
+        }
+
+        if !ModerationState::is_legal_transition(from, to) {
+            return Err(ModerationTransitionError::ForbiddenTransition { from, to });
+        }
+
+        if !role.can_perform(from, to) {
+            return Err(ModerationTransitionError::PermissionDenied { role, from, to });
+        }
+
+        let record = self.append_transition(
+            report_id,
+            actor,
+            from,
+            to,
+            reason,
+            timestamp_unix_ms,
+            proof_timestamp_unix_ms,
+        )?;
+        Ok(record)
+    }
+
+    /// File a new report, moving it into `ReportSubmitted`.
+    pub fn submit_report(
+        &mut self,
+        report_id: &str,
+        actor: &str,
+        reason: &str,
+        timestamp_unix_ms: i64,
+    ) -> Result<ModerationRecord, ModerationTransitionError> {
+        if self.current_state(report_id).is_some() {
+            return Err(ModerationTransitionError::DuplicateTransition {
+                from: ModerationState::ReportSubmitted,
+                to: ModerationState::ReportSubmitted,
+            });
+        }
+        let record = self.append_transition(
+            report_id,
+            actor,
+            ModerationState::ReportSubmitted,
+            ModerationState::ReportSubmitted,
+            reason,
+            timestamp_unix_ms,
+            None,
+        )?;
+        Ok(record)
     }
 }
 
@@ -675,6 +999,158 @@ mod tests {
         assert_eq!(rec.actor, "alice");
         assert_eq!(rec.reason, "spam");
         assert_eq!(rec.proof_timestamp_unix_ms, Some(990));
+        let _ = fs::remove_file(&path);
+    }
+
+    fn temp_log(tag: &str) -> (ModerationAuditLog, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "audit-{tag}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_file(&path);
+        let log = ModerationAuditLog::open(path.to_string_lossy()).unwrap();
+        (log, path)
+    }
+
+    #[test]
+    fn legal_transitions_are_defined() {
+        use ModerationState::*;
+        assert!(ModerationState::is_legal_transition(ReportSubmitted, UnderReview));
+        assert!(ModerationState::is_legal_transition(UnderReview, ActionTaken));
+        assert!(ModerationState::is_legal_transition(ActionTaken, AppealSubmitted));
+        assert!(ModerationState::is_legal_transition(AppealSubmitted, AppealUpheld));
+        assert!(ModerationState::is_legal_transition(AppealSubmitted, AppealRejected));
+        assert!(!ModerationState::is_legal_transition(ReportSubmitted, ActionTaken));
+        assert!(!ModerationState::is_legal_transition(Dismissed, UnderReview));
+        assert!(Dismissed.is_terminal());
+    }
+
+    #[test]
+    fn forbidden_transition_rejected() {
+        let (mut log, path) = temp_log("forbidden");
+        log.submit_report("r1", "alice", "spam", 1000).unwrap();
+        let err = log
+            .transition(
+                "r1",
+                "bob",
+                ReviewerRole::SeniorReviewer,
+                ModerationState::ActionTaken,
+                "skip review",
+                2000,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ModerationTransitionError::ForbiddenTransition { .. }
+        ));
+        // No transition record was appended for the forbidden attempt.
+        assert_eq!(log.history("r1").len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn permission_enforced_in_service_layer() {
+        let (mut log, path) = temp_log("perm");
+        log.submit_report("r1", "alice", "spam", 1000).unwrap();
+        log.transition(
+            "r1",
+            "bob",
+            ReviewerRole::Reviewer,
+            ModerationState::UnderReview,
+            "claim",
+            2000,
+            None,
+        )
+        .unwrap();
+        // A plain reviewer may not take action.
+        let err = log
+            .transition(
+                "r1",
+                "bob",
+                ReviewerRole::Reviewer,
+                ModerationState::ActionTaken,
+                "hide",
+                3000,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ModerationTransitionError::PermissionDenied { .. }
+        ));
+        assert_eq!(log.history("r1").len(), 2);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_submission_is_idempotent() {
+        let (mut log, path) = temp_log("dup");
+        log.submit_report("r1", "alice", "spam", 1000).unwrap();
+        let err = log.submit_report("r1", "alice", "spam", 1001).unwrap_err();
+        assert!(matches!(
+            err,
+            ModerationTransitionError::DuplicateTransition { .. }
+        ));
+        assert_eq!(log.history("r1").len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audit_history_complete_after_retries() {
+        let (mut log, path) = temp_log("retry");
+        log.submit_report("r1", "alice", "spam", 1000).unwrap();
+        // Retry the same submission; must not duplicate.
+        let _ = log.submit_report("r1", "alice", "spam", 1001);
+        log.transition(
+            "r1",
+            "bob",
+            ReviewerRole::Reviewer,
+            ModerationState::UnderReview,
+            "claim",
+            2000,
+            None,
+        )
+        .unwrap();
+        // Retry the same transition; must not duplicate.
+        let _ = log.transition(
+            "r1",
+            "bob",
+            ReviewerRole::Reviewer,
+            ModerationState::UnderReview,
+            "claim",
+            2001,
+            None,
+        );
+        log.transition(
+            "r1",
+            "carol",
+            ReviewerRole::SeniorReviewer,
+            ModerationState::ActionTaken,
+            "hide",
+            3000,
+            None,
+        )
+        .unwrap();
+
+        let history = log.history("r1");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].to_state, Some(ModerationState::ReportSubmitted));
+        assert_eq!(history[1].from_state, Some(ModerationState::ReportSubmitted));
+        assert_eq!(history[1].to_state, Some(ModerationState::UnderReview));
+        assert_eq!(history[2].to_state, Some(ModerationState::ActionTaken));
+        // Actor and timestamp recorded per transition.
+        assert_eq!(history[1].actor, "bob");
+        assert_eq!(history[1].timestamp_unix_ms, 2000);
+        assert_eq!(history[2].actor, "carol");
+        assert_eq!(history[2].timestamp_unix_ms, 3000);
+        assert_eq!(log.current_state("r1"), Some(ModerationState::ActionTaken));
+        // Chain remains valid after retries.
+        assert!(log.verify().unwrap().ok);
         let _ = fs::remove_file(&path);
     }
 }

@@ -96,6 +96,22 @@ pub enum AppError {
     StalePoolState(String),
     /// Liquidity pool state is not supported by the adopted pricing model.
     UnsupportedPoolState(String),
+    /// A wallet signature failed verification (#298).
+    InvalidSignature,
+    /// A wallet signature proof was already consumed (#298).
+    ReplayedProof,
+    /// The submitted profile/discussion revision is not newer than the stored
+    /// one, or does not match the expected predecessor (#298, #299).
+    StaleRevision,
+    /// The wallet no longer owns the resource and must re-prove ownership
+    /// before further edits (#298).
+    WalletRotationRequired,
+    /// A discussion reply would exceed the maximum thread depth (#299).
+    DiscussionDepthExceeded,
+    /// A discussion body exceeds the maximum allowed size (#299).
+    DiscussionBodyTooLarge,
+    /// The parent comment of a discussion reply has been deleted (#299).
+    DiscussionParentDeleted,
     ServiceUnavailable(String),
     Internal(String),
 }
@@ -128,6 +144,13 @@ impl fmt::Display for AppError {
             AppError::UpstreamTimeout(msg) => write!(f, "upstream timeout: {}", msg),
             AppError::StalePoolState(msg) => write!(f, "stale pool state: {}", msg),
             AppError::UnsupportedPoolState(msg) => write!(f, "unsupported pool state: {}", msg),
+            AppError::InvalidSignature => write!(f, "invalid signature"),
+            AppError::ReplayedProof => write!(f, "replayed proof"),
+            AppError::StaleRevision => write!(f, "stale revision"),
+            AppError::WalletRotationRequired => write!(f, "wallet rotation required"),
+            AppError::DiscussionDepthExceeded => write!(f, "discussion depth exceeded"),
+            AppError::DiscussionBodyTooLarge => write!(f, "discussion body too large"),
+            AppError::DiscussionParentDeleted => write!(f, "discussion parent deleted"),
             AppError::Internal(msg) => write!(f, "internal error: {}", msg),
         }
     }
@@ -160,6 +183,13 @@ impl AppError {
             AppError::UpstreamTimeout(_) => (S::GATEWAY_TIMEOUT, c::UPSTREAM_TIMEOUT),
             AppError::StalePoolState(_) => (S::CONFLICT, c::STALE_POOL_STATE),
             AppError::UnsupportedPoolState(_) => (S::UNPROCESSABLE_ENTITY, c::UNSUPPORTED_POOL_STATE),
+            AppError::InvalidSignature => (S::UNAUTHORIZED, c::INVALID_SIGNATURE),
+            AppError::ReplayedProof => (S::CONFLICT, c::REPLAYED_PROOF),
+            AppError::StaleRevision => (S::CONFLICT, c::STALE_REVISION),
+            AppError::WalletRotationRequired => (S::FORBIDDEN, c::WALLET_ROTATION_REQUIRED),
+            AppError::DiscussionDepthExceeded => (S::UNPROCESSABLE_ENTITY, c::DISCUSSION_DEPTH_EXCEEDED),
+            AppError::DiscussionBodyTooLarge => (S::PAYLOAD_TOO_LARGE, c::DISCUSSION_BODY_TOO_LARGE),
+            AppError::DiscussionParentDeleted => (S::CONFLICT, c::DISCUSSION_PARENT_DELETED),
             AppError::ServiceUnavailable(_) => (S::SERVICE_UNAVAILABLE, c::SERVICE_UNAVAILABLE),
             AppError::Internal(_) => (S::INTERNAL_SERVER_ERROR, c::INTERNAL_ERROR),
         }
@@ -314,7 +344,14 @@ impl axum::response::IntoResponse for AppError {
             AppError::TokenRevoked
             | AppError::RateLimited
             | AppError::DatabaseUnavailable
-            | AppError::TokenStoreUnavailable => {
+            | AppError::TokenStoreUnavailable
+            | AppError::InvalidSignature
+            | AppError::ReplayedProof
+            | AppError::StaleRevision
+            | AppError::WalletRotationRequired
+            | AppError::DiscussionDepthExceeded
+            | AppError::DiscussionBodyTooLarge
+            | AppError::DiscussionParentDeleted => {
                 ApiResponse::<()>::error(status, code, crate::response::safe_message(code))
                     .into_response()
             }
