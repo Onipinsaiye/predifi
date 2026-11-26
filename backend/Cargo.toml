@@ -46,7 +46,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 prometheus = "0.13"
 # OpenAPI / Swagger documentation
-utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }
+utoipa = { version = "6.0.0", features = ["axum_extras", "chrono"] }
 # Redis caching for hot data
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 sysinfo = "0.37"
