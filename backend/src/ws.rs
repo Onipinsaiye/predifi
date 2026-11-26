@@ -603,9 +603,10 @@ pub async fn ws_handler(
 
     let span = info_span!(
         "websocket.connect",
-        wallet = ?wallet_filter,
+        // Pseudonymise wallet fields so traces do not expose raw addresses.
+        wallet = ?wallet_filter.as_deref().map(crate::address_pseudonym::pseudonym),
         pool_id = ?pool_filter,
-        subject = %claims.sub,
+        subject = %crate::address_pseudonym::pseudonym(&claims.sub),
         requested_cursor = ?requested_cursor,
     );
     ws.on_upgrade(move |socket| {

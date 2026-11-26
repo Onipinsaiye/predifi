@@ -541,7 +541,9 @@ fn enforce_abuse_quota(
         Err(rejection) => {
             tracing::warn!(
                 action = action.as_str(),
-                wallet = %wallet,
+                // Use a pseudonym, not the raw wallet address, so this warn
+                // cannot be used to enumerate wallets from retained logs.
+                wallet = %crate::address_pseudonym::pseudonym(wallet),
                 network = state.abuse.network(),
                 "abuse quota exceeded"
             );
