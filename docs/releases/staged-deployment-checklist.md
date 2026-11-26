@@ -97,6 +97,12 @@ and a complete rollback plan.
 - Compare the artifact checksum to the reviewed release manifest and, where
   applicable, the registry's immutable image digest. Reject mutable tags such
   as `latest` as the only artifact identity.
+- Run the deployment preflight validator against the release manifest and the
+  selected CLI profile before uploading:
+  `node scripts/validate-deployment-manifest.mjs --manifest <manifest> --profile <profile>`.
+  It verifies required fields, artifact checksums, contract references, the
+  profile's network/version, and the manifest signature, and exits non-zero on
+  any mismatch. Record the command output with the gate evidence.
 - Confirm the artifact being promoted to staging is the same artifact intended
   for production, not a rebuild with different bytes.
 - For Soroban, record the network passphrase, contract IDs, uploaded Wasm hash,
