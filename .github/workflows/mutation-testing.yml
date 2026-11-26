@@ -71,7 +71,7 @@ jobs:
       - name: Run mutation tests on PR diff
         run: python3 mutation-testing/run.py --diff-base "origin/${{ github.base_ref }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: mutants-pr-${{ github.event.pull_request.number }}
@@ -117,7 +117,7 @@ jobs:
         id: name
         run: echo "value=mutants-${{ matrix.suite }}-$(echo '${{ matrix.shard }}' | tr / -)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ${{ steps.name.outputs.value }}
